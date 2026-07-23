@@ -10,7 +10,7 @@
 //! The reader can be cloned, in which case each reader receives a copy of each object. (fanout)
 //!
 //! The stream is closed with [ServeError::Closed] when all writers or readers are dropped.
-use std::{cmp, ops::Deref, sync::Arc};
+use std::{cmp, collections::VecDeque, ops::Deref, sync::Arc};
 
 use bytes::Bytes;
 
@@ -18,6 +18,14 @@ use crate::data::ObjectStatus;
 use crate::watch::State;
 
 use super::{ServeError, Track};
+
+/// Maximum number of subgroup readers retained for late or lagging consumers.
+///
+/// A 60-second Phase-4 PC run creates 1,800 frame-per-subgroup entries at
+/// 30 Hz, so this keeps the complete registered run while bounding longer
+/// live sessions. MoQ tracks are allowed to omit old streams; a consumer that
+/// falls behind this window resumes from the oldest retained subgroup.
+const MAX_SUBGROUP_HISTORY: usize = 2_048;
 
 pub struct Subgroups {
     pub track: Arc<Track>,
@@ -47,14 +55,16 @@ struct SubgroupsState {
     // Preserve every announced subgroup in creation order. Keeping only the
     // latest reader silently skipped intermediate frame-per-subgroup groups
     // when several appends occurred before a reader was polled.
-    subgroups: Vec<SubgroupReader>,
+    subgroups: VecDeque<SubgroupReader>,
+    first_index: u64,
     closed: Result<(), ServeError>,
 }
 
 impl Default for SubgroupsState {
     fn default() -> Self {
         Self {
-            subgroups: Vec::new(),
+            subgroups: VecDeque::new(),
+            first_index: 0,
             closed: Ok(()),
         }
     }
@@ -114,24 +124,29 @@ impl SubgroupsWriter {
 
         let mut state = self.state.lock_mut().ok_or(ServeError::Cancel)?;
 
-        if let Some(latest) = state.subgroups.last() {
+        if let Some(latest) = state.subgroups.back() {
             // TODO: Check this logic again
             if writer.group_id.cmp(&latest.group_id) == cmp::Ordering::Equal {
                 match writer.subgroup_id.cmp(&latest.subgroup_id) {
                     cmp::Ordering::Less => return Ok(writer), // dropped immediately, lul
                     cmp::Ordering::Equal => return Err(ServeError::Duplicate),
-                    cmp::Ordering::Greater => state.subgroups.push(reader),
+                    cmp::Ordering::Greater => state.subgroups.push_back(reader),
                 }
             } else if writer.group_id.cmp(&latest.group_id) == cmp::Ordering::Greater {
-                state.subgroups.push(reader);
+                state.subgroups.push_back(reader);
             } else {
                 return Ok(writer); // drop here as well
             }
         } else {
-            state.subgroups.push(reader);
+            state.subgroups.push_back(reader);
         }
 
-        let latest = state.subgroups.last().expect("just inserted subgroup");
+        while state.subgroups.len() > MAX_SUBGROUP_HISTORY {
+            state.subgroups.pop_front();
+            state.first_index = state.first_index.saturating_add(1);
+        }
+
+        let latest = state.subgroups.back().expect("just inserted subgroup");
         self.next_subgroup_id = latest.subgroup_id + 1;
         self.next_group_id = latest.group_id + 1;
         self.last_group_id = latest.group_id;
@@ -163,7 +178,7 @@ impl Deref for SubgroupsWriter {
 pub struct SubgroupsReader {
     pub info: Arc<Track>,
     state: State<SubgroupsState>,
-    read_index: usize,
+    read_index: u64,
 }
 
 impl SubgroupsReader {
@@ -180,8 +195,17 @@ impl SubgroupsReader {
             {
                 let state = self.state.lock();
 
-                if self.read_index < state.subgroups.len() {
-                    let subgroup = state.subgroups[self.read_index].clone();
+                if self.read_index < state.first_index {
+                    tracing::debug!(
+                        skipped = state.first_index - self.read_index,
+                        "subgroup reader fell behind retained history"
+                    );
+                    self.read_index = state.first_index;
+                }
+
+                let offset = self.read_index.saturating_sub(state.first_index);
+                if offset < state.subgroups.len() as u64 {
+                    let subgroup = state.subgroups[offset as usize].clone();
                     self.read_index += 1;
                     return Ok(Some(subgroup));
                 }
@@ -201,7 +225,7 @@ impl SubgroupsReader {
         let state = self.state.lock();
         state
             .subgroups
-            .last()
+            .back()
             .and_then(|group| group.latest().map(|object_id| (group.group_id, object_id)))
     }
 
@@ -694,5 +718,37 @@ mod tests {
             );
         }
         assert!(reader.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn history_is_bounded_and_a_lagging_reader_fast_forwards() {
+        let (track_writer, track_reader) =
+            Track::new(TrackNamespace::from_utf8_path("test"), "pc").produce();
+        let mut writer = track_writer.subgroups().unwrap();
+        let mut reader = match track_reader.mode().await.unwrap() {
+            TrackReaderMode::Subgroups(reader) => reader,
+            _ => panic!("expected subgroup mode"),
+        };
+
+        for expected_group in 0..(MAX_SUBGROUP_HISTORY as u64 + 3) {
+            let mut subgroup = writer.append(128).unwrap();
+            subgroup
+                .write(Bytes::from(vec![(expected_group % 256) as u8]))
+                .unwrap();
+            drop(subgroup);
+        }
+
+        {
+            let state = reader.state.lock();
+            assert_eq!(state.subgroups.len(), MAX_SUBGROUP_HISTORY);
+            assert_eq!(state.first_index, 3);
+        }
+
+        let first_retained = reader
+            .next()
+            .await
+            .unwrap()
+            .expect("oldest retained subgroup missing");
+        assert_eq!(first_retained.group_id, 3);
     }
 }
