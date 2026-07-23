@@ -19,6 +19,8 @@ use crate::watch::State;
 
 use super::{ServeError, Track};
 
+const DELIVERY_TIMEOUT_RESET_CODE: u64 = 0x2;
+
 /// Maximum number of subgroup readers retained for late or lagging consumers.
 ///
 /// A 60-second Phase-4 PC run creates 1,800 frame-per-subgroup entries at
@@ -442,7 +444,11 @@ impl SubgroupReader {
     pub async fn read_next(&mut self) -> Result<Option<Bytes>, ServeError> {
         let object = self.next().await?;
         match object {
-            Some(mut object) => Ok(Some(object.read_all().await?)),
+            Some(mut object) => match object.read_all().await {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(ServeError::Closed(DELIVERY_TIMEOUT_RESET_CODE)) => Ok(None),
+                Err(err) => Err(err),
+            },
             None => Ok(None),
         }
     }
@@ -594,6 +600,21 @@ impl SubgroupObjectWriter {
         let mut state = state.into_mut().ok_or(ServeError::Cancel)?;
         state.closed = Err(err);
 
+        Ok(())
+    }
+
+    /// Abort an incomplete object without exposing its partial chunks.
+    ///
+    /// This is used when an inbound subgroup stream is deliberately reset by
+    /// DELIVERY_TIMEOUT. Unlike [`close`](Self::close), an abort is valid while
+    /// bytes remain because the object is explicitly being discarded.
+    pub fn abort(mut self, err: ServeError) -> Result<(), ServeError> {
+        let state = self.state.lock();
+        state.closed.clone()?;
+
+        let mut state = state.into_mut().ok_or(ServeError::Cancel)?;
+        state.closed = Err(err);
+        self.remain = 0;
         Ok(())
     }
 }
@@ -750,5 +771,26 @@ mod tests {
             .unwrap()
             .expect("oldest retained subgroup missing");
         assert_eq!(first_retained.group_id, 3);
+    }
+
+    #[tokio::test]
+    async fn delivery_timeout_discards_a_partial_object_without_failing_the_track() {
+        let (track_writer, track_reader) =
+            Track::new(TrackNamespace::from_utf8_path("test"), "pc").produce();
+        let mut writer = track_writer.subgroups().unwrap();
+        let mut subgroup = writer.append(128).unwrap();
+        let mut object = subgroup.create(8, None).unwrap();
+        object.write(Bytes::from_static(b"part")).unwrap();
+        object.abort(ServeError::Closed(DELIVERY_TIMEOUT_RESET_CODE)).unwrap();
+        drop(subgroup);
+        drop(writer);
+
+        let mut reader = match track_reader.mode().await.unwrap() {
+            TrackReaderMode::Subgroups(reader) => reader,
+            _ => panic!("expected subgroup mode"),
+        };
+        let mut subgroup = reader.next().await.unwrap().expect("missing subgroup");
+        assert!(subgroup.read_next().await.unwrap().is_none());
+        assert!(reader.next().await.unwrap().is_none());
     }
 }

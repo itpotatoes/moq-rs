@@ -55,6 +55,16 @@ pub enum SessionError {
 
 // Session Termination Error Codes from draft-ietf-moq-transport-14 Section 13.1.1
 impl SessionError {
+    /// Return the application reset code for an inbound QUIC stream reset.
+    pub(crate) fn stream_reset_code(&self) -> Option<u32> {
+        match self {
+            Self::WebTransport(web_transport::Error::Read(
+                web_transport::quinn::ReadError::Reset(code),
+            )) => Some(*code),
+            _ => None,
+        }
+    }
+
     /// An integer code that is sent over the wire.
     /// Returns Session Termination Error Codes per draft-14.
     pub fn code(&self) -> u64 {

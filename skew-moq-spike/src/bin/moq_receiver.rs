@@ -600,6 +600,14 @@ fn tracks_json(reports: &[DrainReport]) -> String {
 /// The chosen rule is written into `detail` so a run can be re-classified after
 /// the fact without rerunning it.
 fn classify_ending(reports: &[DrainReport], session_finished: bool) -> (RxEnding, String) {
+    classify_ending_with_timeout(reports, session_finished, false)
+}
+
+fn classify_ending_with_timeout(
+    reports: &[DrainReport],
+    session_finished: bool,
+    allow_empty_pc_timeout: bool,
+) -> (RxEnding, String) {
     if let Some(r) = reports.iter().find(|r| r.end == TrackEnd::Failed) {
         return (
             RxEnding::DrainError,
@@ -627,7 +635,11 @@ fn classify_ending(reports: &[DrainReport], session_finished: bool) -> (RxEnding
     //     and failing it would break every LOSS condition in the matrix.
     let dead: Vec<String> = reports
         .iter()
-        .filter(|r| r.received == 0 && r.expected.unwrap_or(0) > 0)
+        .filter(|r| {
+            r.received == 0
+                && r.expected.unwrap_or(0) > 0
+                && !(allow_empty_pc_timeout && r.name == "pc")
+        })
         .map(|r| format!("{}=0/{}", r.name, r.expected.unwrap_or(0)))
         .collect();
     if !dead.is_empty() {
@@ -668,6 +680,16 @@ fn classify_ending(reports: &[DrainReport], session_finished: bool) -> (RxEnding
         return (
             RxEnding::Normal,
             format!("rule=cancel_but_complete tracks={}", names.join("+")),
+        );
+    }
+    if allow_empty_pc_timeout
+        && reports
+            .iter()
+            .any(|r| r.name == "pc" && r.received == 0 && r.expected.unwrap_or(0) > 0)
+    {
+        return (
+            RxEnding::Normal,
+            "rule=fin pc_empty_requires_timeout_accounting".to_string(),
         );
     }
     (RxEnding::Normal, "rule=fin".to_string())
@@ -1094,7 +1116,11 @@ async fn main() -> Result<()> {
                     );
                 }
             }
-            let verdict = classify_ending(&reports, session_run.is_finished());
+            let verdict = classify_ending_with_timeout(
+                &reports,
+                session_run.is_finished(),
+                args.arm == Arm::S2 && args.pc_delivery_timeout_ms.is_some(),
+            );
             reports_out = reports;
             verdict
         }
@@ -1435,6 +1461,20 @@ mod rx_ending_tests {
         assert_ne!(e.exit_code(), 0);
         assert!(d.contains("rule=zero_objects_expected"), "{d}");
         assert!(d.contains("pc=0/800"), "shortfall must be recorded: {d}");
+    }
+
+    #[test]
+    fn s2_pc_zero_can_finish_only_for_external_timeout_accounting() {
+        let reports = vec![
+            rep("pc", TrackEnd::Fin, 0, Some(180)),
+            rep("haptic", TrackEnd::Fin, 600, Some(600)),
+        ];
+        let (normal, detail) = classify_ending_with_timeout(&reports, false, true);
+        assert_eq!(normal, RxEnding::Normal, "{detail}");
+        assert!(detail.contains("requires_timeout_accounting"), "{detail}");
+
+        let (blocked, _) = classify_ending(&reports, false);
+        assert_eq!(blocked, RxEnding::NoObjects);
     }
 
     /// One dead track is enough, even if the other is complete.

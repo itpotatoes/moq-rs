@@ -1197,13 +1197,26 @@ impl Subscriber {
             )?;
 
             while remaining_bytes > 0 {
-                let chunk = reader.read_chunk(remaining_bytes).await?.ok_or_else(|| {
-                    tracing::error!(
-                        "[SUBSCRIBER] recv_subgroup_objects: stream ended with {} bytes remaining",
-                        remaining_bytes
-                    );
-                    SessionError::WrongSize
-                })?;
+                let chunk = match reader.read_chunk(remaining_bytes).await {
+                    Ok(Some(chunk)) => chunk,
+                    Ok(None) => {
+                        tracing::error!(
+                            "[SUBSCRIBER] recv_subgroup_objects: stream ended with {} bytes remaining",
+                            remaining_bytes
+                        );
+                        return Err(SessionError::WrongSize);
+                    }
+                    Err(err) if err.stream_reset_code() == Some(0x2) => {
+                        // Draft-16 DELIVERY_TIMEOUT deliberately resets this
+                        // subgroup stream. Mark the partially received object
+                        // as expired so a consumer never observes truncated
+                        // bytes, then continue with the next independent
+                        // subgroup stream.
+                        object_writer.abort(ServeError::Closed(0x2))?;
+                        return Ok(());
+                    }
+                    Err(err) => return Err(err),
+                };
                 remaining_bytes -= chunk.len();
                 object_writer.write(chunk)?;
             }
