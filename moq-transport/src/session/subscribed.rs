@@ -560,6 +560,30 @@ impl ObjectForwarder {
                 chunks_sent += 1;
             }
 
+            // Instrumentation only (see crate::accept_trace). The payload write
+            // loop above awaits QUIC flow control, so this is the last point in
+            // this crate that is still subject to send backpressure.
+            //
+            // This is a transport-accept time, NOT an on-the-wire time: the
+            // QUIC stack has accepted the bytes, it has not necessarily sent
+            // them and has certainly not had them acknowledged. Under
+            // congestion, flow-control credit runs out and this tracks
+            // backpressure well; outside congestion it is close to a pure
+            // application handoff time.
+            //
+            // Must not block: when no observer is installed this is one
+            // OnceLock load.
+            if let Some(obs) = crate::accept_trace::observer() {
+                obs.on_object_accepted(&crate::accept_trace::ObjectAccepted {
+                    track_name: &subgroup_reader.name.to_string_lossy(),
+                    track_alias: header.track_alias,
+                    group_id: subgroup_reader.group_id,
+                    subgroup_id: subgroup_reader.subgroup_id,
+                    object_id: subgroup_object_reader.object_id,
+                    payload_bytes: bytes_sent,
+                });
+            }
+
             tracing::trace!(
                 "[PUBLISHER] serve_subgroup: completed object #{} ({} chunks, {} bytes total)",
                 object_count + 1,
