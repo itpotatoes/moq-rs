@@ -37,6 +37,7 @@ impl LatePolicy {
 pub struct PlayoutConfig {
     pub d_play_us: u64,
     pub startup_timeout_us: u64,
+    pub startup_rearm_limit: u8,
     pub late_tolerance_us: u64,
     pub max_objects_per_track: usize,
     pub max_span_us: u64,
@@ -50,6 +51,9 @@ impl PlayoutConfig {
         }
         if self.startup_timeout_us == 0 {
             return Err("startup_timeout_us must be > 0");
+        }
+        if self.startup_rearm_limit != 1 {
+            return Err("startup_rearm_limit must be 1");
         }
         if self.max_objects_per_track == 0 {
             return Err("max_objects_per_track must be > 0");
@@ -143,6 +147,7 @@ pub struct PlayoutScheduler {
     haptic: BTreeMap<QueueKey, PlayoutObject>,
     terminal: HashSet<Identity>,
     startup_started_us: Option<u64>,
+    startup_rearms_used: u8,
     epoch: Option<Epoch>,
     startup_failed: bool,
 }
@@ -156,6 +161,7 @@ impl PlayoutScheduler {
             haptic: BTreeMap::new(),
             terminal: HashSet::new(),
             startup_started_us: None,
+            startup_rearms_used: 0,
             epoch: None,
             startup_failed: false,
         })
@@ -214,14 +220,24 @@ impl PlayoutScheduler {
         actions
     }
 
-    /// Emit every object whose fixed common-timeline deadline has arrived, or
-    /// fail startup after the configured bound.
+    /// Emit every object whose fixed common-timeline deadline has arrived.
+    ///
+    /// The first startup timeout terminally accounts for the current buffer,
+    /// then re-arms one identical exact-pair window. The re-arm timer begins
+    /// with the next received object, so an idle input cannot consume it. A
+    /// second timeout preserves the historical permanent-failure behavior.
     pub fn advance(&mut self, now_us: u64) -> Vec<PlayoutAction> {
         if self.epoch.is_none() {
             if let Some(start) = self.startup_started_us {
                 if now_us.saturating_sub(start) >= self.config.startup_timeout_us {
-                    self.startup_failed = true;
-                    return self.drop_all(DROP_STARTUP_TIMEOUT);
+                    let actions = self.drop_all(DROP_STARTUP_TIMEOUT);
+                    if self.startup_rearms_used < self.config.startup_rearm_limit {
+                        self.startup_rearms_used += 1;
+                        self.startup_started_us = None;
+                    } else {
+                        self.startup_failed = true;
+                    }
+                    return actions;
                 }
             }
             return Vec::new();
@@ -430,6 +446,7 @@ mod tests {
         PlayoutConfig {
             d_play_us: 50_000,
             startup_timeout_us: 100_000,
+            startup_rearm_limit: 1,
             late_tolerance_us: 5_000,
             max_objects_per_track: 4,
             max_span_us: 100_000,
@@ -537,15 +554,46 @@ mod tests {
     }
 
     #[test]
-    fn startup_timeout_and_shutdown_account_for_every_buffered_object() {
+    fn startup_rearm_drops_the_old_buffer_then_starts_from_a_new_exact_pair() {
         let mut scheduler = PlayoutScheduler::new(config()).unwrap();
         scheduler.push(object(TRACK_PC, 0, 0, 1, 1_000), 1_000);
         let actions = scheduler.advance(101_000);
         assert_eq!(actions.len(), 1);
         assert!(matches!(&actions[0], PlayoutAction::Drop { reason: DROP_STARTUP_TIMEOUT, .. }));
-        let actions = scheduler.push(object(TRACK_HAPTIC, 0, 0, 1, 102_000), 102_000);
-        assert_eq!(actions.len(), 1);
+        assert!(!scheduler.startup_failed);
+        assert_eq!(scheduler.startup_rearms_used, 1);
+        assert_eq!(scheduler.next_wakeup_us(), None);
 
+        assert!(scheduler
+            .push(object(TRACK_HAPTIC, 1, 200_000, 2, 102_000), 102_000)
+            .is_empty());
+        assert_eq!(scheduler.next_wakeup_us(), Some(202_000));
+        assert!(scheduler
+            .push(object(TRACK_PC, 1, 200_000, 2, 103_000), 103_000)
+            .is_empty());
+        assert!(scheduler.is_started());
+        let actions = scheduler.advance(153_000);
+        assert_eq!(releases(&actions), 2);
+    }
+
+    #[test]
+    fn second_startup_timeout_latches_failure_and_accounts_for_later_objects() {
+        let mut scheduler = PlayoutScheduler::new(config()).unwrap();
+        scheduler.push(object(TRACK_PC, 0, 0, 1, 1_000), 1_000);
+        assert_eq!(scheduler.advance(101_000).len(), 1);
+        scheduler.push(object(TRACK_HAPTIC, 1, 200_000, 2, 102_000), 102_000);
+        let actions = scheduler.advance(202_000);
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(&actions[0], PlayoutAction::Drop { reason: DROP_STARTUP_TIMEOUT, .. }));
+        assert!(scheduler.startup_failed);
+        assert_eq!(scheduler.next_wakeup_us(), None);
+        let actions = scheduler.push(object(TRACK_PC, 1, 200_000, 2, 203_000), 203_000);
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(&actions[0], PlayoutAction::Drop { reason: DROP_STARTUP_TIMEOUT, .. }));
+    }
+
+    #[test]
+    fn shutdown_before_epoch_accounts_for_every_buffered_object() {
         let mut scheduler = PlayoutScheduler::new(config()).unwrap();
         scheduler.push(object(TRACK_PC, 0, 0, 1, 0), 0);
         let actions = scheduler.finish_without_epoch();

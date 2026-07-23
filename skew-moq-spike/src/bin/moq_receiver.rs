@@ -133,6 +133,11 @@ struct Args {
     /// Bound for finding the first exact PC/haptic anchor pair.
     #[arg(long)]
     startup_timeout_ms: Option<u64>,
+    /// Number of identical startup windows allowed after the first timeout.
+    ///
+    /// Phase-4 v5 requires exactly one common re-arm for S1/M1/S2.
+    #[arg(long)]
+    startup_rearm_limit: Option<u8>,
     /// Grace after a fixed timeline deadline before the selected late policy.
     #[arg(long)]
     late_tolerance_ms: Option<u64>,
@@ -162,6 +167,7 @@ fn ms_to_us(value: u64, name: &str) -> Result<u64> {
 fn playout_config(args: &Args) -> Result<Option<PlayoutConfig>> {
     let supplied = args.d_play_ms.is_some()
         || args.startup_timeout_ms.is_some()
+        || args.startup_rearm_limit.is_some()
         || args.late_tolerance_ms.is_some()
         || args.buffer_max_objects_per_track.is_some()
         || args.buffer_max_span_ms.is_some()
@@ -205,6 +211,9 @@ fn playout_config(args: &Args) -> Result<Option<PlayoutConfig>> {
                 .with_context(|| format!("--arm {arm} requires --startup-timeout-ms"))?,
             "startup-timeout-ms",
         )?,
+        startup_rearm_limit: args
+            .startup_rearm_limit
+            .with_context(|| format!("--arm {arm} requires --startup-rearm-limit"))?,
         late_tolerance_us: ms_to_us(
             args.late_tolerance_ms
                 .with_context(|| format!("--arm {arm} requires --late-tolerance-ms"))?,
@@ -225,6 +234,9 @@ fn playout_config(args: &Args) -> Result<Option<PlayoutConfig>> {
             .with_context(|| format!("--arm {arm} requires --late-policy"))?
             .into(),
     };
+    if config.startup_rearm_limit != 1 {
+        bail!("--startup-rearm-limit must be the governing-design value 1");
+    }
     config.validate().map_err(anyhow::Error::msg)?;
     Ok(Some(config))
 }
@@ -1400,6 +1412,7 @@ mod rx_ending_tests {
             arm: Arm::B1,
             d_play_ms: None,
             startup_timeout_ms: None,
+            startup_rearm_limit: None,
             late_tolerance_ms: None,
             buffer_max_objects_per_track: None,
             buffer_max_span_ms: None,
@@ -1625,6 +1638,7 @@ mod rx_ending_tests {
             arm: Arm::S1,
             d_play_ms: Some(50),
             startup_timeout_ms: Some(100),
+            startup_rearm_limit: Some(1),
             late_tolerance_ms: Some(5),
             buffer_max_objects_per_track: Some(64),
             buffer_max_span_ms: Some(250),
@@ -1633,11 +1647,18 @@ mod rx_ending_tests {
         };
         let cfg = playout_config(&base).unwrap().unwrap();
         assert_eq!(cfg.d_play_us, 50_000);
+        assert_eq!(cfg.startup_rearm_limit, 1);
         assert_eq!(cfg.max_objects_per_track, 64);
 
         let mut bad = base;
         bad.d_play_ms = Some(75);
         assert!(playout_config(&bad).unwrap_err().to_string().contains("50 or 100"));
+        bad.d_play_ms = Some(50);
+        bad.startup_rearm_limit = Some(0);
+        assert!(playout_config(&bad)
+            .unwrap_err()
+            .to_string()
+            .contains("startup-rearm-limit"));
     }
 
     #[test]
@@ -1666,6 +1687,7 @@ mod rx_ending_tests {
             arm: Arm::M1,
             d_play_ms: Some(50),
             startup_timeout_ms: Some(100),
+            startup_rearm_limit: Some(1),
             late_tolerance_ms: Some(5),
             buffer_max_objects_per_track: Some(64),
             buffer_max_span_ms: Some(250),

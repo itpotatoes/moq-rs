@@ -232,10 +232,11 @@ impl JsonlLogger {
         };
         let playout = match playout {
             Some(p) => format!(
-                "{}\"playout_clock\":\"receiver_monotonic_us\",\"d_play_us\":{},\"startup_timeout_us\":{},\"late_tolerance_us\":{},\"late_policy\":\"{}\",\"buffer_max_objects_per_track\":{},\"buffer_max_span_us\":{}",
+                "{}\"playout_clock\":\"receiver_monotonic_us\",\"d_play_us\":{},\"startup_timeout_us\":{},\"startup_rearm_limit\":{},\"late_tolerance_us\":{},\"late_policy\":\"{}\",\"buffer_max_objects_per_track\":{},\"buffer_max_span_us\":{}",
                 if phase4_transport.is_some() { "," } else { ",\"arm\":\"s1\"," },
                 p.d_play_us,
                 p.startup_timeout_us,
+                p.startup_rearm_limit,
                 p.late_tolerance_us,
                 p.late_policy.as_str(),
                 p.max_objects_per_track,
@@ -405,6 +406,7 @@ mod phase4_jsonl_tests {
         let config = PlayoutConfig {
             d_play_us: 50_000,
             startup_timeout_us: 100_000,
+            startup_rearm_limit: 1,
             late_tolerance_us: 5_000,
             max_objects_per_track: 64,
             max_span_us: 250_000,
@@ -423,6 +425,7 @@ mod phase4_jsonl_tests {
             "\"arm\":\"s1\"",
             "\"d_play_us\":50000",
             "\"startup_timeout_us\":100000",
+            "\"startup_rearm_limit\":1",
             "\"late_tolerance_us\":5000",
             "\"late_policy\":\"drop-late\"",
             "\"buffer_max_objects_per_track\":64",
@@ -467,6 +470,7 @@ mod phase4_jsonl_tests {
         let config = PlayoutConfig {
             d_play_us: 50_000,
             startup_timeout_us: 100_000,
+            startup_rearm_limit: 1,
             late_tolerance_us: 5_000,
             max_objects_per_track: 64,
             max_span_us: 250_000,
