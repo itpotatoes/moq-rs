@@ -75,6 +75,10 @@ pub struct SubscribeInfo {
     /// Optional parameters
     pub params: KeyValuePairs,
 
+    /// Hop-local object forwarding budget from DELIVERY_TIMEOUT, in integer
+    /// milliseconds. Zero is forbidden by draft-16.
+    pub delivery_timeout_ms: Option<u64>,
+
     // Set to true if this is a track_status request only
     pub track_status: bool,
 }
@@ -89,6 +93,13 @@ impl SubscribeInfo {
         let start_location = filter.as_ref().and_then(|filter| filter.start_location);
         let end_group_id = filter.as_ref().and_then(|filter| filter.end_group_id);
 
+        let delivery_timeout_ms = msg.params.delivery_timeout()?;
+        if delivery_timeout_ms == Some(0) {
+            return Err(SessionError::ProtocolViolation(
+                "DELIVERY_TIMEOUT must be greater than zero".to_string(),
+            ));
+        }
+
         Ok(Self {
             id: msg.id,
             track_namespace: msg.track_namespace.clone(),
@@ -101,6 +112,7 @@ impl SubscribeInfo {
             end_group_id,
             filter,
             params: msg.params.clone(),
+            delivery_timeout_ms,
             track_status: false,
         })
     }
@@ -174,34 +186,34 @@ pub struct Subscribe {
 }
 
 impl Subscribe {
+    #[cfg(test)]
     pub(super) fn new(
         subscriber: Subscriber,
         request_id: u64,
         track: TrackWriter,
     ) -> (Subscribe, SubscribeRecv) {
+        Self::new_with_params(
+            subscriber,
+            request_id,
+            track,
+            KeyValuePairs::default(),
+        )
+        .expect("default SUBSCRIBE parameters must be valid")
+    }
+
+    pub(super) fn new_with_params(
+        subscriber: Subscriber,
+        request_id: u64,
+        track: TrackWriter,
+        params: KeyValuePairs,
+    ) -> Result<(Subscribe, SubscribeRecv), SessionError> {
         let subscribe_message = message::Subscribe {
             id: request_id,
             track_namespace: track.namespace.clone(),
             track_name: track.name.clone(),
-            params: KeyValuePairs::default(),
+            params,
         };
-        let info = SubscribeInfo::new_from_subscribe(&subscribe_message).unwrap_or_else(|err| {
-            tracing::warn!(error = %err, "failed to decode outbound subscribe parameters");
-            SubscribeInfo {
-                id: request_id,
-                track_namespace: track.namespace.clone(),
-                track_name: track.name.clone(),
-                subscriber_priority: 128,
-                group_order: GroupOrder::Publisher,
-                forward: true,
-                filter_type: FilterType::AbsoluteStart,
-                start_location: None,
-                end_group_id: None,
-                filter: None,
-                params: Default::default(),
-                track_status: false,
-            }
-        });
+        let info = SubscribeInfo::new_from_subscribe(&subscribe_message)?;
 
         let (send, recv) = State::default().split();
 
@@ -216,7 +228,7 @@ impl Subscribe {
             writer: Some(track.into()),
         };
 
-        (send, recv)
+        Ok((send, recv))
     }
 
     pub(super) fn send_request(&mut self) {
@@ -435,6 +447,25 @@ mod tests {
         assert!(filter.allows(2, 3));
         assert!(filter.allows(4, 10));
         assert!(!filter.allows(5, 0));
+    }
+
+    #[test]
+    fn delivery_timeout_is_parsed_and_zero_is_rejected() {
+        let mut params = KeyValuePairs::default();
+        params.set_delivery_timeout(67);
+        let info = subscribe_info_with(params);
+        assert_eq!(info.delivery_timeout_ms, Some(67));
+
+        let mut zero = KeyValuePairs::default();
+        zero.set_delivery_timeout(0);
+        let err = SubscribeInfo::new_from_subscribe(&message::Subscribe {
+            id: 0,
+            track_namespace: TrackNamespace::from_utf8_path("test"),
+            track_name: "track".into(),
+            params: zero,
+        })
+        .unwrap_err();
+        assert!(matches!(err, SessionError::ProtocolViolation(_)));
     }
 
     #[test]

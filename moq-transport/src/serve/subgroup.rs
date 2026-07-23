@@ -44,16 +44,17 @@ impl Deref for Subgroups {
 
 // State shared between the writer and reader.
 struct SubgroupsState {
-    latest_subgroup_reader: Option<SubgroupReader>,
-    epoch: u64, // Updated each time latest changes
+    // Preserve every announced subgroup in creation order. Keeping only the
+    // latest reader silently skipped intermediate frame-per-subgroup groups
+    // when several appends occurred before a reader was polled.
+    subgroups: Vec<SubgroupReader>,
     closed: Result<(), ServeError>,
 }
 
 impl Default for SubgroupsState {
     fn default() -> Self {
         Self {
-            latest_subgroup_reader: None,
-            epoch: 0,
+            subgroups: Vec::new(),
             closed: Ok(()),
         }
     }
@@ -113,27 +114,27 @@ impl SubgroupsWriter {
 
         let mut state = self.state.lock_mut().ok_or(ServeError::Cancel)?;
 
-        if let Some(latest) = &state.latest_subgroup_reader {
+        if let Some(latest) = state.subgroups.last() {
             // TODO: Check this logic again
             if writer.group_id.cmp(&latest.group_id) == cmp::Ordering::Equal {
                 match writer.subgroup_id.cmp(&latest.subgroup_id) {
                     cmp::Ordering::Less => return Ok(writer), // dropped immediately, lul
                     cmp::Ordering::Equal => return Err(ServeError::Duplicate),
-                    cmp::Ordering::Greater => state.latest_subgroup_reader = Some(reader),
+                    cmp::Ordering::Greater => state.subgroups.push(reader),
                 }
             } else if writer.group_id.cmp(&latest.group_id) == cmp::Ordering::Greater {
-                state.latest_subgroup_reader = Some(reader);
+                state.subgroups.push(reader);
             } else {
                 return Ok(writer); // drop here as well
             }
         } else {
-            state.latest_subgroup_reader = Some(reader);
+            state.subgroups.push(reader);
         }
 
-        self.next_subgroup_id = state.latest_subgroup_reader.as_ref().unwrap().subgroup_id + 1;
-        self.next_group_id = state.latest_subgroup_reader.as_ref().unwrap().group_id + 1;
-        self.last_group_id = state.latest_subgroup_reader.as_ref().unwrap().group_id;
-        state.epoch += 1;
+        let latest = state.subgroups.last().expect("just inserted subgroup");
+        self.next_subgroup_id = latest.subgroup_id + 1;
+        self.next_group_id = latest.group_id + 1;
+        self.last_group_id = latest.group_id;
 
         Ok(writer)
     }
@@ -162,7 +163,7 @@ impl Deref for SubgroupsWriter {
 pub struct SubgroupsReader {
     pub info: Arc<Track>,
     state: State<SubgroupsState>,
-    epoch: u64,
+    read_index: usize,
 }
 
 impl SubgroupsReader {
@@ -170,7 +171,7 @@ impl SubgroupsReader {
         Self {
             info: track_info,
             state,
-            epoch: 0,
+            read_index: 0,
         }
     }
 
@@ -179,9 +180,10 @@ impl SubgroupsReader {
             {
                 let state = self.state.lock();
 
-                if self.epoch != state.epoch {
-                    self.epoch = state.epoch;
-                    return Ok(state.latest_subgroup_reader.clone());
+                if self.read_index < state.subgroups.len() {
+                    let subgroup = state.subgroups[self.read_index].clone();
+                    self.read_index += 1;
+                    return Ok(Some(subgroup));
                 }
 
                 state.closed.clone()?;
@@ -198,8 +200,8 @@ impl SubgroupsReader {
     pub fn latest(&self) -> Option<(u64, u64)> {
         let state = self.state.lock();
         state
-            .latest_subgroup_reader
-            .as_ref()
+            .subgroups
+            .last()
             .and_then(|group| group.latest().map(|object_id| (group.group_id, object_id)))
     }
 
@@ -323,12 +325,30 @@ impl SubgroupWriter {
         size: usize,
         extension_headers: Option<crate::data::ExtensionHeaders>,
     ) -> Result<SubgroupObjectWriter, ServeError> {
+        self.create_at(size, extension_headers, tokio::time::Instant::now())
+    }
+
+    /// Create the next object and preserve when its header became available to
+    /// this forwarding hop.
+    ///
+    /// Locally produced objects use [`create`](Self::create), whose timestamp
+    /// is the object creation instant. A relay receive path calls this method
+    /// immediately after decoding the object header, which is the draft-16
+    /// DELIVERY_TIMEOUT origin. The timestamp is process-local monotonic state;
+    /// it is never serialized or compared across hosts.
+    pub fn create_at(
+        &mut self,
+        size: usize,
+        extension_headers: Option<crate::data::ExtensionHeaders>,
+        received_at: tokio::time::Instant,
+    ) -> Result<SubgroupObjectWriter, ServeError> {
         let (writer, reader) = SubgroupObject {
             group: self.info.clone(),
             object_id: self.next_object_id,
             status: ObjectStatus::NormalObject,
             size,
             extension_headers: extension_headers.unwrap_or_default(),
+            received_at,
         }
         .produce();
 
@@ -460,6 +480,10 @@ pub struct SubgroupObject {
 
     // Extension headers (for draft-14 compliance, particularly immutable extensions)
     pub extension_headers: crate::data::ExtensionHeaders,
+
+    /// Monotonic instant at which this forwarding hop received/created the
+    /// object header. Used only for hop-local DELIVERY_TIMEOUT enforcement.
+    pub received_at: tokio::time::Instant,
 }
 
 impl SubgroupObject {
@@ -630,5 +654,45 @@ impl Deref for SubgroupObjectReader {
 
     fn deref(&self) -> &Self::Target {
         &self.info
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::coding::TrackNamespace;
+    use crate::serve::{Track, TrackReaderMode};
+
+    #[tokio::test]
+    async fn reader_preserves_every_rapidly_appended_subgroup() {
+        let (track_writer, track_reader) =
+            Track::new(TrackNamespace::from_utf8_path("test"), "pc").produce();
+        let mut writer = track_writer.subgroups().unwrap();
+
+        for expected_group in 0..3u64 {
+            let mut subgroup = writer.append(128).unwrap();
+            assert_eq!(subgroup.group_id, expected_group);
+            subgroup.write(Bytes::from(vec![expected_group as u8])).unwrap();
+            drop(subgroup);
+        }
+        drop(writer);
+
+        let mut reader = match track_reader.mode().await.unwrap() {
+            TrackReaderMode::Subgroups(reader) => reader,
+            _ => panic!("expected subgroup mode"),
+        };
+        for expected_group in 0..3u64 {
+            let mut subgroup = reader
+                .next()
+                .await
+                .unwrap()
+                .expect("missing appended subgroup");
+            assert_eq!(subgroup.group_id, expected_group);
+            assert_eq!(
+                subgroup.read_next().await.unwrap().unwrap(),
+                Bytes::from(vec![expected_group as u8])
+            );
+        }
+        assert!(reader.next().await.unwrap().is_none());
     }
 }

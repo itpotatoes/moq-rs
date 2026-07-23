@@ -1,9 +1,10 @@
-// moq_sender — MoQ naive B1 publisher (the "divergence extreme").
+// moq_sender — Phase-4 MoQ publisher.
 //
 // One QUIC connection to a relay carries TWO tracks (pc, haptic) as independent
-// subgroup streams. NO priority, NO delivery timeout, NO playout timeline — the
-// naive baseline. PC runs a 30fps loop over pre-loaded tier .bin frames; haptic
-// runs a 100Hz loop over MPEG-I test-signal PCM with the snap pairing rule.
+// tracks. B1/S1 preserve the historical long-lived equal-priority mapping.
+// M1 changes only PC to frame-per-subgroup. S2 keeps that mapping and adds
+// static publisher priorities; its PC DELIVERY_TIMEOUT is requested by the
+// receiver and repeated here only for frozen metadata agreement.
 // tx JSONL is byte-schema-identical to webrtc_sender.py.
 //
 // Namespace == run_id, so concurrent/repeat runs never collide on the relay.
@@ -106,6 +107,37 @@ enum TrackSel {
     Haptic,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Arm {
+    B1,
+    S1,
+    M1,
+    S2,
+}
+
+impl Arm {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::B1 => "b1",
+            Self::S1 => "s1",
+            Self::M1 => "m1",
+            Self::S2 => "s2",
+        }
+    }
+
+    fn pc_frame_subgroups(self) -> bool {
+        matches!(self, Self::M1 | Self::S2)
+    }
+
+    fn pc_priority(self) -> u8 {
+        if self == Self::S2 { 1 } else { 128 }
+    }
+
+    fn haptic_priority(self) -> u8 {
+        if self == Self::S2 { 0 } else { 128 }
+    }
+}
+
 impl TrackSel {
     fn as_str(self) -> &'static str {
         match self {
@@ -172,6 +204,51 @@ struct Args {
     /// baselines (the other loop never runs).
     #[arg(long, value_enum, default_value_t = TrackSel::Both)]
     tracks: TrackSel,
+    /// Phase-4 transport arm. B1/S1 preserve the historical wire mapping.
+    #[arg(long, value_enum, default_value_t = Arm::B1)]
+    arm: Arm,
+    /// S2 PC DELIVERY_TIMEOUT, repeated on TX for frozen metadata agreement.
+    /// The receiver places the actual parameter on the PC SUBSCRIBE.
+    #[arg(long)]
+    pc_delivery_timeout_ms: Option<u64>,
+}
+
+fn phase4_transport(args: &Args) -> Result<Option<Phase4TransportMeta>> {
+    match args.arm {
+        Arm::B1 | Arm::S1 => {
+            if args.pc_delivery_timeout_ms.is_some() {
+                anyhow::bail!("PC delivery timeout requires --arm s2");
+            }
+            Ok(None)
+        }
+        Arm::M1 => {
+            if args.pc_delivery_timeout_ms.is_some() {
+                anyhow::bail!("M1 is mapping-only and forbids PC delivery timeout");
+            }
+            Ok(Some(Phase4TransportMeta {
+                arm: "m1",
+                pc_subgroup_mapping: "frame-per-subgroup",
+                pc_publisher_priority: 128,
+                haptic_publisher_priority: 128,
+                pc_delivery_timeout_ms: None,
+            }))
+        }
+        Arm::S2 => {
+            let timeout = args
+                .pc_delivery_timeout_ms
+                .context("--arm s2 requires --pc-delivery-timeout-ms")?;
+            if timeout == 0 {
+                anyhow::bail!("--pc-delivery-timeout-ms must be greater than zero");
+            }
+            Ok(Some(Phase4TransportMeta {
+                arm: "s2",
+                pc_subgroup_mapping: "frame-per-subgroup",
+                pc_publisher_priority: 1,
+                haptic_publisher_priority: 0,
+                pc_delivery_timeout_ms: Some(timeout),
+            }))
+        }
+    }
 }
 
 async fn connect(relay: &Url) -> Result<(web_transport::Session, moq_transport::session::Transport)> {
@@ -192,6 +269,7 @@ async fn main() -> Result<()> {
         )
         .init();
     let args = Args::parse();
+    let phase4_transport = phase4_transport(&args)?;
 
     // ---- Workload ----
     let frames: Vec<Vec<u8>> = match (&args.frames_dir, args.dummy_size) {
@@ -208,15 +286,15 @@ async fn main() -> Result<()> {
     let haptic_src = std::path::Path::new(&args.haptic_wav)
         .file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
 
-    println!("[tx] frames={} S={}B haptic={}B ({} ticks) tracks={} -> {}",
+    println!("[tx] frames={} S={}B haptic={}B ({} ticks) tracks={} arm={} -> {}",
         frames.len(), s_bytes, pcm.len(), n_ticks_in_pcm, args.tracks.as_str(),
-        args.out.display());
+        args.arm.as_str(), args.out.display());
 
     let logger = Arc::new(Mutex::new(JsonlLogger::new(
         &args.out, &args.run_id, "moq", "tx", args.c_mbps, args.rtt_ms,
         args.jitter_ms, args.loss_pct, s_bytes, args.fps, 100, args.seed,
         Some(args.duration), Some(&haptic_src), Some(args.tracks.as_str()),
-        Some(TERM_PROTOCOL_V), None,
+        Some(TERM_PROTOCOL_V), None, phase4_transport,
     )?));
 
     // ---- A2 transport-accept tap ----
@@ -298,8 +376,14 @@ async fn main() -> Result<()> {
         let logger = logger.clone();
         let fps = args.fps;
         let tier = args.tier;
+        let frame_subgroups = args.arm.pc_frame_subgroups();
+        let priority = args.arm.pc_priority();
         let mut pc_sub = pc_tw.subgroups().context("pc subgroups")?;
-        let mut sg = pc_sub.append(128).context("pc append")?;
+        let mut long_sg = if frame_subgroups {
+            None
+        } else {
+            Some(pc_sub.append(priority).context("pc append")?)
+        };
         Some(tokio::spawn(async move {
             let mut i: u64 = 0;
             while Instant::now() < end {
@@ -312,17 +396,30 @@ async fn main() -> Result<()> {
                 buf.extend_from_slice(payload);
                 // Same work as SubgroupWriter::write, but the object identity is
                 // observable so the tx record can carry the wire join key.
-                let (gid, sgid) = (sg.group_id, sg.subgroup_id);
-                let mut obj = sg.create(buf.len(), None).context("pc create")?;
-                let oid = obj.object_id;
-                obj.write(Bytes::from(buf)).context("pc write")?;
-                drop(obj);
+                let bytes = Bytes::from(buf);
+                let (gid, sgid, oid) = if let Some(sg) = long_sg.as_mut() {
+                    let (gid, sgid) = (sg.group_id, sg.subgroup_id);
+                    let mut obj = sg.create(bytes.len(), None).context("pc create")?;
+                    let oid = obj.object_id;
+                    obj.write(bytes).context("pc write")?;
+                    drop(obj);
+                    (gid, sgid, oid)
+                } else {
+                    let mut sg = pc_sub.append(priority).context("pc frame append")?;
+                    let (gid, sgid) = (sg.group_id, sg.subgroup_id);
+                    let mut obj = sg.create(bytes.len(), None).context("pc frame create")?;
+                    let oid = obj.object_id;
+                    obj.write(bytes).context("pc frame write")?;
+                    drop(obj);
+                    drop(sg);
+                    (gid, sgid, oid)
+                };
                 let t_send = now_us();
                 logger.lock().unwrap().log_tx("pc", tier, i as u32, pts, (i + 1) as u32, payload.len(), t_gen, t_send, Some((gid, sgid, oid)));
                 i += 1;
                 sleep_until(anchor + Duration::from_secs_f64(i as f64 / fps as f64)).await;
             }
-            drop(sg);
+            drop(long_sg);
             drop(pc_sub); // close pc track -> subscriber end-of-track
             Ok::<u64, anyhow::Error>(i)
         }))
@@ -341,8 +438,9 @@ async fn main() -> Result<()> {
         let logger = logger.clone();
         let fps = args.fps;
         let duration = args.duration;
+        let priority = args.arm.haptic_priority();
         let mut hap_sub = hap_tw.subgroups().context("haptic subgroups")?;
-        let mut sg = hap_sub.append(128).context("haptic append")?;
+        let mut sg = hap_sub.append(priority).context("haptic append")?;
         // Precompute snap map: tick index -> frame index (period 33.3ms > 10ms tick).
         let n_frames_max = (duration * fps as f64) as u64 + fps;
         let mut snap_map: HashMap<u64, u64> = HashMap::new();

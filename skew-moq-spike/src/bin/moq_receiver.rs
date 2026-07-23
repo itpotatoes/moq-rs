@@ -15,7 +15,11 @@ use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use clap::Parser;
 use moq_native_ietf::{quic, tls};
-use moq_transport::{coding::TrackNamespace, serve::{TrackReaderMode, Tracks}, session::Session};
+use moq_transport::{
+    coding::{KeyValuePairs, TrackNamespace},
+    serve::{TrackReaderMode, Tracks},
+    session::Session,
+};
 use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -29,6 +33,19 @@ use skew_moq::playout::{LatePolicy, PlayoutAction, PlayoutConfig, PlayoutObject,
 enum Arm {
     B1,
     S1,
+    M1,
+    S2,
+}
+
+impl Arm {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::B1 => "b1",
+            Self::S1 => "s1",
+            Self::M1 => "m1",
+            Self::S2 => "s2",
+        }
+    }
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -128,6 +145,9 @@ struct Args {
     /// Fixed late policy for the entire S1 run.
     #[arg(long, value_enum)]
     late_policy: Option<CliLatePolicy>,
+    /// S2 hop-local PC object forwarding budget in integer milliseconds.
+    #[arg(long)]
+    pc_delivery_timeout_ms: Option<u64>,
 }
 
 fn ms_to_us(value: u64, name: &str) -> Result<u64> {
@@ -145,7 +165,8 @@ fn playout_config(args: &Args) -> Result<Option<PlayoutConfig>> {
         || args.late_tolerance_ms.is_some()
         || args.buffer_max_objects_per_track.is_some()
         || args.buffer_max_span_ms.is_some()
-        || args.late_policy.is_some();
+        || args.late_policy.is_some()
+        || args.pc_delivery_timeout_ms.is_some();
     if args.arm == Arm::B1 {
         if supplied {
             bail!("S1 scheduler options require --arm s1; B1 must remain uncontrolled");
@@ -153,31 +174,79 @@ fn playout_config(args: &Args) -> Result<Option<PlayoutConfig>> {
         return Ok(None);
     }
 
-    let d_play_ms = args.d_play_ms.context("--arm s1 requires --d-play-ms")?;
+    match args.arm {
+        Arm::B1 => unreachable!("handled above"),
+        Arm::S1 | Arm::M1 => {
+            if args.pc_delivery_timeout_ms.is_some() {
+                bail!("PC delivery timeout requires --arm s2");
+            }
+        }
+        Arm::S2 => {
+            let timeout = args
+                .pc_delivery_timeout_ms
+                .context("--arm s2 requires --pc-delivery-timeout-ms")?;
+            if timeout == 0 {
+                bail!("--pc-delivery-timeout-ms must be greater than zero");
+            }
+        }
+    }
+
+    let arm = args.arm.as_str();
+    let d_play_ms = args
+        .d_play_ms
+        .with_context(|| format!("--arm {arm} requires --d-play-ms"))?;
     if !matches!(d_play_ms, 50 | 100) {
         bail!("--d-play-ms must be a governing-design candidate: 50 or 100");
     }
     let config = PlayoutConfig {
         d_play_us: ms_to_us(d_play_ms, "d-play-ms")?,
         startup_timeout_us: ms_to_us(
-            args.startup_timeout_ms.context("--arm s1 requires --startup-timeout-ms")?,
+            args.startup_timeout_ms
+                .with_context(|| format!("--arm {arm} requires --startup-timeout-ms"))?,
             "startup-timeout-ms",
         )?,
         late_tolerance_us: ms_to_us(
-            args.late_tolerance_ms.context("--arm s1 requires --late-tolerance-ms")?,
+            args.late_tolerance_ms
+                .with_context(|| format!("--arm {arm} requires --late-tolerance-ms"))?,
             "late-tolerance-ms",
         )?,
         max_objects_per_track: args
             .buffer_max_objects_per_track
-            .context("--arm s1 requires --buffer-max-objects-per-track")?,
+            .with_context(|| {
+                format!("--arm {arm} requires --buffer-max-objects-per-track")
+            })?,
         max_span_us: ms_to_us(
-            args.buffer_max_span_ms.context("--arm s1 requires --buffer-max-span-ms")?,
+            args.buffer_max_span_ms
+                .with_context(|| format!("--arm {arm} requires --buffer-max-span-ms"))?,
             "buffer-max-span-ms",
         )?,
-        late_policy: args.late_policy.context("--arm s1 requires --late-policy")?.into(),
+        late_policy: args
+            .late_policy
+            .with_context(|| format!("--arm {arm} requires --late-policy"))?
+            .into(),
     };
     config.validate().map_err(anyhow::Error::msg)?;
     Ok(Some(config))
+}
+
+fn phase4_transport(args: &Args) -> Option<Phase4TransportMeta> {
+    match args.arm {
+        Arm::B1 | Arm::S1 => None,
+        Arm::M1 => Some(Phase4TransportMeta {
+            arm: "m1",
+            pc_subgroup_mapping: "frame-per-subgroup",
+            pc_publisher_priority: 128,
+            haptic_publisher_priority: 128,
+            pc_delivery_timeout_ms: None,
+        }),
+        Arm::S2 => Some(Phase4TransportMeta {
+            arm: "s2",
+            pc_subgroup_mapping: "frame-per-subgroup",
+            pc_publisher_priority: 1,
+            haptic_publisher_priority: 0,
+            pc_delivery_timeout_ms: args.pc_delivery_timeout_ms,
+        }),
+    }
 }
 
 #[derive(Debug, Default)]
@@ -641,6 +710,7 @@ async fn main() -> Result<()> {
         .init();
     let args = Args::parse();
     let s1_config = playout_config(&args)?;
+    let phase4_transport = phase4_transport(&args);
 
     let logger = Arc::new(Mutex::new(JsonlLogger::new(
         &args.out, &args.run_id, "moq", "rx", args.c_mbps, args.rtt_ms,
@@ -654,6 +724,7 @@ async fn main() -> Result<()> {
         // term_protocol: 종료 프로토콜 세대 마커(Codex 7차 P0 — tx 소실 +
         // shutdown 결손 조합이 구세대로 오인되는 우회를 rx meta 자체로 차단).
         None, None, Some(args.tracks.as_str()), Some(TERM_PROTOCOL_V), s1_config,
+        phase4_transport,
     )?));
 
     let (sess, tp) = connect(&args.relay).await.context("connect relay")?;
@@ -692,7 +763,14 @@ async fn main() -> Result<()> {
                 Some(rr) => rr,
                 None => { ok = false; break; }
             };
-            match subscriber.subscribe_open(tw).await {
+            let mut params = KeyValuePairs::default();
+            if name == "pc" && args.arm == Arm::S2 {
+                params.set_delivery_timeout(
+                    args.pc_delivery_timeout_ms
+                        .expect("S2 timeout validated before connecting"),
+                );
+            }
+            match subscriber.subscribe_open_with_params(tw, params).await {
                 Ok(h) => { this_handles.push(h); this_recv.push((name, rr)); }
                 Err(e) if is_retryable_subscribe_error(&e) => { ok = false; break; }
                 // Anything else is a real fault: fail now, do not poll on it.
@@ -1300,6 +1378,7 @@ mod rx_ending_tests {
             buffer_max_objects_per_track: None,
             buffer_max_span_ms: None,
             late_policy: None,
+            pc_delivery_timeout_ms: None,
         };
 
         let a = base(RxTrackSel::Both, Some(60.0));
@@ -1510,6 +1589,7 @@ mod rx_ending_tests {
             buffer_max_objects_per_track: Some(64),
             buffer_max_span_ms: Some(250),
             late_policy: Some(CliLatePolicy::DropLate),
+            pc_delivery_timeout_ms: None,
         };
         let cfg = playout_config(&base).unwrap().unwrap();
         assert_eq!(cfg.d_play_us, 50_000);
@@ -1518,5 +1598,58 @@ mod rx_ending_tests {
         let mut bad = base;
         bad.d_play_ms = Some(75);
         assert!(playout_config(&bad).unwrap_err().to_string().contains("50 or 100"));
+    }
+
+    #[test]
+    fn m1_and_s2_cli_preserve_the_ablation_boundary() {
+        let mut args = Args {
+            relay: Url::parse("https://127.0.0.1:1").unwrap(),
+            run_id: "t".into(),
+            out: PathBuf::from("/dev/null"),
+            s_bytes: 1,
+            c_mbps: None,
+            rtt_ms: 0.0,
+            jitter_ms: 0.0,
+            loss_pct: 0.0,
+            seed: 0,
+            fps: 30,
+            haptic_hz: 100,
+            max_duration: 10.0,
+            render: false,
+            audio: false,
+            draco: false,
+            python: String::new(),
+            tracks: RxTrackSel::Both,
+            duration_s: Some(1.0),
+            subscribe_timeout: 10.0,
+            subscribe_retry_ms: 100,
+            arm: Arm::M1,
+            d_play_ms: Some(50),
+            startup_timeout_ms: Some(100),
+            late_tolerance_ms: Some(5),
+            buffer_max_objects_per_track: Some(64),
+            buffer_max_span_ms: Some(250),
+            late_policy: Some(CliLatePolicy::DropLate),
+            pc_delivery_timeout_ms: None,
+        };
+
+        assert!(playout_config(&args).is_ok());
+        let m1 = phase4_transport(&args).unwrap();
+        assert_eq!(m1.arm, "m1");
+        assert_eq!(m1.pc_publisher_priority, 128);
+        assert_eq!(m1.pc_delivery_timeout_ms, None);
+
+        args.pc_delivery_timeout_ms = Some(67);
+        assert!(playout_config(&args).is_err(), "M1 must reject timeout");
+
+        args.arm = Arm::S2;
+        assert!(playout_config(&args).is_ok());
+        let s2 = phase4_transport(&args).unwrap();
+        assert_eq!(s2.pc_publisher_priority, 1);
+        assert_eq!(s2.haptic_publisher_priority, 0);
+        assert_eq!(s2.pc_delivery_timeout_ms, Some(67));
+
+        args.pc_delivery_timeout_ms = Some(0);
+        assert!(playout_config(&args).is_err(), "timeout zero is invalid");
     }
 }

@@ -155,6 +155,15 @@ pub struct JsonlLogger {
     w: BufWriter<File>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Phase4TransportMeta {
+    pub arm: &'static str,
+    pub pc_subgroup_mapping: &'static str,
+    pub pc_publisher_priority: u8,
+    pub haptic_publisher_priority: u8,
+    pub pc_delivery_timeout_ms: Option<u64>,
+}
+
 fn esc(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -188,6 +197,9 @@ impl JsonlLogger {
         // Phase 4 S1 only. None preserves existing B1 metadata; Some appends
         // every parameter that can affect a scheduler release/drop decision.
         playout: Option<playout::PlayoutConfig>,
+        // M1/S2 transport intervention. None preserves historical B1/S1 meta
+        // bytes; Some records mapping, publisher priorities, and timeout.
+        phase4_transport: Option<Phase4TransportMeta>,
     ) -> anyhow::Result<Self> {
         let f = File::create(path)?;
         let mut w = BufWriter::new(f);
@@ -220,7 +232,8 @@ impl JsonlLogger {
         };
         let playout = match playout {
             Some(p) => format!(
-                ",\"arm\":\"s1\",\"playout_clock\":\"receiver_monotonic_us\",\"d_play_us\":{},\"startup_timeout_us\":{},\"late_tolerance_us\":{},\"late_policy\":\"{}\",\"buffer_max_objects_per_track\":{},\"buffer_max_span_us\":{}",
+                "{}\"playout_clock\":\"receiver_monotonic_us\",\"d_play_us\":{},\"startup_timeout_us\":{},\"late_tolerance_us\":{},\"late_policy\":\"{}\",\"buffer_max_objects_per_track\":{},\"buffer_max_span_us\":{}",
+                if phase4_transport.is_some() { "," } else { ",\"arm\":\"s1\"," },
                 p.d_play_us,
                 p.startup_timeout_us,
                 p.late_tolerance_us,
@@ -230,11 +243,25 @@ impl JsonlLogger {
             ),
             None => String::new(),
         };
+        let phase4_transport = match phase4_transport {
+            Some(t) => format!(
+                ",\"arm\":\"{}\",\"pc_subgroup_mapping\":\"{}\",\"pc_publisher_priority\":{},\"haptic_publisher_priority\":{},\"pc_delivery_timeout_ms\":{}",
+                esc(t.arm),
+                esc(t.pc_subgroup_mapping),
+                t.pc_publisher_priority,
+                t.haptic_publisher_priority,
+                t.pc_delivery_timeout_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "null".to_string()),
+            ),
+            None => String::new(),
+        };
         writeln!(
             w,
-            "{{\"role\":\"meta\",\"run_id\":\"{}\",\"stack\":\"{}\",\"side\":\"{}\",\"cond\":{{\"C_mbps\":{},\"rtt_ms\":{},\"jitter_ms\":{},\"loss_pct\":{}}},\"S_bytes\":{},\"fps\":{},\"haptic_hz\":{},\"seed\":{},\"clock\":\"monotonic_ns/1000\"{}{}{}{}{}}}",
+            "{{\"role\":\"meta\",\"run_id\":\"{}\",\"stack\":\"{}\",\"side\":\"{}\",\"cond\":{{\"C_mbps\":{},\"rtt_ms\":{},\"jitter_ms\":{},\"loss_pct\":{}}},\"S_bytes\":{},\"fps\":{},\"haptic_hz\":{},\"seed\":{},\"clock\":\"monotonic_ns/1000\"{}{}{}{}{}{}}}",
             esc(run_id), esc(stack), esc(side), cmb, rtt_ms, jitter_ms, loss_pct,
-            s_bytes, fps, haptic_hz, seed, design, extra, tracks, term, playout
+            s_bytes, fps, haptic_hz, seed, design, extra, tracks, term,
+            phase4_transport, playout
         )?;
         w.flush()?;
         Ok(Self { w })
@@ -364,7 +391,7 @@ mod phase4_jsonl_tests {
             JsonlLogger::new(
                 &b1, "run", "moq", "rx", None, 0.0, 0.0, 0.0,
                 10, 30, 100, 1, None, None, Some("both"),
-                Some(TERM_PROTOCOL_V), None,
+                Some(TERM_PROTOCOL_V), None, None,
             ).unwrap();
         }
         let b1_line = std::fs::read_to_string(&b1).unwrap();
@@ -387,7 +414,7 @@ mod phase4_jsonl_tests {
             JsonlLogger::new(
                 &s1, "run", "moq", "rx", None, 0.0, 0.0, 0.0,
                 10, 30, 100, 1, None, None, Some("both"),
-                Some(TERM_PROTOCOL_V), Some(config),
+                Some(TERM_PROTOCOL_V), Some(config), None,
             ).unwrap();
         }
         let s1_line = std::fs::read_to_string(&s1).unwrap();
@@ -413,7 +440,7 @@ mod phase4_jsonl_tests {
             let mut log = JsonlLogger::new(
                 &path, "run", "moq", "rx", None, 0.0, 0.0, 0.0,
                 10, 30, 100, 1, None, None, Some("both"),
-                Some(TERM_PROTOCOL_V), None,
+                Some(TERM_PROTOCOL_V), None, None,
             ).unwrap();
             log.try_log_release("pc", 2, 7, 123_000, 8, 456_000).unwrap();
             log.try_log_drop("haptic", 0, 9, 223_000, 0, 556_000, "late").unwrap();
@@ -431,6 +458,61 @@ mod phase4_jsonl_tests {
             lines[2],
             "{\"role\":\"drop\",\"track\":\"haptic\",\"tier\":0,\"seq\":9,\"pts_us\":223000,\"event_id\":0,\"t_drop\":556000,\"drop_reason\":\"late\"}"
         );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn m1_transport_meta_is_explicit_without_changing_s1_fields() {
+        let path = path("m1-meta");
+        let config = PlayoutConfig {
+            d_play_us: 50_000,
+            startup_timeout_us: 100_000,
+            late_tolerance_us: 5_000,
+            max_objects_per_track: 64,
+            max_span_us: 250_000,
+            late_policy: LatePolicy::DropLate,
+        };
+        {
+            JsonlLogger::new(
+                &path,
+                "run",
+                "moq",
+                "rx",
+                None,
+                0.0,
+                0.0,
+                0.0,
+                10,
+                30,
+                100,
+                1,
+                None,
+                None,
+                Some("both"),
+                Some(TERM_PROTOCOL_V),
+                Some(config),
+                Some(Phase4TransportMeta {
+                    arm: "m1",
+                    pc_subgroup_mapping: "frame-per-subgroup",
+                    pc_publisher_priority: 128,
+                    haptic_publisher_priority: 128,
+                    pc_delivery_timeout_ms: None,
+                }),
+            )
+            .unwrap();
+        }
+        let line = std::fs::read_to_string(&path).unwrap();
+        for field in [
+            "\"arm\":\"m1\"",
+            "\"pc_subgroup_mapping\":\"frame-per-subgroup\"",
+            "\"pc_publisher_priority\":128",
+            "\"haptic_publisher_priority\":128",
+            "\"pc_delivery_timeout_ms\":null",
+            "\"playout_clock\":\"receiver_monotonic_us\"",
+        ] {
+            assert!(line.contains(field), "missing {field}: {line}");
+        }
+        assert_eq!(line.matches("\"arm\":").count(), 1);
         std::fs::remove_file(&path).unwrap();
     }
 }
