@@ -80,6 +80,10 @@ pub struct Subscribed {
     /// Tracks if SubscribeOk has been sent yet or not. Used to send
     /// PUBLISH_DONE vs REQUEST_ERROR on drop.
     ok: bool,
+
+    /// Largest location captured when SUBSCRIBE_OK was sent. The outer Option
+    /// distinguishes "not accepted" from an accepted empty track.
+    accepted_largest: Option<Option<Location>>,
 }
 
 pub(super) struct ObjectForwarder {
@@ -237,13 +241,18 @@ impl Subscribed {
             info,
             forwarder,
             ok: false,
+            accepted_largest: None,
         };
 
         Ok((send, recv))
     }
 
     pub async fn serve(mut self, track: serve::TrackReader) -> Result<(), SessionError> {
-        let res = self.serve_inner(track).await;
+        let res = async {
+            self.accept(&track).await?;
+            self.serve_accepted_inner(track).await
+        }
+        .await;
         if let Err(err) = &res {
             self.close(err.clone().into())?;
         }
@@ -251,7 +260,18 @@ impl Subscribed {
         res
     }
 
-    async fn serve_inner(&mut self, track: serve::TrackReader) -> Result<(), SessionError> {
+    /// Send SUBSCRIBE_OK without starting object forwarding.
+    ///
+    /// Subscription-scoped producers use this barrier to ensure they do not
+    /// generate objects before the peer has received an accepted track alias.
+    pub async fn accept(&mut self, track: &serve::TrackReader) -> Result<(), SessionError> {
+        if self.ok {
+            return Err(SessionError::Duplicate);
+        }
+        if track.namespace != self.info.track_namespace || track.name != self.info.track_name {
+            return Err(SessionError::Internal);
+        }
+
         // Update largest location before sending SubscribeOk
         let largest_location = track.largest_location();
         self.forwarder.set_largest_location(largest_location)?;
@@ -280,7 +300,28 @@ impl Subscribed {
             .await;
 
         self.ok = true; // So we send PUBLISH_DONE on drop
+        self.accepted_largest = Some(largest_location);
+        Ok(())
+    }
 
+    /// Forward an already accepted subscription. [`Self::accept`] must have
+    /// completed for this same track before calling this method.
+    pub async fn serve_accepted(mut self, track: serve::TrackReader) -> Result<(), SessionError> {
+        let res = self.serve_accepted_inner(track).await;
+        if let Err(err) = &res {
+            self.close(err.clone().into())?;
+        }
+        res
+    }
+
+    async fn serve_accepted_inner(
+        &mut self,
+        track: serve::TrackReader,
+    ) -> Result<(), SessionError> {
+        if track.namespace != self.info.track_namespace || track.name != self.info.track_name {
+            return Err(SessionError::Internal);
+        }
+        let largest_location = self.accepted_largest.ok_or(SessionError::Internal)?;
         let delivery_filter = self.info.delivery_filter(largest_location);
         let delivery_timeout = self
             .info
@@ -454,8 +495,7 @@ impl ObjectForwarder {
             return Ok(());
         };
 
-        let first_deadline =
-            delivery_timeout.map(|timeout| first_object.received_at + timeout);
+        let first_deadline = delivery_timeout.map(|timeout| first_object.received_at + timeout);
         let mut send_stream = match first_deadline {
             Some(deadline) => match tokio::time::timeout_at(deadline, publisher.open_uni()).await {
                 Ok(result) => result?,
@@ -631,11 +671,7 @@ impl ObjectForwarder {
                         if let Ok(mut mlog_guard) = mlog.lock() {
                             let time = mlog_guard.elapsed_ms();
                             let stream_id = 0;
-                            let event = mlog::subgroup_header_created(
-                                time,
-                                stream_id,
-                                &header,
-                            );
+                            let event = mlog::subgroup_header_created(time, stream_id, &header);
                             let _ = mlog_guard.add_event(event);
                         }
                     }

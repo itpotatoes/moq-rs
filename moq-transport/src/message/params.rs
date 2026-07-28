@@ -162,6 +162,14 @@ impl Encode for TrackExtensions {
 }
 
 impl SubscriptionFilter {
+    pub fn next_group_start() -> Self {
+        Self {
+            filter_type: FilterType::NextGroupStart,
+            start_location: None,
+            end_group_id: None,
+        }
+    }
+
     pub fn largest_object() -> Self {
         Self {
             filter_type: FilterType::LargestObject,

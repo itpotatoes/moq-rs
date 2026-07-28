@@ -192,13 +192,8 @@ impl Subscribe {
         request_id: u64,
         track: TrackWriter,
     ) -> (Subscribe, SubscribeRecv) {
-        Self::new_with_params(
-            subscriber,
-            request_id,
-            track,
-            KeyValuePairs::default(),
-        )
-        .expect("default SUBSCRIBE parameters must be valid")
+        Self::new_with_params(subscriber, request_id, track, KeyValuePairs::default())
+            .expect("default SUBSCRIBE parameters must be valid")
     }
 
     pub(super) fn new_with_params(
@@ -427,6 +422,20 @@ mod tests {
 
         assert!(!filter.allows(2, 3));
         assert!(filter.allows(2, 4));
+        assert!(filter.allows(3, 0));
+    }
+
+    #[test]
+    fn next_group_filter_skips_the_retained_current_group() {
+        let mut params = KeyValuePairs::default();
+        params
+            .set_subscription_filter(&SubscriptionFilter::next_group_start())
+            .unwrap();
+        let info = subscribe_info_with(params);
+        let filter = info.delivery_filter(Some(Location::new(2, 3)));
+
+        assert!(!filter.allows(2, 3));
+        assert!(!filter.allows(2, 4));
         assert!(filter.allows(3, 0));
     }
 

@@ -5,6 +5,7 @@
 // t_recv = t_play (arrival) and t_gen (from the header) for the D metrics.
 // Each MoQ object is one complete message, so no byte reassembly is needed.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,8 +18,9 @@ use clap::Parser;
 use moq_native_ietf::{quic, tls};
 use moq_transport::{
     coding::{KeyValuePairs, TrackNamespace},
-    serve::{TrackReaderMode, Tracks},
-    session::Session,
+    message::SubscriptionFilter,
+    serve::{Track, TrackReader, TrackReaderMode, Tracks},
+    session::{Session, Subscribe, Subscriber},
 };
 use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
@@ -26,8 +28,15 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use url::Url;
 
+use skew_moq::playout::{
+    LatePolicy, PlayoutAction, PlayoutConfig, PlayoutObject, PlayoutScheduler,
+};
+use skew_moq::s3_controller::{S3Config, S3Controller, S3Observation, S3Update};
+use skew_moq::s3_receiver::{
+    validate_routed_object, IngressEvent, RoutedObject, S3DeadlineTracker, S3ReceiverIngress,
+};
+use skew_moq::s3_switch::{Route, S3SwitchGate, SwitchConfig, TrackRole};
 use skew_moq::*;
-use skew_moq::playout::{LatePolicy, PlayoutAction, PlayoutConfig, PlayoutObject, PlayoutScheduler};
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum Arm {
@@ -35,6 +44,7 @@ enum Arm {
     S1,
     M1,
     S2,
+    S3,
 }
 
 impl Arm {
@@ -44,6 +54,7 @@ impl Arm {
             Self::S1 => "s1",
             Self::M1 => "m1",
             Self::S2 => "s2",
+            Self::S3 => "s3",
         }
     }
 }
@@ -153,6 +164,42 @@ struct Args {
     /// S2 hop-local PC object forwarding budget in integer milliseconds.
     #[arg(long)]
     pc_delivery_timeout_ms: Option<u64>,
+    /// S3 controller window. Required explicitly by --arm s3.
+    #[arg(long)]
+    s3_window_ms: Option<u64>,
+    #[arg(long)]
+    s3_ewma_alpha: Option<f64>,
+    #[arg(long)]
+    s3_miss_streak_threshold: Option<u32>,
+    #[arg(long)]
+    s3_violation_ratio_threshold: Option<f64>,
+    #[arg(long)]
+    s3_target_skew_ms: Option<u64>,
+    #[arg(long)]
+    s3_recovery_fraction: Option<f64>,
+    #[arg(long)]
+    s3_haptic_critical_stable_ms: Option<u64>,
+    #[arg(long)]
+    s3_recovery_stable_ms: Option<u64>,
+    #[arg(long)]
+    s3_cooldown_ms: Option<u64>,
+    #[arg(long)]
+    s3_min_paired_samples: Option<usize>,
+    #[arg(long)]
+    s3_max_window_samples: Option<usize>,
+    /// Request-to-exact-pair first-effect bound. No implicit S3 default.
+    #[arg(long)]
+    s3_effect_timeout_ms: Option<u64>,
+    /// Maximum retry attempts after a failed target subscription.
+    #[arg(long)]
+    s3_switch_retry_limit: Option<u32>,
+    /// Hidden mechanism-test gate. Any run using this is ineligible for
+    /// performance or scientific claims.
+    #[arg(long, hide = true)]
+    s3_test_mode: bool,
+    /// Inject the frozen three-miss trigger after controller activation.
+    #[arg(long, hide = true)]
+    s3_test_force_misses_after_ms: Option<u64>,
 }
 
 fn ms_to_us(value: u64, name: &str) -> Result<u64> {
@@ -187,12 +234,18 @@ fn playout_config(args: &Args) -> Result<Option<PlayoutConfig>> {
                 bail!("PC delivery timeout requires --arm s2");
             }
         }
-        Arm::S2 => {
-            let timeout = args
-                .pc_delivery_timeout_ms
-                .context("--arm s2 requires --pc-delivery-timeout-ms")?;
+        Arm::S2 | Arm::S3 => {
+            let timeout = args.pc_delivery_timeout_ms.with_context(|| {
+                format!(
+                    "--arm {} requires --pc-delivery-timeout-ms",
+                    args.arm.as_str()
+                )
+            })?;
             if timeout == 0 {
                 bail!("--pc-delivery-timeout-ms must be greater than zero");
+            }
+            if args.arm == Arm::S3 && timeout != 67 {
+                bail!("--arm s3 inherits the frozen 67ms PC delivery timeout");
             }
         }
     }
@@ -221,9 +274,7 @@ fn playout_config(args: &Args) -> Result<Option<PlayoutConfig>> {
         )?,
         max_objects_per_track: args
             .buffer_max_objects_per_track
-            .with_context(|| {
-                format!("--arm {arm} requires --buffer-max-objects-per-track")
-            })?,
+            .with_context(|| format!("--arm {arm} requires --buffer-max-objects-per-track"))?,
         max_span_us: ms_to_us(
             args.buffer_max_span_ms
                 .with_context(|| format!("--arm {arm} requires --buffer-max-span-ms"))?,
@@ -241,6 +292,133 @@ fn playout_config(args: &Args) -> Result<Option<PlayoutConfig>> {
     Ok(Some(config))
 }
 
+struct S3RuntimeConfig {
+    controller: S3Config,
+    switch: SwitchConfig,
+    switch_retry_limit: u32,
+    test_force_misses_after_us: Option<u64>,
+}
+
+fn s3_runtime_config(args: &Args) -> Result<Option<S3RuntimeConfig>> {
+    let supplied = args.s3_window_ms.is_some()
+        || args.s3_ewma_alpha.is_some()
+        || args.s3_miss_streak_threshold.is_some()
+        || args.s3_violation_ratio_threshold.is_some()
+        || args.s3_target_skew_ms.is_some()
+        || args.s3_recovery_fraction.is_some()
+        || args.s3_haptic_critical_stable_ms.is_some()
+        || args.s3_recovery_stable_ms.is_some()
+        || args.s3_cooldown_ms.is_some()
+        || args.s3_min_paired_samples.is_some()
+        || args.s3_max_window_samples.is_some()
+        || args.s3_effect_timeout_ms.is_some()
+        || args.s3_switch_retry_limit.is_some()
+        || args.s3_test_mode
+        || args.s3_test_force_misses_after_ms.is_some();
+    if args.arm != Arm::S3 {
+        if supplied {
+            bail!("S3 controller/switch options require --arm s3");
+        }
+        return Ok(None);
+    }
+    if args.tracks != RxTrackSel::Both {
+        bail!("--arm s3 requires --tracks both");
+    }
+    let controller = S3Config {
+        window_us: ms_to_us(
+            args.s3_window_ms
+                .context("--arm s3 requires --s3-window-ms")?,
+            "s3-window-ms",
+        )?,
+        ewma_alpha: args
+            .s3_ewma_alpha
+            .context("--arm s3 requires --s3-ewma-alpha")?,
+        miss_streak_threshold: args
+            .s3_miss_streak_threshold
+            .context("--arm s3 requires --s3-miss-streak-threshold")?,
+        violation_ratio_threshold: args
+            .s3_violation_ratio_threshold
+            .context("--arm s3 requires --s3-violation-ratio-threshold")?,
+        target_skew_us: ms_to_us(
+            args.s3_target_skew_ms
+                .context("--arm s3 requires --s3-target-skew-ms")?,
+            "s3-target-skew-ms",
+        )?,
+        recovery_fraction: args
+            .s3_recovery_fraction
+            .context("--arm s3 requires --s3-recovery-fraction")?,
+        haptic_critical_stable_us: ms_to_us(
+            args.s3_haptic_critical_stable_ms
+                .context("--arm s3 requires --s3-haptic-critical-stable-ms")?,
+            "s3-haptic-critical-stable-ms",
+        )?,
+        recovery_stable_us: ms_to_us(
+            args.s3_recovery_stable_ms
+                .context("--arm s3 requires --s3-recovery-stable-ms")?,
+            "s3-recovery-stable-ms",
+        )?,
+        cooldown_us: ms_to_us(
+            args.s3_cooldown_ms
+                .context("--arm s3 requires --s3-cooldown-ms")?,
+            "s3-cooldown-ms",
+        )?,
+        min_paired_samples: args
+            .s3_min_paired_samples
+            .context("--arm s3 requires --s3-min-paired-samples")?,
+        max_window_samples: args
+            .s3_max_window_samples
+            .context("--arm s3 requires --s3-max-window-samples")?,
+    };
+    if controller.window_us != 1_000_000
+        || controller.ewma_alpha != 0.2
+        || controller.miss_streak_threshold != 3
+        || controller.violation_ratio_threshold != 0.2
+        || controller.recovery_fraction != 0.5
+        || controller.haptic_critical_stable_us != 3_000_000
+        || controller.recovery_stable_us != 5_000_000
+        || controller.cooldown_us != 2_000_000
+    {
+        bail!(
+            "--arm s3 must preserve window=1000ms, alpha=0.2, streak=3, \
+             ratio=0.2, recovery-fraction=0.5, HC=3000ms, Recovery=5000ms, \
+             cooldown=2000ms"
+        );
+    }
+    if !matches!(
+        controller.target_skew_us,
+        15_000 | 25_000 | 50_000 | 100_000
+    ) {
+        bail!("--s3-target-skew-ms must be a governing-design candidate: 15, 25, 50, or 100");
+    }
+    controller.validate().map_err(anyhow::Error::msg)?;
+    let switch = SwitchConfig {
+        effect_timeout_us: ms_to_us(
+            args.s3_effect_timeout_ms
+                .context("--arm s3 requires --s3-effect-timeout-ms")?,
+            "s3-effect-timeout-ms",
+        )?,
+    };
+    switch
+        .validate()
+        .map_err(|error| anyhow::anyhow!("invalid S3 switch config: {error:?}"))?;
+    let switch_retry_limit = args
+        .s3_switch_retry_limit
+        .context("--arm s3 requires --s3-switch-retry-limit")?;
+    if args.s3_test_force_misses_after_ms.is_some() && !args.s3_test_mode {
+        bail!("--s3-test-force-misses-after-ms requires --s3-test-mode");
+    }
+    let test_force_misses_after_us = args
+        .s3_test_force_misses_after_ms
+        .map(|value| ms_to_us(value, "s3-test-force-misses-after-ms"))
+        .transpose()?;
+    Ok(Some(S3RuntimeConfig {
+        controller,
+        switch,
+        switch_retry_limit,
+        test_force_misses_after_us,
+    }))
+}
+
 fn phase4_transport(args: &Args) -> Option<Phase4TransportMeta> {
     match args.arm {
         Arm::B1 | Arm::S1 => None,
@@ -251,8 +429,8 @@ fn phase4_transport(args: &Args) -> Option<Phase4TransportMeta> {
             haptic_publisher_priority: 128,
             pc_delivery_timeout_ms: None,
         }),
-        Arm::S2 => Some(Phase4TransportMeta {
-            arm: "s2",
+        Arm::S2 | Arm::S3 => Some(Phase4TransportMeta {
+            arm: args.arm.as_str(),
             pc_subgroup_mapping: "frame-per-subgroup",
             pc_publisher_priority: 1,
             haptic_publisher_priority: 0,
@@ -283,11 +461,16 @@ fn dispatch_playout_actions(
         match action {
             PlayoutAction::Release(object) => {
                 logger.lock().unwrap().try_log_release(
-                    object.track_name(), h.tier, h.seq, h.pts_us, h.event_id, action_time,
+                    object.track_name(),
+                    h.tier,
+                    h.seq,
+                    h.pts_us,
+                    h.event_id,
+                    action_time,
                 )?;
                 stats.released += 1;
-                let observe = (h.track_id == TRACK_PC && render)
-                    || (h.track_id == TRACK_HAPTIC && audio);
+                let observe =
+                    (h.track_id == TRACK_PC && render) || (h.track_id == TRACK_HAPTIC && audio);
                 if observe {
                     if let Some(tx) = bridge {
                         if tx.try_send(object.bytes).is_err() {
@@ -301,8 +484,13 @@ fn dispatch_playout_actions(
             }
             PlayoutAction::Drop { object, reason } => {
                 logger.lock().unwrap().try_log_drop(
-                    object.track_name(), h.tier, h.seq, h.pts_us, h.event_id,
-                    action_time, reason,
+                    object.track_name(),
+                    h.tier,
+                    h.seq,
+                    h.pts_us,
+                    h.event_id,
+                    action_time,
+                    reason,
                 )?;
                 stats.dropped += 1;
             }
@@ -348,7 +536,9 @@ async fn run_playout_scheduler(
         // Producer ended: deterministically drain the bounded timeline, then
         // return so logger finalization cannot race a detached scheduler task.
         while !scheduler.is_empty() {
-            let Some(wakeup) = scheduler.next_wakeup_us() else { break };
+            let Some(wakeup) = scheduler.next_wakeup_us() else {
+                break;
+            };
             tokio::time::sleep(Duration::from_micros(wakeup.saturating_sub(now_us()))).await;
             let actions = scheduler.advance(now_us());
             dispatch_playout_actions(actions, &logger, bridge.as_ref(), render, audio, &mut stats)?;
@@ -442,7 +632,11 @@ fn expected_for(name: &str, args: &Args) -> Option<u64> {
     if !args.tracks.enabled(name) {
         return Some(0);
     }
-    let rate = if name == "pc" { args.fps } else { args.haptic_hz };
+    let rate = if name == "pc" {
+        args.fps
+    } else {
+        args.haptic_hz
+    };
     Some((d * rate as f64).round() as u64)
 }
 
@@ -579,7 +773,11 @@ impl DrainReport {
         };
         format!(
             "{{\"name\":\"{}\",\"end\":\"{}\",\"received\":{},\"expected\":{},\"complete\":{}}}",
-            self.name, self.end_str(), self.received, expected, complete
+            self.name,
+            self.end_str(),
+            self.received,
+            expected,
+            complete
         )
     }
 }
@@ -627,10 +825,7 @@ fn classify_ending_with_timeout(
         );
     }
     if session_finished {
-        return (
-            RxEnding::SessionEnded,
-            "rule=session_finished".to_string(),
-        );
+        return (RxEnding::SessionEnded, "rule=session_finished".to_string());
     }
     // Zero objects on a track that was expected to carry some is a total
     // failure of that subscription — no loss rate explains it — so unlike a
@@ -660,8 +855,10 @@ fn classify_ending_with_timeout(
             format!("rule=zero_objects_expected {}", dead.join(",")),
         );
     }
-    let cancelled: Vec<&DrainReport> =
-        reports.iter().filter(|r| r.end == TrackEnd::Cancelled).collect();
+    let cancelled: Vec<&DrainReport> = reports
+        .iter()
+        .filter(|r| r.end == TrackEnd::Cancelled)
+        .collect();
     if !cancelled.is_empty() {
         let names: Vec<&str> = cancelled.iter().map(|r| r.name).collect();
         let unknown: Vec<&str> = cancelled
@@ -725,8 +922,994 @@ fn json_escape(s: &str) -> String {
     out
 }
 
-async fn connect(relay: &Url) -> Result<(web_transport::Session, moq_transport::session::Transport)> {
-    let tls_args = tls::Args { disable_verify: true, ..Default::default() };
+#[derive(Debug)]
+enum S3WireEvent {
+    Object(RoutedObject),
+    Ended {
+        role: TrackRole,
+        route: Route,
+        end: TrackEnd,
+        detail: String,
+    },
+}
+
+struct S3LiveSubscription {
+    handle: Subscribe,
+    drain: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct S3ObjectKey {
+    track_id: u8,
+    tier: u16,
+    seq: u32,
+    pts_us: u64,
+    event_id: u32,
+}
+
+impl From<&PlayoutObject> for S3ObjectKey {
+    fn from(object: &PlayoutObject) -> Self {
+        Self {
+            track_id: object.header.track_id,
+            tier: object.header.tier,
+            seq: object.header.seq,
+            pts_us: object.header.pts_us,
+            event_id: object.header.event_id,
+        }
+    }
+}
+
+async fn drain_s3_track(
+    role: TrackRole,
+    route: Route,
+    received_track: TrackReader,
+    logger: Arc<Mutex<JsonlLogger>>,
+    events: mpsc::Sender<S3WireEvent>,
+    bad_headers: Arc<AtomicU64>,
+    ingress_drops: Arc<AtomicU64>,
+    log_failed: Arc<AtomicU64>,
+) {
+    let result = async {
+        let mut subgroups = match received_track.mode().await? {
+            TrackReaderMode::Subgroups(subgroups) => subgroups,
+            _ => return Err(DrainFail::NonSubgroup),
+        };
+        while let Some(mut subgroup) = subgroups.next().await? {
+            while let Some(bytes) = subgroup.read_next().await? {
+                let t_recv = now_us();
+                let Some(header) = unpack_header(&bytes) else {
+                    bad_headers.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                };
+                if header.version != VERSION || bytes.len() != HDR + header.payload_len as usize {
+                    bad_headers.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                let routed = RoutedObject {
+                    role,
+                    route,
+                    object: PlayoutObject {
+                        header,
+                        t_recv,
+                        bytes,
+                    },
+                };
+                if validate_routed_object(&routed).is_err() {
+                    bad_headers.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                if logger
+                    .lock()
+                    .map_err(|_| DrainFail::NonSubgroup)?
+                    .try_log_rx_s3(
+                        role,
+                        route,
+                        header.tier,
+                        header.seq,
+                        header.pts_us,
+                        header.event_id,
+                        header.payload_len,
+                        t_recv,
+                        t_recv,
+                        header.gen_ts_us,
+                    )
+                    .is_err()
+                {
+                    log_failed.fetch_add(1, Ordering::Relaxed);
+                }
+                match events.try_send(S3WireEvent::Object(routed)) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(S3WireEvent::Object(routed))) => {
+                        ingress_drops.fetch_add(1, Ordering::Relaxed);
+                        let header = routed.object.header;
+                        if logger
+                            .lock()
+                            .map_err(|_| DrainFail::NonSubgroup)?
+                            .try_log_drop_s3(
+                                role,
+                                route,
+                                header.tier,
+                                header.seq,
+                                header.pts_us,
+                                header.event_id,
+                                now_us().max(routed.object.t_recv),
+                                "ingress_queue_full",
+                            )
+                            .is_err()
+                        {
+                            log_failed.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
+                    Err(mpsc::error::TrySendError::Full(S3WireEvent::Ended { .. })) => {
+                        unreachable!("object send returned a non-object")
+                    }
+                }
+            }
+        }
+        Ok::<(), DrainFail>(())
+    }
+    .await;
+
+    let (end, detail) = match result {
+        Ok(()) => (TrackEnd::Fin, String::new()),
+        Err(DrainFail::Serve(error)) => (classify_track_end(&error), error.to_string()),
+        Err(DrainFail::NonSubgroup) => (
+            TrackEnd::Failed,
+            "invalid S3 subgroup/log state".to_string(),
+        ),
+    };
+    let _ = events
+        .send(S3WireEvent::Ended {
+            role,
+            route,
+            end,
+            detail,
+        })
+        .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn open_s3_subscription(
+    subscriber: &mut Subscriber,
+    namespace: &TrackNamespace,
+    role: TrackRole,
+    route: Route,
+    initial: bool,
+    retry_limit: u32,
+    args: &Args,
+    logger: Arc<Mutex<JsonlLogger>>,
+    events: mpsc::Sender<S3WireEvent>,
+    bad_headers: Arc<AtomicU64>,
+    ingress_drops: Arc<AtomicU64>,
+    log_failed: Arc<AtomicU64>,
+) -> Result<(S3LiveSubscription, u64, u32)> {
+    let started = tokio::time::Instant::now();
+    let deadline = started + Duration::from_secs_f64(args.subscribe_timeout);
+    let mut retries = 0u32;
+    loop {
+        let (writer, reader) = Track::new(namespace.clone(), route.name).produce();
+        let mut params = KeyValuePairs::default();
+        if role == TrackRole::Pc {
+            params.set_delivery_timeout(
+                args.pc_delivery_timeout_ms
+                    .expect("validated S3 PC delivery timeout"),
+            );
+        }
+        if !initial {
+            params
+                .set_subscription_filter(&SubscriptionFilter::next_group_start())
+                .context("set S3 NextGroupStart filter")?;
+        }
+        match subscriber.subscribe_open_with_params(writer, params).await {
+            Ok(handle) => {
+                let t_ok = now_us();
+                let drain = tokio::spawn(drain_s3_track(
+                    role,
+                    route,
+                    reader,
+                    logger,
+                    events,
+                    bad_headers,
+                    ingress_drops,
+                    log_failed,
+                ));
+                return Ok((S3LiveSubscription { handle, drain }, t_ok, retries));
+            }
+            Err(error)
+                if is_retryable_subscribe_error(&error)
+                    && retries < retry_limit
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                retries += 1;
+                tokio::time::sleep(Duration::from_millis(args.subscribe_retry_ms)).await;
+            }
+            Err(error) => {
+                bail!(
+                    "S3 subscribe {} generation {} failed after {} retries: {}",
+                    route.name,
+                    route.generation,
+                    retries,
+                    error
+                );
+            }
+        }
+    }
+}
+
+fn dispatch_s3_playout_actions(
+    actions: Vec<PlayoutAction>,
+    routes: &mut HashMap<S3ObjectKey, (TrackRole, Route)>,
+    tracker: &mut S3DeadlineTracker,
+    logger: &Arc<Mutex<JsonlLogger>>,
+    bridge: Option<&mpsc::Sender<Bytes>>,
+    render: bool,
+    audio: bool,
+    stats: &mut PlayoutStats,
+    now: u64,
+) -> Result<()> {
+    tracker
+        .note_actions(&actions, now)
+        .map_err(anyhow::Error::msg)?;
+    for action in actions {
+        let object = action.object();
+        let header = object.header;
+        let key = S3ObjectKey::from(object);
+        let (role, route) = routes
+            .remove(&key)
+            .context("missing S3 route for terminal scheduler action")?;
+        match action {
+            PlayoutAction::Release(object) => {
+                logger
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("RX logger poisoned"))?
+                    .try_log_release_s3(
+                        role,
+                        route,
+                        header.tier,
+                        header.seq,
+                        header.pts_us,
+                        header.event_id,
+                        now.max(object.t_recv),
+                    )?;
+                stats.released += 1;
+                let observe = (header.track_id == TRACK_PC && render)
+                    || (header.track_id == TRACK_HAPTIC && audio);
+                if observe {
+                    if let Some(bridge) = bridge {
+                        if bridge.try_send(object.bytes).is_err() {
+                            stats.bridge_observer_dropped += 1;
+                        }
+                    }
+                }
+            }
+            PlayoutAction::Drop { object, reason } => {
+                logger
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("RX logger poisoned"))?
+                    .try_log_drop_s3(
+                        role,
+                        route,
+                        header.tier,
+                        header.seq,
+                        header.pts_us,
+                        header.event_id,
+                        now.max(object.t_recv),
+                        reason,
+                    )?;
+                stats.dropped += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn request_s3_switch(
+    update: S3Update,
+    ingress: &mut S3ReceiverIngress,
+    subscriber: &mut Subscriber,
+    namespace: &TrackNamespace,
+    live: &mut HashMap<(TrackRole, u64), S3LiveSubscription>,
+    config: &S3RuntimeConfig,
+    args: &Args,
+    logger: Arc<Mutex<JsonlLogger>>,
+    events: mpsc::Sender<S3WireEvent>,
+    bad_headers: Arc<AtomicU64>,
+    ingress_drops: Arc<AtomicU64>,
+    log_failed: Arc<AtomicU64>,
+) -> Result<bool> {
+    let Some(transition) = update.transition else {
+        return Ok(false);
+    };
+    let request_at = now_us().max(transition.at_us);
+    {
+        let mut logger = logger
+            .lock()
+            .map_err(|_| anyhow::anyhow!("RX logger poisoned"))?;
+        logger.try_log_s3_transition(transition, update.snapshot)?;
+    }
+    let request = ingress
+        .request(transition, request_at)
+        .map_err(|error| anyhow::anyhow!("request S3 switch: {error:?}"))?;
+    logger
+        .lock()
+        .map_err(|_| anyhow::anyhow!("RX logger poisoned"))?
+        .try_log_s3_switch_request(request)?;
+
+    for role in [TrackRole::Pc, TrackRole::Haptic] {
+        let changed = match role {
+            TrackRole::Pc => request.pc_changed,
+            TrackRole::Haptic => request.haptic_changed,
+        };
+        if !changed {
+            continue;
+        }
+        let route = request.target.for_role(role);
+        let (subscription, t_ok, retries) = open_s3_subscription(
+            subscriber,
+            namespace,
+            role,
+            route,
+            false,
+            config.switch_retry_limit,
+            args,
+            logger.clone(),
+            events.clone(),
+            bad_headers.clone(),
+            ingress_drops.clone(),
+            log_failed.clone(),
+        )
+        .await?;
+        if let Err(error) = ingress.check_timeout(t_ok) {
+            drop(subscription.handle);
+            subscription.drain.abort();
+            let _ = subscription.drain.await;
+            return Err(anyhow::anyhow!(
+                "S3 switch timed out while subscribing: {error:?}"
+            ));
+        }
+        if live.contains_key(&(role, route.generation)) {
+            drop(subscription.handle);
+            subscription.drain.abort();
+            let _ = subscription.drain.await;
+            return Err(anyhow::anyhow!(
+                "duplicate live S3 subscription {} generation {}",
+                route.name,
+                route.generation
+            ));
+        }
+        live.insert((role, route.generation), subscription);
+        ingress
+            .subscribe_ok(role, t_ok)
+            .map_err(|error| anyhow::anyhow!("record S3 SUBSCRIBE_OK: {error:?}"))?;
+        {
+            let mut logger = logger
+                .lock()
+                .map_err(|_| anyhow::anyhow!("RX logger poisoned"))?;
+            logger.try_log_s3_subscribe_ok(request, role, t_ok)?;
+            logger.try_log_info(&format!(
+                "\"event\":\"s3_subscribe\",\"track\":\"{}\",\"route_generation\":{},\"retries\":{}",
+                role.as_str(),
+                route.generation,
+                retries
+            ))?;
+        }
+    }
+    Ok(true)
+}
+
+fn min_wakeup(values: impl IntoIterator<Item = Option<u64>>) -> Option<u64> {
+    values.into_iter().flatten().min()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_s3_receiver(
+    args: &Args,
+    playout: PlayoutConfig,
+    runtime: S3RuntimeConfig,
+    logger: Arc<Mutex<JsonlLogger>>,
+) -> Result<()> {
+    let mut controller = S3Controller::new(runtime.controller).map_err(anyhow::Error::msg)?;
+    let gate = S3SwitchGate::new(runtime.switch)
+        .map_err(|error| anyhow::anyhow!("create S3 switch gate: {error:?}"))?;
+    logger
+        .lock()
+        .map_err(|_| anyhow::anyhow!("RX logger poisoned"))?
+        .try_log_s3_config(&controller, &gate)?;
+    logger
+        .lock()
+        .map_err(|_| anyhow::anyhow!("RX logger poisoned"))?
+        .try_log_info(&format!(
+            "\"event\":\"s3_runtime\",\"switch_retry_limit\":{},\"barrier_max_objects_per_role\":{},\"deadline_max_anchors\":{},\"test_mode\":{},\"test_force_misses_after_us\":{}",
+            runtime.switch_retry_limit,
+            playout.max_objects_per_track,
+            playout.max_objects_per_track,
+            runtime.test_force_misses_after_us.is_some(),
+            runtime
+                .test_force_misses_after_us
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+        ))?;
+    let mut ingress =
+        S3ReceiverIngress::new(gate, playout.max_objects_per_track).map_err(anyhow::Error::msg)?;
+    let mut tracker =
+        S3DeadlineTracker::new(playout.max_objects_per_track).map_err(anyhow::Error::msg)?;
+    let mut scheduler = PlayoutScheduler::new(playout).map_err(anyhow::Error::msg)?;
+    let mut stats = PlayoutStats::default();
+    let mut object_routes: HashMap<S3ObjectKey, (TrackRole, Route)> = HashMap::new();
+
+    let (session, _publisher, mut subscriber) = {
+        let (webtransport, transport) = connect(&args.relay).await.context("connect S3 relay")?;
+        Session::connect(webtransport, None, transport)
+            .await
+            .context("S3 SETUP")?
+    };
+    let mut session_run = tokio::spawn(session.run());
+    let namespace = TrackNamespace::from_utf8_path(&args.run_id);
+
+    let event_capacity = playout
+        .max_objects_per_track
+        .checked_mul(4)
+        .context("S3 ingress capacity overflow")?;
+    let (event_tx, mut event_rx) = mpsc::channel::<S3WireEvent>(event_capacity);
+    let bad_headers = Arc::new(AtomicU64::new(0));
+    let ingress_drops = Arc::new(AtomicU64::new(0));
+    let log_failed = Arc::new(AtomicU64::new(0));
+    let recv_pc = Arc::new(AtomicU64::new(0));
+    let recv_haptic = Arc::new(AtomicU64::new(0));
+
+    let mut bridge_child = None;
+    let bridge_tx: Option<mpsc::Sender<Bytes>> = if args.render || args.audio {
+        let mut command = Command::new(&args.python);
+        command.arg("tools/stage_a_bridge.py");
+        if args.render {
+            command.arg("--render");
+        }
+        if args.audio {
+            command.arg("--audio");
+        }
+        if args.draco {
+            command.arg("--draco");
+        }
+        command
+            .arg("--title")
+            .arg(format!("skew live — {}", args.run_id))
+            .stdin(Stdio::piped());
+        let mut child = command.spawn().context("spawn S3 stage_a_bridge")?;
+        let mut stdin = child.stdin.take().context("open S3 bridge stdin")?;
+        let (tx, mut rx) = mpsc::channel::<Bytes>(64);
+        tokio::spawn(async move {
+            while let Some(bytes) = rx.recv().await {
+                if stdin.write_all(&bytes).await.is_err() {
+                    break;
+                }
+            }
+            let _ = stdin.flush().await;
+        });
+        bridge_child = Some(child);
+        Some(tx)
+    } else {
+        None
+    };
+
+    let mut live: HashMap<(TrackRole, u64), S3LiveSubscription> = HashMap::new();
+    let mut retired_drains = Vec::new();
+    let initial = ingress.gate().active_routes();
+    for (role, route) in [
+        (TrackRole::Pc, initial.pc),
+        (TrackRole::Haptic, initial.haptic),
+    ] {
+        let (subscription, t_ok, retries) = open_s3_subscription(
+            &mut subscriber,
+            &namespace,
+            role,
+            route,
+            true,
+            u32::MAX,
+            args,
+            logger.clone(),
+            event_tx.clone(),
+            bad_headers.clone(),
+            ingress_drops.clone(),
+            log_failed.clone(),
+        )
+        .await?;
+        live.insert((role, route.generation), subscription);
+        logger
+            .lock()
+            .map_err(|_| anyhow::anyhow!("RX logger poisoned"))?
+            .try_log_info(&format!(
+                "\"event\":\"s3_initial_subscribe\",\"track\":\"{}\",\"route_generation\":0,\"t_subscribe_ok\":{},\"retries\":{}",
+                role.as_str(),
+                t_ok,
+                retries
+            ))?;
+    }
+    println!("[rx] S3 subscribed Normal pc+haptic on {}", args.run_id);
+
+    let max_end_us = now_us()
+        .checked_add(Duration::from_secs_f64(args.max_duration).as_micros() as u64)
+        .context("S3 receiver max-duration overflow")?;
+    let mut current_finished = [false, false];
+    let mut normal_end = false;
+    let mut outcome_error: Option<anyhow::Error> = None;
+    let mut controller_active_at_us: Option<u64> = None;
+    let mut forced_misses_injected = false;
+
+    while !normal_end && outcome_error.is_none() {
+        let now = now_us();
+        let pending_at_start = ingress.gate().pending_request().is_some();
+        let switch_deadline = ingress.gate().pending_request().map(|request| {
+            request
+                .request_at_us
+                .saturating_add(runtime.switch.effect_timeout_us)
+                .saturating_add(1)
+        });
+        let forced_miss_wakeup = match (
+            forced_misses_injected,
+            controller_active_at_us,
+            runtime.test_force_misses_after_us,
+        ) {
+            (false, Some(active_at), Some(delay)) => Some(active_at.saturating_add(delay)),
+            _ => None,
+        };
+        let wakeup = min_wakeup([
+            scheduler.next_wakeup_us(),
+            tracker.next_wakeup_us(&scheduler),
+            switch_deadline,
+            forced_miss_wakeup,
+            Some(max_end_us),
+        ])
+        .unwrap_or(max_end_us);
+        let wait = Duration::from_micros(wakeup.saturating_sub(now));
+
+        let event = tokio::select! {
+            event = event_rx.recv() => event,
+            result = &mut session_run => {
+                outcome_error = Some(anyhow::anyhow!("S3 session ended early: {result:?}"));
+                None
+            }
+            _ = tokio::time::sleep(wait) => None,
+        };
+        let now = now_us();
+        if now >= max_end_us {
+            outcome_error = Some(anyhow::anyhow!("S3 receiver max-duration reached"));
+            break;
+        }
+
+        let mut scheduler_actions = Vec::new();
+        if let Some(event) = event {
+            match event {
+                S3WireEvent::Object(routed) => {
+                    match routed.role {
+                        TrackRole::Pc => {
+                            recv_pc.fetch_add(1, Ordering::Relaxed);
+                        }
+                        TrackRole::Haptic => {
+                            recv_haptic.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    let ingress_events = match ingress.push(routed, now) {
+                        Ok(events) => events,
+                        Err(error) => {
+                            outcome_error =
+                                Some(anyhow::anyhow!("S3 ingress validation failed: {error}"));
+                            continue;
+                        }
+                    };
+                    for ingress_event in ingress_events {
+                        match ingress_event {
+                            IngressEvent::Scheduler(routed) => {
+                                if let Err(error) = tracker.note_received(&routed.object) {
+                                    outcome_error = Some(anyhow::anyhow!(error));
+                                    break;
+                                }
+                                let key = S3ObjectKey::from(&routed.object);
+                                if object_routes
+                                    .insert(key, (routed.role, routed.route))
+                                    .is_some()
+                                {
+                                    outcome_error =
+                                        Some(anyhow::anyhow!("duplicate S3 scheduler identity"));
+                                    break;
+                                }
+                                scheduler_actions.extend(scheduler.push(routed.object, now));
+                            }
+                            IngressEvent::Drop { routed, reason } => {
+                                let header = routed.object.header;
+                                if let Err(error) = logger
+                                    .lock()
+                                    .map_err(|_| anyhow::anyhow!("RX logger poisoned"))
+                                    .and_then(|mut logger| {
+                                        logger
+                                            .try_log_drop_s3(
+                                                routed.role,
+                                                routed.route,
+                                                header.tier,
+                                                header.seq,
+                                                header.pts_us,
+                                                header.event_id,
+                                                now.max(routed.object.t_recv),
+                                                reason,
+                                            )
+                                            .map_err(anyhow::Error::from)
+                                    })
+                                {
+                                    outcome_error = Some(error);
+                                    break;
+                                }
+                                stats.dropped += 1;
+                            }
+                            IngressEvent::Applied(applied) => {
+                                let log_result = logger
+                                    .lock()
+                                    .map_err(|_| anyhow::anyhow!("RX logger poisoned"))
+                                    .and_then(|mut logger| {
+                                        logger.try_log_s3_first_effect(applied)?;
+                                        logger.try_log_s3_apply(applied)?;
+                                        Ok::<(), anyhow::Error>(())
+                                    });
+                                if let Err(error) = log_result {
+                                    outcome_error = Some(error);
+                                    break;
+                                }
+                                for (role, route) in [
+                                    (TrackRole::Pc, applied.cancel_pc),
+                                    (TrackRole::Haptic, applied.cancel_haptic),
+                                ] {
+                                    let Some(route) = route else { continue };
+                                    current_finished[match role {
+                                        TrackRole::Pc => 0,
+                                        TrackRole::Haptic => 1,
+                                    }] = false;
+                                    if let Err(error) = logger
+                                        .lock()
+                                        .map_err(|_| anyhow::anyhow!("RX logger poisoned"))
+                                        .and_then(|mut logger| {
+                                            logger
+                                                .try_log_s3_cancel(role, route, now)
+                                                .map_err(anyhow::Error::from)
+                                        })
+                                    {
+                                        outcome_error = Some(error);
+                                        break;
+                                    }
+                                    if let Some(old) = live.remove(&(role, route.generation)) {
+                                        drop(old.handle);
+                                        // The drain owns only the reader and
+                                        // will report the remote cancellation.
+                                        retired_drains.push(old.drain);
+                                    } else {
+                                        outcome_error = Some(anyhow::anyhow!(
+                                            "missing old S3 subscription {} generation {}",
+                                            route.name,
+                                            route.generation
+                                        ));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                S3WireEvent::Ended {
+                    role,
+                    route,
+                    end,
+                    detail,
+                } => {
+                    let current = ingress.gate().active_routes().for_role(role);
+                    if current == route {
+                        if end != TrackEnd::Fin {
+                            outcome_error = Some(anyhow::anyhow!(
+                                "current S3 route {} generation {} ended {:?}: {}",
+                                route.name,
+                                route.generation,
+                                end,
+                                detail
+                            ));
+                        } else {
+                            current_finished[match role {
+                                TrackRole::Pc => 0,
+                                TrackRole::Haptic => 1,
+                            }] = true;
+                            normal_end = current_finished.iter().all(|finished| *finished)
+                                && ingress.gate().pending_request().is_none();
+                        }
+                    }
+                }
+            }
+        }
+
+        scheduler_actions.extend(scheduler.advance(now));
+        if let Err(error) = dispatch_s3_playout_actions(
+            scheduler_actions,
+            &mut object_routes,
+            &mut tracker,
+            &logger,
+            bridge_tx.as_ref(),
+            args.render,
+            args.audio,
+            &mut stats,
+            now,
+        ) {
+            outcome_error = Some(error);
+            continue;
+        }
+        if scheduler.is_started() && !controller.is_active() {
+            if let Err(error) = controller.activate(now) {
+                outcome_error = Some(anyhow::anyhow!(error));
+                continue;
+            }
+            if let Err(error) = tracker.activate() {
+                outcome_error = Some(anyhow::anyhow!(error));
+                continue;
+            }
+            controller_active_at_us = Some(now);
+        }
+        if let Err(error) = ingress.check_timeout(now) {
+            outcome_error = Some(anyhow::anyhow!("S3 switch timeout: {error:?}"));
+            continue;
+        }
+        if !forced_misses_injected
+            && ingress.gate().pending_request().is_none()
+            && controller_active_at_us
+                .zip(runtime.test_force_misses_after_us)
+                .is_some_and(|(active_at, delay)| now >= active_at.saturating_add(delay))
+        {
+            forced_misses_injected = true;
+            let mut final_update = None;
+            for _ in 0..3 {
+                match controller.observe(S3Observation {
+                    now_us: now,
+                    deadline_miss: true,
+                    abs_skew_us: None,
+                }) {
+                    Ok(update) => final_update = Some(update),
+                    Err(error) => {
+                        outcome_error = Some(anyhow::anyhow!(error));
+                        break;
+                    }
+                }
+            }
+            if outcome_error.is_none() {
+                if let Err(error) = logger
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("RX logger poisoned"))
+                    .and_then(|mut logger| {
+                        logger
+                            .try_log_info(
+                                "\"event\":\"s3_test_forced_deadline_misses\",\"count\":3,\"scientific_eligible\":false",
+                            )
+                            .map_err(anyhow::Error::from)
+                    })
+                {
+                    outcome_error = Some(error);
+                    continue;
+                }
+                if let Some(update) = final_update {
+                    if let Err(error) = request_s3_switch(
+                        update,
+                        &mut ingress,
+                        &mut subscriber,
+                        &namespace,
+                        &mut live,
+                        &runtime,
+                        args,
+                        logger.clone(),
+                        event_tx.clone(),
+                        bad_headers.clone(),
+                        ingress_drops.clone(),
+                        log_failed.clone(),
+                    )
+                    .await
+                    {
+                        outcome_error = Some(error);
+                        continue;
+                    }
+                }
+            }
+        }
+        let observations = match tracker.advance(&scheduler, now) {
+            Ok(observations) => observations,
+            Err(error) => {
+                outcome_error = Some(anyhow::anyhow!(error));
+                continue;
+            }
+        };
+        if pending_at_start || ingress.gate().pending_request().is_some() {
+            if !observations.is_empty() {
+                if let Err(error) = logger
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("RX logger poisoned"))
+                    .and_then(|mut logger| {
+                        logger
+                            .try_log_info(&format!(
+                                "\"event\":\"s3_observations_suppressed_during_switch\",\"count\":{}",
+                                observations.len()
+                            ))
+                            .map_err(anyhow::Error::from)
+                    })
+                {
+                    outcome_error = Some(error);
+                }
+            }
+        } else {
+            for observation in observations {
+                let update = match controller.observe(observation) {
+                    Ok(update) => update,
+                    Err(error) => {
+                        outcome_error = Some(anyhow::anyhow!(error));
+                        break;
+                    }
+                };
+                match request_s3_switch(
+                    update,
+                    &mut ingress,
+                    &mut subscriber,
+                    &namespace,
+                    &mut live,
+                    &runtime,
+                    args,
+                    logger.clone(),
+                    event_tx.clone(),
+                    bad_headers.clone(),
+                    ingress_drops.clone(),
+                    log_failed.clone(),
+                )
+                .await
+                {
+                    Ok(true) => break,
+                    Ok(false) => {}
+                    Err(error) => {
+                        outcome_error = Some(error);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    for event in ingress.finish_pending() {
+        if let IngressEvent::Drop { routed, reason } = event {
+            let header = routed.object.header;
+            logger
+                .lock()
+                .map_err(|_| anyhow::anyhow!("RX logger poisoned"))?
+                .try_log_drop_s3(
+                    routed.role,
+                    routed.route,
+                    header.tier,
+                    header.seq,
+                    header.pts_us,
+                    header.event_id,
+                    now_us().max(routed.object.t_recv),
+                    reason,
+                )?;
+            stats.dropped += 1;
+        }
+    }
+
+    // Stop every subscription before joining/aborting its drain, then stop the
+    // session. No detached reader is allowed to write after shutdown logging.
+    for (_, subscription) in live.drain() {
+        drop(subscription.handle);
+        subscription.drain.abort();
+        let _ = subscription.drain.await;
+    }
+    for drain in retired_drains {
+        if !drain.is_finished() {
+            drain.abort();
+        }
+        let _ = drain.await;
+    }
+    session_run.abort();
+    let _ = session_run.await;
+    drop(event_tx);
+    drop(bridge_tx);
+    if let Some(mut child) = bridge_child {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+    }
+
+    if scheduler.is_started() {
+        let budget_end = now_us()
+            .saturating_add(playout.d_play_us)
+            .saturating_add(playout.max_span_us)
+            .saturating_add(playout.late_tolerance_us)
+            .saturating_add(250_000);
+        while !scheduler.is_empty() && now_us() <= budget_end {
+            let Some(wakeup) = scheduler.next_wakeup_us() else {
+                break;
+            };
+            tokio::time::sleep(Duration::from_micros(wakeup.saturating_sub(now_us()))).await;
+            let now = now_us();
+            let actions = scheduler.advance(now);
+            dispatch_s3_playout_actions(
+                actions,
+                &mut object_routes,
+                &mut tracker,
+                &logger,
+                None,
+                false,
+                false,
+                &mut stats,
+                now,
+            )?;
+        }
+    } else {
+        let now = now_us();
+        let actions = scheduler.finish_without_epoch();
+        dispatch_s3_playout_actions(
+            actions,
+            &mut object_routes,
+            &mut tracker,
+            &logger,
+            None,
+            false,
+            false,
+            &mut stats,
+            now,
+        )?;
+    }
+
+    let n_pc = recv_pc.load(Ordering::Relaxed);
+    let n_haptic = recv_haptic.load(Ordering::Relaxed);
+    let n_bad = bad_headers.load(Ordering::Relaxed);
+    let n_ingress_drop = ingress_drops.load(Ordering::Relaxed);
+    let failed = outcome_error.is_some()
+        || n_bad > 0
+        || n_ingress_drop > 0
+        || log_failed.load(Ordering::Relaxed) > 0
+        || !object_routes.is_empty();
+    {
+        let mut logger = logger
+            .lock()
+            .map_err(|_| anyhow::anyhow!("RX logger poisoned"))?;
+        logger.try_log_info(&format!(
+            "\"recv_pc\":{n_pc},\"recv_haptic\":{n_haptic},\"bad_headers\":{n_bad},\"s1_released\":{},\"s1_dropped\":{},\"s1_ingress_dropped\":{n_ingress_drop},\"s1_bridge_observer_dropped\":{}",
+            stats.released,
+            stats.dropped,
+            stats.bridge_observer_dropped,
+        ))?;
+        logger.try_log_info(&format!(
+            "\"event\":\"shutdown\",\"ending\":\"{}\",\"exit_code\":{},\"bad_headers\":{},\"subscribe_retries\":0,\"subscribe_wait_ms\":0,\"tracks\":[],\"detail\":\"{}\"",
+            if failed { "error" } else { "normal" },
+            if failed { 1 } else { 0 },
+            n_bad,
+            json_escape(
+                &outcome_error
+                    .as_ref()
+                    .map(|error| format!("{error:#}"))
+                    .unwrap_or_else(|| "rule=s3_current_routes_fin".to_string())
+            )
+        ))?;
+        logger.try_flush()?;
+    }
+    if let Some(error) = outcome_error {
+        return Err(error);
+    }
+    if failed {
+        bail!(
+            "S3 final integrity failure: bad_headers={n_bad} ingress_drops={n_ingress_drop} route_residue={}",
+            object_routes.len()
+        );
+    }
+    println!(
+        "[rx] done (normal S3): pc={n_pc} haptic={n_haptic} -> {}",
+        args.out.display()
+    );
+    Ok(())
+}
+
+async fn connect(
+    relay: &Url,
+) -> Result<(web_transport::Session, moq_transport::session::Transport)> {
+    let tls_args = tls::Args {
+        disable_verify: true,
+        ..Default::default()
+    };
     let tls = tls_args.load()?;
     let bind: SocketAddr = "[::]:0".parse().unwrap();
     let quic = quic::Endpoint::new(quic::Config::new(bind, None, tls)?)?;
@@ -744,11 +1927,22 @@ async fn main() -> Result<()> {
         .init();
     let args = Args::parse();
     let s1_config = playout_config(&args)?;
+    let s3_runtime = s3_runtime_config(&args)?;
     let phase4_transport = phase4_transport(&args);
 
     let logger = Arc::new(Mutex::new(JsonlLogger::new(
-        &args.out, &args.run_id, "moq", "rx", args.c_mbps, args.rtt_ms,
-        args.jitter_ms, args.loss_pct, args.s_bytes, args.fps, args.haptic_hz, args.seed,
+        &args.out,
+        &args.run_id,
+        "moq",
+        "rx",
+        args.c_mbps,
+        args.rtt_ms,
+        args.jitter_ms,
+        args.loss_pct,
+        args.s_bytes,
+        args.fps,
+        args.haptic_hz,
+        args.seed,
         // duration_s = None **유지**: rx meta에 duration_s를 넣으면 분석기의
         // 설계 분모 출처(`_design`이 rx_meta.duration_s도 읽음)로 흡수되어
         // 기대 프레임 분모의 provenance가 바뀐다. 분모는 tx meta/CLI 주입만
@@ -757,12 +1951,27 @@ async fn main() -> Result<()> {
         // 기록해 두면 tx 로그를 잃은 C3 rx 로그도 단독 트랙으로 분류된다.
         // term_protocol: 종료 프로토콜 세대 마커(Codex 7차 P0 — tx 소실 +
         // shutdown 결손 조합이 구세대로 오인되는 우회를 rx meta 자체로 차단).
-        None, None, Some(args.tracks.as_str()), Some(TERM_PROTOCOL_V), s1_config,
+        None,
+        None,
+        Some(args.tracks.as_str()),
+        Some(TERM_PROTOCOL_V),
+        s1_config,
         phase4_transport,
     )?));
 
+    if args.arm == Arm::S3 {
+        return run_s3_receiver(
+            &args,
+            s1_config.expect("S3 requires the common playout scheduler"),
+            s3_runtime.expect("validated S3 runtime config"),
+            logger,
+        )
+        .await;
+    }
+
     let (sess, tp) = connect(&args.relay).await.context("connect relay")?;
-    let (session, _pub, mut subscriber) = Session::connect(sess, None, tp).await.context("SETUP")?;
+    let (session, _pub, mut subscriber) =
+        Session::connect(sess, None, tp).await.context("SETUP")?;
     let mut session_run = tokio::spawn(session.run());
 
     let namespace = TrackNamespace::from_utf8_path(&args.run_id);
@@ -791,11 +2000,17 @@ async fn main() -> Result<()> {
         for name in names {
             let tw = match sub_tracks.create(name) {
                 Some(tw) => tw,
-                None => { ok = false; break; }
+                None => {
+                    ok = false;
+                    break;
+                }
             };
             let rr = match sub_reader.get_track_reader(&namespace, name) {
                 Some(rr) => rr,
-                None => { ok = false; break; }
+                None => {
+                    ok = false;
+                    break;
+                }
             };
             let mut params = KeyValuePairs::default();
             if name == "pc" && args.arm == Arm::S2 {
@@ -805,8 +2020,14 @@ async fn main() -> Result<()> {
                 );
             }
             match subscriber.subscribe_open_with_params(tw, params).await {
-                Ok(h) => { this_handles.push(h); this_recv.push((name, rr)); }
-                Err(e) if is_retryable_subscribe_error(&e) => { ok = false; break; }
+                Ok(h) => {
+                    this_handles.push(h);
+                    this_recv.push((name, rr));
+                }
+                Err(e) if is_retryable_subscribe_error(&e) => {
+                    ok = false;
+                    break;
+                }
                 // Anything else is a real fault: fail now, do not poll on it.
                 Err(e) => {
                     fatal = Some(anyhow::anyhow!("subscribe {name} failed: {e}"));
@@ -828,7 +2049,8 @@ async fn main() -> Result<()> {
         if tokio::time::Instant::now() >= sub_deadline {
             bail!(
                 "could not subscribe within {}s ({} retries; publisher never announced?)",
-                args.subscribe_timeout, sub_stats.retries
+                args.subscribe_timeout,
+                sub_stats.retries
             );
         }
         // Check the session is still alive before retrying.
@@ -853,22 +2075,34 @@ async fn main() -> Result<()> {
     let ftx: Option<mpsc::Sender<Bytes>> = if args.render || args.audio {
         let mut cmd = Command::new(&args.python);
         cmd.arg("tools/stage_a_bridge.py");
-        if args.render { cmd.arg("--render"); }
-        if args.audio { cmd.arg("--audio"); }
-        if args.draco { cmd.arg("--draco"); }
-        cmd.arg("--title").arg(format!("skew live — {}", args.run_id));
+        if args.render {
+            cmd.arg("--render");
+        }
+        if args.audio {
+            cmd.arg("--audio");
+        }
+        if args.draco {
+            cmd.arg("--draco");
+        }
+        cmd.arg("--title")
+            .arg(format!("skew live — {}", args.run_id));
         cmd.stdin(Stdio::piped());
         let mut child = cmd.spawn().context("spawn stage_a_bridge")?;
         let mut stdin = child.stdin.take().unwrap();
         let (tx, mut rx) = mpsc::channel::<Bytes>(64);
         tokio::spawn(async move {
             while let Some(b) = rx.recv().await {
-                if stdin.write_all(&b).await.is_err() { break; }
+                if stdin.write_all(&b).await.is_err() {
+                    break;
+                }
             }
             let _ = stdin.flush().await; // EOF on drop -> bridge exits
         });
         bridge_child = Some(child);
-        println!("[rx] Stage A bridge: render={} audio={}", args.render, args.audio);
+        println!(
+            "[rx] Stage A bridge: render={} audio={}",
+            args.render, args.audio
+        );
         Some(tx)
     } else {
         None
@@ -885,7 +2119,12 @@ async fn main() -> Result<()> {
             .context("S1 ingress capacity overflow")?;
         let (tx, rx) = mpsc::channel::<PlayoutObject>(capacity);
         let task = tokio::spawn(run_playout_scheduler(
-            config, rx, logger.clone(), ftx.clone(), args.render, args.audio,
+            config,
+            rx,
+            logger.clone(),
+            ftx.clone(),
+            args.render,
+            args.audio,
         ));
         println!(
             "[rx] S1 scheduler: D_play={}ms startup={}ms late={}ms policy={} objects/track={} span={}ms",
@@ -1022,7 +2261,9 @@ async fn main() -> Result<()> {
         for d in &mut drains {
             match d.await {
                 Ok(t) => ends.push(t),
-                Err(e) if e.is_panic() => ends.push(("?", TrackEnd::Failed, format!("drain task panicked: {e}"))),
+                Err(e) if e.is_panic() => {
+                    ends.push(("?", TrackEnd::Failed, format!("drain task panicked: {e}")))
+                }
                 Err(e) => ends.push(("?", TrackEnd::Failed, format!("drain task join error: {e}"))),
             }
         }
@@ -1108,7 +2349,13 @@ async fn main() -> Result<()> {
                 .into_iter()
                 .map(|(name, end, detail)| {
                     let received = if name == "pc" { n_pc } else { n_hap };
-                    DrainReport { name, end, received, expected: expected_for(name, &args), detail }
+                    DrainReport {
+                        name,
+                        end,
+                        received,
+                        expected: expected_for(name, &args),
+                        detail,
+                    }
                 })
                 .collect();
             for r in &reports {
@@ -1205,7 +2452,9 @@ async fn main() -> Result<()> {
     );
 
     if record_io_failed {
-        eprintln!("[rx] FATAL: could not write the shutdown record; exiting {EXIT_FINALIZE_FAILED}");
+        eprintln!(
+            "[rx] FATAL: could not write the shutdown record; exiting {EXIT_FINALIZE_FAILED}"
+        );
         std::process::exit(EXIT_FINALIZE_FAILED);
     }
     if ending != RxEnding::Normal {
@@ -1230,7 +2479,13 @@ mod rx_ending_tests {
     use super::*;
 
     fn rep(name: &'static str, end: TrackEnd, received: u64, expected: Option<u64>) -> DrainReport {
-        DrainReport { name, end, received, expected, detail: String::new() }
+        DrainReport {
+            name,
+            end,
+            received,
+            expected,
+            detail: String::new(),
+        }
     }
 
     /// Path 1 — normal FIN, complete reception. The only rc=0 case.
@@ -1256,7 +2511,11 @@ mod rx_ending_tests {
             rep("haptic", TrackEnd::Fin, 600, None),
         ];
         let (e, _) = classify_ending(&reports, false);
-        assert_eq!(e, RxEnding::Normal, "a clean FIN is authoritative regardless of count");
+        assert_eq!(
+            e,
+            RxEnding::Normal,
+            "a clean FIN is authoritative regardless of count"
+        );
     }
 
     /// Path 2 — publisher cancel with partial reception. Must be non-zero and
@@ -1271,7 +2530,10 @@ mod rx_ending_tests {
         assert_eq!(e, RxEnding::CancelledIncomplete, "{d}");
         assert_eq!(e.exit_code(), EXIT_RX_CANCELLED_INCOMPLETE);
         assert_ne!(e.exit_code(), 0);
-        assert!(d.contains("rule=cancel_incomplete"), "reason must be recorded: {d}");
+        assert!(
+            d.contains("rule=cancel_incomplete"),
+            "reason must be recorded: {d}"
+        );
         assert!(d.contains("pc=90/180"), "shortfall must be recorded: {d}");
     }
 
@@ -1286,7 +2548,10 @@ mod rx_ending_tests {
         let (e, d) = classify_ending(&reports, false);
         assert_eq!(e, RxEnding::CancelledIncomplete);
         assert!(d.contains("rule=cancel_without_expectation"), "{d}");
-        assert!(d.contains("--duration-s"), "must say how to resolve it: {d}");
+        assert!(
+            d.contains("--duration-s"),
+            "must say how to resolve it: {d}"
+        );
     }
 
     /// Cancel that provably delivered the design quantity is a real completion.
@@ -1352,7 +2617,11 @@ mod rx_ending_tests {
                 rep("haptic", unused_end, 0, Some(0)),
             ];
             let (e, d) = classify_ending(&reports, false);
-            assert_eq!(e, RxEnding::Normal, "unused C3 track {unused_end:?} must be normal: {d}");
+            assert_eq!(
+                e,
+                RxEnding::Normal,
+                "unused C3 track {unused_end:?} must be normal: {d}"
+            );
             assert_eq!(e.exit_code(), 0);
         }
     }
@@ -1374,8 +2643,14 @@ mod rx_ending_tests {
         use moq_transport::serve::ServeError;
         assert_eq!(classify_track_end(&ServeError::Done), TrackEnd::Fin);
         assert_eq!(classify_track_end(&ServeError::Cancel), TrackEnd::Cancelled);
-        assert_eq!(classify_track_end(&ServeError::Closed(0)), TrackEnd::Cancelled);
-        assert_eq!(classify_track_end(&ServeError::Closed(1)), TrackEnd::Cancelled);
+        assert_eq!(
+            classify_track_end(&ServeError::Closed(0)),
+            TrackEnd::Cancelled
+        );
+        assert_eq!(
+            classify_track_end(&ServeError::Closed(1)),
+            TrackEnd::Cancelled
+        );
         assert_eq!(classify_track_end(&ServeError::NotFound), TrackEnd::Failed);
         assert_eq!(classify_track_end(&ServeError::Duplicate), TrackEnd::Failed);
         assert_eq!(
@@ -1418,6 +2693,21 @@ mod rx_ending_tests {
             buffer_max_span_ms: None,
             late_policy: None,
             pc_delivery_timeout_ms: None,
+            s3_window_ms: None,
+            s3_ewma_alpha: None,
+            s3_miss_streak_threshold: None,
+            s3_violation_ratio_threshold: None,
+            s3_target_skew_ms: None,
+            s3_recovery_fraction: None,
+            s3_haptic_critical_stable_ms: None,
+            s3_recovery_stable_ms: None,
+            s3_cooldown_ms: None,
+            s3_min_paired_samples: None,
+            s3_max_window_samples: None,
+            s3_effect_timeout_ms: None,
+            s3_switch_retry_limit: None,
+            s3_test_mode: false,
+            s3_test_force_misses_after_ms: None,
         };
 
         let a = base(RxTrackSel::Both, Some(60.0));
@@ -1426,7 +2716,11 @@ mod rx_ending_tests {
 
         let a = base(RxTrackSel::Pc, Some(60.0));
         assert_eq!(expected_for("pc", &a), Some(1800));
-        assert_eq!(expected_for("haptic", &a), Some(0), "disabled track expects 0");
+        assert_eq!(
+            expected_for("haptic", &a),
+            Some(0),
+            "disabled track expects 0"
+        );
 
         let a = base(RxTrackSel::Haptic, Some(60.0));
         assert_eq!(expected_for("pc", &a), Some(0));
@@ -1512,7 +2806,11 @@ mod rx_ending_tests {
                 rep("haptic", TrackEnd::Fin, 600, Some(600)),
             ];
             let (e, d) = classify_ending(&reports, false);
-            assert_eq!(e, RxEnding::Normal, "received={received} must stay normal: {d}");
+            assert_eq!(
+                e,
+                RxEnding::Normal,
+                "received={received} must stay normal: {d}"
+            );
             assert_eq!(e.exit_code(), 0);
         }
     }
@@ -1550,7 +2848,11 @@ mod rx_ending_tests {
             rep("haptic", TrackEnd::Fin, 0, None),
         ];
         let (e, d) = classify_ending(&reports, false);
-        assert_eq!(e, RxEnding::Normal, "unprovable, so not claimed as failure: {d}");
+        assert_eq!(
+            e,
+            RxEnding::Normal,
+            "unprovable, so not claimed as failure: {d}"
+        );
     }
 
     /// Severity order: a drain failure and a dead session both outrank the
@@ -1601,7 +2903,10 @@ mod rx_ending_tests {
             ServeError::Internal("x".into()),
             ServeError::NotImplemented("x".into()),
         ] {
-            assert!(!is_retryable_subscribe_error(&e), "{e:?} must not be retried");
+            assert!(
+                !is_retryable_subscribe_error(&e),
+                "{e:?} must not be retried"
+            );
         }
     }
 
@@ -1644,6 +2949,21 @@ mod rx_ending_tests {
             buffer_max_span_ms: Some(250),
             late_policy: Some(CliLatePolicy::DropLate),
             pc_delivery_timeout_ms: None,
+            s3_window_ms: None,
+            s3_ewma_alpha: None,
+            s3_miss_streak_threshold: None,
+            s3_violation_ratio_threshold: None,
+            s3_target_skew_ms: None,
+            s3_recovery_fraction: None,
+            s3_haptic_critical_stable_ms: None,
+            s3_recovery_stable_ms: None,
+            s3_cooldown_ms: None,
+            s3_min_paired_samples: None,
+            s3_max_window_samples: None,
+            s3_effect_timeout_ms: None,
+            s3_switch_retry_limit: None,
+            s3_test_mode: false,
+            s3_test_force_misses_after_ms: None,
         };
         let cfg = playout_config(&base).unwrap().unwrap();
         assert_eq!(cfg.d_play_us, 50_000);
@@ -1652,7 +2972,10 @@ mod rx_ending_tests {
 
         let mut bad = base;
         bad.d_play_ms = Some(75);
-        assert!(playout_config(&bad).unwrap_err().to_string().contains("50 or 100"));
+        assert!(playout_config(&bad)
+            .unwrap_err()
+            .to_string()
+            .contains("50 or 100"));
         bad.d_play_ms = Some(50);
         bad.startup_rearm_limit = Some(0);
         assert!(playout_config(&bad)
@@ -1693,6 +3016,21 @@ mod rx_ending_tests {
             buffer_max_span_ms: Some(250),
             late_policy: Some(CliLatePolicy::DropLate),
             pc_delivery_timeout_ms: None,
+            s3_window_ms: None,
+            s3_ewma_alpha: None,
+            s3_miss_streak_threshold: None,
+            s3_violation_ratio_threshold: None,
+            s3_target_skew_ms: None,
+            s3_recovery_fraction: None,
+            s3_haptic_critical_stable_ms: None,
+            s3_recovery_stable_ms: None,
+            s3_cooldown_ms: None,
+            s3_min_paired_samples: None,
+            s3_max_window_samples: None,
+            s3_effect_timeout_ms: None,
+            s3_switch_retry_limit: None,
+            s3_test_mode: false,
+            s3_test_force_misses_after_ms: None,
         };
 
         assert!(playout_config(&args).is_ok());
@@ -1713,5 +3051,31 @@ mod rx_ending_tests {
 
         args.pc_delivery_timeout_ms = Some(0);
         assert!(playout_config(&args).is_err(), "timeout zero is invalid");
+
+        args.arm = Arm::S3;
+        args.pc_delivery_timeout_ms = Some(67);
+        args.startup_timeout_ms = Some(2_000);
+        args.late_tolerance_ms = Some(10);
+        args.s3_window_ms = Some(1_000);
+        args.s3_ewma_alpha = Some(0.2);
+        args.s3_miss_streak_threshold = Some(3);
+        args.s3_violation_ratio_threshold = Some(0.2);
+        args.s3_target_skew_ms = Some(25);
+        args.s3_recovery_fraction = Some(0.5);
+        args.s3_haptic_critical_stable_ms = Some(3_000);
+        args.s3_recovery_stable_ms = Some(5_000);
+        args.s3_cooldown_ms = Some(2_000);
+        args.s3_min_paired_samples = Some(5);
+        args.s3_max_window_samples = Some(128);
+        args.s3_effect_timeout_ms = Some(1_000);
+        args.s3_switch_retry_limit = Some(2);
+        assert!(playout_config(&args).is_ok());
+        let runtime = s3_runtime_config(&args).unwrap().unwrap();
+        assert_eq!(runtime.controller.target_skew_us, 25_000);
+        assert_eq!(runtime.switch.effect_timeout_us, 1_000_000);
+        assert_eq!(runtime.switch_retry_limit, 2);
+
+        args.s3_target_skew_ms = Some(30);
+        assert!(s3_runtime_config(&args).is_err());
     }
 }

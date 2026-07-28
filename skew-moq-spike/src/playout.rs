@@ -183,6 +183,13 @@ impl PlayoutScheduler {
         (self.pc.len(), self.haptic.len())
     }
 
+    /// Receiver-monotonic release deadline for one source PTS after the exact
+    /// startup epoch exists. S3 uses the same timeline to evaluate its frozen
+    /// snapped-anchor deadline-miss definition.
+    pub fn deadline_us(&self, pts_us: u64) -> Option<u64> {
+        self.epoch.map(|_| self.due_us(pts_us))
+    }
+
     /// Insert one received object and return any immediately determined
     /// actions.  Repeated exact identities are ignored so they can never be
     /// released twice; the receive-layer integrity checker remains responsible
@@ -211,7 +218,8 @@ impl PlayoutScheduler {
 
         self.startup_started_us.get_or_insert(now_us);
         let track = object.header.track_id;
-        self.buffer_mut(track).insert(QueueKey::from(&object), object);
+        self.buffer_mut(track)
+            .insert(QueueKey::from(&object), object);
 
         let mut actions = self.enforce_bounds(track);
         self.try_start(now_us);
@@ -251,12 +259,20 @@ impl PlayoutScheduler {
                 .filter_map(|(key, _)| (self.due_us(key.pts_us) <= now_us).then_some(*key))
                 .collect();
             for key in keys {
-                let object = self.buffer_mut(track).remove(&key).expect("key came from buffer");
+                let object = self
+                    .buffer_mut(track)
+                    .remove(&key)
+                    .expect("key came from buffer");
                 due.push((self.due_us(object.header.pts_us), object));
             }
         }
         due.sort_by_key(|(deadline, object)| {
-            (*deadline, object.header.pts_us, object.header.track_id, object.header.seq)
+            (
+                *deadline,
+                object.header.pts_us,
+                object.header.track_id,
+                object.header.seq,
+            )
         });
 
         let mut actions = Vec::with_capacity(due.len());
@@ -364,7 +380,10 @@ impl PlayoutScheduler {
             }
         }
         loop {
-            let span = match (self.buffer(track).first_key_value(), self.buffer(track).last_key_value()) {
+            let span = match (
+                self.buffer(track).first_key_value(),
+                self.buffer(track).last_key_value(),
+            ) {
                 (Some((first, _)), Some((last, _))) => last.pts_us.saturating_sub(first.pts_us),
                 _ => 0,
             };
@@ -402,7 +421,10 @@ impl PlayoutScheduler {
                 .copied()
                 .collect();
             for key in keys {
-                let object = self.buffer_mut(track).remove(&key).expect("key came from buffer");
+                let object = self
+                    .buffer_mut(track)
+                    .remove(&key)
+                    .expect("key came from buffer");
                 self.terminal.insert(object.identity());
                 dropped.push(PlayoutAction::Drop {
                     object,
@@ -424,15 +446,18 @@ impl PlayoutScheduler {
             .chain(std::mem::take(&mut self.haptic).into_values())
             .collect();
         objects.sort_by_key(|object| {
-            (object.header.pts_us, object.header.track_id, object.header.seq)
+            (
+                object.header.pts_us,
+                object.header.track_id,
+                object.header.seq,
+            )
         });
         objects
             .into_iter()
             .filter_map(|object| {
-                self.terminal.insert(object.identity()).then_some(PlayoutAction::Drop {
-                    object,
-                    reason,
-                })
+                self.terminal
+                    .insert(object.identity())
+                    .then_some(PlayoutAction::Drop { object, reason })
             })
             .collect()
     }
@@ -472,14 +497,21 @@ mod tests {
     }
 
     fn releases(actions: &[PlayoutAction]) -> usize {
-        actions.iter().filter(|a| matches!(a, PlayoutAction::Release(_))).count()
+        actions
+            .iter()
+            .filter(|a| matches!(a, PlayoutAction::Release(_)))
+            .count()
     }
 
     #[test]
     fn exact_anchor_pair_creates_one_epoch_and_common_deadline() {
         let mut scheduler = PlayoutScheduler::new(config()).unwrap();
-        assert!(scheduler.push(object(TRACK_PC, 0, 0, 1, 1_000), 1_000).is_empty());
-        assert!(scheduler.push(object(TRACK_HAPTIC, 0, 0, 1, 2_000), 2_000).is_empty());
+        assert!(scheduler
+            .push(object(TRACK_PC, 0, 0, 1, 1_000), 1_000)
+            .is_empty());
+        assert!(scheduler
+            .push(object(TRACK_HAPTIC, 0, 0, 1, 2_000), 2_000)
+            .is_empty());
         assert!(scheduler.is_started());
         assert_eq!(scheduler.next_wakeup_us(), Some(52_000));
         assert!(scheduler.advance(51_999).is_empty());
@@ -515,7 +547,13 @@ mod tests {
         scheduler.push(object(TRACK_HAPTIC, 0, 0, 1, 0), 0);
         let actions = scheduler.advance(60_000);
         assert_eq!(actions.len(), 2);
-        assert!(actions.iter().all(|a| matches!(a, PlayoutAction::Drop { reason: DROP_LATE, .. })));
+        assert!(actions.iter().all(|a| matches!(
+            a,
+            PlayoutAction::Drop {
+                reason: DROP_LATE,
+                ..
+            }
+        )));
 
         let mut release_cfg = config();
         release_cfg.late_policy = LatePolicy::ReleaseLate;
@@ -534,14 +572,26 @@ mod tests {
         scheduler.push(object(TRACK_PC, 0, 0, 1, 0), 0);
         scheduler.push(object(TRACK_PC, 1, 10_000, 2, 1), 1);
         let actions = scheduler.push(object(TRACK_PC, 2, 20_000, 3, 2), 2);
-        assert!(matches!(&actions[0], PlayoutAction::Drop { reason: DROP_BUFFER_OBJECT_LIMIT, .. }));
+        assert!(matches!(
+            &actions[0],
+            PlayoutAction::Drop {
+                reason: DROP_BUFFER_OBJECT_LIMIT,
+                ..
+            }
+        ));
 
         let mut cfg = config();
         cfg.max_span_us = 10_000;
         let mut scheduler = PlayoutScheduler::new(cfg).unwrap();
         scheduler.push(object(TRACK_PC, 0, 0, 1, 0), 0);
         let actions = scheduler.push(object(TRACK_PC, 1, 20_000, 2, 1), 1);
-        assert!(matches!(&actions[0], PlayoutAction::Drop { reason: DROP_BUFFER_SPAN_LIMIT, .. }));
+        assert!(matches!(
+            &actions[0],
+            PlayoutAction::Drop {
+                reason: DROP_BUFFER_SPAN_LIMIT,
+                ..
+            }
+        ));
 
         let mut scheduler = PlayoutScheduler::new(config()).unwrap();
         scheduler.push(object(TRACK_PC, 0, 0, 1, 0), 0);
@@ -549,7 +599,10 @@ mod tests {
         let actions = scheduler.push(object(TRACK_PC, 1, 10_000_000, 2, 1), 1);
         assert!(actions.iter().any(|action| matches!(
             action,
-            PlayoutAction::Drop { reason: DROP_BUFFER_SPAN_LIMIT, .. }
+            PlayoutAction::Drop {
+                reason: DROP_BUFFER_SPAN_LIMIT,
+                ..
+            }
         )));
     }
 
@@ -559,7 +612,13 @@ mod tests {
         scheduler.push(object(TRACK_PC, 0, 0, 1, 1_000), 1_000);
         let actions = scheduler.advance(101_000);
         assert_eq!(actions.len(), 1);
-        assert!(matches!(&actions[0], PlayoutAction::Drop { reason: DROP_STARTUP_TIMEOUT, .. }));
+        assert!(matches!(
+            &actions[0],
+            PlayoutAction::Drop {
+                reason: DROP_STARTUP_TIMEOUT,
+                ..
+            }
+        ));
         assert!(!scheduler.startup_failed);
         assert_eq!(scheduler.startup_rearms_used, 1);
         assert_eq!(scheduler.next_wakeup_us(), None);
@@ -584,12 +643,24 @@ mod tests {
         scheduler.push(object(TRACK_HAPTIC, 1, 200_000, 2, 102_000), 102_000);
         let actions = scheduler.advance(202_000);
         assert_eq!(actions.len(), 1);
-        assert!(matches!(&actions[0], PlayoutAction::Drop { reason: DROP_STARTUP_TIMEOUT, .. }));
+        assert!(matches!(
+            &actions[0],
+            PlayoutAction::Drop {
+                reason: DROP_STARTUP_TIMEOUT,
+                ..
+            }
+        ));
         assert!(scheduler.startup_failed);
         assert_eq!(scheduler.next_wakeup_us(), None);
         let actions = scheduler.push(object(TRACK_PC, 1, 200_000, 2, 203_000), 203_000);
         assert_eq!(actions.len(), 1);
-        assert!(matches!(&actions[0], PlayoutAction::Drop { reason: DROP_STARTUP_TIMEOUT, .. }));
+        assert!(matches!(
+            &actions[0],
+            PlayoutAction::Drop {
+                reason: DROP_STARTUP_TIMEOUT,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -598,7 +669,13 @@ mod tests {
         scheduler.push(object(TRACK_PC, 0, 0, 1, 0), 0);
         let actions = scheduler.finish_without_epoch();
         assert_eq!(actions.len(), 1);
-        assert!(matches!(&actions[0], PlayoutAction::Drop { reason: DROP_SHUTDOWN_BEFORE_EPOCH, .. }));
+        assert!(matches!(
+            &actions[0],
+            PlayoutAction::Drop {
+                reason: DROP_SHUTDOWN_BEFORE_EPOCH,
+                ..
+            }
+        ));
     }
 
     #[test]

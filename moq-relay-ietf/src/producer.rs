@@ -120,10 +120,10 @@ impl Producer {
             .await
         {
             let ns = namespace.to_utf8_path();
-            tracing::info!(namespace = %ns, track = %track_name, source = "local", "serving subscribe from local: {:?}", track.info);
+            tracing::info!(namespace = %ns, track = %track_name, source = "local", "serving subscribe from local: {:?}", track.reader.info);
             timing_guard.set_label("source", "local");
             let _track_guard = GaugeGuard::new("moq_relay_active_tracks");
-            return Ok(subscribed.serve(track).await?);
+            return Ok(subscribed.serve(track.reader.clone()).await?);
         }
 
         // Check remote tracks after local exact tracks and namespace route sources.
