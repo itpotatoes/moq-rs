@@ -34,6 +34,7 @@ use skew_moq::playout::{
 use skew_moq::s3_controller::{S3Config, S3Controller, S3Observation, S3Update};
 use skew_moq::s3_receiver::{
     validate_routed_object, IngressEvent, RoutedObject, S3DeadlineTracker, S3ReceiverIngress,
+    DROP_STALE_TIER,
 };
 use skew_moq::s3_switch::{Route, S3SwitchGate, SwitchConfig, TrackRole};
 use skew_moq::*;
@@ -1553,6 +1554,36 @@ async fn run_s3_receiver(
                                 stats.dropped += 1;
                             }
                             IngressEvent::Applied(applied) => {
+                                // The ingress gate prevents *new* stale objects,
+                                // but old-route objects may already be in the
+                                // common playout scheduler. At atomic apply,
+                                // terminally evict only cancelled-generation
+                                // objects beyond the exact-pair barrier. Older
+                                // slots may finish on their frozen deadlines.
+                                for (role, route) in [
+                                    (TrackRole::Pc, applied.cancel_pc),
+                                    (TrackRole::Haptic, applied.cancel_haptic),
+                                ] {
+                                    let Some(route) = route else { continue };
+                                    let evicted =
+                                        scheduler.drop_matching(DROP_STALE_TIER, |object| {
+                                            object.header.pts_us > applied.exact_pts_us
+                                                && object_routes
+                                                    .get(&S3ObjectKey::from(object))
+                                                    .is_some_and(|stored| *stored == (role, route))
+                                        });
+                                    for action in &evicted {
+                                        if let Err(error) = tracker.forget_evicted(action.object())
+                                        {
+                                            outcome_error = Some(anyhow::anyhow!(error));
+                                            break;
+                                        }
+                                    }
+                                    scheduler_actions.extend(evicted);
+                                }
+                                if outcome_error.is_some() {
+                                    break;
+                                }
                                 let log_result = logger
                                     .lock()
                                     .map_err(|_| anyhow::anyhow!("RX logger poisoned"))

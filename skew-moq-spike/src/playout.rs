@@ -317,6 +317,42 @@ impl PlayoutScheduler {
         self.drop_all(DROP_SHUTDOWN_BEFORE_EPOCH)
     }
 
+    /// Terminally discard buffered objects selected by an external routing
+    /// gate. S3 uses this at atomic route apply so already-buffered objects
+    /// from the cancelled generation cannot leak past the switch barrier.
+    pub fn drop_matching<F>(&mut self, reason: &'static str, mut predicate: F) -> Vec<PlayoutAction>
+    where
+        F: FnMut(&PlayoutObject) -> bool,
+    {
+        let mut objects = Vec::new();
+        for track in [TRACK_PC, TRACK_HAPTIC] {
+            let keys: Vec<QueueKey> = self
+                .buffer(track)
+                .iter()
+                .filter_map(|(key, object)| predicate(object).then_some(*key))
+                .collect();
+            for key in keys {
+                let object = self
+                    .buffer_mut(track)
+                    .remove(&key)
+                    .expect("key came from buffer");
+                self.terminal.insert(object.identity());
+                objects.push(object);
+            }
+        }
+        objects.sort_by_key(|object| {
+            (
+                object.header.pts_us,
+                object.header.track_id,
+                object.header.seq,
+            )
+        });
+        objects
+            .into_iter()
+            .map(|object| PlayoutAction::Drop { object, reason })
+            .collect()
+    }
+
     fn buffer(&self, track: u8) -> &BTreeMap<QueueKey, PlayoutObject> {
         if track == TRACK_PC {
             &self.pc
@@ -633,6 +669,26 @@ mod tests {
         assert!(scheduler.is_started());
         let actions = scheduler.advance(153_000);
         assert_eq!(releases(&actions), 2);
+    }
+
+    #[test]
+    fn external_route_barrier_drops_only_selected_future_objects() {
+        let mut scheduler = PlayoutScheduler::new(config()).unwrap();
+        scheduler.push(object(TRACK_PC, 0, 0, 1, 1_000), 1_000);
+        scheduler.push(object(TRACK_HAPTIC, 0, 0, 1, 1_001), 1_001);
+        scheduler.push(object(TRACK_HAPTIC, 1, 10_000, 0, 1_002), 1_002);
+        scheduler.push(object(TRACK_HAPTIC, 2, 20_000, 0, 1_003), 1_003);
+
+        let actions = scheduler.drop_matching("stale_tier", |item| {
+            item.header.track_id == TRACK_HAPTIC && item.header.pts_us > 10_000
+        });
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(
+            &actions[0],
+            PlayoutAction::Drop { object, reason }
+                if object.header.seq == 2 && *reason == "stale_tier"
+        ));
+        assert_eq!(scheduler.buffered_counts(), (1, 2));
     }
 
     #[test]

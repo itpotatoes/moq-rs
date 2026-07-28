@@ -77,6 +77,27 @@ impl S3DeadlineTracker {
         Ok(())
     }
 
+    /// Forget a scheduler object terminally evicted by the external route
+    /// barrier. Ordinary playout drops remain observations; only cancelled
+    /// generation objects use this path.
+    pub fn forget_evicted(&mut self, object: &PlayoutObject) -> Result<(), &'static str> {
+        let Some(key) = PairKey::from_object(object) else {
+            return Ok(());
+        };
+        match object.header.track_id {
+            TRACK_PC => {
+                self.pc_arrivals.remove(&key);
+                self.pc_releases.remove(&key);
+            }
+            TRACK_HAPTIC => {
+                self.haptic_arrivals.remove(&key);
+                self.haptic_releases.remove(&key);
+            }
+            _ => return Err("deadline tracker forgot an invalid semantic track"),
+        }
+        Ok(())
+    }
+
     /// Call after scheduler actions have been emitted for `now_us`, before
     /// [`Self::advance`] evaluates anchors due at the same timestamp.
     pub fn note_actions(
@@ -728,5 +749,24 @@ mod tests {
         // tracker must not substitute receive time or a zero skew.
         scheduler.advance(50_002);
         assert!(tracker.advance(&scheduler, 50_002).unwrap().is_empty());
+    }
+
+    #[test]
+    fn route_barrier_evictions_do_not_create_stale_deadline_observations() {
+        let routes = ingress(4).gate().active_routes();
+        let pc = object(TrackRole::Pc, routes.pc, 0, 1).object;
+        let haptic = object(TrackRole::Haptic, routes.haptic, 0, 1).object;
+        let mut scheduler = scheduler();
+        scheduler.push(pc.clone(), 1);
+        scheduler.push(haptic.clone(), 2);
+        let mut tracker = S3DeadlineTracker::new(8).unwrap();
+        tracker.note_received(&pc).unwrap();
+        tracker.note_received(&haptic).unwrap();
+        tracker.activate().unwrap();
+
+        tracker.forget_evicted(&pc).unwrap();
+        tracker.forget_evicted(&haptic).unwrap();
+        assert!(tracker.advance(&scheduler, 50_002).unwrap().is_empty());
+        assert_eq!(tracker.next_wakeup_us(&scheduler), None);
     }
 }
