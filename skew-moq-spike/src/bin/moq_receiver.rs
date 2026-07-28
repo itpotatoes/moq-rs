@@ -190,6 +190,10 @@ struct Args {
     /// Request-to-exact-pair first-effect bound. No implicit S3 default.
     #[arg(long)]
     s3_effect_timeout_ms: Option<u64>,
+    /// Maximum retry attempts while establishing the initial Normal routes.
+    /// Explicitly bounded so a missing publisher cannot exhaust request IDs.
+    #[arg(long)]
+    s3_initial_retry_limit: Option<u32>,
     /// Maximum retry attempts after a failed target subscription.
     #[arg(long)]
     s3_switch_retry_limit: Option<u32>,
@@ -295,6 +299,7 @@ fn playout_config(args: &Args) -> Result<Option<PlayoutConfig>> {
 struct S3RuntimeConfig {
     controller: S3Config,
     switch: SwitchConfig,
+    initial_retry_limit: u32,
     switch_retry_limit: u32,
     test_force_misses_after_us: Option<u64>,
 }
@@ -312,6 +317,7 @@ fn s3_runtime_config(args: &Args) -> Result<Option<S3RuntimeConfig>> {
         || args.s3_min_paired_samples.is_some()
         || args.s3_max_window_samples.is_some()
         || args.s3_effect_timeout_ms.is_some()
+        || args.s3_initial_retry_limit.is_some()
         || args.s3_switch_retry_limit.is_some()
         || args.s3_test_mode
         || args.s3_test_force_misses_after_ms.is_some();
@@ -401,6 +407,9 @@ fn s3_runtime_config(args: &Args) -> Result<Option<S3RuntimeConfig>> {
     switch
         .validate()
         .map_err(|error| anyhow::anyhow!("invalid S3 switch config: {error:?}"))?;
+    let initial_retry_limit = args
+        .s3_initial_retry_limit
+        .context("--arm s3 requires --s3-initial-retry-limit")?;
     let switch_retry_limit = args
         .s3_switch_retry_limit
         .context("--arm s3 requires --s3-switch-retry-limit")?;
@@ -414,6 +423,7 @@ fn s3_runtime_config(args: &Args) -> Result<Option<S3RuntimeConfig>> {
     Ok(Some(S3RuntimeConfig {
         controller,
         switch,
+        initial_retry_limit,
         switch_retry_limit,
         test_force_misses_after_us,
     }))
@@ -1321,7 +1331,8 @@ async fn run_s3_receiver(
         .lock()
         .map_err(|_| anyhow::anyhow!("RX logger poisoned"))?
         .try_log_info(&format!(
-            "\"event\":\"s3_runtime\",\"switch_retry_limit\":{},\"barrier_max_objects_per_role\":{},\"deadline_max_anchors\":{},\"test_mode\":{},\"test_force_misses_after_us\":{}",
+            "\"event\":\"s3_runtime\",\"initial_retry_limit\":{},\"switch_retry_limit\":{},\"barrier_max_objects_per_role\":{},\"deadline_max_anchors\":{},\"test_mode\":{},\"test_force_misses_after_us\":{}",
+            runtime.initial_retry_limit,
             runtime.switch_retry_limit,
             playout.max_objects_per_track,
             playout.max_objects_per_track,
@@ -1406,7 +1417,7 @@ async fn run_s3_receiver(
             role,
             route,
             true,
-            u32::MAX,
+            runtime.initial_retry_limit,
             args,
             logger.clone(),
             event_tx.clone(),
@@ -2705,6 +2716,7 @@ mod rx_ending_tests {
             s3_min_paired_samples: None,
             s3_max_window_samples: None,
             s3_effect_timeout_ms: None,
+            s3_initial_retry_limit: None,
             s3_switch_retry_limit: None,
             s3_test_mode: false,
             s3_test_force_misses_after_ms: None,
@@ -2961,6 +2973,7 @@ mod rx_ending_tests {
             s3_min_paired_samples: None,
             s3_max_window_samples: None,
             s3_effect_timeout_ms: None,
+            s3_initial_retry_limit: None,
             s3_switch_retry_limit: None,
             s3_test_mode: false,
             s3_test_force_misses_after_ms: None,
@@ -3028,6 +3041,7 @@ mod rx_ending_tests {
             s3_min_paired_samples: None,
             s3_max_window_samples: None,
             s3_effect_timeout_ms: None,
+            s3_initial_retry_limit: None,
             s3_switch_retry_limit: None,
             s3_test_mode: false,
             s3_test_force_misses_after_ms: None,
@@ -3068,11 +3082,13 @@ mod rx_ending_tests {
         args.s3_min_paired_samples = Some(5);
         args.s3_max_window_samples = Some(128);
         args.s3_effect_timeout_ms = Some(1_000);
+        args.s3_initial_retry_limit = Some(20);
         args.s3_switch_retry_limit = Some(2);
         assert!(playout_config(&args).is_ok());
         let runtime = s3_runtime_config(&args).unwrap().unwrap();
         assert_eq!(runtime.controller.target_skew_us, 25_000);
         assert_eq!(runtime.switch.effect_timeout_us, 1_000_000);
+        assert_eq!(runtime.initial_retry_limit, 20);
         assert_eq!(runtime.switch_retry_limit, 2);
 
         args.s3_target_skew_ms = Some(30);
