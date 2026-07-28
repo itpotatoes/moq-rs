@@ -353,6 +353,16 @@ impl PlayoutScheduler {
             .collect()
     }
 
+    /// Insert one object identity into the terminal set without touching the
+    /// buffers or the shared push/advance semantics. S3 uses this when an
+    /// already-staged release from the same ingress batch is converted into a
+    /// terminal switch-barrier drop outside the scheduler; S1/S2 never call
+    /// it, so the ablation boundary of `push` is preserved. Returns whether
+    /// the identity was newly inserted.
+    pub fn mark_terminal(&mut self, object: &PlayoutObject) -> bool {
+        self.terminal.insert(object.identity())
+    }
+
     fn buffer(&self, track: u8) -> &BTreeMap<QueueKey, PlayoutObject> {
         if track == TRACK_PC {
             &self.pc
@@ -689,6 +699,21 @@ mod tests {
                 if object.header.seq == 2 && *reason == "stale_tier"
         ));
         assert_eq!(scheduler.buffered_counts(), (1, 2));
+    }
+
+    #[test]
+    fn mark_terminal_is_idempotent_and_prevents_later_scheduling() {
+        let mut scheduler = PlayoutScheduler::new(config()).unwrap();
+        scheduler.push(object(TRACK_PC, 0, 0, 1, 0), 0);
+        scheduler.push(object(TRACK_HAPTIC, 0, 0, 1, 0), 0);
+        let stale = object(TRACK_PC, 1, 10_000, 2, 1);
+        assert!(scheduler.mark_terminal(&stale));
+        assert!(!scheduler.mark_terminal(&stale), "second insert is a no-op");
+        assert!(
+            scheduler.push(stale, 1).is_empty(),
+            "a marked identity can never re-enter scheduling"
+        );
+        assert_eq!(scheduler.buffered_counts(), (1, 1));
     }
 
     #[test]

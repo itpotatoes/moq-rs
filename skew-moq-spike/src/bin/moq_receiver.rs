@@ -36,7 +36,7 @@ use skew_moq::s3_receiver::{
     validate_routed_object, IngressEvent, RoutedObject, S3DeadlineTracker, S3ReceiverIngress,
     DROP_STALE_TIER,
 };
-use skew_moq::s3_switch::{Route, S3SwitchGate, SwitchConfig, TrackRole};
+use skew_moq::s3_switch::{Route, S3SwitchGate, SwitchApplied, SwitchConfig, TrackRole};
 use skew_moq::*;
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -1215,6 +1215,72 @@ fn dispatch_s3_playout_actions(
     Ok(())
 }
 
+/// At atomic S3 apply, terminally evict cancelled-generation objects with
+/// `pts_us` beyond the exact-pair barrier from BOTH places they can exist
+/// within one ingress batch:
+///
+/// 1. already staged in `scheduler_actions` — the ingress emits
+///    `Scheduler(routed)` before `Applied`, and `scheduler.push` for that
+///    earlier event internally advances the timeline, so an ALREADY-OVERDUE
+///    old-route object can be emitted as a `Release` before the apply is
+///    handled. Such staged releases are converted in place into terminal
+///    `stale_tier` drops, marked terminal in the scheduler, and forgotten by
+///    the deadline tracker exactly like buffered evictions;
+/// 2. still buffered in the scheduler — evicted via `drop_matching` as
+///    before.
+///
+/// Staged drops are already terminal and stay untouched, which also makes a
+/// repeat of the same cancellation idempotent (a converted object cannot be
+/// converted or counted again). Objects at or below the barrier PTS and
+/// objects of non-cancelled routes pass through unchanged. Every evicted
+/// object therefore yields exactly one terminal drop record, zero release
+/// records, and no retained deadline-tracker observation.
+fn apply_s3_route_barrier(
+    applied: &SwitchApplied,
+    scheduler: &mut PlayoutScheduler,
+    scheduler_actions: &mut Vec<PlayoutAction>,
+    object_routes: &HashMap<S3ObjectKey, (TrackRole, Route)>,
+    tracker: &mut S3DeadlineTracker,
+) -> Result<(), &'static str> {
+    for (role, route) in [
+        (TrackRole::Pc, applied.cancel_pc),
+        (TrackRole::Haptic, applied.cancel_haptic),
+    ] {
+        let Some(route) = route else { continue };
+        let cancelled = |object: &PlayoutObject| {
+            object.header.pts_us > applied.exact_pts_us
+                && object_routes
+                    .get(&S3ObjectKey::from(object))
+                    .is_some_and(|stored| *stored == (role, route))
+        };
+        for action in scheduler_actions.iter_mut() {
+            let convert = match &*action {
+                PlayoutAction::Release(object) => cancelled(object),
+                PlayoutAction::Drop { .. } => false,
+            };
+            if !convert {
+                continue;
+            }
+            let PlayoutAction::Release(object) = action else {
+                unreachable!("convert selects only staged releases");
+            };
+            let object = object.clone();
+            scheduler.mark_terminal(&object);
+            tracker.forget_evicted(&object)?;
+            *action = PlayoutAction::Drop {
+                object,
+                reason: DROP_STALE_TIER,
+            };
+        }
+        let evicted = scheduler.drop_matching(DROP_STALE_TIER, cancelled);
+        for action in &evicted {
+            tracker.forget_evicted(action.object())?;
+        }
+        scheduler_actions.extend(evicted);
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn request_s3_switch(
     update: S3Update,
@@ -1556,32 +1622,21 @@ async fn run_s3_receiver(
                             IngressEvent::Applied(applied) => {
                                 // The ingress gate prevents *new* stale objects,
                                 // but old-route objects may already be in the
-                                // common playout scheduler. At atomic apply,
+                                // common playout scheduler, or already staged
+                                // as actions by an earlier `scheduler.push` in
+                                // this same ingress batch. At atomic apply,
                                 // terminally evict only cancelled-generation
-                                // objects beyond the exact-pair barrier. Older
-                                // slots may finish on their frozen deadlines.
-                                for (role, route) in [
-                                    (TrackRole::Pc, applied.cancel_pc),
-                                    (TrackRole::Haptic, applied.cancel_haptic),
-                                ] {
-                                    let Some(route) = route else { continue };
-                                    let evicted =
-                                        scheduler.drop_matching(DROP_STALE_TIER, |object| {
-                                            object.header.pts_us > applied.exact_pts_us
-                                                && object_routes
-                                                    .get(&S3ObjectKey::from(object))
-                                                    .is_some_and(|stored| *stored == (role, route))
-                                        });
-                                    for action in &evicted {
-                                        if let Err(error) = tracker.forget_evicted(action.object())
-                                        {
-                                            outcome_error = Some(anyhow::anyhow!(error));
-                                            break;
-                                        }
-                                    }
-                                    scheduler_actions.extend(evicted);
-                                }
-                                if outcome_error.is_some() {
+                                // objects beyond the exact-pair barrier from
+                                // both places. Older slots may finish on their
+                                // frozen deadlines.
+                                if let Err(error) = apply_s3_route_barrier(
+                                    &applied,
+                                    &mut scheduler,
+                                    &mut scheduler_actions,
+                                    &object_routes,
+                                    &mut tracker,
+                                ) {
+                                    outcome_error = Some(anyhow::anyhow!(error));
                                     break;
                                 }
                                 let log_result = logger
@@ -3124,5 +3179,531 @@ mod rx_ending_tests {
 
         args.s3_target_skew_ms = Some(30);
         assert!(s3_runtime_config(&args).is_err());
+    }
+}
+
+// ---- S3 switch-barrier ordering-race tests ---------------------------------
+//
+// `S3ReceiverIngress::push` emits `Scheduler(routed)` before `Applied`, and
+// `PlayoutScheduler::push` internally advances the timeline. An overdue
+// cancelled-route object above the barrier PTS can therefore already be
+// staged as a `Release` in the same batch before the `Applied` arm runs.
+// These tests drive the same ingress/scheduler/tracker composition as the
+// `run_s3_receiver` event loop, without a network.
+
+#[cfg(test)]
+mod s3_barrier_race_tests {
+    use super::*;
+    use skew_moq::s3_controller::{S3State, S3Transition, TransitionCause};
+    use skew_moq::s3_switch::Routes;
+
+    fn routed(
+        role: TrackRole,
+        route: Route,
+        pts_us: u64,
+        event_id: u32,
+        t_recv: u64,
+    ) -> RoutedObject {
+        let (track_id, tier) = match role {
+            TrackRole::Pc => (
+                TRACK_PC,
+                match route.name {
+                    "pc" => 2,
+                    "pc-d7" => 3,
+                    "pc-d6" => 4,
+                    _ => 99,
+                },
+            ),
+            TrackRole::Haptic => (TRACK_HAPTIC, 0),
+        };
+        RoutedObject {
+            role,
+            route,
+            object: PlayoutObject {
+                header: Header {
+                    version: VERSION,
+                    track_id,
+                    tier,
+                    seq: event_id,
+                    pts_us,
+                    event_id,
+                    gen_ts_us: 1,
+                    payload_len: 0,
+                },
+                t_recv,
+                bytes: Bytes::new(),
+            },
+        }
+    }
+
+    fn transition(from: S3State, to: S3State, at_us: u64) -> S3Transition {
+        S3Transition {
+            at_us,
+            from,
+            to,
+            cause: TransitionCause::DeadlineMissStreak,
+        }
+    }
+
+    fn test_playout() -> PlayoutConfig {
+        PlayoutConfig {
+            d_play_us: 50_000,
+            startup_timeout_us: 2_000_000,
+            startup_rearm_limit: 1,
+            late_tolerance_us: 50_000,
+            max_objects_per_track: 64,
+            max_span_us: 2_000_000,
+            late_policy: LatePolicy::DropLate,
+        }
+    }
+
+    /// Mirrors the per-event wiring of `run_s3_receiver`: ingress events feed
+    /// the tracker, the route map, the scheduler, and the apply barrier in the
+    /// same order, then the trailing `advance` and the dispatch accounting.
+    struct Harness {
+        ingress: S3ReceiverIngress,
+        scheduler: PlayoutScheduler,
+        tracker: S3DeadlineTracker,
+        object_routes: HashMap<S3ObjectKey, (TrackRole, Route)>,
+        released: Vec<S3ObjectKey>,
+        dropped: Vec<(S3ObjectKey, &'static str)>,
+        barrier_dropped: usize,
+        pushed_to_scheduler: usize,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            let gate = S3SwitchGate::new(SwitchConfig {
+                effect_timeout_us: 10_000_000,
+            })
+            .unwrap();
+            Self {
+                ingress: S3ReceiverIngress::new(gate, 64).unwrap(),
+                scheduler: PlayoutScheduler::new(test_playout()).unwrap(),
+                tracker: S3DeadlineTracker::new(64).unwrap(),
+                object_routes: HashMap::new(),
+                released: Vec::new(),
+                dropped: Vec::new(),
+                barrier_dropped: 0,
+                pushed_to_scheduler: 0,
+            }
+        }
+
+        fn push(&mut self, routed: RoutedObject, now: u64) -> Vec<PlayoutAction> {
+            let mut scheduler_actions = Vec::new();
+            for event in self.ingress.push(routed, now).unwrap() {
+                match event {
+                    IngressEvent::Scheduler(routed) => {
+                        self.tracker.note_received(&routed.object).unwrap();
+                        let key = S3ObjectKey::from(&routed.object);
+                        assert!(
+                            self.object_routes
+                                .insert(key, (routed.role, routed.route))
+                                .is_none(),
+                            "duplicate S3 scheduler identity"
+                        );
+                        self.pushed_to_scheduler += 1;
+                        scheduler_actions.extend(self.scheduler.push(routed.object, now));
+                    }
+                    IngressEvent::Drop { .. } => {
+                        self.barrier_dropped += 1;
+                    }
+                    IngressEvent::Applied(applied) => {
+                        apply_s3_route_barrier(
+                            &applied,
+                            &mut self.scheduler,
+                            &mut scheduler_actions,
+                            &self.object_routes,
+                            &mut self.tracker,
+                        )
+                        .unwrap();
+                    }
+                }
+            }
+            scheduler_actions.extend(self.scheduler.advance(now));
+            self.dispatch(&scheduler_actions, now);
+            scheduler_actions
+        }
+
+        /// Mirrors `dispatch_s3_playout_actions` accounting. The route-map
+        /// removal is the conservation check: exactly one terminal action per
+        /// scheduler-entered object, never two.
+        fn dispatch(&mut self, actions: &[PlayoutAction], now: u64) {
+            self.tracker.note_actions(actions, now).unwrap();
+            for action in actions {
+                let key = S3ObjectKey::from(action.object());
+                assert!(
+                    self.object_routes.remove(&key).is_some(),
+                    "missing S3 route for terminal scheduler action"
+                );
+                match action {
+                    PlayoutAction::Release(_) => self.released.push(key),
+                    PlayoutAction::Drop { reason, .. } => self.dropped.push((key, reason)),
+                }
+            }
+        }
+    }
+
+    /// Required test 1 — the ordering race itself. Recovery -> Normal where
+    /// the unchanged-route haptic anchor arrives last, `now` is beyond
+    /// several deadlines, and the cancelled PC route has objects above the
+    /// barrier PTS already overdue in the buffer. `scheduler.push(anchor)`
+    /// stages them as releases before the `Applied` event is handled; every
+    /// such object must still end as exactly one `stale_tier` terminal drop,
+    /// zero releases, and no retained tracker observation.
+    #[test]
+    fn overdue_cancelled_route_releases_staged_before_apply_become_stale_drops() {
+        let mut h = Harness::new();
+        let gen0 = h.ingress.gate().active_routes();
+
+        // Exact startup pair on generation-0 routes: epoch at now=2_000, so
+        // due(pts) = 52_000 + pts.
+        h.push(routed(TrackRole::Pc, gen0.pc, 0, 1, 1_000), 1_000);
+        h.push(routed(TrackRole::Haptic, gen0.haptic, 0, 1, 2_000), 2_000);
+        assert!(h.scheduler.is_started());
+        h.tracker.activate().unwrap();
+
+        // Normal -> HapticCritical (both routes change), applied at pts 10_000.
+        let first = h
+            .ingress
+            .request(
+                transition(S3State::Normal, S3State::HapticCritical, 3_000),
+                3_000,
+            )
+            .unwrap();
+        h.ingress.subscribe_ok(TrackRole::Pc, 3_100).unwrap();
+        h.ingress.subscribe_ok(TrackRole::Haptic, 3_200).unwrap();
+        h.push(routed(TrackRole::Pc, first.target.pc, 10_000, 2, 3_300), 3_300);
+        h.push(
+            routed(TrackRole::Haptic, first.target.haptic, 10_000, 2, 3_400),
+            3_400,
+        );
+
+        // HapticCritical -> Recovery (both change), applied at pts 20_000.
+        let second = h
+            .ingress
+            .request(
+                transition(S3State::HapticCritical, S3State::Recovery, 4_000),
+                4_000,
+            )
+            .unwrap();
+        h.ingress.subscribe_ok(TrackRole::Pc, 4_100).unwrap();
+        h.ingress.subscribe_ok(TrackRole::Haptic, 4_200).unwrap();
+        h.push(routed(TrackRole::Pc, second.target.pc, 20_000, 3, 4_300), 4_300);
+        h.push(
+            routed(TrackRole::Haptic, second.target.haptic, 20_000, 3, 4_400),
+            4_400,
+        );
+        let recovery = h.ingress.gate().active_routes();
+        assert_eq!(recovery.pc.name, "pc-d7");
+
+        // Old-route PC objects above the coming barrier (pts 30_000), plus a
+        // current-route haptic sibling for pts 60_000 that must survive.
+        h.push(routed(TrackRole::Pc, recovery.pc, 60_000, 6, 5_000), 5_000);
+        h.push(routed(TrackRole::Pc, recovery.pc, 70_000, 7, 5_100), 5_100);
+        h.push(routed(TrackRole::Haptic, recovery.haptic, 60_000, 6, 5_200), 5_200);
+
+        // Recovery -> Normal: only PC changes; haptic stays current.
+        let third = h
+            .ingress
+            .request(transition(S3State::Recovery, S3State::Normal, 6_000), 6_000)
+            .unwrap();
+        assert!(third.pc_changed && !third.haptic_changed);
+        h.ingress.subscribe_ok(TrackRole::Pc, 6_100).unwrap();
+        assert!(h
+            .push(routed(TrackRole::Pc, third.target.pc, 30_000, 4, 7_000), 7_000)
+            .is_empty());
+
+        // The unchanged-route haptic anchor arrives LAST, with `now` beyond
+        // the deadlines of pts 30_000/60_000/70_000 (due 82k/112k/122k, late
+        // tolerance 50k keeps 60k/70k releasable).
+        let actions = h.push(
+            routed(TrackRole::Haptic, recovery.haptic, 30_000, 4, 130_000),
+            130_000,
+        );
+
+        let stale: Vec<&PlayoutAction> = actions
+            .iter()
+            .filter(|action| {
+                matches!(
+                    action,
+                    PlayoutAction::Drop {
+                        reason: DROP_STALE_TIER,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(stale.len(), 2, "both overdue cancelled-route objects");
+        for action in &stale {
+            let header = action.object().header;
+            assert_eq!(header.track_id, TRACK_PC);
+            assert_eq!(header.tier, 3, "cancelled pc-d7 route");
+            assert!(header.pts_us > 30_000);
+        }
+        // Zero releases escaped for the cancelled route above the barrier.
+        for action in &actions {
+            if let PlayoutAction::Release(object) = action {
+                assert!(
+                    object.header.track_id == TRACK_HAPTIC,
+                    "cancelled-route PC release escaped the barrier: {:?}",
+                    object.header
+                );
+            }
+        }
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(action, PlayoutAction::Release(_)))
+                .count(),
+            2,
+            "haptic pts 30_000 anchor and haptic pts 60_000 still release"
+        );
+
+        // Scheduler terminal set holds the converted identities: re-pushing an
+        // overdue duplicate must be ignored instead of being emitted again.
+        let duplicate = routed(TrackRole::Pc, recovery.pc, 60_000, 6, 131_000).object;
+        assert!(h.scheduler.push(duplicate, 131_000).is_empty());
+
+        // The tracker retained no observation for the evicted objects: the
+        // matching haptic anchors now report a plain PC deadline miss, never a
+        // fabricated exact-pair release skew.
+        let observations = h.tracker.advance(&h.scheduler, 130_000).unwrap();
+        assert_eq!(observations.len(), 2, "pts 30_000 and pts 60_000 anchors");
+        assert!(observations.iter().all(|obs| obs.deadline_miss));
+        assert!(observations.iter().all(|obs| obs.abs_skew_us.is_none()));
+        assert_eq!(h.tracker.next_wakeup_us(&h.scheduler), None);
+
+        // Accounting conservation: every scheduler-entered object produced
+        // exactly one terminal action (dispatch panics on double emission).
+        assert_eq!(h.pushed_to_scheduler, 6);
+        assert_eq!(h.released.len() + h.dropped.len(), 6);
+        assert!(h.object_routes.is_empty());
+        assert_eq!(
+            h.dropped
+                .iter()
+                .filter(|(_, reason)| *reason == DROP_STALE_TIER)
+                .count(),
+            2
+        );
+        // Barrier-only target objects (2 + 2 + 1 across the three applies)
+        // were terminally dropped by the ingress, never by the scheduler.
+        assert_eq!(h.barrier_dropped, 5);
+    }
+
+    /// Required test 2 — applying the same cancellation twice must not double
+    /// count: converted actions stay converted, the buffered pass finds
+    /// nothing, and release+drop actions still conserve the pushed objects.
+    #[test]
+    fn repeated_apply_filtering_is_idempotent_and_conserves_accounting() {
+        let route = Route {
+            name: "pc-d7",
+            generation: 2,
+        };
+        let mut scheduler = PlayoutScheduler::new(test_playout()).unwrap();
+        let mut tracker = S3DeadlineTracker::new(64).unwrap();
+        let mut object_routes: HashMap<S3ObjectKey, (TrackRole, Route)> = HashMap::new();
+
+        let gen0 = Routes {
+            pc: Route {
+                name: "pc",
+                generation: 0,
+            },
+            haptic: Route {
+                name: "haptic",
+                generation: 0,
+            },
+        };
+        let mut pushed = 0usize;
+        for routed_object in [
+            routed(TrackRole::Pc, gen0.pc, 0, 1, 1_000),
+            routed(TrackRole::Haptic, gen0.haptic, 0, 1, 2_000),
+            routed(TrackRole::Pc, route, 60_000, 6, 3_000),
+            routed(TrackRole::Pc, route, 70_000, 7, 3_100),
+        ] {
+            tracker.note_received(&routed_object.object).unwrap();
+            object_routes.insert(
+                S3ObjectKey::from(&routed_object.object),
+                (routed_object.role, routed_object.route),
+            );
+            pushed += 1;
+            let now = routed_object.object.t_recv;
+            assert!(scheduler.push(routed_object.object, now).is_empty());
+        }
+
+        // Everything is overdue: pts 0 is beyond tolerance (late drops), the
+        // pts 60k/70k pc-d7 objects are staged as releases.
+        let mut actions = scheduler.advance(130_000);
+        assert_eq!(actions.len(), pushed);
+
+        let applied = SwitchApplied {
+            decision_at_us: 6_000,
+            request_at_us: 6_000,
+            effect_at_us: 130_000,
+            request_to_effect_us: 124_000,
+            from: S3State::Recovery,
+            to: S3State::Normal,
+            cause: TransitionCause::DeadlineMissStreak,
+            exact_pts_us: 30_000,
+            exact_event_id: 4,
+            active: Routes {
+                pc: Route {
+                    name: "pc",
+                    generation: 3,
+                },
+                haptic: Route {
+                    name: "haptic",
+                    generation: 0,
+                },
+            },
+            cancel_pc: Some(route),
+            cancel_haptic: None,
+        };
+
+        let snapshot = |actions: &[PlayoutAction]| -> Vec<(S3ObjectKey, Option<&'static str>)> {
+            actions
+                .iter()
+                .map(|action| match action {
+                    PlayoutAction::Release(object) => (S3ObjectKey::from(object), None),
+                    PlayoutAction::Drop { object, reason } => {
+                        (S3ObjectKey::from(object), Some(*reason))
+                    }
+                })
+                .collect()
+        };
+
+        apply_s3_route_barrier(
+            &applied,
+            &mut scheduler,
+            &mut actions,
+            &object_routes,
+            &mut tracker,
+        )
+        .unwrap();
+        let first_pass = snapshot(&actions);
+        assert_eq!(actions.len(), pushed, "no action added or lost");
+        assert_eq!(
+            first_pass
+                .iter()
+                .filter(|(_, reason)| *reason == Some(DROP_STALE_TIER))
+                .count(),
+            2
+        );
+        assert_eq!(
+            first_pass.iter().filter(|(_, reason)| reason.is_none()).count(),
+            0,
+            "no release survives for the cancelled route above the barrier"
+        );
+
+        // Second application of the identical cancellation: byte-for-byte the
+        // same staged actions, an empty buffered eviction, no double drops.
+        apply_s3_route_barrier(
+            &applied,
+            &mut scheduler,
+            &mut actions,
+            &object_routes,
+            &mut tracker,
+        )
+        .unwrap();
+        assert_eq!(snapshot(&actions), first_pass);
+        assert_eq!(scheduler.buffered_counts(), (0, 0));
+
+        // Terminal-set consistency: the converted identities can never be
+        // scheduled again.
+        for (pts_us, event_id) in [(60_000, 6), (70_000, 7)] {
+            let duplicate = routed(TrackRole::Pc, route, pts_us, event_id, 131_000).object;
+            assert!(scheduler.push(duplicate, 131_000).is_empty());
+        }
+    }
+
+    /// Required test 3 — one-role transition: with only the PC route
+    /// cancelled, staged haptic releases (and PC objects at the barrier PTS)
+    /// must remain releases; only cancelled-route PC objects above the
+    /// barrier convert.
+    #[test]
+    fn one_role_cancellation_leaves_haptic_and_at_barrier_releases_untouched() {
+        let pc_route = Route {
+            name: "pc-d7",
+            generation: 2,
+        };
+        let haptic_route = Route {
+            name: "haptic",
+            generation: 2,
+        };
+        let mut scheduler = PlayoutScheduler::new(test_playout()).unwrap();
+        let mut tracker = S3DeadlineTracker::new(64).unwrap();
+        let mut object_routes: HashMap<S3ObjectKey, (TrackRole, Route)> = HashMap::new();
+
+        for routed_object in [
+            routed(TrackRole::Pc, pc_route, 0, 1, 1_000),
+            routed(TrackRole::Haptic, haptic_route, 0, 1, 2_000),
+            // At the barrier PTS: must stay a release.
+            routed(TrackRole::Pc, pc_route, 30_000, 4, 3_000),
+            // Above the barrier on the cancelled route: must convert.
+            routed(TrackRole::Pc, pc_route, 60_000, 6, 3_100),
+            // Above the barrier on the unchanged haptic route: must stay.
+            routed(TrackRole::Haptic, haptic_route, 60_000, 6, 3_200),
+        ] {
+            tracker.note_received(&routed_object.object).unwrap();
+            object_routes.insert(
+                S3ObjectKey::from(&routed_object.object),
+                (routed_object.role, routed_object.route),
+            );
+            let now = routed_object.object.t_recv;
+            scheduler.push(routed_object.object, now);
+        }
+
+        // now=130_000: pts 0 is late-dropped, pts 30_000/60_000 stage releases.
+        let mut actions = scheduler.advance(130_000);
+        let applied = SwitchApplied {
+            decision_at_us: 6_000,
+            request_at_us: 6_000,
+            effect_at_us: 130_000,
+            request_to_effect_us: 124_000,
+            from: S3State::Recovery,
+            to: S3State::Normal,
+            cause: TransitionCause::DeadlineMissStreak,
+            exact_pts_us: 30_000,
+            exact_event_id: 4,
+            active: Routes {
+                pc: Route {
+                    name: "pc",
+                    generation: 3,
+                },
+                haptic: haptic_route,
+            },
+            cancel_pc: Some(pc_route),
+            cancel_haptic: None,
+        };
+        apply_s3_route_barrier(
+            &applied,
+            &mut scheduler,
+            &mut actions,
+            &object_routes,
+            &mut tracker,
+        )
+        .unwrap();
+
+        let mut releases = Vec::new();
+        let mut stale = Vec::new();
+        for action in &actions {
+            match action {
+                PlayoutAction::Release(object) => {
+                    releases.push((object.header.track_id, object.header.pts_us));
+                }
+                PlayoutAction::Drop {
+                    object,
+                    reason: DROP_STALE_TIER,
+                } => stale.push((object.header.track_id, object.header.pts_us)),
+                PlayoutAction::Drop { .. } => {}
+            }
+        }
+        releases.sort_unstable();
+        assert_eq!(
+            releases,
+            vec![(TRACK_PC, 30_000), (TRACK_HAPTIC, 60_000)],
+            "at-barrier PC and unchanged-route haptic stay releases"
+        );
+        assert_eq!(stale, vec![(TRACK_PC, 60_000)]);
     }
 }
