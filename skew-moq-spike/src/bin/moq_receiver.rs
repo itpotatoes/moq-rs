@@ -34,7 +34,7 @@ use skew_moq::playout::{
 use skew_moq::s3_controller::{S3Config, S3Controller, S3Observation, S3Update};
 use skew_moq::s3_receiver::{
     validate_routed_object, IngressEvent, RoutedObject, S3DeadlineTracker, S3ReceiverIngress,
-    DROP_STALE_TIER,
+    DROP_DUPLICATE_IDENTITY, DROP_STALE_TIER,
 };
 use skew_moq::s3_switch::{Route, S3SwitchGate, SwitchApplied, SwitchConfig, TrackRole};
 use skew_moq::*;
@@ -1579,6 +1579,40 @@ async fn run_s3_receiver(
                     for ingress_event in ingress_events {
                         match ingress_event {
                             IngressEvent::Scheduler(routed) => {
+                                // A duplicate wire copy of an identity the
+                                // scheduler already knows (terminal, or still
+                                // buffered from another route) would be
+                                // silently ignored by `scheduler.push`, so it
+                                // would never produce a terminal action and
+                                // its route/tracker registrations would leak
+                                // into shutdown residue. Terminally drop it
+                                // here BEFORE any registration.
+                                if scheduler.knows_identity(&routed.object) {
+                                    let header = routed.object.header;
+                                    if let Err(error) = logger
+                                        .lock()
+                                        .map_err(|_| anyhow::anyhow!("RX logger poisoned"))
+                                        .and_then(|mut logger| {
+                                            logger
+                                                .try_log_drop_s3(
+                                                    routed.role,
+                                                    routed.route,
+                                                    header.tier,
+                                                    header.seq,
+                                                    header.pts_us,
+                                                    header.event_id,
+                                                    now.max(routed.object.t_recv),
+                                                    DROP_DUPLICATE_IDENTITY,
+                                                )
+                                                .map_err(anyhow::Error::from)
+                                        })
+                                    {
+                                        outcome_error = Some(error);
+                                        break;
+                                    }
+                                    stats.dropped += 1;
+                                    continue;
+                                }
                                 if let Err(error) = tracker.note_received(&routed.object) {
                                     outcome_error = Some(anyhow::anyhow!(error));
                                     break;
@@ -3269,6 +3303,7 @@ mod s3_barrier_race_tests {
         dropped: Vec<(S3ObjectKey, &'static str)>,
         barrier_dropped: usize,
         pushed_to_scheduler: usize,
+        duplicate_dropped: Vec<(S3ObjectKey, &'static str)>,
     }
 
     impl Harness {
@@ -3286,6 +3321,7 @@ mod s3_barrier_race_tests {
                 dropped: Vec::new(),
                 barrier_dropped: 0,
                 pushed_to_scheduler: 0,
+                duplicate_dropped: Vec::new(),
             }
         }
 
@@ -3294,6 +3330,17 @@ mod s3_barrier_race_tests {
             for event in self.ingress.push(routed, now).unwrap() {
                 match event {
                     IngressEvent::Scheduler(routed) => {
+                        // Mirrors the receiver's duplicate-identity guard:
+                        // an identity the scheduler already knows is
+                        // terminally dropped BEFORE any tracker/route/push
+                        // registration.
+                        if self.scheduler.knows_identity(&routed.object) {
+                            self.duplicate_dropped.push((
+                                S3ObjectKey::from(&routed.object),
+                                DROP_DUPLICATE_IDENTITY,
+                            ));
+                            continue;
+                        }
                         self.tracker.note_received(&routed.object).unwrap();
                         let key = S3ObjectKey::from(&routed.object);
                         assert!(
@@ -3705,5 +3752,221 @@ mod s3_barrier_race_tests {
             "at-barrier PC and unchanged-route haptic stay releases"
         );
         assert_eq!(stale, vec![(TRACK_PC, 60_000)]);
+    }
+
+    /// Confirmed-leak regression (run p4g5cdyn_..._s3, route_residue=1): the
+    /// first copy of one header identity arrives on the current route and is
+    /// terminally evicted by the switch barrier; the SAME identity then
+    /// arrives on the NEW current route. Before the guard, that second copy
+    /// registered a tracker arrival and an `object_routes` entry while
+    /// `scheduler.push` silently ignored it (terminal-set dedup), so no
+    /// terminal action ever removed the entry and shutdown failed with route
+    /// residue. It must instead become exactly one `duplicate_identity`
+    /// terminal drop with no registration at all.
+    #[test]
+    fn duplicate_identity_after_terminal_first_copy_is_dropped_without_residue() {
+        let mut h = Harness::new();
+        let gen0 = h.ingress.gate().active_routes();
+
+        // Exact startup pair on generation 0: epoch at now=2_000, so
+        // due(pts) = 52_000 + pts.
+        h.push(routed(TrackRole::Pc, gen0.pc, 0, 1, 1_000), 1_000);
+        h.push(routed(TrackRole::Haptic, gen0.haptic, 0, 1, 2_000), 2_000);
+        assert!(h.scheduler.is_started());
+        h.tracker.activate().unwrap();
+
+        // First copy on the soon-cancelled current haptic route, above the
+        // coming barrier: enters the scheduler buffer.
+        h.push(routed(TrackRole::Haptic, gen0.haptic, 30_000, 4, 3_000), 3_000);
+        assert_eq!(h.pushed_to_scheduler, 3);
+
+        // Normal -> HapticCritical (both routes change); the exact pair at
+        // pts 10_000 applies the switch and the barrier terminally evicts the
+        // buffered generation-0 haptic pts 30_000 as `stale_tier`.
+        let request = h
+            .ingress
+            .request(
+                transition(S3State::Normal, S3State::HapticCritical, 4_000),
+                4_000,
+            )
+            .unwrap();
+        h.ingress.subscribe_ok(TrackRole::Pc, 4_100).unwrap();
+        h.ingress.subscribe_ok(TrackRole::Haptic, 4_200).unwrap();
+        h.push(routed(TrackRole::Pc, request.target.pc, 10_000, 2, 4_300), 4_300);
+        h.push(
+            routed(TrackRole::Haptic, request.target.haptic, 10_000, 2, 4_400),
+            4_400,
+        );
+        assert_eq!(
+            h.dropped
+                .iter()
+                .filter(|(key, reason)| *reason == DROP_STALE_TIER && key.pts_us == 30_000)
+                .count(),
+            1,
+            "first copy is terminal via the barrier eviction"
+        );
+        let current = h.ingress.gate().active_routes();
+        assert_ne!(current.haptic, gen0.haptic, "haptic route switched");
+
+        // The SAME header identity arrives moments later on the new current
+        // route (CurrentReleaseEligible at the ingress).
+        let before = h.scheduler.buffered_counts();
+        let actions = h.push(
+            routed(TrackRole::Haptic, current.haptic, 30_000, 4, 5_000),
+            5_000,
+        );
+        assert!(actions.is_empty(), "duplicate stages no scheduler action");
+        assert_eq!(h.scheduler.buffered_counts(), before, "scheduler untouched");
+        assert_eq!(h.duplicate_dropped.len(), 1, "exactly one duplicate drop");
+        let (dup_key, dup_reason) = h.duplicate_dropped[0];
+        assert_eq!(dup_reason, DROP_DUPLICATE_IDENTITY);
+        assert_eq!(
+            (dup_key.track_id, dup_key.pts_us, dup_key.event_id),
+            (TRACK_HAPTIC, 30_000, 4)
+        );
+
+        // The tracker holds no observation for the duplicate: its arrival was
+        // never re-registered after `forget_evicted`, so only pair pts 0
+        // remains pending and it produces nothing without releases.
+        let observations = h.tracker.advance(&h.scheduler, 130_000).unwrap();
+        assert!(
+            observations.is_empty(),
+            "no fabricated observation from the duplicate: {observations:?}"
+        );
+
+        // Drain everything and check conservation: every scheduler-entered
+        // object yields exactly one terminal record and no route residue.
+        let actions = h.scheduler.advance(130_000);
+        h.dispatch(&actions, 130_000);
+        assert!(h.object_routes.is_empty(), "no route residue at shutdown");
+        assert_eq!(
+            h.released.len() + h.dropped.len(),
+            h.pushed_to_scheduler,
+            "terminal records == pushed objects"
+        );
+        assert_eq!(
+            h.dropped
+                .iter()
+                .filter(|(key, _)| key.pts_us == 30_000)
+                .count(),
+            1,
+            "the identity has exactly one scheduler-side terminal record"
+        );
+    }
+
+    /// Buffered variant of the same leak: the first copy is still buffered on
+    /// the cancelled route (pts at/below the barrier survives on its frozen
+    /// deadline) when the duplicate arrives on the new current route. The
+    /// duplicate gets one `duplicate_identity` drop and the original still
+    /// releases exactly once at its frozen deadline.
+    #[test]
+    fn duplicate_identity_while_original_buffered_drops_duplicate_and_releases_original_once() {
+        let mut h = Harness::new();
+        let gen0 = h.ingress.gate().active_routes();
+
+        h.push(routed(TrackRole::Pc, gen0.pc, 0, 1, 1_000), 1_000);
+        h.push(routed(TrackRole::Haptic, gen0.haptic, 0, 1, 2_000), 2_000);
+        assert!(h.scheduler.is_started());
+        h.tracker.activate().unwrap();
+
+        // First copy below the coming barrier: survives the switch buffered.
+        h.push(routed(TrackRole::Haptic, gen0.haptic, 5_000, 2, 3_000), 3_000);
+
+        let request = h
+            .ingress
+            .request(
+                transition(S3State::Normal, S3State::HapticCritical, 4_000),
+                4_000,
+            )
+            .unwrap();
+        h.ingress.subscribe_ok(TrackRole::Pc, 4_100).unwrap();
+        h.ingress.subscribe_ok(TrackRole::Haptic, 4_200).unwrap();
+        h.push(routed(TrackRole::Pc, request.target.pc, 10_000, 3, 4_300), 4_300);
+        h.push(
+            routed(TrackRole::Haptic, request.target.haptic, 10_000, 3, 4_400),
+            4_400,
+        );
+        assert!(
+            h.dropped.is_empty(),
+            "pts 5_000 <= barrier 10_000 stays buffered on its frozen deadline"
+        );
+        let current = h.ingress.gate().active_routes();
+        assert_ne!(current.haptic, gen0.haptic);
+
+        // Duplicate identity on the new current route while the original is
+        // still buffered: one duplicate drop, nothing else changes.
+        let before = h.scheduler.buffered_counts();
+        let actions = h.push(
+            routed(TrackRole::Haptic, current.haptic, 5_000, 2, 4_500),
+            4_500,
+        );
+        assert!(actions.is_empty());
+        assert_eq!(h.scheduler.buffered_counts(), before);
+        assert_eq!(h.duplicate_dropped.len(), 1);
+        assert_eq!(h.duplicate_dropped[0].1, DROP_DUPLICATE_IDENTITY);
+        assert_eq!(h.duplicate_dropped[0].0.pts_us, 5_000);
+
+        // The original still releases exactly once, on time at its frozen
+        // deadline due(5_000) = 57_000 (pts 0 is within the late tolerance).
+        let actions = h.scheduler.advance(57_000);
+        h.dispatch(&actions, 57_000);
+        assert_eq!(
+            h.released
+                .iter()
+                .filter(|key| key.track_id == TRACK_HAPTIC && key.pts_us == 5_000)
+                .count(),
+            1
+        );
+        assert!(h.dropped.is_empty(), "no scheduler-side drop in this run");
+        assert!(h.object_routes.is_empty());
+        assert_eq!(h.released.len() + h.dropped.len(), h.pushed_to_scheduler);
+    }
+
+    /// Non-duplicate control: DISTINCT identities delivered across the two
+    /// routes flow unchanged — no `duplicate_identity` drop, every object
+    /// releases, and conservation holds.
+    #[test]
+    fn distinct_identities_on_two_routes_flow_unchanged() {
+        let mut h = Harness::new();
+        let gen0 = h.ingress.gate().active_routes();
+
+        h.push(routed(TrackRole::Pc, gen0.pc, 0, 1, 1_000), 1_000);
+        h.push(routed(TrackRole::Haptic, gen0.haptic, 0, 1, 2_000), 2_000);
+        assert!(h.scheduler.is_started());
+        h.tracker.activate().unwrap();
+
+        // Old-route identity below the barrier survives the switch.
+        h.push(routed(TrackRole::Haptic, gen0.haptic, 5_000, 2, 3_000), 3_000);
+
+        let request = h
+            .ingress
+            .request(
+                transition(S3State::Normal, S3State::HapticCritical, 4_000),
+                4_000,
+            )
+            .unwrap();
+        h.ingress.subscribe_ok(TrackRole::Pc, 4_100).unwrap();
+        h.ingress.subscribe_ok(TrackRole::Haptic, 4_200).unwrap();
+        h.push(routed(TrackRole::Pc, request.target.pc, 10_000, 3, 4_300), 4_300);
+        h.push(
+            routed(TrackRole::Haptic, request.target.haptic, 10_000, 3, 4_400),
+            4_400,
+        );
+        let current = h.ingress.gate().active_routes();
+
+        // A DISTINCT identity on the new current route.
+        h.push(routed(TrackRole::Haptic, current.haptic, 30_000, 4, 4_500), 4_500);
+        assert!(h.duplicate_dropped.is_empty(), "no duplicate drop for distinct identities");
+        assert_eq!(h.pushed_to_scheduler, 4);
+
+        // Drain at due(30_000) = 82_000: pts 0 and pts 5_000 are within the
+        // late tolerance, so all four objects release.
+        let actions = h.scheduler.advance(82_000);
+        h.dispatch(&actions, 82_000);
+        assert_eq!(h.released.len(), 4);
+        assert!(h.dropped.is_empty());
+        assert!(h.duplicate_dropped.is_empty());
+        assert!(h.object_routes.is_empty());
+        assert_eq!(h.released.len() + h.dropped.len(), h.pushed_to_scheduler);
     }
 }

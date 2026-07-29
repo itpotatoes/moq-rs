@@ -17,6 +17,12 @@ use crate::{TRACK_HAPTIC, TRACK_PC};
 pub const DROP_STALE_TIER: &str = "stale_tier";
 pub const DROP_SWITCH_BARRIER: &str = "switch_barrier";
 pub const DROP_SWITCH_BARRIER_OVERFLOW: &str = "switch_barrier_overflow";
+/// A second wire copy of one header identity reached the scheduler-eligible
+/// path while the scheduler already knows that identity (terminal or
+/// buffered) from another route. The receiver terminally drops the duplicate
+/// before registering route/tracker state so rx = release + drop conservation
+/// holds without route residue.
+pub const DROP_DUPLICATE_IDENTITY: &str = "duplicate_identity";
 
 #[derive(Debug, Clone, Copy)]
 struct AnchorArrival {

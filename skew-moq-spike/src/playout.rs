@@ -363,6 +363,21 @@ impl PlayoutScheduler {
         self.terminal.insert(object.identity())
     }
 
+    /// Whether this exact header identity is already known to the scheduler —
+    /// terminally accounted or still buffered on either track. Uses exactly
+    /// the checks `push` uses for its silent duplicate dedup, without mutating
+    /// anything. S3 queries this before registering per-object route state so
+    /// a duplicate identity arriving on a new current route can be terminally
+    /// dropped outside the scheduler instead of leaking route/tracker entries
+    /// when `push` ignores it; S1/S2 never call it, so the shared
+    /// push/advance semantics are untouched.
+    pub fn knows_identity(&self, object: &PlayoutObject) -> bool {
+        let identity = object.identity();
+        self.terminal.contains(&identity)
+            || self.pc.values().any(|item| item.identity() == identity)
+            || self.haptic.values().any(|item| item.identity() == identity)
+    }
+
     fn buffer(&self, track: u8) -> &BTreeMap<QueueKey, PlayoutObject> {
         if track == TRACK_PC {
             &self.pc
@@ -714,6 +729,32 @@ mod tests {
             "a marked identity can never re-enter scheduling"
         );
         assert_eq!(scheduler.buffered_counts(), (1, 1));
+    }
+
+    #[test]
+    fn knows_identity_matches_push_dedup_domain_without_mutation() {
+        let mut scheduler = PlayoutScheduler::new(config()).unwrap();
+        let buffered_pc = object(TRACK_PC, 0, 0, 1, 0);
+        let buffered_haptic = object(TRACK_HAPTIC, 0, 0, 1, 0);
+        scheduler.push(buffered_pc.clone(), 0);
+        scheduler.push(buffered_haptic.clone(), 0);
+        let terminal = object(TRACK_PC, 1, 10_000, 2, 1);
+        scheduler.mark_terminal(&terminal);
+
+        // Exactly the identities `push` would silently ignore.
+        assert!(scheduler.knows_identity(&buffered_pc), "pc buffer");
+        assert!(scheduler.knows_identity(&buffered_haptic), "haptic buffer");
+        assert!(scheduler.knows_identity(&terminal), "terminal set");
+        let unknown = object(TRACK_HAPTIC, 2, 20_000, 3, 2);
+        assert!(!scheduler.knows_identity(&unknown));
+        // A differing identity field (seq) is a different identity.
+        assert!(!scheduler.knows_identity(&object(TRACK_PC, 9, 0, 1, 0)));
+
+        // Query mutates nothing: the unknown identity still enters normally.
+        assert_eq!(scheduler.buffered_counts(), (1, 1));
+        scheduler.push(unknown.clone(), 2);
+        assert_eq!(scheduler.buffered_counts(), (1, 2));
+        assert!(scheduler.knows_identity(&unknown));
     }
 
     #[test]
