@@ -200,6 +200,140 @@ pub struct RoutedObject {
     pub object: PlayoutObject,
 }
 
+/// Why a retiring route's wire subscription was finally released.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetirementCause {
+    /// The bounded drain deadline passed.
+    Deadline,
+    /// The route's wire track ended (FIN or remote close) before the deadline.
+    TrackEnd,
+}
+
+impl RetirementCause {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Deadline => "deadline",
+            Self::TrackEnd => "track_end",
+        }
+    }
+}
+
+/// Bounded deferral of the old-route wire UNSUBSCRIBE at the S3 switch
+/// barrier.
+///
+/// At atomic apply the replaced generation is already stale for scheduling
+/// (`S3SwitchGate::classify_object` returns `StaleDrop`), and the registered
+/// cancel record is written at apply time. The wire subscription, however,
+/// must stay open for one registered PC delivery-timeout window: an immediate
+/// UNSUBSCRIBE makes the relay hard-stop in-flight pre-/at-barrier objects —
+/// they then neither arrive nor produce a relay `delivery_timeout` event and
+/// become unaccounted (v11 evidence: exactly the dual-published at-barrier
+/// frame). While the subscription is retiring, the relay's normal per-object
+/// delivery timeout resolves every in-flight object (delivery → rx row then
+/// terminal stale drop; or timeout → relay event), so the disposition
+/// partition stays exact.
+///
+/// The window reuses the frozen 67ms S3 PC delivery timeout — no new timing
+/// constant — and is far below the registered 2s controller cooldown, so a
+/// retiring route can never overlap the next switch's make-before-break
+/// producer budget.
+pub struct S3RetirementQueue<T> {
+    budget_us: u64,
+    entries: Vec<RetiringEntry<T>>,
+}
+
+struct RetiringEntry<T> {
+    role: TrackRole,
+    route: Route,
+    deadline_us: u64,
+    payload: T,
+}
+
+impl<T> S3RetirementQueue<T> {
+    pub fn new(budget_us: u64) -> Result<Self, &'static str> {
+        if budget_us == 0 {
+            return Err("S3 retirement budget must be > 0");
+        }
+        Ok(Self {
+            budget_us,
+            entries: Vec::new(),
+        })
+    }
+
+    pub fn budget_us(&self) -> u64 {
+        self.budget_us
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn contains(&self, role: TrackRole, route: Route) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.role == role && entry.route == route)
+    }
+
+    /// Start retiring one cancelled route. The deadline is `now + budget`.
+    /// A duplicate (role, route) is a lifecycle defect; the payload is
+    /// returned so the caller can release it before failing loud.
+    pub fn admit(
+        &mut self,
+        role: TrackRole,
+        route: Route,
+        payload: T,
+        now_us: u64,
+    ) -> Result<(), (&'static str, T)> {
+        if self.contains(role, route) {
+            return Err(("duplicate retiring S3 route", payload));
+        }
+        self.entries.push(RetiringEntry {
+            role,
+            route,
+            deadline_us: now_us.saturating_add(self.budget_us),
+            payload,
+        });
+        Ok(())
+    }
+
+    /// Earliest pending unsubscribe deadline, for the event-loop wakeup.
+    pub fn next_deadline_us(&self) -> Option<u64> {
+        self.entries.iter().map(|entry| entry.deadline_us).min()
+    }
+
+    /// Remove and return every route whose drain window has passed.
+    pub fn take_due(&mut self, now_us: u64) -> Vec<(TrackRole, Route, T)> {
+        let mut due = Vec::new();
+        let mut index = 0;
+        while index < self.entries.len() {
+            if self.entries[index].deadline_us <= now_us {
+                let entry = self.entries.swap_remove(index);
+                due.push((entry.role, entry.route, entry.payload));
+            } else {
+                index += 1;
+            }
+        }
+        due
+    }
+
+    /// Complete retirement early because the route's wire track ended.
+    pub fn take_ended(&mut self, role: TrackRole, route: Route) -> Option<T> {
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| entry.role == role && entry.route == route)?;
+        Some(self.entries.swap_remove(index).payload)
+    }
+
+    /// Release every remaining entry (receiver shutdown).
+    pub fn drain_all(&mut self) -> Vec<(TrackRole, Route, T)> {
+        std::mem::take(&mut self.entries)
+            .into_iter()
+            .map(|entry| (entry.role, entry.route, entry.payload))
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum IngressEvent {
     Scheduler(RoutedObject),
@@ -755,6 +889,69 @@ mod tests {
         // tracker must not substitute receive time or a zero skew.
         scheduler.advance(50_002);
         assert!(tracker.advance(&scheduler, 50_002).unwrap().is_empty());
+    }
+
+    #[test]
+    fn retirement_queue_defers_release_until_deadline_or_track_end() {
+        let mut queue: S3RetirementQueue<&'static str> = S3RetirementQueue::new(67_000).unwrap();
+        let old_pc = Route {
+            name: "pc",
+            generation: 0,
+        };
+        let old_haptic = Route {
+            name: "haptic",
+            generation: 0,
+        };
+        queue
+            .admit(TrackRole::Pc, old_pc, "pc-sub", 1_000)
+            .unwrap();
+        queue
+            .admit(TrackRole::Haptic, old_haptic, "haptic-sub", 1_000)
+            .unwrap();
+        assert!(queue.contains(TrackRole::Pc, old_pc));
+        assert_eq!(queue.next_deadline_us(), Some(68_000));
+
+        // Nothing is released before the registered drain window passes.
+        assert!(queue.take_due(67_999).is_empty());
+        assert!(!queue.is_empty());
+
+        // A track that ends early completes retirement immediately.
+        assert_eq!(
+            queue.take_ended(TrackRole::Haptic, old_haptic),
+            Some("haptic-sub")
+        );
+        assert_eq!(queue.take_ended(TrackRole::Haptic, old_haptic), None);
+
+        // The deadline releases the remainder exactly once.
+        let due = queue.take_due(68_000);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].0, TrackRole::Pc);
+        assert_eq!(due[0].2, "pc-sub");
+        assert!(queue.is_empty());
+        assert_eq!(queue.next_deadline_us(), None);
+    }
+
+    #[test]
+    fn retirement_queue_rejects_zero_budget_and_duplicate_routes() {
+        assert!(S3RetirementQueue::<()>::new(0).is_err());
+        let mut queue: S3RetirementQueue<u32> = S3RetirementQueue::new(67_000).unwrap();
+        let route = Route {
+            name: "pc",
+            generation: 3,
+        };
+        queue.admit(TrackRole::Pc, route, 7, 10).unwrap();
+        let (reason, payload) = queue.admit(TrackRole::Pc, route, 8, 11).unwrap_err();
+        assert_eq!(reason, "duplicate retiring S3 route");
+        assert_eq!(payload, 8);
+        // Same generation on the other role is a distinct lifecycle.
+        let haptic_route = Route {
+            name: "haptic",
+            generation: 3,
+        };
+        queue.admit(TrackRole::Haptic, haptic_route, 9, 12).unwrap();
+        let drained = queue.drain_all();
+        assert_eq!(drained.len(), 2);
+        assert!(queue.is_empty());
     }
 
     #[test]

@@ -33,8 +33,8 @@ use skew_moq::playout::{
 };
 use skew_moq::s3_controller::{S3Config, S3Controller, S3Observation, S3Update};
 use skew_moq::s3_receiver::{
-    validate_routed_object, IngressEvent, RoutedObject, S3DeadlineTracker, S3ReceiverIngress,
-    DROP_DUPLICATE_IDENTITY, DROP_STALE_TIER,
+    validate_routed_object, IngressEvent, RetirementCause, RoutedObject, S3DeadlineTracker,
+    S3ReceiverIngress, S3RetirementQueue, DROP_DUPLICATE_IDENTITY, DROP_STALE_TIER,
 };
 use skew_moq::s3_switch::{Route, S3SwitchGate, SwitchApplied, SwitchConfig, TrackRole};
 use skew_moq::*;
@@ -1380,6 +1380,63 @@ fn min_wakeup(values: impl IntoIterator<Item = Option<u64>>) -> Option<u64> {
     values.into_iter().flatten().min()
 }
 
+/// Lifecycle defects while moving a cancelled route into retirement. Both are
+/// fail-loud; `Duplicate` returns the payload so the caller can release it.
+#[derive(Debug)]
+enum RetireError<T> {
+    Missing,
+    Duplicate(T),
+}
+
+/// At atomic S3 apply, move the cancelled route's live wire subscription into
+/// the bounded retirement queue instead of unsubscribing immediately. The
+/// route is already stale for scheduling (every later object of it terminally
+/// drops as `stale_tier`), so deferral changes no release decision; it only
+/// keeps the delivery/timeout accounting path open for in-flight
+/// pre-/at-barrier objects.
+fn retire_cancelled_s3_route<T>(
+    live: &mut HashMap<(TrackRole, u64), T>,
+    retiring: &mut S3RetirementQueue<T>,
+    role: TrackRole,
+    route: Route,
+    now: u64,
+) -> Result<(), RetireError<T>> {
+    let Some(old) = live.remove(&(role, route.generation)) else {
+        return Err(RetireError::Missing);
+    };
+    retiring
+        .admit(role, route, old, now)
+        .map_err(|(_reason, old)| RetireError::Duplicate(old))
+}
+
+/// Release one retiring old-route subscription: dropping the wire handle sends
+/// the deferred UNSUBSCRIBE, and the drain task joins the existing retired
+/// pool for shutdown. The registered cancel record was already written at
+/// apply time; this only records when and why the wire release happened.
+fn release_retired_s3_subscription(
+    role: TrackRole,
+    route: Route,
+    subscription: S3LiveSubscription,
+    cause: RetirementCause,
+    now: u64,
+    logger: &Arc<Mutex<JsonlLogger>>,
+    retired_drains: &mut Vec<tokio::task::JoinHandle<()>>,
+) -> Result<()> {
+    drop(subscription.handle);
+    retired_drains.push(subscription.drain);
+    logger
+        .lock()
+        .map_err(|_| anyhow::anyhow!("RX logger poisoned"))?
+        .try_log_info(&format!(
+            "\"event\":\"s3_retired_unsubscribe\",\"track\":\"{}\",\"wire_track\":\"{}\",\"generation\":{},\"cause\":\"{}\",\"t_unsubscribe\":{now}",
+            role.as_str(),
+            route.name,
+            route.generation,
+            cause.as_str(),
+        ))?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_s3_receiver(
     args: &Args,
@@ -1473,6 +1530,17 @@ async fn run_s3_receiver(
 
     let mut live: HashMap<(TrackRole, u64), S3LiveSubscription> = HashMap::new();
     let mut retired_drains = Vec::new();
+    // Registered §v8 barrier semantics make the old generation stale at apply,
+    // but the wire UNSUBSCRIBE is deferred by the frozen 67ms PC delivery
+    // timeout so in-flight pre-/at-barrier objects resolve through the normal
+    // delivery/timeout contract instead of being orphaned by a relay
+    // hard-stop (v11 single-frame unaccounted defect).
+    let mut retiring: S3RetirementQueue<S3LiveSubscription> = S3RetirementQueue::new(ms_to_us(
+        args.pc_delivery_timeout_ms
+            .context("S3 route retirement requires --pc-delivery-timeout-ms")?,
+        "pc-delivery-timeout-ms",
+    )?)
+    .map_err(anyhow::Error::msg)?;
     let initial = ingress.gate().active_routes();
     for (role, route) in [
         (TrackRole::Pc, initial.pc),
@@ -1537,6 +1605,7 @@ async fn run_s3_receiver(
             tracker.next_wakeup_us(&scheduler),
             switch_deadline,
             forced_miss_wakeup,
+            retiring.next_deadline_us(),
             Some(max_end_us),
         ])
         .unwrap_or(max_end_us);
@@ -1554,6 +1623,24 @@ async fn run_s3_receiver(
         if now >= max_end_us {
             outcome_error = Some(anyhow::anyhow!("S3 receiver max-duration reached"));
             break;
+        }
+
+        // Complete route retirements whose bounded drain window has passed.
+        for (role, route, subscription) in retiring.take_due(now) {
+            if let Err(error) = release_retired_s3_subscription(
+                role,
+                route,
+                subscription,
+                RetirementCause::Deadline,
+                now,
+                &logger,
+                &mut retired_drains,
+            ) {
+                outcome_error = Some(error);
+            }
+        }
+        if outcome_error.is_some() {
+            continue;
         }
 
         let mut scheduler_actions = Vec::new();
@@ -1706,18 +1793,41 @@ async fn run_s3_receiver(
                                         outcome_error = Some(error);
                                         break;
                                     }
-                                    if let Some(old) = live.remove(&(role, route.generation)) {
-                                        drop(old.handle);
-                                        // The drain owns only the reader and
-                                        // will report the remote cancellation.
-                                        retired_drains.push(old.drain);
-                                    } else {
-                                        outcome_error = Some(anyhow::anyhow!(
-                                            "missing old S3 subscription {} generation {}",
-                                            route.name,
-                                            route.generation
-                                        ));
-                                        break;
+                                    // Defer the wire UNSUBSCRIBE for one
+                                    // registered PC delivery-timeout window:
+                                    // the old generation is already stale for
+                                    // scheduling, but in-flight
+                                    // pre-/at-barrier objects must still
+                                    // resolve as delivery or a relay
+                                    // delivery_timeout event, not vanish in a
+                                    // relay hard-stop.
+                                    match retire_cancelled_s3_route(
+                                        &mut live,
+                                        &mut retiring,
+                                        role,
+                                        route,
+                                        now,
+                                    ) {
+                                        Ok(()) => {}
+                                        Err(RetireError::Missing) => {
+                                            outcome_error = Some(anyhow::anyhow!(
+                                                "missing old S3 subscription {} generation {}",
+                                                route.name,
+                                                route.generation
+                                            ));
+                                            break;
+                                        }
+                                        Err(RetireError::Duplicate(old)) => {
+                                            drop(old.handle);
+                                            old.drain.abort();
+                                            retired_drains.push(old.drain);
+                                            outcome_error = Some(anyhow::anyhow!(
+                                                "duplicate retiring S3 route {} generation {}",
+                                                route.name,
+                                                route.generation
+                                            ));
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -1730,6 +1840,24 @@ async fn run_s3_receiver(
                     end,
                     detail,
                 } => {
+                    // A retiring route that ends (relay FIN/close) has nothing
+                    // left in flight: complete its deferred unsubscribe now.
+                    // A retiring route is never the current route, so the
+                    // current-route end handling below stays unreachable for
+                    // it by construction.
+                    if let Some(subscription) = retiring.take_ended(role, route) {
+                        if let Err(error) = release_retired_s3_subscription(
+                            role,
+                            route,
+                            subscription,
+                            RetirementCause::TrackEnd,
+                            now,
+                            &logger,
+                            &mut retired_drains,
+                        ) {
+                            outcome_error = Some(error);
+                        }
+                    }
                     let current = ingress.gate().active_routes().for_role(role);
                     if current == route {
                         if end != TrackEnd::Fin {
@@ -1924,6 +2052,13 @@ async fn run_s3_receiver(
 
     // Stop every subscription before joining/aborting its drain, then stop the
     // session. No detached reader is allowed to write after shutdown logging.
+    // Retiring routes lose their remaining drain window at shutdown; this is
+    // identical to the pre-existing treatment of live routes.
+    for (_role, _route, subscription) in retiring.drain_all() {
+        drop(subscription.handle);
+        subscription.drain.abort();
+        let _ = subscription.drain.await;
+    }
     for (_, subscription) in live.drain() {
         drop(subscription.handle);
         subscription.drain.abort();
@@ -3968,5 +4103,316 @@ mod s3_barrier_race_tests {
         assert!(h.duplicate_dropped.is_empty());
         assert!(h.object_routes.is_empty());
         assert_eq!(h.released.len() + h.dropped.len(), h.pushed_to_scheduler);
+    }
+}
+
+// ---- S3 switch-barrier retirement tests ------------------------------------
+//
+// v11 defect: at apply, the receiver immediately dropped the old-route
+// subscription handle. The relay hard-stopped on the UNSUBSCRIBE, so an
+// in-flight pre-/at-barrier frame neither arrived nor produced a relay
+// delivery_timeout event — exactly one unaccounted frame per affected run.
+// The fix keeps the old-route wire path open for one registered PC
+// delivery-timeout window (S3RetirementQueue), during which such a frame
+// either arrives (rx row + terminal stale drop) or hits the relay timeout.
+// These tests drive the same functions the `run_s3_receiver` loop uses.
+
+#[cfg(test)]
+mod s3_retirement_tests {
+    use super::*;
+    use skew_moq::s3_controller::{S3State, S3Transition, TransitionCause};
+
+    /// Frozen S3 PC delivery timeout (67ms), the registered bound the
+    /// retirement window reuses.
+    const BUDGET_US: u64 = 67_000;
+
+    fn transition(from: S3State, to: S3State, at_us: u64) -> S3Transition {
+        S3Transition {
+            at_us,
+            from,
+            to,
+            cause: TransitionCause::DeadlineMissStreak,
+        }
+    }
+
+    #[test]
+    fn cancelled_route_is_retired_bounded_not_unsubscribed_immediately() {
+        let mut live: HashMap<(TrackRole, u64), u32> = HashMap::new();
+        let mut retiring: S3RetirementQueue<u32> = S3RetirementQueue::new(BUDGET_US).unwrap();
+        let old = Route {
+            name: "pc",
+            generation: 0,
+        };
+        live.insert((TrackRole::Pc, 0), 7);
+
+        retire_cancelled_s3_route(&mut live, &mut retiring, TrackRole::Pc, old, 1_000).unwrap();
+        assert!(live.is_empty());
+        assert!(retiring.contains(TrackRole::Pc, old));
+        assert_eq!(retiring.next_deadline_us(), Some(1_000 + BUDGET_US));
+        // The subscription is NOT released before the registered window ends…
+        assert!(retiring.take_due(1_000 + BUDGET_US - 1).is_empty());
+        // …and is released exactly once at the deadline.
+        let due = retiring.take_due(1_000 + BUDGET_US);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].0, TrackRole::Pc);
+        assert_eq!(due[0].1, old);
+        assert_eq!(due[0].2, 7);
+        assert!(retiring.is_empty());
+
+        // Lifecycle defects fail loud instead of leaking or double-freeing.
+        assert!(matches!(
+            retire_cancelled_s3_route(&mut live, &mut retiring, TrackRole::Pc, old, 70_000),
+            Err(RetireError::Missing)
+        ));
+        let next = Route {
+            name: "pc",
+            generation: 1,
+        };
+        live.insert((TrackRole::Pc, 1), 8);
+        retire_cancelled_s3_route(&mut live, &mut retiring, TrackRole::Pc, next, 70_100).unwrap();
+        live.insert((TrackRole::Pc, 1), 9);
+        assert!(matches!(
+            retire_cancelled_s3_route(&mut live, &mut retiring, TrackRole::Pc, next, 70_200),
+            Err(RetireError::Duplicate(9))
+        ));
+    }
+
+    fn wire_object(tier: u16, seq: u32, pts_us: u64, event_id: u32) -> Bytes {
+        let payload = [0u8; 4];
+        let header = pack_header(
+            TRACK_PC,
+            tier,
+            seq,
+            pts_us,
+            event_id,
+            1,
+            payload.len() as u32,
+        );
+        let mut bytes = Vec::with_capacity(HDR + payload.len());
+        bytes.extend_from_slice(&header);
+        bytes.extend_from_slice(&payload);
+        Bytes::from(bytes)
+    }
+
+    fn barrier_object(role: TrackRole, route: Route, pts_us: u64, event_id: u32) -> RoutedObject {
+        let (track_id, tier) = match role {
+            TrackRole::Pc => (
+                TRACK_PC,
+                match route.name {
+                    "pc" => 2,
+                    "pc-d7" => 3,
+                    "pc-d6" => 4,
+                    _ => 99,
+                },
+            ),
+            TrackRole::Haptic => (TRACK_HAPTIC, 0),
+        };
+        RoutedObject {
+            role,
+            route,
+            object: PlayoutObject {
+                header: Header {
+                    version: VERSION,
+                    track_id,
+                    tier,
+                    seq: event_id,
+                    pts_us,
+                    event_id,
+                    gen_ts_us: 1,
+                    payload_len: 0,
+                },
+                t_recv: 1,
+                bytes: Bytes::new(),
+            },
+        }
+    }
+
+    fn test_log_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "skew-{name}-{}-{}.jsonl",
+            std::process::id(),
+            now_us()
+        ))
+    }
+
+    /// Regression for the v11 single-frame loss: after apply, the old route's
+    /// wire path stays open, so an in-flight at-barrier frame is DELIVERED
+    /// (rx-logged by the still-running drain) and terminally stale-dropped by
+    /// the ingress — zero unaccounted. A post-barrier old-route frame is
+    /// equally barrier-dropped and never released. Track end completes the
+    /// retirement before the deadline.
+    #[tokio::test]
+    async fn in_flight_pre_barrier_frame_delivers_and_accounts_during_retirement() {
+        // Receiver-side atomic apply with barrier (pts 3_500_000, event 106),
+        // mirroring the v11 evidence run D50/T50.
+        let gate = S3SwitchGate::new(SwitchConfig {
+            effect_timeout_us: 10_000_000,
+        })
+        .unwrap();
+        let mut ingress = S3ReceiverIngress::new(gate, 64).unwrap();
+        let old = ingress.gate().active_routes();
+        let request = ingress
+            .request(
+                transition(S3State::Normal, S3State::HapticCritical, 1_000),
+                1_000,
+            )
+            .unwrap();
+        ingress.subscribe_ok(TrackRole::Pc, 1_100).unwrap();
+        ingress.subscribe_ok(TrackRole::Haptic, 1_200).unwrap();
+        assert!(ingress
+            .push(
+                barrier_object(TrackRole::Pc, request.target.pc, 3_500_000, 106),
+                2_000
+            )
+            .unwrap()
+            .is_empty());
+        let events = ingress
+            .push(
+                barrier_object(TrackRole::Haptic, request.target.haptic, 3_500_000, 106),
+                2_100,
+            )
+            .unwrap();
+        let applied = events
+            .iter()
+            .find_map(|event| match event {
+                IngressEvent::Applied(applied) => Some(*applied),
+                _ => None,
+            })
+            .expect("exact-pair apply");
+        let cancel_pc = applied.cancel_pc.expect("old PC route cancelled");
+        assert_eq!(cancel_pc, old.pc);
+
+        // The fix: the cancelled route is retired (wire subscription kept),
+        // not unsubscribed at apply.
+        let mut live: HashMap<(TrackRole, u64), &'static str> = HashMap::new();
+        live.insert((TrackRole::Pc, cancel_pc.generation), "old-pc-subscription");
+        let mut retiring: S3RetirementQueue<&'static str> =
+            S3RetirementQueue::new(BUDGET_US).unwrap();
+        retire_cancelled_s3_route(
+            &mut live,
+            &mut retiring,
+            TrackRole::Pc,
+            cancel_pc,
+            applied.effect_at_us,
+        )
+        .unwrap();
+
+        // Wire: the old-route drain keeps reading during the window, exactly
+        // as in `run_s3_receiver` (the drain task is untouched at apply).
+        let out = test_log_path("s3-retire-rx");
+        let logger = Arc::new(Mutex::new(
+            JsonlLogger::new(
+                &out,
+                "run",
+                "moq",
+                "rx",
+                None,
+                0.0,
+                0.0,
+                0.0,
+                10,
+                30,
+                100,
+                1,
+                None,
+                None,
+                Some("both"),
+                Some(TERM_PROTOCOL_V),
+                None,
+                None,
+            )
+            .unwrap(),
+        ));
+        let (event_tx, mut event_rx) = mpsc::channel::<S3WireEvent>(16);
+        let bad_headers = Arc::new(AtomicU64::new(0));
+        let ingress_drops = Arc::new(AtomicU64::new(0));
+        let log_failed = Arc::new(AtomicU64::new(0));
+        let (writer, reader) = Track::new(TrackNamespace::from_utf8_path("/retire"), "pc").produce();
+        let drain = tokio::spawn(drain_s3_track(
+            TrackRole::Pc,
+            cancel_pc,
+            reader,
+            logger.clone(),
+            event_tx,
+            bad_headers.clone(),
+            ingress_drops.clone(),
+            log_failed.clone(),
+        ));
+
+        // The relay serves the in-flight at-barrier copy plus one
+        // post-barrier frame on the still-open old route.
+        let mut subgroups = writer.subgroups().unwrap();
+        let mut subgroup = subgroups.append(1).unwrap();
+        subgroup.write(wire_object(2, 105, 3_500_000, 106)).unwrap();
+        subgroup.write(wire_object(2, 106, 3_533_333, 107)).unwrap();
+
+        let mut received = Vec::new();
+        for _ in 0..2 {
+            let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+                .await
+                .expect("in-flight frame must arrive during the drain window")
+                .expect("drain alive");
+            match event {
+                S3WireEvent::Object(routed) => received.push(routed),
+                other => panic!("expected object, got end: {other:?}"),
+            }
+        }
+        assert_eq!(received[0].object.header.pts_us, 3_500_000);
+        assert_eq!(received[0].object.header.event_id, 106);
+        assert_eq!(received[0].route, cancel_pc);
+
+        // Both frames are terminal barrier drops — never scheduler releases.
+        for routed in received {
+            let events = ingress
+                .push(routed, applied.effect_at_us + 10_000)
+                .unwrap();
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [IngressEvent::Drop {
+                        reason: DROP_STALE_TIER,
+                        ..
+                    }]
+                ),
+                "cancelled-route frame must be a stale terminal drop"
+            );
+        }
+
+        // Track end (publisher FIN) completes retirement before the deadline.
+        drop(subgroup);
+        drop(subgroups);
+        let ended = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+            .await
+            .expect("track end must be observed")
+            .expect("drain alive");
+        match ended {
+            S3WireEvent::Ended { role, route, end, .. } => {
+                assert_eq!(role, TrackRole::Pc);
+                assert_eq!(route, cancel_pc);
+                assert_eq!(end, TrackEnd::Fin);
+            }
+            other => panic!("expected end, got {other:?}"),
+        }
+        assert_eq!(
+            retiring.take_ended(TrackRole::Pc, cancel_pc),
+            Some("old-pc-subscription")
+        );
+        assert!(retiring.is_empty());
+        drain.await.unwrap();
+
+        // Delivery accounting: the at-barrier identity has an rx row for its
+        // (route, identity) — it is received, not unaccounted.
+        assert_eq!(bad_headers.load(Ordering::Relaxed), 0);
+        assert_eq!(log_failed.load(Ordering::Relaxed), 0);
+        let log = std::fs::read_to_string(&out).unwrap();
+        assert!(
+            log.lines().any(|line| line.contains("\"role\":\"rx\"")
+                && line.contains("\"pts_us\":3500000")
+                && line.contains("\"event_id\":106")
+                && line.contains("\"wire_track\":\"pc\"")
+                && line.contains("\"route_generation\":0")),
+            "at-barrier frame must be rx-accounted on the old route: {log}"
+        );
+        std::fs::remove_file(&out).unwrap();
     }
 }
