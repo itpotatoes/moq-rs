@@ -10,7 +10,7 @@
 //! The reader can be cloned, in which case each reader receives a copy of each object. (fanout)
 //!
 //! The stream is closed with [ServeError::Closed] when all writers or readers are dropped.
-use std::{cmp, collections::VecDeque, ops::Deref, sync::Arc};
+use std::{collections::VecDeque, ops::Deref, sync::Arc};
 
 use bytes::Bytes;
 
@@ -59,6 +59,11 @@ struct SubgroupsState {
     // when several appends occurred before a reader was polled.
     subgroups: VecDeque<SubgroupReader>,
     first_index: u64,
+    // The subgroup with the numerically largest (group_id, subgroup_id).
+    // Groups may arrive out of order over independent QUIC streams, so the
+    // back of the arrival-ordered deque is not necessarily the largest; this
+    // watermark never regresses when a late subgroup arrives.
+    latest: Option<SubgroupReader>,
     closed: Result<(), ServeError>,
 }
 
@@ -67,6 +72,7 @@ impl Default for SubgroupsState {
         Self {
             subgroups: VecDeque::new(),
             first_index: 0,
+            latest: None,
             closed: Ok(()),
         }
     }
@@ -126,29 +132,37 @@ impl SubgroupsWriter {
 
         let mut state = self.state.lock_mut().ok_or(ServeError::Cancel)?;
 
-        if let Some(latest) = state.subgroups.back() {
-            // TODO: Check this logic again
-            if writer.group_id.cmp(&latest.group_id) == cmp::Ordering::Equal {
-                match writer.subgroup_id.cmp(&latest.subgroup_id) {
-                    cmp::Ordering::Less => return Ok(writer), // dropped immediately, lul
-                    cmp::Ordering::Equal => return Err(ServeError::Duplicate),
-                    cmp::Ordering::Greater => state.subgroups.push_back(reader),
-                }
-            } else if writer.group_id.cmp(&latest.group_id) == cmp::Ordering::Greater {
-                state.subgroups.push_back(reader);
-            } else {
-                return Ok(writer); // drop here as well
-            }
-        } else {
-            state.subgroups.push_back(reader);
+        // Groups and subgroups may arrive out of order (independent QUIC
+        // streams), so a re-created identity must be detected against the
+        // full retained history, not only the most recent entry.
+        if state
+            .subgroups
+            .iter()
+            .chain(state.latest.as_ref())
+            .any(|prior| prior.group_id == writer.group_id && prior.subgroup_id == writer.subgroup_id)
+        {
+            return Err(ServeError::Duplicate);
         }
+
+        // Enqueue every unique subgroup in arrival order. A late-but-unique
+        // subgroup must keep its reader: returning a writer whose reader was
+        // discarded cancels the still-unread network stream. Consumers (and
+        // any downstream delivery-timeout policy) decide a late group's fate.
+        if state
+            .latest
+            .as_ref()
+            .is_none_or(|latest| (writer.group_id, writer.subgroup_id) > (latest.group_id, latest.subgroup_id))
+        {
+            state.latest = Some(reader.clone());
+        }
+        state.subgroups.push_back(reader);
 
         while state.subgroups.len() > MAX_SUBGROUP_HISTORY {
             state.subgroups.pop_front();
             state.first_index = state.first_index.saturating_add(1);
         }
 
-        let latest = state.subgroups.back().expect("just inserted subgroup");
+        let latest = state.latest.as_ref().expect("just inserted subgroup");
         self.next_subgroup_id = latest.subgroup_id + 1;
         self.next_group_id = latest.group_id + 1;
         self.last_group_id = latest.group_id;
@@ -226,8 +240,8 @@ impl SubgroupsReader {
     pub fn latest(&self) -> Option<(u64, u64)> {
         let state = self.state.lock();
         state
-            .subgroups
-            .back()
+            .latest
+            .as_ref()
             .and_then(|group| group.latest().map(|object_id| (group.group_id, object_id)))
     }
 
@@ -771,6 +785,129 @@ mod tests {
             .unwrap()
             .expect("oldest retained subgroup missing");
         assert_eq!(first_retained.group_id, 3);
+    }
+
+    #[tokio::test]
+    async fn late_subgroup_keeps_its_reader_and_the_track_proceeds() {
+        let (track_writer, track_reader) =
+            Track::new(TrackNamespace::from_utf8_path("test"), "pc").produce();
+        let mut writer = track_writer.subgroups().unwrap();
+
+        // Upstream QUIC may deliver independent subgroup streams out of
+        // order: group 570 arrives after 571..=580, then 581 follows.
+        let arrival: Vec<u64> = std::iter::once(569)
+            .chain(571..=580)
+            .chain([570, 581])
+            .collect();
+
+        for &group_id in &arrival {
+            let mut subgroup = writer
+                .create(Subgroup {
+                    group_id,
+                    subgroup_id: 0,
+                    priority: 128,
+                })
+                .unwrap_or_else(|err| panic!("group {} rejected: {:?}", group_id, err));
+            // A late group's writer must not be cancelled by a discarded
+            // reader; its payload stays receivable.
+            subgroup
+                .write(Bytes::from(group_id.to_be_bytes().to_vec()))
+                .unwrap_or_else(|err| panic!("group {} write failed: {:?}", group_id, err));
+        }
+        drop(writer);
+
+        let mut reader = match track_reader.mode().await.unwrap() {
+            TrackReaderMode::Subgroups(reader) => reader,
+            _ => panic!("expected subgroup mode"),
+        };
+        for &group_id in &arrival {
+            let mut subgroup = reader
+                .next()
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("group {} missing", group_id));
+            assert_eq!(subgroup.group_id, group_id);
+            assert_eq!(
+                subgroup.read_next().await.unwrap().unwrap(),
+                Bytes::from(group_id.to_be_bytes().to_vec())
+            );
+        }
+        assert!(reader.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn late_subgroup_does_not_regress_the_latest_watermark() {
+        let (track_writer, track_reader) =
+            Track::new(TrackNamespace::from_utf8_path("test"), "pc").produce();
+        let mut writer = track_writer.subgroups().unwrap();
+        let reader = match track_reader.mode().await.unwrap() {
+            TrackReaderMode::Subgroups(reader) => reader,
+            _ => panic!("expected subgroup mode"),
+        };
+
+        for group_id in std::iter::once(569).chain(571..=580) {
+            let mut subgroup = writer
+                .create(Subgroup {
+                    group_id,
+                    subgroup_id: 0,
+                    priority: 128,
+                })
+                .unwrap();
+            subgroup.write(Bytes::from_static(b"x")).unwrap();
+        }
+        assert_eq!(reader.latest(), Some((580, 0)));
+
+        // The late arrival of 570 must not move the watermark backwards.
+        let mut late = writer
+            .create(Subgroup {
+                group_id: 570,
+                subgroup_id: 0,
+                priority: 128,
+            })
+            .unwrap();
+        late.write(Bytes::from_static(b"x")).unwrap();
+        assert_eq!(reader.latest(), Some((580, 0)));
+
+        // A subsequent group advances it normally.
+        let mut next = writer
+            .create(Subgroup {
+                group_id: 581,
+                subgroup_id: 0,
+                priority: 128,
+            })
+            .unwrap();
+        next.write(Bytes::from_static(b"x")).unwrap();
+        assert_eq!(reader.latest(), Some((581, 0)));
+    }
+
+    #[tokio::test]
+    async fn recreated_group_id_is_a_duplicate_below_and_at_the_watermark() {
+        let (track_writer, _track_reader) =
+            Track::new(TrackNamespace::from_utf8_path("test"), "pc").produce();
+        let mut writer = track_writer.subgroups().unwrap();
+
+        for group_id in 569..=571 {
+            writer
+                .create(Subgroup {
+                    group_id,
+                    subgroup_id: 0,
+                    priority: 128,
+                })
+                .unwrap();
+        }
+
+        for group_id in [571, 570, 569] {
+            let result = writer.create(Subgroup {
+                group_id,
+                subgroup_id: 0,
+                priority: 128,
+            });
+            assert!(
+                matches!(result, Err(ServeError::Duplicate)),
+                "re-created group {} must be a duplicate",
+                group_id
+            );
+        }
     }
 
     #[tokio::test]

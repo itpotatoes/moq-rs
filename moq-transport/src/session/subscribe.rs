@@ -334,7 +334,10 @@ impl SubscribeRecv {
             // TODO SLG - understand why both of these are needed, clock demo won't run if I comment out TrackWriteMode::Track
             TrackWriterMode::Track(track) => track.subgroups()?,
             TrackWriterMode::Subgroups(subgroups) => subgroups,
-            _ => return Err(ServeError::Mode),
+            other => {
+                self.writer = Some(other);
+                return Err(ServeError::Mode);
+            }
         };
 
         let writer = subgroups.create(serve::Subgroup {
@@ -342,11 +345,13 @@ impl SubscribeRecv {
             // When subgroup_id is not present in the header type, it implicitly means subgroup 0
             subgroup_id: header.subgroup_id.unwrap_or(0),
             priority: header.publisher_priority,
-        })?;
+        });
 
+        // Restore the track writer even when this one subgroup fails (e.g. a
+        // duplicate identity), so subsequent subgroup streams keep serving.
         self.writer = Some(subgroups.into());
 
-        Ok(writer)
+        writer
     }
 
     pub fn datagram(&mut self, datagram: data::Datagram) -> Result<(), ServeError> {
@@ -526,5 +531,72 @@ mod tests {
             subscribe.closed().await,
             Err(ServeError::Closed(code)) if code == message::PublishDoneCode::Expired as u64
         ));
+    }
+
+    #[tokio::test]
+    async fn duplicate_subgroup_leaves_later_streams_serving() {
+        let rid = crate::session::RequestId::new(0, 100, 100, 0);
+        let subscriber = crate::session::Subscriber::new(
+            crate::session::Queue::default(),
+            None,
+            rid,
+            crate::session::PendingRequests::default(),
+        );
+        let (writer, _reader) =
+            serve::Track::new(TrackNamespace::from_utf8_path("test"), "track").produce();
+        let (_subscribe, mut recv) = Subscribe::new(subscriber, 1, writer);
+
+        let header = |group_id| data::SubgroupHeader {
+            header_type: data::StreamHeaderType::SubgroupZeroId,
+            track_alias: 10,
+            group_id,
+            subgroup_id: Some(0),
+            publisher_priority: 128,
+        };
+
+        recv.subgroup(header(0)).unwrap();
+
+        // A duplicate subgroup identity is stream-local: it fails this one
+        // stream without consuming the track writer.
+        assert!(matches!(
+            recv.subgroup(header(0)),
+            Err(ServeError::Duplicate)
+        ));
+
+        // The subscription keeps serving subsequent subgroup streams.
+        recv.subgroup(header(1)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn mode_mismatch_preserves_the_track_writer() {
+        let rid = crate::session::RequestId::new(0, 100, 100, 0);
+        let subscriber = crate::session::Subscriber::new(
+            crate::session::Queue::default(),
+            None,
+            rid,
+            crate::session::PendingRequests::default(),
+        );
+        let (writer, _reader) =
+            serve::Track::new(TrackNamespace::from_utf8_path("test"), "track").produce();
+        let (_subscribe, mut recv) = Subscribe::new(subscriber, 1, writer);
+
+        let datagrams = match recv.writer.take().unwrap() {
+            TrackWriterMode::Track(track) => track.datagrams().unwrap(),
+            _ => unreachable!("fresh subscription starts in track mode"),
+        };
+        recv.writer = Some(datagrams.into());
+
+        let header = || data::SubgroupHeader {
+            header_type: data::StreamHeaderType::SubgroupZeroId,
+            track_alias: 10,
+            group_id: 0,
+            subgroup_id: Some(0),
+            publisher_priority: 128,
+        };
+
+        // A mode mismatch is stream-local: it must not consume the writer,
+        // so a second stream sees Mode again instead of fatal Done.
+        assert!(matches!(recv.subgroup(header()), Err(ServeError::Mode)));
+        assert!(matches!(recv.subgroup(header()), Err(ServeError::Mode)));
     }
 }

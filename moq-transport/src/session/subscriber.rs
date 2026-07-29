@@ -30,6 +30,32 @@ use super::{
 // Default timeout for waiting for subscribe aliases to become available via SUBSCRIBE_OK (1 second)
 const DEFAULT_ALIAS_WAIT_TIME_MS: u64 = 1000;
 
+/// Classify a serve-layer error raised while receiving one subgroup stream.
+///
+/// Stream-local conditions — a duplicate or late subgroup identity, an
+/// unknown/already-removed subscription, a wrong mode or size, or a closed
+/// subgroup — must end only that stream's task; other streams of the track
+/// keep serving. Only errors meaning the local consumer of the whole track is
+/// gone (`Cancel`: all readers dropped; `Done`: track writer already closed)
+/// or an internal invariant failure justify tearing down the subscription,
+/// which sends UNSUBSCRIBE for the entire track.
+fn serve_error_is_stream_local(err: &ServeError) -> bool {
+    match err {
+        ServeError::Duplicate
+        | ServeError::NotFound
+        | ServeError::NotFoundWithId(..)
+        | ServeError::Mode
+        | ServeError::Size
+        | ServeError::Closed(_)
+        | ServeError::NotImplemented(_)
+        | ServeError::NotImplementedWithId(..) => true,
+        ServeError::Cancel
+        | ServeError::Done
+        | ServeError::Internal(_)
+        | ServeError::InternalWithId(..) => false,
+    }
+}
+
 // TODO remove Clone.
 #[derive(Clone)]
 pub struct Subscriber {
@@ -982,6 +1008,17 @@ impl Subscriber {
             .recv_stream_inner(reader, stream_header.header_type, subgroup_header, mlog)
             .await;
         if let Err(SessionError::Serve(err)) = &res {
+            // An error scoped to this one subgroup stream must not tear down
+            // the subscription: terminate only this stream's task.
+            if serve_error_is_stream_local(err) {
+                tracing::warn!(
+                    "[SUBSCRIBER] recv_stream: stream-local error for track_alias={}: {:?}; subscription kept",
+                    track_alias,
+                    err
+                );
+                return Ok(());
+            }
+
             tracing::warn!(
                 "[SUBSCRIBER] recv_stream: stream processing error for track_alias={}: {:?}",
                 track_alias,
@@ -1412,6 +1449,26 @@ mod tests {
             params: Default::default(),
             track_extensions: Default::default(),
         }
+    }
+
+    #[test]
+    fn serve_error_classification_isolates_stream_local_errors() {
+        // Stream-local: terminate only the one subgroup stream's task.
+        assert!(serve_error_is_stream_local(&ServeError::Duplicate));
+        assert!(serve_error_is_stream_local(&ServeError::NotFound));
+        assert!(serve_error_is_stream_local(&ServeError::not_found_ctx(
+            "subscribe_id=1 not found".to_string()
+        )));
+        assert!(serve_error_is_stream_local(&ServeError::Mode));
+        assert!(serve_error_is_stream_local(&ServeError::Size));
+        assert!(serve_error_is_stream_local(&ServeError::Closed(0x2)));
+
+        // Consumer gone or invariant failure: the subscription is torn down.
+        assert!(!serve_error_is_stream_local(&ServeError::Cancel));
+        assert!(!serve_error_is_stream_local(&ServeError::Done));
+        assert!(!serve_error_is_stream_local(&ServeError::internal_ctx(
+            "invariant".to_string()
+        )));
     }
 
     #[tokio::test]

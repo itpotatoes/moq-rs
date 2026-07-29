@@ -307,17 +307,22 @@ impl PublishReceivedRecv {
         let mut subgroups = match writer {
             TrackWriterMode::Track(track) => track.subgroups()?,
             TrackWriterMode::Subgroups(subgroups) => subgroups,
-            _ => return Err(ServeError::Mode),
+            other => {
+                self.writer = Some(other);
+                return Err(ServeError::Mode);
+            }
         };
 
         let subgroup_writer = subgroups.create(serve::Subgroup {
             group_id: header.group_id,
             subgroup_id: header.subgroup_id.unwrap_or(0),
             priority: header.publisher_priority,
-        })?;
+        });
 
+        // Restore the track writer even when this one subgroup fails (e.g. a
+        // duplicate identity), so subsequent subgroup streams keep serving.
         self.writer = Some(subgroups.into());
-        Ok(subgroup_writer)
+        subgroup_writer
     }
 
     /// Write a datagram Object into the track.
