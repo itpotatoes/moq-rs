@@ -67,6 +67,19 @@ pub enum Transport {
 
 const DEFAULT_MAX_REQUEST_ID: u64 = 100;
 
+/// Send priority applied to the MoQT control stream on both the client
+/// (`open_bi`) and server (`accept_bi`) paths.
+///
+/// quinn schedules send streams strictly by descending `i32` priority with no
+/// anti-starvation, and data subgroup streams are assigned
+/// `publisher_priority as i32` (a `u8`, so at most 255; see
+/// `subscribed.rs`). Without an explicit priority the control stream stays at
+/// quinn's default of 0, so a sustained data backlog can starve tiny control
+/// frames (e.g. SUBSCRIBE_OK) indefinitely. `i32::MAX` guarantees control
+/// frames always preempt data subgroups while leaving the relative ordering
+/// *between* data streams untouched.
+pub(crate) const CONTROL_STREAM_PRIORITY: i32 = i32::MAX;
+
 /// Session-level protocol limits advertised during setup.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct SessionConfig {
@@ -531,8 +544,12 @@ impl Session {
         });
 
         let control = session.open_bi().await?;
-        let mut sender = Writer::new(control.0);
-        let mut recver = Reader::new(control.1);
+        let (mut control_send, control_recv) = control;
+        // Keep control messages ahead of any data-stream backlog; see
+        // CONTROL_STREAM_PRIORITY. Data subgroup priorities are untouched.
+        control_send.set_priority(CONTROL_STREAM_PRIORITY);
+        let mut sender = Writer::new(control_send);
+        let mut recver = Reader::new(control_recv);
 
         let mut params = KeyValuePairs::default();
 
@@ -627,8 +644,12 @@ impl Session {
         });
 
         let control = session.accept_bi().await?;
-        let mut sender = Writer::new(control.0);
-        let mut recver = Reader::new(control.1);
+        let (mut control_send, control_recv) = control;
+        // Keep control messages ahead of any data-stream backlog; see
+        // CONTROL_STREAM_PRIORITY. Data subgroup priorities are untouched.
+        control_send.set_priority(CONTROL_STREAM_PRIORITY);
+        let mut sender = Writer::new(control_send);
+        let mut recver = Reader::new(control_recv);
 
         let client: setup::Client = recver.decode().await?;
         tracing::debug!(
@@ -1100,6 +1121,24 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ========================================================================
+    // control-stream priority
+    // ========================================================================
+
+    /// The generic `web_transport::SendStream` exposes `set_priority` but no
+    /// `priority()` getter, and constructing a real stream requires a live
+    /// QUIC session, so the applied value cannot be read back at unit level.
+    /// This constant-level assertion pins the invariant instead: the control
+    /// stream must strictly dominate every possible data subgroup priority
+    /// (`publisher_priority as i32`, a `u8`, so <= 255 — see
+    /// `subscribed.rs::serve_subgroup`). Live verification path: quinn qlog /
+    /// mlog control-message latency under saturated data backlog.
+    #[test]
+    fn control_stream_priority_dominates_all_data_priorities() {
+        assert_eq!(CONTROL_STREAM_PRIORITY, i32::MAX);
+        assert!(CONTROL_STREAM_PRIORITY > u8::MAX as i32);
+    }
 
     // ========================================================================
     // normalize_connection_path
