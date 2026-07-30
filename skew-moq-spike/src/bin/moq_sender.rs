@@ -122,6 +122,8 @@ enum Arm {
     S1,
     M1,
     S2,
+    #[value(name = "s2eq")]
+    S2Eq,
     S3,
 }
 
@@ -132,12 +134,13 @@ impl Arm {
             Self::S1 => "s1",
             Self::M1 => "m1",
             Self::S2 => "s2",
+            Self::S2Eq => "s2eq",
             Self::S3 => "s3",
         }
     }
 
     fn pc_frame_subgroups(self) -> bool {
-        matches!(self, Self::M1 | Self::S2 | Self::S3)
+        matches!(self, Self::M1 | Self::S2 | Self::S2Eq | Self::S3)
     }
 
     fn pc_priority(self) -> u8 {
@@ -264,11 +267,12 @@ fn phase4_transport(args: &Args) -> Result<Option<Phase4TransportMeta>> {
                 pc_subgroup_mapping: "frame-per-subgroup",
                 pc_publisher_priority: 128,
                 haptic_publisher_priority: 128,
+                publisher_priority_profile: "equal-128",
                 data_priority_mapping: args.data_priority_mapping.as_str(),
                 pc_delivery_timeout_ms: None,
             }))
         }
-        Arm::S2 | Arm::S3 => {
+        Arm::S2 | Arm::S2Eq | Arm::S3 => {
             let timeout = args.pc_delivery_timeout_ms.with_context(|| {
                 format!(
                     "--arm {} requires --pc-delivery-timeout-ms",
@@ -284,8 +288,13 @@ fn phase4_transport(args: &Args) -> Result<Option<Phase4TransportMeta>> {
             Ok(Some(Phase4TransportMeta {
                 arm: args.arm.as_str(),
                 pc_subgroup_mapping: "frame-per-subgroup",
-                pc_publisher_priority: 1,
-                haptic_publisher_priority: 0,
+                pc_publisher_priority: args.arm.pc_priority(),
+                haptic_publisher_priority: args.arm.haptic_priority(),
+                publisher_priority_profile: if args.arm == Arm::S2Eq {
+                    "equal-128"
+                } else {
+                    "relative-haptic0-pc1"
+                },
                 data_priority_mapping: args.data_priority_mapping.as_str(),
                 pc_delivery_timeout_ms: Some(timeout),
             }))

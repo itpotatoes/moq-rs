@@ -45,6 +45,8 @@ enum Arm {
     S1,
     M1,
     S2,
+    #[value(name = "s2eq")]
+    S2Eq,
     S3,
 }
 
@@ -55,6 +57,7 @@ impl Arm {
             Self::S1 => "s1",
             Self::M1 => "m1",
             Self::S2 => "s2",
+            Self::S2Eq => "s2eq",
             Self::S3 => "s3",
         }
     }
@@ -243,7 +246,7 @@ fn playout_config(args: &Args) -> Result<Option<PlayoutConfig>> {
                 bail!("PC delivery timeout requires --arm s2");
             }
         }
-        Arm::S2 | Arm::S3 => {
+        Arm::S2 | Arm::S2Eq | Arm::S3 => {
             let timeout = args.pc_delivery_timeout_ms.with_context(|| {
                 format!(
                     "--arm {} requires --pc-delivery-timeout-ms",
@@ -442,14 +445,20 @@ fn phase4_transport(args: &Args) -> Option<Phase4TransportMeta> {
             pc_subgroup_mapping: "frame-per-subgroup",
             pc_publisher_priority: 128,
             haptic_publisher_priority: 128,
+            publisher_priority_profile: "equal-128",
             data_priority_mapping: args.data_priority_mapping.as_str(),
             pc_delivery_timeout_ms: None,
         }),
-        Arm::S2 | Arm::S3 => Some(Phase4TransportMeta {
+        Arm::S2 | Arm::S2Eq | Arm::S3 => Some(Phase4TransportMeta {
             arm: args.arm.as_str(),
             pc_subgroup_mapping: "frame-per-subgroup",
-            pc_publisher_priority: 1,
-            haptic_publisher_priority: 0,
+            pc_publisher_priority: if args.arm == Arm::S2Eq { 128 } else { 1 },
+            haptic_publisher_priority: if args.arm == Arm::S2Eq { 128 } else { 0 },
+            publisher_priority_profile: if args.arm == Arm::S2Eq {
+                "equal-128"
+            } else {
+                "relative-haptic0-pc1"
+            },
             data_priority_mapping: args.data_priority_mapping.as_str(),
             pc_delivery_timeout_ms: args.pc_delivery_timeout_ms,
         }),
@@ -2302,7 +2311,7 @@ async fn main() -> Result<()> {
                 }
             };
             let mut params = KeyValuePairs::default();
-            if name == "pc" && args.arm == Arm::S2 {
+            if name == "pc" && matches!(args.arm, Arm::S2 | Arm::S2Eq) {
                 params.set_delivery_timeout(
                     args.pc_delivery_timeout_ms
                         .expect("S2 timeout validated before connecting"),
@@ -2667,7 +2676,8 @@ async fn main() -> Result<()> {
             let verdict = classify_ending_with_timeout(
                 &reports,
                 session_run.is_finished(),
-                args.arm == Arm::S2 && args.pc_delivery_timeout_ms.is_some(),
+                matches!(args.arm, Arm::S2 | Arm::S2Eq)
+                    && args.pc_delivery_timeout_ms.is_some(),
             );
             reports_out = reports;
             verdict
@@ -3343,6 +3353,15 @@ mod rx_ending_tests {
         assert_eq!(s2.pc_publisher_priority, 1);
         assert_eq!(s2.haptic_publisher_priority, 0);
         assert_eq!(s2.pc_delivery_timeout_ms, Some(67));
+
+        args.arm = Arm::S2Eq;
+        let s2eq = phase4_transport(&args).unwrap();
+        assert!(playout_config(&args).is_ok());
+        assert_eq!(s2eq.arm, "s2eq");
+        assert_eq!(s2eq.pc_publisher_priority, 128);
+        assert_eq!(s2eq.haptic_publisher_priority, 128);
+        assert_eq!(s2eq.publisher_priority_profile, "equal-128");
+        assert_eq!(s2eq.pc_delivery_timeout_ms, Some(67));
 
         args.pc_delivery_timeout_ms = Some(0);
         assert!(playout_config(&args).is_err(), "timeout zero is invalid");
