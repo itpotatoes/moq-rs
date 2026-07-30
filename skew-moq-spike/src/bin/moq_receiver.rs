@@ -20,7 +20,7 @@ use moq_transport::{
     coding::{KeyValuePairs, TrackNamespace},
     message::SubscriptionFilter,
     serve::{Track, TrackReader, TrackReaderMode, Tracks},
-    session::{Session, Subscribe, Subscriber},
+    session::{DataPriorityMapping, Session, SessionConfig, Subscribe, Subscriber},
 };
 use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
@@ -95,6 +95,10 @@ struct Args {
     loss_pct: f64,
     #[arg(long, default_value_t = 0)]
     seed: u64,
+    /// Local translation from MoQT publisher priority to quinn stream
+    /// priority. Kept explicit so bridge runs cannot silently mix v1/v2.
+    #[arg(long, default_value = "legacy-v1")]
+    data_priority_mapping: DataPriorityMapping,
     #[arg(long, default_value_t = 30)]
     fps: u64,
     #[arg(long, default_value_t = 100)]
@@ -438,6 +442,7 @@ fn phase4_transport(args: &Args) -> Option<Phase4TransportMeta> {
             pc_subgroup_mapping: "frame-per-subgroup",
             pc_publisher_priority: 128,
             haptic_publisher_priority: 128,
+            data_priority_mapping: args.data_priority_mapping.as_str(),
             pc_delivery_timeout_ms: None,
         }),
         Arm::S2 | Arm::S3 => Some(Phase4TransportMeta {
@@ -445,6 +450,7 @@ fn phase4_transport(args: &Args) -> Option<Phase4TransportMeta> {
             pc_subgroup_mapping: "frame-per-subgroup",
             pc_publisher_priority: 1,
             haptic_publisher_priority: 0,
+            data_priority_mapping: args.data_priority_mapping.as_str(),
             pc_delivery_timeout_ms: args.pc_delivery_timeout_ms,
         }),
     }
@@ -1476,9 +1482,17 @@ async fn run_s3_receiver(
 
     let (session, _publisher, mut subscriber) = {
         let (webtransport, transport) = connect(&args.relay).await.context("connect S3 relay")?;
-        Session::connect(webtransport, None, transport)
-            .await
-            .context("S3 SETUP")?
+        Session::connect_with_config(
+            webtransport,
+            None,
+            transport,
+            SessionConfig {
+                data_priority_mapping: args.data_priority_mapping,
+                ..SessionConfig::default()
+            },
+        )
+        .await
+        .context("S3 SETUP")?
     };
     let mut session_run = tokio::spawn(session.run());
     let namespace = TrackNamespace::from_utf8_path(&args.run_id);
@@ -2236,8 +2250,17 @@ async fn main() -> Result<()> {
     }
 
     let (sess, tp) = connect(&args.relay).await.context("connect relay")?;
-    let (session, _pub, mut subscriber) =
-        Session::connect(sess, None, tp).await.context("SETUP")?;
+    let (session, _pub, mut subscriber) = Session::connect_with_config(
+        sess,
+        None,
+        tp,
+        SessionConfig {
+            data_priority_mapping: args.data_priority_mapping,
+            ..SessionConfig::default()
+        },
+    )
+    .await
+    .context("SETUP")?;
     let mut session_run = tokio::spawn(session.run());
 
     let namespace = TrackNamespace::from_utf8_path(&args.run_id);
@@ -2939,6 +2962,7 @@ mod rx_ending_tests {
             jitter_ms: 0.0,
             loss_pct: 0.0,
             seed: 0,
+            data_priority_mapping: DataPriorityMapping::LegacyV1,
             fps: 30,
             haptic_hz: 100,
             max_duration: 10.0,
@@ -3196,6 +3220,7 @@ mod rx_ending_tests {
             jitter_ms: 0.0,
             loss_pct: 0.0,
             seed: 0,
+            data_priority_mapping: DataPriorityMapping::LegacyV1,
             fps: 30,
             haptic_hz: 100,
             max_duration: 10.0,
@@ -3264,6 +3289,7 @@ mod rx_ending_tests {
             jitter_ms: 0.0,
             loss_pct: 0.0,
             seed: 0,
+            data_priority_mapping: DataPriorityMapping::LegacyV1,
             fps: 30,
             haptic_hz: 100,
             max_duration: 10.0,

@@ -80,7 +80,10 @@ mod tests {
 
     #[test]
     fn new_with_session_config_stores_custom_config() {
-        let config = SessionConfig { max_request_id: 7 };
+        let config = SessionConfig {
+            max_request_id: 7,
+            ..SessionConfig::default()
+        };
         let manager =
             RemoteManager::new_with_session_config(Arc::new(NoopCoordinator), vec![], config);
 

@@ -491,6 +491,7 @@ mod tests {
                 pc_subgroup_mapping: "frame-per-subgroup",
                 pc_publisher_priority: 128,
                 haptic_publisher_priority: 128,
+                data_priority_mapping: "legacy-v1",
                 pc_delivery_timeout_ms: Some(67),
             }),
         )

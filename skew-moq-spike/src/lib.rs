@@ -180,6 +180,7 @@ pub struct Phase4TransportMeta {
     pub pc_subgroup_mapping: &'static str,
     pub pc_publisher_priority: u8,
     pub haptic_publisher_priority: u8,
+    pub data_priority_mapping: &'static str,
     pub pc_delivery_timeout_ms: Option<u64>,
 }
 
@@ -265,11 +266,12 @@ impl JsonlLogger {
         };
         let phase4_transport = match phase4_transport {
             Some(t) => format!(
-                ",\"arm\":\"{}\",\"pc_subgroup_mapping\":\"{}\",\"pc_publisher_priority\":{},\"haptic_publisher_priority\":{},\"pc_delivery_timeout_ms\":{}",
+                ",\"arm\":\"{}\",\"pc_subgroup_mapping\":\"{}\",\"pc_publisher_priority\":{},\"haptic_publisher_priority\":{},\"data_priority_mapping\":\"{}\",\"pc_delivery_timeout_ms\":{}",
                 esc(t.arm),
                 esc(t.pc_subgroup_mapping),
                 t.pc_publisher_priority,
                 t.haptic_publisher_priority,
+                esc(t.data_priority_mapping),
                 t.pc_delivery_timeout_ms
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "null".to_string()),
@@ -616,6 +618,7 @@ mod phase4_jsonl_tests {
                     pc_subgroup_mapping: "frame-per-subgroup",
                     pc_publisher_priority: 128,
                     haptic_publisher_priority: 128,
+                    data_priority_mapping: "legacy-v1",
                     pc_delivery_timeout_ms: None,
                 }),
             )
@@ -627,6 +630,7 @@ mod phase4_jsonl_tests {
             "\"pc_subgroup_mapping\":\"frame-per-subgroup\"",
             "\"pc_publisher_priority\":128",
             "\"haptic_publisher_priority\":128",
+            "\"data_priority_mapping\":\"legacy-v1\"",
             "\"pc_delivery_timeout_ms\":null",
             "\"playout_clock\":\"receiver_monotonic_us\"",
         ] {

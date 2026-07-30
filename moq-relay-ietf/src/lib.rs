@@ -48,7 +48,7 @@ pub use api::*;
 pub use consumer::*;
 pub use coordinator::*;
 pub use local::*;
-pub use moq_transport::session::SessionConfig;
+pub use moq_transport::session::{DataPriorityMapping, SessionConfig};
 pub use producer::*;
 pub use relay::*;
 pub use remote::RemoteManager;

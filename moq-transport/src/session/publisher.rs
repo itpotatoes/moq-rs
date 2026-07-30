@@ -19,9 +19,10 @@ use crate::{
 use crate::watch::Queue;
 
 use super::{
-    split_published_state, ObjectForwarderRecv, PendingRequest, PendingRequests, PublishNamespace,
-    PublishNamespaceRecv, Published, PublishedInfo, PublishedRecv, RequestId, RequestIdAllocation,
-    Session, SessionConfig, SessionError, Subscribed, TrackStatusRequested,
+    split_published_state, DataPriorityMapping, ObjectForwarderRecv, PendingRequest,
+    PendingRequests, PublishNamespace, PublishNamespaceRecv, Published, PublishedInfo,
+    PublishedRecv, RequestId, RequestIdAllocation, Session, SessionConfig, SessionError,
+    Subscribed, TrackStatusRequested,
 };
 use crate::message::RequestErrorCode;
 
@@ -127,6 +128,9 @@ pub struct Publisher {
 
     /// Optional mlog writer for logging transport events
     mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+
+    /// Local mapping from MoQT publisher priority to quinn stream priority.
+    data_priority_mapping: DataPriorityMapping,
 }
 
 impl Publisher {
@@ -136,6 +140,7 @@ impl Publisher {
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
         request_id: RequestId,
         pending_requests: PendingRequests,
+        data_priority_mapping: DataPriorityMapping,
     ) -> Self {
         Self {
             webtransport,
@@ -150,7 +155,12 @@ impl Publisher {
             request_id,
             pending_requests,
             mlog,
+            data_priority_mapping,
         }
+    }
+
+    pub(super) fn data_priority_mapping(&self) -> DataPriorityMapping {
+        self.data_priority_mapping
     }
 
     pub async fn accept(

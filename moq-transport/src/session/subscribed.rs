@@ -520,8 +520,15 @@ impl ObjectForwarder {
             .ok_or(ServeError::Done)?
             .record_stream_opened();
 
-        // TODO figure out u32 vs u64 priority
-        send_stream.set_priority(subgroup_reader.priority as i32);
+        let mapping = publisher.data_priority_mapping();
+        let quinn_priority = mapping.to_quinn(subgroup_reader.priority);
+        tracing::trace!(
+            publisher_priority = subgroup_reader.priority,
+            quinn_priority,
+            data_priority_mapping = mapping.as_str(),
+            "mapped MoQT publisher priority to quinn send-stream priority"
+        );
+        send_stream.set_priority(quinn_priority);
 
         let mut output = SubgroupOutput::Stream(Writer::new(send_stream));
         Self::serve_subgroup_objects(

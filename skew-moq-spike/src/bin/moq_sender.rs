@@ -19,7 +19,11 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use clap::Parser;
 use moq_native_ietf::{quic, tls};
-use moq_transport::{coding::TrackNamespace, serve::Tracks, session::Session};
+use moq_transport::{
+    coding::TrackNamespace,
+    serve::Tracks,
+    session::{DataPriorityMapping, Session, SessionConfig},
+};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::time::{sleep_until, Instant};
 use url::Url;
@@ -206,6 +210,11 @@ struct Args {
     loss_pct: f64,
     #[arg(long, default_value_t = 0)]
     seed: u64,
+    /// Local translation from MoQT publisher priority to quinn stream
+    /// priority. legacy-v1 reproduces existing evidence; moqt-v2 implements
+    /// MoQT's lower-number-first semantics.
+    #[arg(long, default_value = "legacy-v1")]
+    data_priority_mapping: DataPriorityMapping,
     /// A2 instrumentation: emit role:"accept" records. These carry the time at
     /// which the QUIC stack accepted the object's last payload byte — a
     /// transport-accept time, not an on-the-wire time.
@@ -255,6 +264,7 @@ fn phase4_transport(args: &Args) -> Result<Option<Phase4TransportMeta>> {
                 pc_subgroup_mapping: "frame-per-subgroup",
                 pc_publisher_priority: 128,
                 haptic_publisher_priority: 128,
+                data_priority_mapping: args.data_priority_mapping.as_str(),
                 pc_delivery_timeout_ms: None,
             }))
         }
@@ -276,6 +286,7 @@ fn phase4_transport(args: &Args) -> Result<Option<Phase4TransportMeta>> {
                 pc_subgroup_mapping: "frame-per-subgroup",
                 pc_publisher_priority: 1,
                 haptic_publisher_priority: 0,
+                data_priority_mapping: args.data_priority_mapping.as_str(),
                 pc_delivery_timeout_ms: Some(timeout),
             }))
         }
@@ -510,8 +521,13 @@ async fn main() -> Result<()> {
     let outcome: Result<()> = async {
         // ---- MoQ session ----
         let (sess, tp) = connect(&args.relay).await.context("connect relay")?;
-        let (session, mut publisher, _sub) =
-            Session::connect(sess, None, tp).await.context("SETUP")?;
+        let config = SessionConfig {
+            data_priority_mapping: args.data_priority_mapping,
+            ..SessionConfig::default()
+        };
+        let (session, mut publisher, _sub) = Session::connect_with_config(sess, None, tp, config)
+            .await
+            .context("SETUP")?;
 
         // Register each task with the finalizer *immediately* after spawning it.
         // Registering both only after the track setup left a window in which a
