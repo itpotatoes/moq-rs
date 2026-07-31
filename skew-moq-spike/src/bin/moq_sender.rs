@@ -285,6 +285,10 @@ fn preflight_info(p: Preflight) -> String {
     )
 }
 
+fn registered_s_bytes(frame_mean: f64) -> u64 {
+    frame_mean.round() as u64
+}
+
 fn json_f64(value: f64) -> String {
     if value.is_finite() {
         format!("{value:.9}")
@@ -325,8 +329,8 @@ async fn main() -> Result<()> {
         (None, None) => anyhow::bail!("need --frames-dir or --dummy-size"),
     };
     let pcm = load_haptic_pcm(&args.haptic_wav)?;
-    let s_bytes = frames[0].len() as u64;
     let pf = preflight(&frames, &args);
+    let s_bytes = registered_s_bytes(pf.frame_mean);
     let frames = Arc::new(frames);
     let pcm = Arc::new(pcm);
     let haptic_src = std::path::Path::new(&args.haptic_wav)
@@ -795,4 +799,15 @@ async fn main() -> Result<()> {
         std::process::exit(EXIT_FINALIZE_FAILED);
     }
     outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::registered_s_bytes;
+
+    #[test]
+    fn registered_s_bytes_is_rounded_workload_mean() {
+        assert_eq!(registered_s_bytes(457_294.6), 457_295);
+        assert_ne!(registered_s_bytes(457_294.6), 452_040);
+    }
 }
