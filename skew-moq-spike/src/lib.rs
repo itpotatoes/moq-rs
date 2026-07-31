@@ -323,6 +323,7 @@ impl LogicalReassembler {
             self.pending_bytes = self.pending_bytes.saturating_sub(pending.stored_bytes);
             self.stats.incomplete_frames += 1;
         }
+        self.insertion_order.retain(|candidate| candidate != key);
     }
 
     fn evict_oldest(&mut self) -> bool {
@@ -440,6 +441,7 @@ impl LogicalReassembler {
         }
 
         let pending = self.pending.remove(&key).expect("complete pending frame");
+        self.insertion_order.retain(|candidate| candidate != &key);
         self.pending_bytes = self.pending_bytes.saturating_sub(pending.stored_bytes);
         let mut payload = Vec::with_capacity(pending.stored_bytes);
         for idx in 0..pending.chunk_total {
@@ -993,6 +995,23 @@ mod phase1_v5_tests {
         assert!(r.feed(header(3, objects[1].len()), &objects[1], 2).is_err());
         assert_eq!(r.stats.invalid_chunks, 1);
         assert_eq!(r.stats.incomplete_frames, 1);
+    }
+
+    #[test]
+    fn completed_frames_do_not_accumulate_order_metadata() {
+        let object = equal_chunks(&vec![5; 100], 0, 178).unwrap();
+        let mut r = LogicalReassembler::new(178, 2, 4096, 1_000_000).unwrap();
+        for logical_id in 0_u32..100 {
+            let mut one = object[0].clone();
+            one[4..8].copy_from_slice(&logical_id.to_le_bytes());
+            let completed = r
+                .feed(header(logical_id, one.len()), &one, logical_id as u64)
+                .unwrap();
+            assert!(completed.is_some());
+        }
+        assert_eq!(r.pending_frames(), 0);
+        assert_eq!(r.pending_bytes(), 0);
+        assert!(r.insertion_order.is_empty());
     }
 
     #[test]
