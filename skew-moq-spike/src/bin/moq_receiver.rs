@@ -66,10 +66,20 @@ struct Args {
     loss_pct: f64,
     #[arg(long, default_value_t = 0)]
     seed: u64,
-    #[arg(long, default_value_t = 30)]
-    fps: u64,
-    #[arg(long, default_value_t = 100)]
-    haptic_hz: u64,
+    #[arg(long)]
+    pc_rate_hz: u64,
+    #[arg(long)]
+    haptic_rate_hz: u64,
+    #[arg(long, value_enum)]
+    payload_mode: PayloadMode,
+    #[arg(long)]
+    chunk_bytes: usize,
+    #[arg(long)]
+    reassembly_max_pending_frames: usize,
+    #[arg(long)]
+    reassembly_max_pending_bytes: usize,
+    #[arg(long)]
+    reassembly_max_age_ms: u64,
     #[arg(long, default_value_t = 180.0)]
     max_duration: f64,
     /// Stage A: render received pc frames via the Python bridge (same pipeline as B0).
@@ -361,7 +371,11 @@ fn expected_for(name: &str, args: &Args) -> Option<u64> {
     if !args.tracks.enabled(name) {
         return Some(0);
     }
-    let rate = if name == "pc" { args.fps } else { args.haptic_hz };
+    let rate = if name == "pc" {
+        args.pc_rate_hz
+    } else {
+        args.haptic_rate_hz
+    };
     Some((d * rate as f64).round() as u64)
 }
 
@@ -640,11 +654,20 @@ async fn main() -> Result<()> {
         )
         .init();
     let args = Args::parse();
+    validate_v5_rates(args.pc_rate_hz, args.haptic_rate_hz)?;
+    anyhow::ensure!(args.chunk_bytes > 0, "--chunk-bytes must be positive");
+    anyhow::ensure!(
+        args.reassembly_max_pending_frames > 0
+            && args.reassembly_max_pending_bytes > 0
+            && args.reassembly_max_age_ms > 0,
+        "all reassembly bounds must be positive"
+    );
     let s1_config = playout_config(&args)?;
 
     let logger = Arc::new(Mutex::new(JsonlLogger::new(
         &args.out, &args.run_id, "moq", "rx", args.c_mbps, args.rtt_ms,
-        args.jitter_ms, args.loss_pct, args.s_bytes, args.fps, args.haptic_hz, args.seed,
+        args.jitter_ms, args.loss_pct, args.s_bytes, args.pc_rate_hz,
+        args.haptic_rate_hz, args.seed,
         // duration_s = None **유지**: rx meta에 duration_s를 넣으면 분석기의
         // 설계 분모 출처(`_design`이 rx_meta.duration_s도 읽음)로 흡수되어
         // 기대 프레임 분모의 provenance가 바뀐다. 분모는 tx meta/CLI 주입만
@@ -654,6 +677,11 @@ async fn main() -> Result<()> {
         // term_protocol: 종료 프로토콜 세대 마커(Codex 7차 P0 — tx 소실 +
         // shutdown 결손 조합이 구세대로 오인되는 우회를 rx meta 자체로 차단).
         None, None, Some(args.tracks.as_str()), Some(TERM_PROTOCOL_V), s1_config,
+        Some(V5Meta {
+            log_schema_version: 2,
+            payload_mode: args.payload_mode,
+            chunk_bytes: args.chunk_bytes,
+        }),
     )?));
 
     let (sess, tp) = connect(&args.relay).await.context("connect relay")?;
@@ -791,6 +819,10 @@ async fn main() -> Result<()> {
 
     // Drain each track: parse header, log rx, (optionally) forward for render/audio.
     let counts: Vec<Arc<AtomicU64>> = names.iter().map(|_| Arc::new(AtomicU64::new(0))).collect();
+    let wire_stats: Vec<Arc<Mutex<ReassemblyStats>>> = names
+        .iter()
+        .map(|_| Arc::new(Mutex::new(ReassemblyStats::default())))
+        .collect();
     // Header-integrity counters (R3b). A mismatch means the rx log cannot be
     // trusted as a measurement, so it is counted, recorded, and exits non-zero.
     let bad_headers = Arc::new(AtomicU64::new(0));
@@ -803,11 +835,31 @@ async fn main() -> Result<()> {
         let s1_tx = s1_tx.clone();
         let ingress_drops = ingress_drops.clone();
         let ingress_log_failed = ingress_log_failed.clone();
+        let wire_stats_out = wire_stats[idx].clone();
+        let payload_mode = args.payload_mode;
+        let chunk_bytes = args.chunk_bytes;
+        let reassembly_max_pending_frames = args.reassembly_max_pending_frames;
+        let reassembly_max_pending_bytes = args.reassembly_max_pending_bytes;
+        let reassembly_max_age_us = args.reassembly_max_age_ms.saturating_mul(1_000);
         let fwd = (name == "pc" && args.render) || (name == "haptic" && args.audio);
         drains.push(tokio::spawn(async move {
+            let mut reassembler = if payload_mode == PayloadMode::EqualChunk {
+                match LogicalReassembler::new(
+                    chunk_bytes,
+                    reassembly_max_pending_frames,
+                    reassembly_max_pending_bytes,
+                    reassembly_max_age_us,
+                ) {
+                    Ok(value) => Some(value),
+                    Err(e) => return (name, TrackEnd::Failed, format!("{e:#}")),
+                }
+            } else {
+                None
+            };
+            let mut frame_stats = ReassemblyStats::default();
             // Inner future yields the raw ServeError so the ending can be
             // classified before the error is erased.
-            let inner = async move {
+            let inner = async {
             let mut subgroups = match received_track.mode().await? {
                 TrackReaderMode::Subgroups(s) => s,
                 _ => return Err(DrainFail::NonSubgroup),
@@ -842,6 +894,32 @@ async fn main() -> Result<()> {
                         bad.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
+                    let (h, logical_obj) = if let Some(r) = reassembler.as_mut() {
+                        let complete = match r.feed(h, &obj[HDR..], t) {
+                            Ok(value) => value,
+                            Err(e) => {
+                                eprintln!("[rx] {name}: invalid equal-chunk object: {e:#}");
+                                bad.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                        };
+                        let Some(complete) = complete else {
+                            continue;
+                        };
+                        let h = complete.header;
+                        let packed = pack_header(
+                            h.track_id, h.tier, h.seq, h.pts_us, h.event_id,
+                            h.gen_ts_us, h.payload_len,
+                        );
+                        let mut logical = Vec::with_capacity(HDR + complete.payload.len());
+                        logical.extend_from_slice(&packed);
+                        logical.extend_from_slice(&complete.payload);
+                        (h, Bytes::from(logical))
+                    } else {
+                        frame_stats.chunks_received += 1;
+                        frame_stats.frames_completed += 1;
+                        (h, obj.clone())
+                    };
                     logger.lock().unwrap().log_rx(
                         track, h.tier, h.seq, h.pts_us, h.event_id, h.payload_len, t, t, h.gen_ts_us,
                     );
@@ -850,7 +928,7 @@ async fn main() -> Result<()> {
                         let scheduled = PlayoutObject {
                             header: h,
                             t_recv: t,
-                            bytes: obj.clone(),
+                            bytes: logical_obj.clone(),
                         };
                         match tx.try_send(scheduled) {
                             Ok(()) => {}
@@ -881,7 +959,7 @@ async fn main() -> Result<()> {
                         }
                     } else if fwd {
                         if let Some(tx) = &ftx {
-                            let _ = tx.try_send(obj.clone()); // drop-on-full (latest-wins-ish)
+                            let _ = tx.try_send(logical_obj); // drop-on-full (latest-wins-ish)
                         }
                     }
                 }
@@ -890,7 +968,14 @@ async fn main() -> Result<()> {
             };
             // Reader exhausted cleanly == FIN. Otherwise classify the error;
             // only `Done` is a FIN, `Cancel`/`Closed` stay ambiguous.
-            match inner.await {
+            let result = inner.await;
+            if let Some(r) = reassembler.as_mut() {
+                r.finish();
+                *wire_stats_out.lock().unwrap() = r.stats.clone();
+            } else {
+                *wire_stats_out.lock().unwrap() = frame_stats;
+            }
+            match result {
                 Ok(()) => (name, TrackEnd::Fin, String::new()),
                 Err(DrainFail::Serve(e)) => (name, classify_track_end(&e), format!("{e}")),
                 Err(DrainFail::NonSubgroup) => (name, TrackEnd::Failed, "non-subgroup delivery".into()),
@@ -972,6 +1057,8 @@ async fn main() -> Result<()> {
 
     let n_pc = counts[0].load(Ordering::Relaxed);
     let n_hap = counts[1].load(Ordering::Relaxed);
+    let pc_wire = wire_stats[0].lock().unwrap().clone();
+    let hap_wire = wire_stats[1].lock().unwrap().clone();
 
     let mut reports_out: Vec<DrainReport> = Vec::new();
     let (ending, detail) = match drained {
@@ -1045,7 +1132,15 @@ async fn main() -> Result<()> {
         };
         if lg
             .try_log_info(&format!(
-                "\"recv_pc\":{n_pc},\"recv_haptic\":{n_hap},\"bad_headers\":{n_bad},\"s1_released\":{},\"s1_dropped\":{},\"s1_ingress_dropped\":{},\"s1_bridge_observer_dropped\":{}",
+                "\"recv_pc\":{n_pc},\"recv_haptic\":{n_hap},\"bad_headers\":{n_bad},\"pc_chunks_received\":{},\"haptic_chunks_received\":{},\"frames_completed\":{},\"incomplete_frames\":{},\"duplicate_chunks\":{},\"invalid_chunks\":{},\"reassembly_peak_frames\":{},\"reassembly_peak_bytes\":{},\"s1_released\":{},\"s1_dropped\":{},\"s1_ingress_dropped\":{},\"s1_bridge_observer_dropped\":{}",
+                pc_wire.chunks_received,
+                hap_wire.chunks_received,
+                pc_wire.frames_completed + hap_wire.frames_completed,
+                pc_wire.incomplete_frames + hap_wire.incomplete_frames,
+                pc_wire.duplicate_chunks + hap_wire.duplicate_chunks,
+                pc_wire.invalid_chunks + hap_wire.invalid_chunks,
+                pc_wire.peak_frames.max(hap_wire.peak_frames),
+                pc_wire.peak_bytes.max(hap_wire.peak_bytes),
                 s1_stats.released,
                 s1_stats.dropped,
                 ingress_drops.load(Ordering::Relaxed),
@@ -1282,8 +1377,13 @@ mod rx_ending_tests {
             jitter_ms: 0.0,
             loss_pct: 0.0,
             seed: 0,
-            fps: 30,
-            haptic_hz: 100,
+            pc_rate_hz: 30,
+            haptic_rate_hz: 90,
+            payload_mode: PayloadMode::Frame,
+            chunk_bytes: 178,
+            reassembly_max_pending_frames: 64,
+            reassembly_max_pending_bytes: 64 * 1024 * 1024,
+            reassembly_max_age_ms: 2_000,
             max_duration: 10.0,
             render: false,
             audio: false,
@@ -1304,7 +1404,7 @@ mod rx_ending_tests {
 
         let a = base(RxTrackSel::Both, Some(60.0));
         assert_eq!(expected_for("pc", &a), Some(1800));
-        assert_eq!(expected_for("haptic", &a), Some(6000));
+        assert_eq!(expected_for("haptic", &a), Some(5400));
 
         let a = base(RxTrackSel::Pc, Some(60.0));
         assert_eq!(expected_for("pc", &a), Some(1800));
@@ -1312,7 +1412,7 @@ mod rx_ending_tests {
 
         let a = base(RxTrackSel::Haptic, Some(60.0));
         assert_eq!(expected_for("pc", &a), Some(0));
-        assert_eq!(expected_for("haptic", &a), Some(6000));
+        assert_eq!(expected_for("haptic", &a), Some(5400));
 
         let a = base(RxTrackSel::Both, None);
         assert_eq!(expected_for("pc", &a), None, "no duration => unprovable");
@@ -1492,8 +1592,13 @@ mod rx_ending_tests {
             jitter_ms: 0.0,
             loss_pct: 0.0,
             seed: 0,
-            fps: 30,
-            haptic_hz: 100,
+            pc_rate_hz: 30,
+            haptic_rate_hz: 90,
+            payload_mode: PayloadMode::Frame,
+            chunk_bytes: 178,
+            reassembly_max_pending_frames: 64,
+            reassembly_max_pending_bytes: 64 * 1024 * 1024,
+            reassembly_max_age_ms: 2_000,
             max_duration: 10.0,
             render: false,
             audio: false,

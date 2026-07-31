@@ -2,14 +2,14 @@
 //
 // One QUIC connection to a relay carries TWO tracks (pc, haptic) as independent
 // subgroup streams. NO priority, NO delivery timeout, NO playout timeline — the
-// naive baseline. PC runs a 30fps loop over pre-loaded tier .bin frames; haptic
-// runs a 100Hz loop over MPEG-I test-signal PCM with the snap pairing rule.
-// tx JSONL is byte-schema-identical to webrtc_sender.py.
+// naive baseline. The v5 generation uses PC 30 Hz and haptic 90 Hz with exact
+// 1:3 rational-time anchors. `frame` sends one MoQ object per logical item;
+// `equal-chunk` sends fixed-size objects and keeps logical JSONL rows.
 //
 // Namespace == run_id, so concurrent/repeat runs never collide on the relay.
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -141,8 +141,22 @@ struct Args {
     tier: u16,
     #[arg(long)]
     haptic_wav: String,
-    #[arg(long, default_value_t = 30)]
-    fps: u64,
+    #[arg(long)]
+    pc_rate_hz: u64,
+    #[arg(long)]
+    haptic_rate_hz: u64,
+    #[arg(long, value_enum)]
+    payload_mode: PayloadMode,
+    #[arg(long)]
+    chunk_bytes: usize,
+    /// Read workloads, report object-rate/overhead estimates, and exit without
+    /// changing external network state.
+    #[arg(long)]
+    preflight_only: bool,
+    /// Equal-chunk debug only: permit per-object accept records. Disabled in
+    /// formal runs because tens of thousands of rows/s can dominate timing.
+    #[arg(long)]
+    chunk_trace: bool,
     /// Delay before workload starts so the subscriber can attach.
     #[arg(long, default_value_t = 1.0)]
     warmup: f64,
@@ -174,6 +188,111 @@ struct Args {
     tracks: TrackSel,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct TrackRunStats {
+    logical_generated: u64,
+    chunks_sent: u64,
+    source_payload_bytes: u64,
+    padding_bytes: u64,
+    period: PeriodStats,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Preflight {
+    frame_min: usize,
+    frame_mean: f64,
+    frame_max: usize,
+    chunks_min: usize,
+    chunks_mean: f64,
+    chunks_max: usize,
+    pc_objects_per_s: f64,
+    haptic_objects_per_s: f64,
+    source_payload_mbps: f64,
+    application_object_mbps: f64,
+    header_bytes_per_s: f64,
+    header_overhead_ratio: f64,
+}
+
+fn preflight(frames: &[Vec<u8>], args: &Args) -> Preflight {
+    let mut sizes: Vec<usize> = frames.iter().map(Vec::len).collect();
+    sizes.sort_unstable();
+    let frame_sum: usize = sizes.iter().sum();
+    let frame_mean = frame_sum as f64 / sizes.len() as f64;
+    let chunks: Vec<usize> = sizes
+        .iter()
+        .map(|&size| match args.payload_mode {
+            PayloadMode::Frame => 1,
+            PayloadMode::EqualChunk => size.div_ceil(args.chunk_bytes).max(1),
+        })
+        .collect();
+    let chunks_sum: usize = chunks.iter().sum();
+    let chunks_mean = chunks_sum as f64 / chunks.len() as f64;
+    let pc_objects_per_s = chunks_mean * args.pc_rate_hz as f64;
+    let haptic_objects_per_s = args.haptic_rate_hz as f64;
+    let source_haptic_bytes_per_s =
+        PCM_SAMPLE_RATE_HZ as f64 * PCM_BYTES_PER_SAMPLE as f64;
+    let source_payload_bytes_per_s =
+        frame_mean * args.pc_rate_hz as f64 + source_haptic_bytes_per_s;
+    let application_bytes_per_s = match args.payload_mode {
+        PayloadMode::Frame => {
+            source_payload_bytes_per_s
+                + (pc_objects_per_s + haptic_objects_per_s) * HDR as f64
+        }
+        PayloadMode::EqualChunk => {
+            (pc_objects_per_s + haptic_objects_per_s)
+                * (HDR + CHUNK_HDR + args.chunk_bytes) as f64
+        }
+    };
+    let header_bytes_per_s = match args.payload_mode {
+        PayloadMode::Frame => (pc_objects_per_s + haptic_objects_per_s) * HDR as f64,
+        PayloadMode::EqualChunk => {
+            (pc_objects_per_s + haptic_objects_per_s) * (HDR + CHUNK_HDR) as f64
+        }
+    };
+    Preflight {
+        frame_min: *sizes.first().unwrap(),
+        frame_mean,
+        frame_max: *sizes.last().unwrap(),
+        chunks_min: *chunks.iter().min().unwrap(),
+        chunks_mean,
+        chunks_max: *chunks.iter().max().unwrap(),
+        pc_objects_per_s,
+        haptic_objects_per_s,
+        source_payload_mbps: source_payload_bytes_per_s * 8.0 / 1e6,
+        application_object_mbps: application_bytes_per_s * 8.0 / 1e6,
+        header_bytes_per_s,
+        header_overhead_ratio: header_bytes_per_s / application_bytes_per_s,
+    }
+}
+
+fn preflight_info(p: Preflight) -> String {
+    format!(
+        "\"event\":\"preflight\",\"frame_bytes_min\":{},\"frame_bytes_mean\":{:.3},\"frame_bytes_max\":{},\"chunks_per_frame_min\":{},\"chunks_per_frame_mean\":{:.3},\"chunks_per_frame_max\":{},\"pc_objects_per_s\":{:.3},\"haptic_objects_per_s\":{:.3},\"total_objects_per_s\":{:.3},\"source_payload_mbps\":{:.6},\"application_object_mbps\":{:.6},\"header_bytes_per_s\":{:.3},\"header_overhead_ratio\":{:.9},\"throughput_warning\":{}",
+        p.frame_min,
+        p.frame_mean,
+        p.frame_max,
+        p.chunks_min,
+        p.chunks_mean,
+        p.chunks_max,
+        p.pc_objects_per_s,
+        p.haptic_objects_per_s,
+        p.pc_objects_per_s + p.haptic_objects_per_s,
+        p.source_payload_mbps,
+        p.application_object_mbps,
+        p.header_bytes_per_s,
+        p.header_overhead_ratio,
+        p.pc_objects_per_s >= 50_000.0,
+    )
+}
+
+fn json_f64(value: f64) -> String {
+    if value.is_finite() {
+        format!("{value:.9}")
+    } else {
+        "null".to_string()
+    }
+}
+
 async fn connect(relay: &Url) -> Result<(web_transport::Session, moq_transport::session::Transport)> {
     let tls_args = tls::Args { disable_verify: true, ..Default::default() };
     let tls = tls_args.load()?;
@@ -192,6 +311,12 @@ async fn main() -> Result<()> {
         )
         .init();
     let args = Args::parse();
+    let ratio = validate_v5_rates(args.pc_rate_hz, args.haptic_rate_hz)?;
+    anyhow::ensure!(args.chunk_bytes > 0, "--chunk-bytes must be positive");
+    anyhow::ensure!(
+        args.chunk_bytes <= u32::MAX as usize,
+        "--chunk-bytes exceeds the wire field"
+    );
 
     // ---- Workload ----
     let frames: Vec<Vec<u8>> = match (&args.frames_dir, args.dummy_size) {
@@ -200,24 +325,45 @@ async fn main() -> Result<()> {
         (None, None) => anyhow::bail!("need --frames-dir or --dummy-size"),
     };
     let pcm = load_haptic_pcm(&args.haptic_wav)?;
-    let tick_bytes = HAPTIC_SAMPLES_PER_TICK * 2; // 160B
-    let n_ticks_in_pcm = (pcm.len() / tick_bytes).max(1) as u64;
     let s_bytes = frames[0].len() as u64;
+    let pf = preflight(&frames, &args);
     let frames = Arc::new(frames);
     let pcm = Arc::new(pcm);
     let haptic_src = std::path::Path::new(&args.haptic_wav)
         .file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
 
-    println!("[tx] frames={} S={}B haptic={}B ({} ticks) tracks={} -> {}",
-        frames.len(), s_bytes, pcm.len(), n_ticks_in_pcm, args.tracks.as_str(),
-        args.out.display());
+    println!(
+        "[tx] frames={} S={}B haptic={}B pc={}Hz haptic={}Hz mode={} chunk={}B tracks={} -> {}",
+        frames.len(), s_bytes, pcm.len(), args.pc_rate_hz, args.haptic_rate_hz,
+        args.payload_mode.as_str(), args.chunk_bytes, args.tracks.as_str(),
+        args.out.display()
+    );
+    println!(
+        "[tx] preflight mean_frame={:.1}B mean_chunks={:.1} pc_objects/s={:.1} app={:.3}Mbps warning={}",
+        pf.frame_mean, pf.chunks_mean, pf.pc_objects_per_s,
+        pf.application_object_mbps, pf.pc_objects_per_s >= 50_000.0
+    );
 
     let logger = Arc::new(Mutex::new(JsonlLogger::new(
         &args.out, &args.run_id, "moq", "tx", args.c_mbps, args.rtt_ms,
-        args.jitter_ms, args.loss_pct, s_bytes, args.fps, 100, args.seed,
+        args.jitter_ms, args.loss_pct, s_bytes, args.pc_rate_hz,
+        args.haptic_rate_hz, args.seed,
         Some(args.duration), Some(&haptic_src), Some(args.tracks.as_str()),
         Some(TERM_PROTOCOL_V), None,
+        Some(V5Meta {
+            log_schema_version: 2,
+            payload_mode: args.payload_mode,
+            chunk_bytes: args.chunk_bytes,
+        }),
     )?));
+    logger.lock().unwrap().log_info(&preflight_info(pf));
+    if args.preflight_only {
+        logger.lock().unwrap().try_log_info(
+            "\"event\":\"shutdown\",\"ending\":\"preflight_only\",\"exit_code\":0"
+        )?;
+        println!("[tx] preflight-only complete -> {}", args.out.display());
+        return Ok(());
+    }
 
     // ---- A2 transport-accept tap ----
     // Installed before the session exists so no object can be forwarded before
@@ -228,7 +374,9 @@ async fn main() -> Result<()> {
     // a transport-accept time, not an on-the-wire time. It follows send
     // backpressure under congestion and degenerates to a handoff time
     // otherwise.
-    let accept_trace = if args.accept_trace {
+    let accept_trace_enabled = args.accept_trace
+        && (args.payload_mode == PayloadMode::Frame || args.chunk_trace);
+    let accept_trace = if accept_trace_enabled {
         Some(AcceptTrace::install(args.accept_trace_capacity, logger.clone())?)
     } else {
         None
@@ -251,8 +399,8 @@ async fn main() -> Result<()> {
 
     // Everything below feeds the single finalizer at the end of `main`.
     let mut producers: Option<Producers> = None;
-    let mut n_pc: u64 = 0;
-    let mut n_hap: u64 = 0;
+    let mut pc_stats = TrackRunStats::default();
+    let mut hap_stats = TrackRunStats::default();
     let mut ending = Ending::Normal;
 
     // Fallible section. It must not use `?` to leave `main` — errors are
@@ -290,41 +438,74 @@ async fn main() -> Result<()> {
         let anchor = Instant::now();
         let end = anchor + Duration::from_secs_f64(args.duration);
 
-    // ---- PC loop: 30 fps ----
+    // ---- PC loop: rational PC Hz ----
     // The whole subgroups chain lives in the task, so it fully drops when the
     // loop ends — closing the track so the subscriber sees end-of-track.
     let pc_task = if args.tracks.pc_on() {
         let frames = frames.clone();
         let logger = logger.clone();
-        let fps = args.fps;
+        let pc_rate_hz = args.pc_rate_hz;
         let tier = args.tier;
+        let payload_mode = args.payload_mode;
+        let chunk_bytes = args.chunk_bytes;
         let mut pc_sub = pc_tw.subgroups().context("pc subgroups")?;
         let mut sg = pc_sub.append(128).context("pc append")?;
         Some(tokio::spawn(async move {
             let mut i: u64 = 0;
+            let mut stats = TrackRunStats::default();
             while Instant::now() < end {
-                let pts = frame_pts_us(i, fps);
+                sleep_until(anchor + Duration::from_nanos(deadline_ns(i, pc_rate_hz))).await;
+                if Instant::now() >= end {
+                    break;
+                }
+                let pts = timestamp_us(i, pc_rate_hz);
                 let payload = &frames[(i as usize) % frames.len()];
                 let t_gen = now_us();
-                let hdr = pack_header(TRACK_PC, tier, i as u32, pts, (i + 1) as u32, t_gen, payload.len() as u32);
-                let mut buf = Vec::with_capacity(HDR + payload.len());
-                buf.extend_from_slice(&hdr);
-                buf.extend_from_slice(payload);
-                // Same work as SubgroupWriter::write, but the object identity is
-                // observable so the tx record can carry the wire join key.
-                let (gid, sgid) = (sg.group_id, sg.subgroup_id);
-                let mut obj = sg.create(buf.len(), None).context("pc create")?;
-                let oid = obj.object_id;
-                obj.write(Bytes::from(buf)).context("pc write")?;
-                drop(obj);
+                stats.period.observe(t_gen);
+                let object_payloads: Vec<Cow<'_, [u8]>> = match payload_mode {
+                    PayloadMode::Frame => vec![Cow::Borrowed(payload.as_slice())],
+                    PayloadMode::EqualChunk => {
+                        equal_chunks(payload, i as u32, chunk_bytes)?
+                            .into_iter()
+                            .map(Cow::Owned)
+                            .collect()
+                    }
+                };
+                let mut frame_obj = None;
+                for object_payload in &object_payloads {
+                    let hdr = pack_header(
+                        TRACK_PC, tier, i as u32, pts, (i + 1) as u32, t_gen,
+                        object_payload.len() as u32,
+                    );
+                    let mut buf = Vec::with_capacity(HDR + object_payload.len());
+                    buf.extend_from_slice(&hdr);
+                    buf.extend_from_slice(object_payload.as_ref());
+                    let (gid, sgid) = (sg.group_id, sg.subgroup_id);
+                    let mut obj = sg.create(buf.len(), None).context("pc create")?;
+                    let oid = obj.object_id;
+                    obj.write(Bytes::from(buf)).context("pc write")?;
+                    drop(obj);
+                    if payload_mode == PayloadMode::Frame {
+                        frame_obj = Some((gid, sgid, oid));
+                    }
+                }
                 let t_send = now_us();
-                logger.lock().unwrap().log_tx("pc", tier, i as u32, pts, (i + 1) as u32, payload.len(), t_gen, t_send, Some((gid, sgid, oid)));
+                logger.lock().unwrap().log_tx(
+                    "pc", tier, i as u32, pts, (i + 1) as u32,
+                    payload.len(), t_gen, t_send, frame_obj,
+                );
+                stats.logical_generated += 1;
+                stats.chunks_sent += object_payloads.len() as u64;
+                stats.source_payload_bytes += payload.len() as u64;
+                if payload_mode == PayloadMode::EqualChunk {
+                    stats.padding_bytes +=
+                        (object_payloads.len() * chunk_bytes - payload.len()) as u64;
+                }
                 i += 1;
-                sleep_until(anchor + Duration::from_secs_f64(i as f64 / fps as f64)).await;
             }
             drop(sg);
             drop(pc_sub); // close pc track -> subscriber end-of-track
-            Ok::<u64, anyhow::Error>(i)
+            Ok::<TrackRunStats, anyhow::Error>(stats)
         }))
     } else {
         // C3 haptic-only: never call `append`, so no subgroup stream and no
@@ -335,50 +516,79 @@ async fn main() -> Result<()> {
         None
     };
 
-    // ---- Haptic loop: 100 Hz with snap pairing ----
+    // ---- Haptic loop: rational 90 Hz with exact 3:1 anchors ----
     let hap_task = if args.tracks.haptic_on() {
         let pcm = pcm.clone();
         let logger = logger.clone();
-        let fps = args.fps;
-        let duration = args.duration;
+        let pc_rate_hz = args.pc_rate_hz;
+        let haptic_rate_hz = args.haptic_rate_hz;
+        let payload_mode = args.payload_mode;
+        let chunk_bytes = args.chunk_bytes;
         let mut hap_sub = hap_tw.subgroups().context("haptic subgroups")?;
         let mut sg = hap_sub.append(128).context("haptic append")?;
-        // Precompute snap map: tick index -> frame index (period 33.3ms > 10ms tick).
-        let n_frames_max = (duration * fps as f64) as u64 + fps;
-        let mut snap_map: HashMap<u64, u64> = HashMap::new();
-        for fi in 0..n_frames_max {
-            snap_map.insert(snap_tick(fi, fps), fi);
-        }
         Some(tokio::spawn(async move {
             let mut k: u64 = 0;
+            let mut stats = TrackRunStats::default();
             while Instant::now() < end {
-                let (pts, event_id) = if let Some(&fi) = snap_map.get(&k) {
-                    // Align send to the pts instant (removes structural offset).
-                    let pts = frame_pts_us(fi, fps);
-                    sleep_until(anchor + Duration::from_secs_f64(pts as f64 / 1e6)).await;
+                sleep_until(
+                    anchor + Duration::from_nanos(deadline_ns(k, haptic_rate_hz))
+                ).await;
+                if Instant::now() >= end {
+                    break;
+                }
+                let (pts, event_id) = if k % ratio == 0 {
+                    let fi = k / ratio;
+                    let pts = timestamp_us(fi, pc_rate_hz);
                     (pts, (fi + 1) as u32)
                 } else {
-                    (k * HAPTIC_TICK_US, 0u32)
+                    (timestamp_us(k, haptic_rate_hz), 0u32)
                 };
-                let off = ((k % n_ticks_in_pcm) as usize) * tick_bytes;
-                let payload = &pcm[off..(off + tick_bytes).min(pcm.len())];
+                let payload = pcm_tick_payload(
+                    &pcm, k, PCM_SAMPLE_RATE_HZ, haptic_rate_hz
+                )?;
                 let t_gen = now_us();
-                let hdr = pack_header(TRACK_HAPTIC, HAPTIC_TIER_FULL, k as u32, pts, event_id, t_gen, payload.len() as u32);
-                let mut buf = Vec::with_capacity(HDR + payload.len());
-                buf.extend_from_slice(&hdr);
-                buf.extend_from_slice(payload);
-                let (gid, sgid) = (sg.group_id, sg.subgroup_id);
-                let mut obj = sg.create(buf.len(), None).context("haptic create")?;
-                let oid = obj.object_id;
-                obj.write(Bytes::from(buf)).context("haptic write")?;
-                drop(obj);
-                logger.lock().unwrap().log_tx("haptic", HAPTIC_TIER_FULL, k as u32, pts, event_id, payload.len(), t_gen, now_us(), Some((gid, sgid, oid)));
+                stats.period.observe(t_gen);
+                let object_payloads: Vec<Cow<'_, [u8]>> = match payload_mode {
+                    PayloadMode::Frame => vec![Cow::Borrowed(payload.as_slice())],
+                    PayloadMode::EqualChunk => equal_chunks(&payload, k as u32, chunk_bytes)?
+                        .into_iter()
+                        .map(Cow::Owned)
+                        .collect(),
+                };
+                let mut frame_obj = None;
+                for object_payload in &object_payloads {
+                    let hdr = pack_header(
+                        TRACK_HAPTIC, HAPTIC_TIER_FULL, k as u32, pts, event_id,
+                        t_gen, object_payload.len() as u32,
+                    );
+                    let mut buf = Vec::with_capacity(HDR + object_payload.len());
+                    buf.extend_from_slice(&hdr);
+                    buf.extend_from_slice(object_payload.as_ref());
+                    let (gid, sgid) = (sg.group_id, sg.subgroup_id);
+                    let mut obj = sg.create(buf.len(), None).context("haptic create")?;
+                    let oid = obj.object_id;
+                    obj.write(Bytes::from(buf)).context("haptic write")?;
+                    drop(obj);
+                    if payload_mode == PayloadMode::Frame {
+                        frame_obj = Some((gid, sgid, oid));
+                    }
+                }
+                logger.lock().unwrap().log_tx(
+                    "haptic", HAPTIC_TIER_FULL, k as u32, pts, event_id,
+                    payload.len(), t_gen, now_us(), frame_obj,
+                );
+                stats.logical_generated += 1;
+                stats.chunks_sent += object_payloads.len() as u64;
+                stats.source_payload_bytes += payload.len() as u64;
+                if payload_mode == PayloadMode::EqualChunk {
+                    stats.padding_bytes +=
+                        (object_payloads.len() * chunk_bytes - payload.len()) as u64;
+                }
                 k += 1;
-                sleep_until(anchor + Duration::from_secs_f64(k as f64 * 0.01)).await;
             }
             drop(sg);
             drop(hap_sub); // close haptic track
-            Ok::<u64, anyhow::Error>(k)
+            Ok::<TrackRunStats, anyhow::Error>(stats)
         }))
     } else {
         // C3 pc-only: see the pc branch above — zero haptic objects on the
@@ -402,11 +612,17 @@ async fn main() -> Result<()> {
             let mut ns_done: Option<JoinOutcome> = None;
             let outcome = tokio::select! {
                 r = async {
-                    let n_pc = match pc_task { Some(h) => h.await??, None => 0 };
-                    let n_hap = match hap_task { Some(h) => h.await??, None => 0 };
-                    Ok::<_, anyhow::Error>((n_pc, n_hap))
+                    let pc = match pc_task {
+                        Some(h) => h.await??,
+                        None => TrackRunStats::default(),
+                    };
+                    let haptic = match hap_task {
+                        Some(h) => h.await??,
+                        None => TrackRunStats::default(),
+                    };
+                    Ok::<_, anyhow::Error>((pc, haptic))
                 } => match r {
-                    Ok((a, b)) => { n_pc = a; n_hap = b; Ok(()) }
+                    Ok((a, b)) => { pc_stats = a; hap_stats = b; Ok(()) }
                     Err(e) => Err(e),
                 },
                 _ = wait_signal(&mut sig_rx) => { ending = Ending::Signal; Ok(()) }
@@ -434,7 +650,11 @@ async fn main() -> Result<()> {
         if ending == Ending::Signal {
             return Ok(());
         }
-        println!("[tx] sent pc={n_pc} haptic={n_hap}; draining {}s", args.drain_timeout);
+        println!(
+            "[tx] sent pc={} haptic={} chunks={}/{}; draining {}s",
+            pc_stats.logical_generated, hap_stats.logical_generated,
+            pc_stats.chunks_sent, hap_stats.chunks_sent, args.drain_timeout
+        );
 
         // Keep the session up so the relay forwards the backlog to the
         // subscriber — but let a signal cut the wait short, which is exactly
@@ -500,7 +720,27 @@ async fn main() -> Result<()> {
             }
         }
         if lg
-            .try_log_info(&format!("\"sent_pc\":{n_pc},\"sent_haptic\":{n_hap}"))
+            .try_log_info(&format!(
+                "\"sent_pc\":{},\"sent_haptic\":{},\"pc_frames_generated\":{},\"pc_chunks_sent\":{},\"haptic_ticks_generated\":{},\"haptic_chunks_sent\":{},\"chunk_payload_bytes\":{},\"chunk_padding_bytes\":{},\"chunk_objects_per_s\":{:.6},\"pc_achieved_rate_hz\":{},\"haptic_achieved_rate_hz\":{},\"pc_period_mean_ms\":{},\"pc_period_std_ms\":{},\"haptic_period_mean_ms\":{},\"haptic_period_std_ms\":{},\"accept_trace_requested\":{},\"accept_trace_enabled\":{},\"chunk_trace\":{}",
+                pc_stats.logical_generated,
+                hap_stats.logical_generated,
+                pc_stats.logical_generated,
+                pc_stats.chunks_sent,
+                hap_stats.logical_generated,
+                hap_stats.chunks_sent,
+                pc_stats.source_payload_bytes + hap_stats.source_payload_bytes,
+                pc_stats.padding_bytes + hap_stats.padding_bytes,
+                (pc_stats.chunks_sent + hap_stats.chunks_sent) as f64 / args.duration,
+                json_f64(pc_stats.period.achieved_rate_hz()),
+                json_f64(hap_stats.period.achieved_rate_hz()),
+                json_f64(pc_stats.period.mean_ms()),
+                json_f64(pc_stats.period.std_ms()),
+                json_f64(hap_stats.period.mean_ms()),
+                json_f64(hap_stats.period.std_ms()),
+                args.accept_trace,
+                accept_trace_enabled,
+                args.chunk_trace,
+            ))
             .is_err()
         {
             record_io_failed = true;

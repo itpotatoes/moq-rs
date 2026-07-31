@@ -6,6 +6,7 @@
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 pub mod playout;
 
@@ -13,9 +14,18 @@ pub const HDR: usize = 32;
 pub const VERSION: u8 = 1;
 pub const TRACK_PC: u8 = 0;
 pub const TRACK_HAPTIC: u8 = 1;
+/// Historical v4 period. New v5 code must use `timestamp_us`/`deadline_ns`.
 pub const HAPTIC_TICK_US: u64 = 10_000; // 100 Hz
+/// Historical v4 fixed PCM slice. v5 uses `pcm_sample_bounds`.
 pub const HAPTIC_SAMPLES_PER_TICK: usize = 80; // 8kHz * 10ms
 pub const HAPTIC_TIER_FULL: u16 = 0;
+pub const PC_RATE_HZ_V5: u64 = 30;
+pub const HAPTIC_RATE_HZ_V5: u64 = 90;
+pub const PCM_SAMPLE_RATE_HZ: u64 = 8_000;
+pub const PCM_BYTES_PER_SAMPLE: usize = 2;
+pub const DEFAULT_CHUNK_BYTES: usize = 178;
+pub const CHUNK_HDR: usize = 20;
+pub const CHUNK_VERSION: u8 = 1;
 /// 종료 프로토콜 세대. meta의 `term_protocol`로 기록되어, 분석기가 TX/RX
 /// shutdown 정확히 1개를 무조건 요구하는 근거가 된다. 프로토콜 의미가
 /// 바뀌면 올린다(1 = shutdown 레코드 각 1개 + exit_code/ending 기록).
@@ -50,6 +60,167 @@ pub fn snap_tick(frame_idx: u64, fps: u64) -> u64 {
     frame_pts_us(frame_idx, fps) / HAPTIC_TICK_US
 }
 
+/// v5 rational PTS: floor(index * 1e6 / rate). The u128 intermediate avoids
+/// overflow during long-running tests.
+pub fn timestamp_us(index: u64, rate_hz: u64) -> u64 {
+    assert!(rate_hz > 0, "rate_hz must be positive");
+    ((index as u128 * 1_000_000u128) / rate_hz as u128) as u64
+}
+
+/// v5 absolute monotonic deadline offset: floor(index * 1e9 / rate).
+pub fn deadline_ns(index: u64, rate_hz: u64) -> u64 {
+    assert!(rate_hz > 0, "rate_hz must be positive");
+    ((index as u128 * 1_000_000_000u128) / rate_hz as u128) as u64
+}
+
+pub fn validate_v5_rates(pc_rate_hz: u64, haptic_rate_hz: u64) -> anyhow::Result<u64> {
+    anyhow::ensure!(pc_rate_hz > 0, "pc_rate_hz must be positive");
+    anyhow::ensure!(haptic_rate_hz > 0, "haptic_rate_hz must be positive");
+    anyhow::ensure!(
+        haptic_rate_hz % pc_rate_hz == 0,
+        "haptic_rate_hz must be an integer multiple of pc_rate_hz"
+    );
+    let ratio = haptic_rate_hz / pc_rate_hz;
+    anyhow::ensure!(ratio == 3, "v5 requires exact PC:haptic rate ratio 1:3");
+    Ok(ratio)
+}
+
+pub fn anchor_tick(
+    frame_idx: u64,
+    pc_rate_hz: u64,
+    haptic_rate_hz: u64,
+) -> anyhow::Result<u64> {
+    Ok(frame_idx * validate_v5_rates(pc_rate_hz, haptic_rate_hz)?)
+}
+
+pub fn nearest_tolerance_us(haptic_rate_hz: u64) -> u64 {
+    assert!(haptic_rate_hz > 0, "haptic_rate_hz must be positive");
+    (1_000_000 + 2 * haptic_rate_hz - 1) / (2 * haptic_rate_hz)
+}
+
+pub fn pcm_sample_bounds(tick_idx: u64, sample_rate_hz: u64, haptic_rate_hz: u64) -> (u64, u64) {
+    assert!(sample_rate_hz > 0 && haptic_rate_hz > 0);
+    (
+        ((tick_idx as u128 * sample_rate_hz as u128) / haptic_rate_hz as u128) as u64,
+        (((tick_idx + 1) as u128 * sample_rate_hz as u128) / haptic_rate_hz as u128) as u64,
+    )
+}
+
+/// Copy one rational-rate tick from cyclic PCM without changing the source
+/// timebase. The source must contain whole 16-bit samples.
+pub fn pcm_tick_payload(
+    pcm: &[u8],
+    tick_idx: u64,
+    sample_rate_hz: u64,
+    haptic_rate_hz: u64,
+) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(
+        !pcm.is_empty() && pcm.len() % PCM_BYTES_PER_SAMPLE == 0,
+        "PCM must contain whole 16-bit samples"
+    );
+    let total_samples = pcm.len() / PCM_BYTES_PER_SAMPLE;
+    let (start, end) = pcm_sample_bounds(tick_idx, sample_rate_hz, haptic_rate_hz);
+    let mut out = Vec::with_capacity((end - start) as usize * PCM_BYTES_PER_SAMPLE);
+    for absolute in start..end {
+        let sample = absolute as usize % total_samples;
+        let off = sample * PCM_BYTES_PER_SAMPLE;
+        out.extend_from_slice(&pcm[off..off + PCM_BYTES_PER_SAMPLE]);
+    }
+    Ok(out)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum PayloadMode {
+    #[value(name = "frame")]
+    Frame,
+    #[value(name = "equal_chunk", alias = "equal-chunk")]
+    EqualChunk,
+}
+
+impl PayloadMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Frame => "frame",
+            Self::EqualChunk => "equal_chunk",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkEnvelope {
+    pub version: u8,
+    pub flags: u8,
+    pub reserved: u16,
+    pub logical_id: u32,
+    pub chunk_idx: u32,
+    pub chunk_total: u32,
+    pub valid_bytes: u32,
+}
+
+impl ChunkEnvelope {
+    pub fn pack(self) -> anyhow::Result<[u8; CHUNK_HDR]> {
+        anyhow::ensure!(self.version == CHUNK_VERSION, "unsupported chunk version");
+        anyhow::ensure!(self.flags == 0 && self.reserved == 0, "unsupported chunk flags");
+        anyhow::ensure!(self.chunk_total > 0, "chunk_total must be positive");
+        anyhow::ensure!(self.chunk_idx < self.chunk_total, "chunk_idx out of range");
+        let mut b = [0u8; CHUNK_HDR];
+        b[0] = self.version;
+        b[1] = self.flags;
+        b[2..4].copy_from_slice(&self.reserved.to_le_bytes());
+        b[4..8].copy_from_slice(&self.logical_id.to_le_bytes());
+        b[8..12].copy_from_slice(&self.chunk_idx.to_le_bytes());
+        b[12..16].copy_from_slice(&self.chunk_total.to_le_bytes());
+        b[16..20].copy_from_slice(&self.valid_bytes.to_le_bytes());
+        Ok(b)
+    }
+
+    pub fn unpack(buf: &[u8]) -> anyhow::Result<Self> {
+        anyhow::ensure!(buf.len() >= CHUNK_HDR, "chunk envelope is shorter than {CHUNK_HDR}B");
+        let out = Self {
+            version: buf[0],
+            flags: buf[1],
+            reserved: u16::from_le_bytes(buf[2..4].try_into().unwrap()),
+            logical_id: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+            chunk_idx: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+            chunk_total: u32::from_le_bytes(buf[12..16].try_into().unwrap()),
+            valid_bytes: u32::from_le_bytes(buf[16..20].try_into().unwrap()),
+        };
+        anyhow::ensure!(out.version == CHUNK_VERSION, "unsupported chunk version");
+        anyhow::ensure!(out.flags == 0 && out.reserved == 0, "unsupported chunk flags");
+        anyhow::ensure!(out.chunk_total > 0, "chunk_total must be positive");
+        anyhow::ensure!(out.chunk_idx < out.chunk_total, "chunk_idx out of range");
+        Ok(out)
+    }
+}
+
+/// Build fixed-size v5 object payloads (20B envelope + padded chunk).
+pub fn equal_chunks(payload: &[u8], logical_id: u32, chunk_bytes: usize) -> anyhow::Result<Vec<Vec<u8>>> {
+    anyhow::ensure!(chunk_bytes > 0, "chunk_bytes must be positive");
+    let total = payload.len().div_ceil(chunk_bytes).max(1);
+    anyhow::ensure!(total <= u32::MAX as usize, "too many chunks");
+    let mut out = Vec::with_capacity(total);
+    for idx in 0..total {
+        let start = idx * chunk_bytes;
+        let end = (start + chunk_bytes).min(payload.len());
+        let part = &payload[start..end];
+        let env = ChunkEnvelope {
+            version: CHUNK_VERSION,
+            flags: 0,
+            reserved: 0,
+            logical_id,
+            chunk_idx: idx as u32,
+            chunk_total: total as u32,
+            valid_bytes: part.len() as u32,
+        };
+        let mut object = Vec::with_capacity(CHUNK_HDR + chunk_bytes);
+        object.extend_from_slice(&env.pack()?);
+        object.extend_from_slice(part);
+        object.resize(CHUNK_HDR + chunk_bytes, 0);
+        out.push(object);
+    }
+    Ok(out)
+}
+
 /// Pack the 32B header: version, track_id, tier, seq, pts_us, event_id,
 /// gen_ts_us, payload_len (little-endian, no padding).
 pub fn pack_header(
@@ -73,7 +244,7 @@ pub fn pack_header(
     b
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
     pub version: u8,
     pub track_id: u8,
@@ -83,6 +254,273 @@ pub struct Header {
     pub event_id: u32,
     pub gen_ts_us: u64,
     pub payload_len: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ReassemblyStats {
+    pub chunks_received: u64,
+    pub frames_completed: u64,
+    pub incomplete_frames: u64,
+    pub duplicate_chunks: u64,
+    pub invalid_chunks: u64,
+    pub peak_frames: usize,
+    pub peak_bytes: usize,
+}
+
+#[derive(Debug)]
+struct PendingLogical {
+    header: Header,
+    chunk_total: u32,
+    last_us: u64,
+    chunks: BTreeMap<u32, Vec<u8>>,
+    stored_bytes: usize,
+}
+
+#[derive(Debug)]
+pub struct CompletedLogical {
+    pub header: Header,
+    pub payload: Vec<u8>,
+}
+
+/// Bounded equal-chunk reassembler. Capacity eviction and FIN disposal are
+/// counted as incomplete logical frames rather than silently forgotten.
+pub struct LogicalReassembler {
+    chunk_bytes: usize,
+    max_pending_frames: usize,
+    max_pending_bytes: usize,
+    max_age_us: u64,
+    pending: HashMap<(u8, u32), PendingLogical>,
+    insertion_order: VecDeque<(u8, u32)>,
+    pending_bytes: usize,
+    pub stats: ReassemblyStats,
+}
+
+impl LogicalReassembler {
+    pub fn new(
+        chunk_bytes: usize,
+        max_pending_frames: usize,
+        max_pending_bytes: usize,
+        max_age_us: u64,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(chunk_bytes > 0, "chunk_bytes must be positive");
+        anyhow::ensure!(max_pending_frames > 0, "max_pending_frames must be positive");
+        anyhow::ensure!(max_pending_bytes > 0, "max_pending_bytes must be positive");
+        anyhow::ensure!(max_age_us > 0, "max_age_us must be positive");
+        Ok(Self {
+            chunk_bytes,
+            max_pending_frames,
+            max_pending_bytes,
+            max_age_us,
+            pending: HashMap::new(),
+            insertion_order: VecDeque::new(),
+            pending_bytes: 0,
+            stats: ReassemblyStats::default(),
+        })
+    }
+
+    fn remove_incomplete(&mut self, key: &(u8, u32)) {
+        if let Some(pending) = self.pending.remove(key) {
+            self.pending_bytes = self.pending_bytes.saturating_sub(pending.stored_bytes);
+            self.stats.incomplete_frames += 1;
+        }
+    }
+
+    fn evict_oldest(&mut self) -> bool {
+        while let Some(key) = self.insertion_order.pop_front() {
+            if self.pending.contains_key(&key) {
+                self.remove_incomplete(&key);
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn dispose_stale(&mut self, now_us: u64) {
+        let stale: Vec<_> = self
+            .pending
+            .iter()
+            .filter_map(|(key, p)| {
+                (now_us.saturating_sub(p.last_us) > self.max_age_us).then_some(*key)
+            })
+            .collect();
+        for key in stale {
+            self.remove_incomplete(&key);
+        }
+    }
+
+    fn reject<T>(&mut self, message: &str) -> anyhow::Result<T> {
+        self.stats.invalid_chunks += 1;
+        anyhow::bail!("{message}")
+    }
+
+    pub fn feed(
+        &mut self,
+        header: Header,
+        object_payload: &[u8],
+        now_us: u64,
+    ) -> anyhow::Result<Option<CompletedLogical>> {
+        self.stats.chunks_received += 1;
+        let env = match ChunkEnvelope::unpack(object_payload) {
+            Ok(v) => v,
+            Err(e) => {
+                self.stats.invalid_chunks += 1;
+                return Err(e);
+            }
+        };
+        if object_payload.len() != CHUNK_HDR + self.chunk_bytes {
+            return self.reject("chunk object payload length mismatch");
+        }
+        if env.valid_bytes as usize > self.chunk_bytes {
+            return self.reject("valid_bytes exceeds chunk_bytes");
+        }
+        if header.seq != env.logical_id {
+            return self.reject("base header seq/logical_id mismatch");
+        }
+        self.dispose_stale(now_us);
+        let key = (header.track_id, env.logical_id);
+        if let Some(p) = self.pending.get(&key) {
+            let same = p.chunk_total == env.chunk_total
+                && p.header.version == header.version
+                && p.header.track_id == header.track_id
+                && p.header.tier == header.tier
+                && p.header.seq == header.seq
+                && p.header.pts_us == header.pts_us
+                && p.header.event_id == header.event_id
+                && p.header.gen_ts_us == header.gen_ts_us;
+            if !same {
+                return self.reject("inconsistent logical-frame header or chunk_total");
+            }
+            if p.chunks.contains_key(&env.chunk_idx) {
+                self.stats.duplicate_chunks += 1;
+                return Ok(None);
+            }
+        } else {
+            let incoming = env.valid_bytes as usize;
+            if incoming > self.max_pending_bytes {
+                return self.reject("single chunk exceeds reassembly byte bound");
+            }
+            while self.pending.len() >= self.max_pending_frames
+                || self.pending_bytes + incoming > self.max_pending_bytes
+            {
+                if !self.evict_oldest() {
+                    return self.reject("could not enforce reassembly bounds");
+                }
+            }
+            self.pending.insert(
+                key,
+                PendingLogical {
+                    header,
+                    chunk_total: env.chunk_total,
+                    last_us: now_us,
+                    chunks: BTreeMap::new(),
+                    stored_bytes: 0,
+                },
+            );
+            self.insertion_order.push_back(key);
+        }
+
+        let valid = env.valid_bytes as usize;
+        if self.pending_bytes + valid > self.max_pending_bytes {
+            self.remove_incomplete(&key);
+            return self.reject("logical frame exceeds reassembly byte bound");
+        }
+        let data = object_payload[CHUNK_HDR..CHUNK_HDR + valid].to_vec();
+        let complete = {
+            let pending = self.pending.get_mut(&key).expect("inserted above");
+            pending.chunks.insert(env.chunk_idx, data);
+            pending.stored_bytes += valid;
+            pending.last_us = now_us;
+            pending.chunks.len() == pending.chunk_total as usize
+        };
+        self.pending_bytes += valid;
+        self.stats.peak_frames = self.stats.peak_frames.max(self.pending.len());
+        self.stats.peak_bytes = self.stats.peak_bytes.max(self.pending_bytes);
+        if !complete {
+            return Ok(None);
+        }
+
+        let pending = self.pending.remove(&key).expect("complete pending frame");
+        self.pending_bytes = self.pending_bytes.saturating_sub(pending.stored_bytes);
+        let mut payload = Vec::with_capacity(pending.stored_bytes);
+        for idx in 0..pending.chunk_total {
+            let Some(part) = pending.chunks.get(&idx) else {
+                return self.reject("complete count but missing chunk index");
+            };
+            payload.extend_from_slice(part);
+        }
+        let mut logical_header = pending.header;
+        logical_header.payload_len = payload.len() as u32;
+        self.stats.frames_completed += 1;
+        Ok(Some(CompletedLogical { header: logical_header, payload }))
+    }
+
+    pub fn finish(&mut self) -> usize {
+        let remaining = self.pending.len();
+        let keys: Vec<_> = self.pending.keys().copied().collect();
+        for key in keys {
+            self.remove_incomplete(&key);
+        }
+        remaining
+    }
+
+    pub fn pending_frames(&self) -> usize {
+        self.pending.len()
+    }
+
+    pub fn pending_bytes(&self) -> usize {
+        self.pending_bytes
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PeriodStats {
+    count: u64,
+    first_us: u64,
+    last_us: u64,
+    previous_us: u64,
+    intervals: u64,
+    mean_us: f64,
+    m2_us: f64,
+}
+
+impl PeriodStats {
+    pub fn observe(&mut self, value_us: u64) {
+        if self.count == 0 {
+            self.first_us = value_us;
+        } else {
+            let interval = value_us.saturating_sub(self.previous_us) as f64;
+            self.intervals += 1;
+            let delta = interval - self.mean_us;
+            self.mean_us += delta / self.intervals as f64;
+            self.m2_us += delta * (interval - self.mean_us);
+        }
+        self.count += 1;
+        self.previous_us = value_us;
+        self.last_us = value_us;
+    }
+
+    pub fn count(&self) -> u64 {
+        self.count
+    }
+
+    pub fn achieved_rate_hz(&self) -> f64 {
+        if self.count < 2 || self.last_us <= self.first_us {
+            return f64::NAN;
+        }
+        (self.count - 1) as f64 * 1_000_000.0 / (self.last_us - self.first_us) as f64
+    }
+
+    pub fn mean_ms(&self) -> f64 {
+        if self.intervals == 0 { f64::NAN } else { self.mean_us / 1_000.0 }
+    }
+
+    pub fn std_ms(&self) -> f64 {
+        if self.intervals == 0 {
+            f64::NAN
+        } else {
+            (self.m2_us / self.intervals as f64).sqrt() / 1_000.0
+        }
+    }
 }
 
 pub fn unpack_header(buf: &[u8]) -> Option<Header> {
@@ -155,6 +593,13 @@ pub struct JsonlLogger {
     w: BufWriter<File>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct V5Meta {
+    pub log_schema_version: u32,
+    pub payload_mode: PayloadMode,
+    pub chunk_bytes: usize,
+}
+
 fn esc(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -188,6 +633,9 @@ impl JsonlLogger {
         // Phase 4 S1 only. None preserves existing B1 metadata; Some appends
         // every parameter that can affect a scheduler release/drop decision.
         playout: Option<playout::PlayoutConfig>,
+        // Phase-1 reviewer-feedback generation. None preserves byte-identical
+        // historical v4 metadata; Some emits the v5 Hz/schema/mode contract.
+        v5: Option<V5Meta>,
     ) -> anyhow::Result<Self> {
         let f = File::create(path)?;
         let mut w = BufWriter::new(f);
@@ -230,12 +678,23 @@ impl JsonlLogger {
             ),
             None => String::new(),
         };
-        writeln!(
-            w,
-            "{{\"role\":\"meta\",\"run_id\":\"{}\",\"stack\":\"{}\",\"side\":\"{}\",\"cond\":{{\"C_mbps\":{},\"rtt_ms\":{},\"jitter_ms\":{},\"loss_pct\":{}}},\"S_bytes\":{},\"fps\":{},\"haptic_hz\":{},\"seed\":{},\"clock\":\"monotonic_ns/1000\"{}{}{}{}{}}}",
-            esc(run_id), esc(stack), esc(side), cmb, rtt_ms, jitter_ms, loss_pct,
-            s_bytes, fps, haptic_hz, seed, design, extra, tracks, term, playout
-        )?;
+        if let Some(v5) = v5 {
+            writeln!(
+                w,
+                "{{\"role\":\"meta\",\"run_id\":\"{}\",\"stack\":\"{}\",\"side\":\"{}\",\"cond\":{{\"C_mbps\":{},\"rtt_ms\":{},\"jitter_ms\":{},\"loss_pct\":{}}},\"S_bytes\":{},\"schema_version\":\"v5\",\"metric_schema_version\":\"v5\",\"log_schema_version\":{},\"pc_rate_hz\":{},\"haptic_rate_hz\":{},\"payload_mode\":\"{}\",\"chunk_bytes\":{},\"seed\":{},\"clock\":\"monotonic_ns/1000\"{}{}{}{}{},\"threshold_profile\":\"lenient\",\"pc_late_threshold_ms\":87.0,\"haptic_late_threshold_ms\":-125.0}}",
+                esc(run_id), esc(stack), esc(side), cmb, rtt_ms, jitter_ms, loss_pct,
+                s_bytes, v5.log_schema_version, fps, haptic_hz,
+                v5.payload_mode.as_str(), v5.chunk_bytes, seed,
+                design, extra, tracks, term, playout
+            )?;
+        } else {
+            writeln!(
+                w,
+                "{{\"role\":\"meta\",\"run_id\":\"{}\",\"stack\":\"{}\",\"side\":\"{}\",\"cond\":{{\"C_mbps\":{},\"rtt_ms\":{},\"jitter_ms\":{},\"loss_pct\":{}}},\"S_bytes\":{},\"fps\":{},\"haptic_hz\":{},\"seed\":{},\"clock\":\"monotonic_ns/1000\"{}{}{}{}{}}}",
+                esc(run_id), esc(stack), esc(side), cmb, rtt_ms, jitter_ms, loss_pct,
+                s_bytes, fps, haptic_hz, seed, design, extra, tracks, term, playout
+            )?;
+        }
         w.flush()?;
         Ok(Self { w })
     }
@@ -364,7 +823,7 @@ mod phase4_jsonl_tests {
             JsonlLogger::new(
                 &b1, "run", "moq", "rx", None, 0.0, 0.0, 0.0,
                 10, 30, 100, 1, None, None, Some("both"),
-                Some(TERM_PROTOCOL_V), None,
+                Some(TERM_PROTOCOL_V), None, None,
             ).unwrap();
         }
         let b1_line = std::fs::read_to_string(&b1).unwrap();
@@ -387,7 +846,7 @@ mod phase4_jsonl_tests {
             JsonlLogger::new(
                 &s1, "run", "moq", "rx", None, 0.0, 0.0, 0.0,
                 10, 30, 100, 1, None, None, Some("both"),
-                Some(TERM_PROTOCOL_V), Some(config),
+                Some(TERM_PROTOCOL_V), Some(config), None,
             ).unwrap();
         }
         let s1_line = std::fs::read_to_string(&s1).unwrap();
@@ -413,7 +872,7 @@ mod phase4_jsonl_tests {
             let mut log = JsonlLogger::new(
                 &path, "run", "moq", "rx", None, 0.0, 0.0, 0.0,
                 10, 30, 100, 1, None, None, Some("both"),
-                Some(TERM_PROTOCOL_V), None,
+                Some(TERM_PROTOCOL_V), None, None,
             ).unwrap();
             log.try_log_release("pc", 2, 7, 123_000, 8, 456_000).unwrap();
             log.try_log_drop("haptic", 0, 9, 223_000, 0, 556_000, "late").unwrap();
@@ -432,6 +891,134 @@ mod phase4_jsonl_tests {
             "{\"role\":\"drop\",\"track\":\"haptic\",\"tier\":0,\"seq\":9,\"pts_us\":223000,\"event_id\":0,\"t_drop\":556000,\"drop_reason\":\"late\"}"
         );
         std::fs::remove_file(&path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod phase1_v5_tests {
+    use super::*;
+
+    fn header(logical_id: u32, payload_len: usize) -> Header {
+        Header {
+            version: VERSION,
+            track_id: TRACK_PC,
+            tier: 2,
+            seq: logical_id,
+            pts_us: timestamp_us(logical_id as u64, PC_RATE_HZ_V5),
+            event_id: logical_id + 1,
+            gen_ts_us: 123,
+            payload_len: payload_len as u32,
+        }
+    }
+
+    #[test]
+    fn rational_time_and_exact_anchor_hold_for_ten_seconds() {
+        assert_eq!(validate_v5_rates(30, 90).unwrap(), 3);
+        for frame in 0..300 {
+            let tick = anchor_tick(frame, 30, 90).unwrap();
+            assert_eq!(tick, 3 * frame);
+            assert_eq!(timestamp_us(frame, 30), timestamp_us(tick, 90));
+        }
+        assert_eq!(deadline_ns(900, 90), 10_000_000_000);
+        assert_eq!(nearest_tolerance_us(90), 5_556);
+    }
+
+    #[test]
+    fn pcm_90hz_distribution_is_exact() {
+        let counts: Vec<_> = (0..90)
+            .map(|tick| {
+                let (start, end) = pcm_sample_bounds(tick, 8_000, 90);
+                end - start
+            })
+            .collect();
+        assert_eq!(counts.iter().sum::<u64>(), 8_000);
+        assert_eq!(counts.iter().filter(|&&n| n == 89).count(), 80);
+        assert_eq!(counts.iter().filter(|&&n| n == 88).count(), 10);
+    }
+
+    #[test]
+    fn equal_chunk_round_trip_handles_padding_and_out_of_order() {
+        let source: Vec<u8> = (0..901).map(|i| (i % 251) as u8).collect();
+        let objects = equal_chunks(&source, 7, 178).unwrap();
+        let mut r = LogicalReassembler::new(178, 8, 4096, 1_000_000).unwrap();
+        let mut complete = None;
+        for object in objects.iter().rev() {
+            complete = r.feed(header(7, object.len()), object, 100).unwrap().or(complete);
+        }
+        let complete = complete.expect("logical frame completed");
+        assert_eq!(complete.header.payload_len as usize, source.len());
+        assert_eq!(complete.payload, source);
+        assert_eq!(r.stats.frames_completed, 1);
+        assert_eq!(r.stats.incomplete_frames, 0);
+    }
+
+    #[test]
+    fn duplicate_and_missing_chunks_are_accounted() {
+        let objects = equal_chunks(&vec![9; 400], 8, 178).unwrap();
+        let mut r = LogicalReassembler::new(178, 8, 4096, 1_000_000).unwrap();
+        r.feed(header(8, objects[0].len()), &objects[0], 1).unwrap();
+        r.feed(header(8, objects[0].len()), &objects[0], 2).unwrap();
+        assert_eq!(r.stats.duplicate_chunks, 1);
+        assert_eq!(r.finish(), 1);
+        assert_eq!(r.stats.incomplete_frames, 1);
+    }
+
+    #[test]
+    fn inconsistent_total_is_invalid() {
+        let objects = equal_chunks(&vec![4; 200], 9, 178).unwrap();
+        let mut damaged = objects[1].clone();
+        damaged[12..16].copy_from_slice(&3u32.to_le_bytes());
+        let mut r = LogicalReassembler::new(178, 8, 4096, 1_000_000).unwrap();
+        r.feed(header(9, objects[0].len()), &objects[0], 1).unwrap();
+        assert!(r.feed(header(9, damaged.len()), &damaged, 2).is_err());
+        assert_eq!(r.stats.invalid_chunks, 1);
+    }
+
+    #[test]
+    fn reassembly_capacity_eviction_is_accounted() {
+        let a = equal_chunks(&vec![1; 200], 1, 178).unwrap();
+        let b = equal_chunks(&vec![2; 200], 2, 178).unwrap();
+        let mut r = LogicalReassembler::new(178, 1, 4096, 1_000_000).unwrap();
+        r.feed(header(1, a[0].len()), &a[0], 1).unwrap();
+        r.feed(header(2, b[0].len()), &b[0], 2).unwrap();
+        assert_eq!(r.stats.incomplete_frames, 1);
+        assert_eq!(r.stats.peak_frames, 1);
+    }
+
+    #[test]
+    fn logical_frame_byte_bound_is_fail_loud_and_accounted() {
+        let objects = equal_chunks(&vec![3; 400], 3, 178).unwrap();
+        let mut r = LogicalReassembler::new(178, 8, 200, 1_000_000).unwrap();
+        r.feed(header(3, objects[0].len()), &objects[0], 1).unwrap();
+        assert!(r.feed(header(3, objects[1].len()), &objects[1], 2).is_err());
+        assert_eq!(r.stats.invalid_chunks, 1);
+        assert_eq!(r.stats.incomplete_frames, 1);
+    }
+
+    #[test]
+    fn v5_meta_uses_hz_names_and_schema_gate() {
+        let path = std::env::temp_dir().join(format!(
+            "skew-v5-meta-{}-{}.jsonl", std::process::id(), now_us()
+        ));
+        {
+            JsonlLogger::new(
+                &path, "v5", "moq", "tx", None, 0.0, 0.0, 0.0,
+                10, 30, 90, 1, Some(10.0), None, Some("both"),
+                Some(TERM_PROTOCOL_V), None,
+                Some(V5Meta {
+                    log_schema_version: 2,
+                    payload_mode: PayloadMode::EqualChunk,
+                    chunk_bytes: 178,
+                }),
+            ).unwrap();
+        }
+        let line = std::fs::read_to_string(&path).unwrap();
+        assert!(line.contains("\"schema_version\":\"v5\""));
+        assert!(line.contains("\"pc_rate_hz\":30"));
+        assert!(line.contains("\"haptic_rate_hz\":90"));
+        assert!(line.contains("\"payload_mode\":\"equal_chunk\""));
+        assert!(!line.contains("\"fps\""));
+        std::fs::remove_file(path).unwrap();
     }
 }
 
