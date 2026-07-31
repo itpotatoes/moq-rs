@@ -153,7 +153,7 @@ impl Published {
             end_group_id: None,
         };
 
-        match forwarder.serve(track, delivery_filter).await {
+        match forwarder.serve(track, delivery_filter, None).await {
             Err(SessionError::Serve(ServeError::Cancel)) => Ok(()),
             res => res,
         }

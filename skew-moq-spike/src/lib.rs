@@ -9,6 +9,12 @@ use std::path::Path;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 pub mod playout;
+pub mod s3_controller;
+pub mod s3_logging;
+pub mod s3_producer;
+pub mod s3_receiver;
+pub mod s3_sender;
+pub mod s3_switch;
 
 pub const HDR: usize = 32;
 pub const VERSION: u8 = 1;
@@ -43,7 +49,10 @@ pub fn track_name(track_id: u8) -> &'static str {
 /// System-wide (identical across network namespaces on one kernel), so the
 /// one-way delay D = t_recv − t_gen is valid across the tx/rx processes.
 pub fn now_us() -> u64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     unsafe {
         libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
     }
@@ -548,7 +557,11 @@ pub fn unpack_header(buf: &[u8]) -> Option<Header> {
 pub fn load_frames(dir: &str) -> anyhow::Result<Vec<Vec<u8>>> {
     let mut paths: Vec<_> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().map(|x| x == "bin" || x == "drc").unwrap_or(false))
+        .filter(|p| {
+            p.extension()
+                .map(|x| x == "bin" || x == "drc")
+                .unwrap_or(false)
+        })
         .collect();
     paths.sort();
     if paths.is_empty() {
@@ -564,7 +577,10 @@ pub fn load_frames(dir: &str) -> anyhow::Result<Vec<Vec<u8>>> {
 /// Read raw PCM bytes from a WAV file, asserting 8kHz / mono / 16-bit.
 pub fn load_haptic_pcm(path: &str) -> anyhow::Result<Vec<u8>> {
     let bytes = std::fs::read(path)?;
-    anyhow::ensure!(bytes.len() > 44 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE", "not a WAV: {path}");
+    anyhow::ensure!(
+        bytes.len() > 44 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE",
+        "not a WAV: {path}"
+    );
     // Walk sub-chunks: [id:4][size:4][data:size], starting at offset 12.
     let mut off = 12usize;
     let mut fmt_ok = false;
@@ -576,7 +592,10 @@ pub fn load_haptic_pcm(path: &str) -> anyhow::Result<Vec<u8>> {
             let channels = u16::from_le_bytes(bytes[body + 2..body + 4].try_into().unwrap());
             let rate = u32::from_le_bytes(bytes[body + 4..body + 8].try_into().unwrap());
             let bits = u16::from_le_bytes(bytes[body + 14..body + 16].try_into().unwrap());
-            anyhow::ensure!(rate == 8000 && channels == 1 && bits == 16, "haptic WAV must be 8kHz/mono/16bit (got {rate}Hz/{channels}ch/{bits}bit)");
+            anyhow::ensure!(
+                rate == 8000 && channels == 1 && bits == 16,
+                "haptic WAV must be 8kHz/mono/16bit (got {rate}Hz/{channels}ch/{bits}bit)"
+            );
             fmt_ok = true;
         }
         if id == b"data" {
@@ -600,6 +619,17 @@ pub struct V5Meta {
     pub log_schema_version: u32,
     pub payload_mode: PayloadMode,
     pub chunk_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Phase4TransportMeta {
+    pub arm: &'static str,
+    pub pc_subgroup_mapping: &'static str,
+    pub pc_publisher_priority: u8,
+    pub haptic_publisher_priority: u8,
+    pub publisher_priority_profile: &'static str,
+    pub data_priority_mapping: &'static str,
+    pub pc_delivery_timeout_ms: Option<u64>,
 }
 
 fn esc(s: &str) -> String {
@@ -635,6 +665,9 @@ impl JsonlLogger {
         // Phase 4 S1 only. None preserves existing B1 metadata; Some appends
         // every parameter that can affect a scheduler release/drop decision.
         playout: Option<playout::PlayoutConfig>,
+        // M1/S2/S3 transport intervention. None preserves historical B1/S1
+        // fields; Some records mapping, priorities, and timeout.
+        phase4_transport: Option<Phase4TransportMeta>,
         // Phase-1 reviewer-feedback generation. None preserves byte-identical
         // historical v4 metadata; Some emits the v5 Hz/schema/mode contract.
         v5: Option<V5Meta>,
@@ -670,9 +703,11 @@ impl JsonlLogger {
         };
         let playout = match playout {
             Some(p) => format!(
-                ",\"arm\":\"s1\",\"playout_clock\":\"receiver_monotonic_us\",\"d_play_us\":{},\"startup_timeout_us\":{},\"late_tolerance_us\":{},\"late_policy\":\"{}\",\"buffer_max_objects_per_track\":{},\"buffer_max_span_us\":{}",
+                "{}\"playout_clock\":\"receiver_monotonic_us\",\"d_play_us\":{},\"startup_timeout_us\":{},\"startup_rearm_limit\":{},\"late_tolerance_us\":{},\"late_policy\":\"{}\",\"buffer_max_objects_per_track\":{},\"buffer_max_span_us\":{}",
+                if phase4_transport.is_some() { "," } else { ",\"arm\":\"s1\"," },
                 p.d_play_us,
                 p.startup_timeout_us,
+                p.startup_rearm_limit,
                 p.late_tolerance_us,
                 p.late_policy.as_str(),
                 p.max_objects_per_track,
@@ -680,21 +715,37 @@ impl JsonlLogger {
             ),
             None => String::new(),
         };
+        let phase4_transport = match phase4_transport {
+            Some(t) => format!(
+                ",\"arm\":\"{}\",\"pc_subgroup_mapping\":\"{}\",\"pc_publisher_priority\":{},\"haptic_publisher_priority\":{},\"publisher_priority_profile\":\"{}\",\"data_priority_mapping\":\"{}\",\"pc_delivery_timeout_ms\":{}",
+                esc(t.arm),
+                esc(t.pc_subgroup_mapping),
+                t.pc_publisher_priority,
+                t.haptic_publisher_priority,
+                esc(t.publisher_priority_profile),
+                esc(t.data_priority_mapping),
+                t.pc_delivery_timeout_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "null".to_string()),
+            ),
+            None => String::new(),
+        };
         if let Some(v5) = v5 {
             writeln!(
                 w,
-                "{{\"role\":\"meta\",\"run_id\":\"{}\",\"stack\":\"{}\",\"side\":\"{}\",\"cond\":{{\"C_mbps\":{},\"rtt_ms\":{},\"jitter_ms\":{},\"loss_pct\":{}}},\"S_bytes\":{},\"schema_version\":\"v5\",\"metric_schema_version\":\"v5\",\"log_schema_version\":{},\"pc_rate_hz\":{},\"haptic_rate_hz\":{},\"payload_mode\":\"{}\",\"chunk_bytes\":{},\"seed\":{},\"clock\":\"monotonic_ns/1000\"{}{}{}{}{},\"threshold_profile\":\"lenient\",\"pc_late_threshold_ms\":87.0,\"haptic_late_threshold_ms\":-125.0}}",
+                "{{\"role\":\"meta\",\"run_id\":\"{}\",\"stack\":\"{}\",\"side\":\"{}\",\"cond\":{{\"C_mbps\":{},\"rtt_ms\":{},\"jitter_ms\":{},\"loss_pct\":{}}},\"S_bytes\":{},\"schema_version\":\"v5\",\"metric_schema_version\":\"v5\",\"log_schema_version\":{},\"pc_rate_hz\":{},\"haptic_rate_hz\":{},\"payload_mode\":\"{}\",\"chunk_bytes\":{},\"seed\":{},\"clock\":\"monotonic_ns/1000\"{}{}{}{}{}{},\"threshold_profile\":\"lenient\",\"pc_late_threshold_ms\":87.0,\"haptic_late_threshold_ms\":-125.0}}",
                 esc(run_id), esc(stack), esc(side), cmb, rtt_ms, jitter_ms, loss_pct,
                 s_bytes, v5.log_schema_version, fps, haptic_hz,
                 v5.payload_mode.as_str(), v5.chunk_bytes, seed,
-                design, extra, tracks, term, playout
+                design, extra, tracks, term, phase4_transport, playout
             )?;
         } else {
             writeln!(
                 w,
-                "{{\"role\":\"meta\",\"run_id\":\"{}\",\"stack\":\"{}\",\"side\":\"{}\",\"cond\":{{\"C_mbps\":{},\"rtt_ms\":{},\"jitter_ms\":{},\"loss_pct\":{}}},\"S_bytes\":{},\"fps\":{},\"haptic_hz\":{},\"seed\":{},\"clock\":\"monotonic_ns/1000\"{}{}{}{}{}}}",
+                "{{\"role\":\"meta\",\"run_id\":\"{}\",\"stack\":\"{}\",\"side\":\"{}\",\"cond\":{{\"C_mbps\":{},\"rtt_ms\":{},\"jitter_ms\":{},\"loss_pct\":{}}},\"S_bytes\":{},\"fps\":{},\"haptic_hz\":{},\"seed\":{},\"clock\":\"monotonic_ns/1000\"{}{}{}{}{}{}}}",
                 esc(run_id), esc(stack), esc(side), cmb, rtt_ms, jitter_ms, loss_pct,
-                s_bytes, fps, haptic_hz, seed, design, extra, tracks, term, playout
+                s_bytes, fps, haptic_hz, seed, design, extra, tracks, term,
+                phase4_transport, playout
             )?;
         }
         w.flush()?;
@@ -707,7 +758,18 @@ impl JsonlLogger {
     /// pre-A2 schema and to `skew_logging.py`; when `Some`, three keys are
     /// appended after `t_send`. No existing key changes name, order or meaning.
     #[allow(clippy::too_many_arguments)]
-    pub fn log_tx(&mut self, track: &str, tier: u16, seq: u32, pts_us: u64, event_id: u32, size: usize, t_gen: u64, t_send: u64, obj: Option<(u64, u64, u64)>) {
+    pub fn log_tx(
+        &mut self,
+        track: &str,
+        tier: u16,
+        seq: u32,
+        pts_us: u64,
+        event_id: u32,
+        size: usize,
+        t_gen: u64,
+        t_send: u64,
+        obj: Option<(u64, u64, u64)>,
+    ) {
         let objf = match obj {
             Some((g, sg, o)) => format!(",\"group_id\":{g},\"subgroup_id\":{sg},\"object_id\":{o}"),
             None => String::new(),
@@ -720,7 +782,18 @@ impl JsonlLogger {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn log_rx(&mut self, track: &str, tier: u16, seq: u32, pts_us: u64, event_id: u32, size: u32, t_recv: u64, t_play: u64, t_gen: u64) {
+    pub fn log_rx(
+        &mut self,
+        track: &str,
+        tier: u16,
+        seq: u32,
+        pts_us: u64,
+        event_id: u32,
+        size: u32,
+        t_recv: u64,
+        t_play: u64,
+        t_gen: u64,
+    ) {
         let _ = writeln!(
             self.w,
             "{{\"role\":\"rx\",\"track\":\"{track}\",\"tier\":{tier},\"seq\":{seq},\"pts_us\":{pts_us},\"event_id\":{event_id},\"size\":{size},\"t_recv\":{t_recv},\"t_play\":{t_play},\"t_gen\":{t_gen}}}"
@@ -730,7 +803,15 @@ impl JsonlLogger {
 
     /// Phase-4 L1-R application-release record. This is not L2 `t_play`.
     #[allow(clippy::too_many_arguments)]
-    pub fn try_log_release(&mut self, track: &str, tier: u16, seq: u32, pts_us: u64, event_id: u32, t_release: u64) -> std::io::Result<()> {
+    pub fn try_log_release(
+        &mut self,
+        track: &str,
+        tier: u16,
+        seq: u32,
+        pts_us: u64,
+        event_id: u32,
+        t_release: u64,
+    ) -> std::io::Result<()> {
         writeln!(
             self.w,
             "{{\"role\":\"release\",\"track\":\"{track}\",\"tier\":{tier},\"seq\":{seq},\"pts_us\":{pts_us},\"event_id\":{event_id},\"t_release\":{t_release}}}"
@@ -740,7 +821,16 @@ impl JsonlLogger {
 
     /// Phase-4 L1-R terminal drop record with the same exact identity as rx.
     #[allow(clippy::too_many_arguments)]
-    pub fn try_log_drop(&mut self, track: &str, tier: u16, seq: u32, pts_us: u64, event_id: u32, t_drop: u64, drop_reason: &str) -> std::io::Result<()> {
+    pub fn try_log_drop(
+        &mut self,
+        track: &str,
+        tier: u16,
+        seq: u32,
+        pts_us: u64,
+        event_id: u32,
+        t_drop: u64,
+        drop_reason: &str,
+    ) -> std::io::Result<()> {
         writeln!(
             self.w,
             "{{\"role\":\"drop\",\"track\":\"{track}\",\"tier\":{tier},\"seq\":{seq},\"pts_us\":{pts_us},\"event_id\":{event_id},\"t_drop\":{t_drop},\"drop_reason\":\"{}\"}}",
@@ -770,7 +860,15 @@ impl JsonlLogger {
     /// integrity counters must reflect records that actually reached the file,
     /// not records we merely attempted (A2-c R3).
     #[allow(clippy::too_many_arguments)]
-    pub fn log_accept(&mut self, track: &str, group_id: u64, subgroup_id: u64, object_id: u64, t_accept: u64, size: usize) -> std::io::Result<()> {
+    pub fn log_accept(
+        &mut self,
+        track: &str,
+        group_id: u64,
+        subgroup_id: u64,
+        object_id: u64,
+        t_accept: u64,
+        size: usize,
+    ) -> std::io::Result<()> {
         writeln!(
             self.w,
             "{{\"role\":\"accept\",\"track\":\"{track}\",\"group_id\":{group_id},\"subgroup_id\":{subgroup_id},\"object_id\":{object_id},\"t_accept\":{t_accept},\"size\":{size}}}"
@@ -825,7 +923,7 @@ mod phase4_jsonl_tests {
             JsonlLogger::new(
                 &b1, "run", "moq", "rx", None, 0.0, 0.0, 0.0,
                 10, 30, 100, 1, None, None, Some("both"),
-                Some(TERM_PROTOCOL_V), None, None,
+                Some(TERM_PROTOCOL_V), None, None, None,
             ).unwrap();
         }
         let b1_line = std::fs::read_to_string(&b1).unwrap();
@@ -839,6 +937,7 @@ mod phase4_jsonl_tests {
         let config = PlayoutConfig {
             d_play_us: 50_000,
             startup_timeout_us: 100_000,
+            startup_rearm_limit: 1,
             late_tolerance_us: 5_000,
             max_objects_per_track: 64,
             max_span_us: 250_000,
@@ -848,7 +947,7 @@ mod phase4_jsonl_tests {
             JsonlLogger::new(
                 &s1, "run", "moq", "rx", None, 0.0, 0.0, 0.0,
                 10, 30, 100, 1, None, None, Some("both"),
-                Some(TERM_PROTOCOL_V), Some(config), None,
+                Some(TERM_PROTOCOL_V), Some(config), None, None,
             ).unwrap();
         }
         let s1_line = std::fs::read_to_string(&s1).unwrap();
@@ -857,6 +956,7 @@ mod phase4_jsonl_tests {
             "\"arm\":\"s1\"",
             "\"d_play_us\":50000",
             "\"startup_timeout_us\":100000",
+            "\"startup_rearm_limit\":1",
             "\"late_tolerance_us\":5000",
             "\"late_policy\":\"drop-late\"",
             "\"buffer_max_objects_per_track\":64",
@@ -874,7 +974,7 @@ mod phase4_jsonl_tests {
             let mut log = JsonlLogger::new(
                 &path, "run", "moq", "rx", None, 0.0, 0.0, 0.0,
                 10, 30, 100, 1, None, None, Some("both"),
-                Some(TERM_PROTOCOL_V), None, None,
+                Some(TERM_PROTOCOL_V), None, None, None,
             ).unwrap();
             log.try_log_release("pc", 2, 7, 123_000, 8, 456_000).unwrap();
             log.try_log_drop("haptic", 0, 9, 223_000, 0, 556_000, "late").unwrap();
@@ -892,6 +992,67 @@ mod phase4_jsonl_tests {
             lines[2],
             "{\"role\":\"drop\",\"track\":\"haptic\",\"tier\":0,\"seq\":9,\"pts_us\":223000,\"event_id\":0,\"t_drop\":556000,\"drop_reason\":\"late\"}"
         );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn m1_transport_meta_is_explicit_without_changing_s1_fields() {
+        let path = path("m1-meta");
+        let config = PlayoutConfig {
+            d_play_us: 50_000,
+            startup_timeout_us: 100_000,
+            startup_rearm_limit: 1,
+            late_tolerance_us: 5_000,
+            max_objects_per_track: 64,
+            max_span_us: 250_000,
+            late_policy: LatePolicy::DropLate,
+        };
+        {
+            JsonlLogger::new(
+                &path,
+                "run",
+                "moq",
+                "rx",
+                None,
+                0.0,
+                0.0,
+                0.0,
+                10,
+                30,
+                100,
+                1,
+                None,
+                None,
+                Some("both"),
+                Some(TERM_PROTOCOL_V),
+                Some(config),
+                Some(Phase4TransportMeta {
+                    arm: "m1",
+                    pc_subgroup_mapping: "frame-per-subgroup",
+                    pc_publisher_priority: 128,
+                    haptic_publisher_priority: 128,
+                    publisher_priority_profile: "equal-128",
+                    data_priority_mapping: "legacy-v1",
+                    pc_delivery_timeout_ms: None,
+                }),
+                None,
+            )
+            .unwrap();
+        }
+        let line = std::fs::read_to_string(&path).unwrap();
+        for field in [
+            "\"arm\":\"m1\"",
+            "\"pc_subgroup_mapping\":\"frame-per-subgroup\"",
+            "\"pc_publisher_priority\":128",
+            "\"haptic_publisher_priority\":128",
+            "\"publisher_priority_profile\":\"equal-128\"",
+            "\"data_priority_mapping\":\"legacy-v1\"",
+            "\"pc_delivery_timeout_ms\":null",
+            "\"playout_clock\":\"receiver_monotonic_us\"",
+        ] {
+            assert!(line.contains(field), "missing {field}: {line}");
+        }
+        assert_eq!(line.matches("\"arm\":").count(), 1);
         std::fs::remove_file(&path).unwrap();
     }
 }
@@ -1023,7 +1184,7 @@ mod phase1_v5_tests {
             JsonlLogger::new(
                 &path, "v5", "moq", "tx", None, 0.0, 0.0, 0.0,
                 10, 30, 90, 1, Some(10.0), None, Some("both"),
-                Some(TERM_PROTOCOL_V), None,
+                Some(TERM_PROTOCOL_V), None, None,
                 Some(V5Meta {
                     log_schema_version: 2,
                     payload_mode: PayloadMode::EqualChunk,
@@ -1090,6 +1251,9 @@ impl TrackTag {
 #[derive(Debug, Clone)]
 pub struct AcceptRec {
     pub track: TrackTag,
+    /// Track alias negotiated for this concrete subscription. S3 uses it to
+    /// disambiguate repeated subscriptions to the same wire track name.
+    pub track_alias: u64,
     pub group_id: u64,
     pub subgroup_id: u64,
     pub object_id: u64,
@@ -1204,7 +1368,11 @@ impl AcceptSnapshot {
         if self.callbacks < self.exits() {
             return false;
         }
-        if self.in_flight == 0 && self.producers_joined && self.producers_quiesced && self.callbacks != self.exits() {
+        if self.in_flight == 0
+            && self.producers_joined
+            && self.producers_quiesced
+            && self.callbacks != self.exits()
+        {
             return false;
         }
         self.written + self.io_errors <= self.enqueued
@@ -1274,6 +1442,7 @@ impl moq_transport::accept_trace::AcceptObserver for AcceptTap {
         let t_accept = now_us();
         let rec = AcceptRec {
             track: TrackTag::from_name(ev.track_name),
+            track_alias: ev.track_alias,
             group_id: ev.group_id,
             subgroup_id: ev.subgroup_id,
             object_id: ev.object_id,
@@ -1364,7 +1533,10 @@ pub struct ProducerJoins {
 impl ProducerJoins {
     /// No producers were ever started — nothing can call back.
     pub fn none_started() -> Self {
-        Self { session: JoinOutcome::NotStarted, ns: JoinOutcome::NotStarted }
+        Self {
+            session: JoinOutcome::NotStarted,
+            ns: JoinOutcome::NotStarted,
+        }
     }
 
     pub fn all_complete(self) -> bool {
@@ -1460,7 +1632,14 @@ pub trait AcceptSink: Send + 'static {
 
 impl AcceptSink for JsonlLogger {
     fn write_accept(&mut self, rec: &AcceptRec) -> std::io::Result<()> {
-        self.log_accept(rec.track.as_str(), rec.group_id, rec.subgroup_id, rec.object_id, rec.t_accept, rec.size)
+        self.log_accept(
+            rec.track.as_str(),
+            rec.group_id,
+            rec.subgroup_id,
+            rec.object_id,
+            rec.t_accept,
+            rec.size,
+        )
     }
     fn flush_accept(&mut self) -> std::io::Result<()> {
         self.try_flush()
@@ -1499,7 +1678,10 @@ impl AcceptTrace {
     ) -> anyhow::Result<Arc<Self>> {
         let (tx, rx) = tokio::sync::mpsc::channel::<AcceptRec>(capacity);
         let counters = Arc::new(AcceptCounters::default());
-        let tap = Arc::new(AcceptTap { tx, c: counters.clone() });
+        let tap = Arc::new(AcceptTap {
+            tx,
+            c: counters.clone(),
+        });
         moq_transport::accept_trace::set_observer(tap)
             .map_err(|_| anyhow::anyhow!("accept_trace observer already installed"))?;
 
@@ -1524,7 +1706,10 @@ impl AcceptTrace {
     ) -> (Arc<Self>, Arc<AcceptTap>) {
         let (tx, rx) = tokio::sync::mpsc::channel::<AcceptRec>(capacity);
         let counters = Arc::new(AcceptCounters::default());
-        let tap = Arc::new(AcceptTap { tx, c: counters.clone() });
+        let tap = Arc::new(AcceptTap {
+            tx,
+            c: counters.clone(),
+        });
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
         let handle = tokio::spawn(drain_task(rx, stop_rx, sink, counters.clone()));
         (
@@ -1551,7 +1736,12 @@ impl AcceptTrace {
     /// Reading in the opposite order lets the snapshot see an exit without its
     /// callback and report a conservation violation that never happened — which
     /// is exactly what the straggler test caught.
-    fn snapshot(&self, drain_complete: bool, producers_quiesced: bool, joins: ProducerJoins) -> AcceptSnapshot {
+    fn snapshot(
+        &self,
+        drain_complete: bool,
+        producers_quiesced: bool,
+        joins: ProducerJoins,
+    ) -> AcceptSnapshot {
         let enqueued = self.counters.enqueued.load(Ordering::SeqCst);
         let dropped_full = self.counters.dropped_full.load(Ordering::SeqCst);
         let dropped_closed = self.counters.dropped_closed.load(Ordering::SeqCst);
@@ -1619,8 +1809,7 @@ impl AcceptTrace {
 
         // 2. Confirm producers have stopped. Bounded by a third of the budget:
         //    if they have not stopped, say so rather than waiting them out.
-        let quiesce_deadline =
-            std::cmp::min(deadline, tokio::time::Instant::now() + budget / 3);
+        let quiesce_deadline = std::cmp::min(deadline, tokio::time::Instant::now() + budget / 3);
         let producers_quiesced = self.await_quiescence(quiesce_deadline).await;
 
         // 3. No further enqueues: the record set is now finite.
@@ -1651,8 +1840,7 @@ impl AcceptTrace {
         let handle = self.handle.lock().ok().and_then(|mut g| g.take());
         let mut joined = false;
         if let Some(mut h) = handle {
-            let remaining = deadline
-                .saturating_duration_since(tokio::time::Instant::now())
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now())
                 + Duration::from_millis(500);
             match tokio::time::timeout(remaining, &mut h).await {
                 Ok(Ok(())) => joined = true,
@@ -1810,21 +1998,32 @@ mod accept_shutdown_tests {
 
     impl MemSink {
         fn new() -> Self {
-            Self { lines: Vec::new(), fail_writes: false, fail_flush: false }
+            Self {
+                lines: Vec::new(),
+                fail_writes: false,
+                fail_flush: false,
+            }
         }
     }
 
     impl AcceptSink for MemSink {
         fn write_accept(&mut self, rec: &AcceptRec) -> std::io::Result<()> {
             if self.fail_writes {
-                return Err(std::io::Error::new(std::io::ErrorKind::Other, "injected write failure"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "injected write failure",
+                ));
             }
-            self.lines.push(format!("{}:{}", rec.track.as_str(), rec.object_id));
+            self.lines
+                .push(format!("{}:{}", rec.track.as_str(), rec.object_id));
             Ok(())
         }
         fn flush_accept(&mut self) -> std::io::Result<()> {
             if self.fail_flush {
-                return Err(std::io::Error::new(std::io::ErrorKind::Other, "injected flush failure"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "injected flush failure",
+                ));
             }
             Ok(())
         }
@@ -1842,7 +2041,10 @@ mod accept_shutdown_tests {
         for i in 0..500 {
             fire(&tap, i);
         }
-        let s = trace.shutdown(Duration::from_secs(2), ProducerJoins::none_started()).await.expect("first caller");
+        let s = trace
+            .shutdown(Duration::from_secs(2), ProducerJoins::none_started())
+            .await
+            .expect("first caller");
         assert_eq!(s.callbacks, 500);
         assert_eq!(s.written, 500, "every callback must reach the sink");
         assert_eq!(s.unwritten(), 0);
@@ -1885,14 +2087,20 @@ mod accept_shutdown_tests {
 
         // Let the producer get going, then shut down underneath it.
         tokio::time::sleep(Duration::from_millis(30)).await;
-        let s = trace.shutdown(Duration::from_secs(2), ProducerJoins::none_started()).await.expect("first caller");
+        let s = trace
+            .shutdown(Duration::from_secs(2), ProducerJoins::none_started())
+            .await
+            .expect("first caller");
         stop.store(true, Ordering::Relaxed);
         producer.join().unwrap();
 
         assert!(s.callbacks > 0, "producer must have fired");
         // The conservation law is the real assertion: every callback took
         // exactly one exit, even under a live race.
-        assert!(s.conservation_ok(), "R4 conservation under straggler race: {s:?}");
+        assert!(
+            s.conservation_ok(),
+            "R4 conservation under straggler race: {s:?}"
+        );
         assert!(
             s.callbacks >= s.exits(),
             "read order must guarantee callbacks >= exits even mid-race: {s:?}"
@@ -1920,9 +2128,15 @@ mod accept_shutdown_tests {
         for i in 0..300 {
             fire(&tap, i);
         }
-        let s = trace.shutdown(Duration::from_secs(2), ProducerJoins::none_started()).await.expect("first caller");
+        let s = trace
+            .shutdown(Duration::from_secs(2), ProducerJoins::none_started())
+            .await
+            .expect("first caller");
         assert_eq!(s.enqueued, 300);
-        assert_eq!(s.written, 300, "queued-at-close records must still be drained");
+        assert_eq!(
+            s.written, 300,
+            "queued-at-close records must still be drained"
+        );
         assert_eq!(s.unwritten(), 0);
         assert!(s.intact(), "{s:?}");
         assert_eq!(sink.lock().unwrap().lines.len(), 300);
@@ -1940,9 +2154,27 @@ mod accept_shutdown_tests {
             fire(&tap, i);
         }
 
-        let a = { let t = trace.clone(); tokio::spawn(async move { t.shutdown(Duration::from_secs(2), ProducerJoins::none_started()).await }) };
-        let b = { let t = trace.clone(); tokio::spawn(async move { t.shutdown(Duration::from_secs(2), ProducerJoins::none_started()).await }) };
-        let c = { let t = trace.clone(); tokio::spawn(async move { t.shutdown(Duration::from_secs(2), ProducerJoins::none_started()).await }) };
+        let a = {
+            let t = trace.clone();
+            tokio::spawn(async move {
+                t.shutdown(Duration::from_secs(2), ProducerJoins::none_started())
+                    .await
+            })
+        };
+        let b = {
+            let t = trace.clone();
+            tokio::spawn(async move {
+                t.shutdown(Duration::from_secs(2), ProducerJoins::none_started())
+                    .await
+            })
+        };
+        let c = {
+            let t = trace.clone();
+            tokio::spawn(async move {
+                t.shutdown(Duration::from_secs(2), ProducerJoins::none_started())
+                    .await
+            })
+        };
         let rs = vec![a.await.unwrap(), b.await.unwrap(), c.await.unwrap()];
         let some: Vec<_> = rs.into_iter().flatten().collect();
         assert_eq!(some.len(), 1, "exactly one caller may own the stats record");
@@ -1960,7 +2192,10 @@ mod accept_shutdown_tests {
         for i in 0..120 {
             fire(&tap, i);
         }
-        let s = trace.shutdown(Duration::from_secs(2), ProducerJoins::none_started()).await.expect("first caller");
+        let s = trace
+            .shutdown(Duration::from_secs(2), ProducerJoins::none_started())
+            .await
+            .expect("first caller");
         assert_eq!(s.callbacks, 120);
         assert_eq!(s.enqueued, 120);
         assert_eq!(s.written, 0, "failed writes must never count as written");
@@ -1982,7 +2217,10 @@ mod accept_shutdown_tests {
         for i in 0..80 {
             fire(&tap, i);
         }
-        let s = trace.shutdown(Duration::from_secs(2), ProducerJoins::none_started()).await.expect("first caller");
+        let s = trace
+            .shutdown(Duration::from_secs(2), ProducerJoins::none_started())
+            .await
+            .expect("first caller");
         assert_eq!(s.callbacks, 80);
         assert_eq!(s.written, 0, "unflushed records must not count as written");
         assert_eq!(s.io_errors, 80);
@@ -1999,7 +2237,10 @@ mod accept_shutdown_tests {
         for i in 0..500 {
             fire(&tap, i);
         }
-        let s = trace.shutdown(Duration::from_secs(2), ProducerJoins::none_started()).await.expect("first caller");
+        let s = trace
+            .shutdown(Duration::from_secs(2), ProducerJoins::none_started())
+            .await
+            .expect("first caller");
         assert_eq!(s.callbacks, 500);
         assert!(s.dropped_full > 0, "a 4-slot channel must overflow: {s:?}");
         assert!(s.conservation_ok(), "R4 conservation under overflow: {s:?}");
@@ -2015,9 +2256,18 @@ mod accept_shutdown_tests {
         for i in 0..50 {
             fire(&tap, i);
         }
-        assert!(trace.shutdown(Duration::from_secs(2), ProducerJoins::none_started()).await.is_some());
-        assert!(trace.shutdown(Duration::from_secs(2), ProducerJoins::none_started()).await.is_none());
-        assert!(trace.shutdown(Duration::from_secs(2), ProducerJoins::none_started()).await.is_none());
+        assert!(trace
+            .shutdown(Duration::from_secs(2), ProducerJoins::none_started())
+            .await
+            .is_some());
+        assert!(trace
+            .shutdown(Duration::from_secs(2), ProducerJoins::none_started())
+            .await
+            .is_none());
+        assert!(trace
+            .shutdown(Duration::from_secs(2), ProducerJoins::none_started())
+            .await
+            .is_none());
     }
 
     /// Callbacks arriving after the tap is closed are counted as
@@ -2029,7 +2279,10 @@ mod accept_shutdown_tests {
         for i in 0..10 {
             fire(&tap, i);
         }
-        let _ = trace.shutdown(Duration::from_secs(2), ProducerJoins::none_started()).await.expect("first caller");
+        let _ = trace
+            .shutdown(Duration::from_secs(2), ProducerJoins::none_started())
+            .await
+            .expect("first caller");
         // Post-shutdown callbacks: the tap is closed, so these are counted.
         for i in 10..25 {
             fire(&tap, i);
@@ -2052,18 +2305,35 @@ mod accept_shutdown_tests {
         // Consistent-but-lossy: 10 callbacks = 8 enqueued + 1 full + 1 closed,
         // of which 7 written and 1 errored. Conservation holds, intact does not.
         let s = AcceptSnapshot {
-            callbacks: 10, enqueued: 8, written: 7, dropped_full: 1,
-            dropped_closed: 1, io_errors: 1, in_flight: 0, drain_complete: true,
-            producers_quiesced: true, producers_joined: true,
-            session_join: JoinOutcome::Cancelled, ns_join: JoinOutcome::Cancelled,
+            callbacks: 10,
+            enqueued: 8,
+            written: 7,
+            dropped_full: 1,
+            dropped_closed: 1,
+            io_errors: 1,
+            in_flight: 0,
+            drain_complete: true,
+            producers_quiesced: true,
+            producers_joined: true,
+            session_join: JoinOutcome::Cancelled,
+            ns_join: JoinOutcome::Cancelled,
             capacity: 64,
         };
         let body = s.info_body();
         for k in [
-            "\"event\":\"accept_trace\"", "accept_callbacks", "accept_enqueued",
-            "accept_written", "accept_unwritten", "dropped_full", "dropped_closed",
-            "io_errors", "drain_complete", "producers_quiesced", "conservation_ok",
-            "accept_intact", "accept_capacity",
+            "\"event\":\"accept_trace\"",
+            "accept_callbacks",
+            "accept_enqueued",
+            "accept_written",
+            "accept_unwritten",
+            "dropped_full",
+            "dropped_closed",
+            "io_errors",
+            "drain_complete",
+            "producers_quiesced",
+            "conservation_ok",
+            "accept_intact",
+            "accept_capacity",
         ] {
             assert!(body.contains(k), "missing {k} in {body}");
         }
@@ -2079,10 +2349,18 @@ mod accept_shutdown_tests {
     #[test]
     fn conservation_leg1_detects_unaccounted_callbacks() {
         let s = AcceptSnapshot {
-            callbacks: 10, enqueued: 8, written: 8, dropped_full: 0,
-            dropped_closed: 0, io_errors: 0, in_flight: 0, drain_complete: true,
-            producers_quiesced: true, producers_joined: true,
-            session_join: JoinOutcome::Cancelled, ns_join: JoinOutcome::Cancelled,
+            callbacks: 10,
+            enqueued: 8,
+            written: 8,
+            dropped_full: 0,
+            dropped_closed: 0,
+            io_errors: 0,
+            in_flight: 0,
+            drain_complete: true,
+            producers_quiesced: true,
+            producers_joined: true,
+            session_join: JoinOutcome::Cancelled,
+            ns_join: JoinOutcome::Cancelled,
             capacity: 64,
         };
         // 10 != 8 + 0 + 0 — two callbacks vanished without an exit.
@@ -2096,10 +2374,18 @@ mod accept_shutdown_tests {
     #[test]
     fn conservation_leg2_detects_double_counting() {
         let s = AcceptSnapshot {
-            callbacks: 8, enqueued: 8, written: 7, dropped_full: 0,
-            dropped_closed: 0, io_errors: 3, in_flight: 0, drain_complete: true,
-            producers_quiesced: true, producers_joined: true,
-            session_join: JoinOutcome::Cancelled, ns_join: JoinOutcome::Cancelled,
+            callbacks: 8,
+            enqueued: 8,
+            written: 7,
+            dropped_full: 0,
+            dropped_closed: 0,
+            io_errors: 3,
+            in_flight: 0,
+            drain_complete: true,
+            producers_quiesced: true,
+            producers_joined: true,
+            session_join: JoinOutcome::Cancelled,
+            ns_join: JoinOutcome::Cancelled,
             capacity: 64,
         };
         // 7 + 3 > 8 — a record was counted twice.
@@ -2113,10 +2399,18 @@ mod accept_shutdown_tests {
     #[test]
     fn non_quiesced_producers_break_intact() {
         let s = AcceptSnapshot {
-            callbacks: 100, enqueued: 100, written: 100, dropped_full: 0,
-            dropped_closed: 0, io_errors: 0, in_flight: 0, drain_complete: true,
-            producers_quiesced: false, producers_joined: true,
-            session_join: JoinOutcome::Cancelled, ns_join: JoinOutcome::Cancelled,
+            callbacks: 100,
+            enqueued: 100,
+            written: 100,
+            dropped_full: 0,
+            dropped_closed: 0,
+            io_errors: 0,
+            in_flight: 0,
+            drain_complete: true,
+            producers_quiesced: false,
+            producers_joined: true,
+            session_join: JoinOutcome::Cancelled,
+            ns_join: JoinOutcome::Cancelled,
             capacity: 64,
         };
         assert!(s.conservation_ok());
@@ -2127,10 +2421,18 @@ mod accept_shutdown_tests {
     #[test]
     fn incomplete_drain_breaks_intact() {
         let s = AcceptSnapshot {
-            callbacks: 100, enqueued: 100, written: 100, dropped_full: 0,
-            dropped_closed: 0, io_errors: 0, in_flight: 0, drain_complete: false,
-            producers_quiesced: true, producers_joined: true,
-            session_join: JoinOutcome::Cancelled, ns_join: JoinOutcome::Cancelled,
+            callbacks: 100,
+            enqueued: 100,
+            written: 100,
+            dropped_full: 0,
+            dropped_closed: 0,
+            io_errors: 0,
+            in_flight: 0,
+            drain_complete: false,
+            producers_quiesced: true,
+            producers_joined: true,
+            session_join: JoinOutcome::Cancelled,
+            ns_join: JoinOutcome::Cancelled,
             capacity: 64,
         };
         assert!(!s.intact());
@@ -2194,12 +2496,21 @@ mod fault_injection_tests {
         for i in 0..50 {
             fire(&tap, i);
         }
-        let joins = ProducerJoins { session: JoinOutcome::TimedOut, ns: JoinOutcome::Cancelled };
-        let s = trace.shutdown(Duration::from_secs(2), joins).await.expect("first caller");
+        let joins = ProducerJoins {
+            session: JoinOutcome::TimedOut,
+            ns: JoinOutcome::Cancelled,
+        };
+        let s = trace
+            .shutdown(Duration::from_secs(2), joins)
+            .await
+            .expect("first caller");
 
         assert_eq!(s.written, 50, "the accept side itself is clean");
         assert!(s.conservation_ok());
-        assert!(s.producers_quiesced, "nothing is calling back, so it looks quiet");
+        assert!(
+            s.producers_quiesced,
+            "nothing is calling back, so it looks quiet"
+        );
         assert!(!s.producers_joined, "but the join failed");
         assert!(
             !s.intact(),
@@ -2222,7 +2533,10 @@ mod fault_injection_tests {
         assert_eq!(outcome, JoinOutcome::Panicked);
         assert!(!outcome.is_complete());
 
-        let joins = ProducerJoins { session: JoinOutcome::Panicked, ns: JoinOutcome::Cancelled };
+        let joins = ProducerJoins {
+            session: JoinOutcome::Panicked,
+            ns: JoinOutcome::Cancelled,
+        };
         assert!(!joins.all_complete());
     }
 
@@ -2237,7 +2551,10 @@ mod fault_injection_tests {
         });
         let outcome = join_producer(Some(looper), None, Duration::from_secs(2)).await;
         assert_eq!(outcome, JoinOutcome::Cancelled);
-        assert!(outcome.is_complete(), "abort+join is the normal, successful path");
+        assert!(
+            outcome.is_complete(),
+            "abort+join is the normal, successful path"
+        );
     }
 
     /// A handle already driven to completion elsewhere must never be re-polled
@@ -2289,7 +2606,10 @@ mod fault_injection_tests {
         );
         assert!(s.written < s.enqueued, "records were left unwritten: {s:?}");
         assert!(s.unwritten() > 0);
-        assert!(!s.intact(), "an aborted drain must never report intact: {s:?}");
+        assert!(
+            !s.intact(),
+            "an aborted drain must never report intact: {s:?}"
+        );
         assert!(
             elapsed < Duration::from_millis(1200),
             "shutdown must stay bounded, took {elapsed:?}"
@@ -2324,7 +2644,10 @@ mod fault_injection_tests {
 
         let exe = std::env::current_exe().expect("test binary path");
         let out = std::process::Command::new(exe)
-            .args(["--exact", "fault_injection_tests::watchdog_exits_with_code_3"])
+            .args([
+                "--exact",
+                "fault_injection_tests::watchdog_exits_with_code_3",
+            ])
             .arg("--nocapture")
             .env(TRIGGER, "1")
             .output()

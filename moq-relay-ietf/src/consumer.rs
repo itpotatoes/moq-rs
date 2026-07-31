@@ -180,11 +180,11 @@ impl Consumer {
                     tracing::info!(namespace = %ns, "PUBLISH_NAMESPACE closed");
                     return Ok(());
                 },
-                Some(track) = requests.recv() => {
+                Some(request) = requests.recv() => {
                     let mut subscriber = self.subscriber.clone();
 
                     tasks.push(async move {
-                        let info = track.clone();
+                        let info = request.writer.clone();
                         let namespace = info.namespace.to_utf8_path();
                         let track_name = info.name.clone();
                         tracing::info!(
@@ -193,7 +193,27 @@ impl Consumer {
                             "forwarding subscribe: {:?}", info
                         );
 
-                        if let Err(err) = subscriber.subscribe(track).await {
+                        let subscribe = match subscriber.subscribe_open(request.writer).await {
+                            Ok(subscribe) => subscribe,
+                            Err(err) => {
+                                tracing::warn!(
+                                    namespace = %namespace,
+                                    track = %track_name,
+                                    error = %err,
+                                    "failed forwarding subscribe: {:?}", info
+                                );
+                                return Ok(());
+                            }
+                        };
+                        let mut cancelled = request.cancelled;
+                        let result = tokio::select! {
+                            result = subscribe.closed() => result,
+                            _ = cancelled.wait_for(|cancelled| *cancelled) => {
+                                drop(subscribe);
+                                return Ok(());
+                            }
+                        };
+                        if let Err(err) = result {
                             tracing::warn!(
                                 namespace = %namespace,
                                 track = %track_name,

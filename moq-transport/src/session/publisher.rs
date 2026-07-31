@@ -19,9 +19,10 @@ use crate::{
 use crate::watch::Queue;
 
 use super::{
-    split_published_state, ObjectForwarderRecv, PendingRequest, PendingRequests, PublishNamespace,
-    PublishNamespaceRecv, Published, PublishedInfo, PublishedRecv, RequestId, RequestIdAllocation,
-    Session, SessionConfig, SessionError, Subscribed, TrackStatusRequested,
+    split_published_state, DataPriorityMapping, ObjectForwarderRecv, PendingRequest,
+    PendingRequests, PublishNamespace, PublishNamespaceRecv, Published, PublishedInfo,
+    PublishedRecv, RequestId, RequestIdAllocation, Session, SessionConfig, SessionError,
+    Subscribed, TrackStatusRequested,
 };
 use crate::message::RequestErrorCode;
 
@@ -127,6 +128,9 @@ pub struct Publisher {
 
     /// Optional mlog writer for logging transport events
     mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+
+    /// Local mapping from MoQT publisher priority to quinn stream priority.
+    data_priority_mapping: DataPriorityMapping,
 }
 
 impl Publisher {
@@ -136,6 +140,7 @@ impl Publisher {
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
         request_id: RequestId,
         pending_requests: PendingRequests,
+        data_priority_mapping: DataPriorityMapping,
     ) -> Self {
         Self {
             webtransport,
@@ -150,7 +155,12 @@ impl Publisher {
             request_id,
             pending_requests,
             mlog,
+            data_priority_mapping,
         }
+    }
+
+    pub(super) fn data_priority_mapping(&self) -> DataPriorityMapping {
+        self.data_priority_mapping
     }
 
     pub async fn accept(
@@ -188,14 +198,22 @@ impl Publisher {
         Ok((session, publisher))
     }
 
-    /// Send a PUBLISH_NAMESPACE for a namespace and serve tracks using the provided
-    /// [serve::TracksReader].  Blocks until the namespace is unannounced or an error occurs.
-    pub async fn publish_namespace(&mut self, tracks: TracksReader) -> Result<(), SessionError> {
+    /// Start a PUBLISH_NAMESPACE and return the peer-facing lifecycle handle.
+    ///
+    /// Unlike [`Self::publish_namespace`], this does not hide inbound
+    /// [`Subscribed`] handles behind a static [`TracksReader`]. Applications
+    /// that need subscription-scoped producers can await
+    /// [`PublishNamespace::subscribed`], serve the requested track, and stop
+    /// the producer when that subscription closes.
+    pub fn publish_namespace_open(
+        &mut self,
+        namespace: TrackNamespace,
+    ) -> Result<PublishNamespace, SessionError> {
         let publish_ns = match self
             .publish_namespaces
             .lock()
             .map_err(|_| SessionError::Internal)?
-            .entry(tracks.namespace.clone())
+            .entry(namespace.clone())
         {
             // Duplicate PUBLISH_NAMESPACE for the same namespace is a protocol error.
             hash_map::Entry::Occupied(_) => return Err(ServeError::Duplicate.into()),
@@ -213,13 +231,20 @@ impl Publisher {
                 };
                 self.pending_requests
                     .insert(request_id, PendingRequest::PublishNamespace)?;
-                let (mut send, recv) =
-                    PublishNamespace::new(self.clone(), request_id, tracks.namespace.clone());
+                let (mut send, recv) = PublishNamespace::new(self.clone(), request_id, namespace);
                 entry.insert(recv);
                 send.send_request();
                 send
             }
         };
+
+        Ok(publish_ns)
+    }
+
+    /// Send a PUBLISH_NAMESPACE for a namespace and serve tracks using the provided
+    /// [serve::TracksReader].  Blocks until the namespace is unannounced or an error occurs.
+    pub async fn publish_namespace(&mut self, tracks: TracksReader) -> Result<(), SessionError> {
+        let publish_ns = self.publish_namespace_open(tracks.namespace.clone())?;
 
         let mut subscribe_tasks = FuturesUnordered::new();
         let mut status_tasks = FuturesUnordered::new();

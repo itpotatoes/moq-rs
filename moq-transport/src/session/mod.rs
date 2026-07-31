@@ -37,7 +37,11 @@ use writer::*;
 
 use futures::{stream::FuturesUnordered, StreamExt};
 use request_id::max_request_id_from_params;
-use std::sync::{Arc, Mutex};
+use std::{
+    fmt,
+    str::FromStr,
+    sync::{Arc, Mutex},
+};
 
 use crate::coding::{KeyValuePairs, Value};
 use crate::message::Message;
@@ -67,17 +71,91 @@ pub enum Transport {
 
 const DEFAULT_MAX_REQUEST_ID: u64 = 100;
 
+/// Send priority applied to the MoQT control stream on both the client
+/// (`open_bi`) and server (`accept_bi`) paths.
+///
+/// quinn schedules send streams strictly by descending `i32` priority with no
+/// anti-starvation, and data subgroup streams are assigned
+/// `publisher_priority as i32` (a `u8`, so at most 255; see
+/// `subscribed.rs`). Without an explicit priority the control stream stays at
+/// quinn's default of 0, so a sustained data backlog can starve tiny control
+/// frames (e.g. SUBSCRIBE_OK) indefinitely. `i32::MAX` guarantees control
+/// frames always preempt data subgroups while leaving the relative ordering
+/// *between* data streams untouched.
+pub(crate) const CONTROL_STREAM_PRIORITY: i32 = i32::MAX;
+
+/// Translation from the MoQT publisher-priority domain to quinn's send-stream
+/// priority domain.
+///
+/// MoQT assigns higher precedence to smaller `u8` values, whereas quinn sends
+/// larger `i32` priorities first. `LegacyV1` preserves the historical direct
+/// cast for reproducibility. `MoqtV2` reverses the bounded `u8` domain so the
+/// wire priority order is preserved at the QUIC scheduler.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum DataPriorityMapping {
+    LegacyV1,
+    MoqtV2,
+}
+
+impl DataPriorityMapping {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LegacyV1 => "legacy-v1",
+            Self::MoqtV2 => "moqt-v2",
+        }
+    }
+
+    pub const fn to_quinn(self, publisher_priority: u8) -> i32 {
+        match self {
+            Self::LegacyV1 => publisher_priority as i32,
+            Self::MoqtV2 => (u8::MAX - publisher_priority) as i32,
+        }
+    }
+}
+
+impl Default for DataPriorityMapping {
+    fn default() -> Self {
+        Self::LegacyV1
+    }
+}
+
+impl fmt::Display for DataPriorityMapping {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for DataPriorityMapping {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "legacy-v1" => Ok(Self::LegacyV1),
+            "moqt-v2" => Ok(Self::MoqtV2),
+            _ => Err(format!(
+                "invalid data priority mapping {value:?}; expected legacy-v1 or moqt-v2"
+            )),
+        }
+    }
+}
+
 /// Session-level protocol limits advertised during setup.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct SessionConfig {
     /// Maximum request ID plus one that we advertise to the peer.
     pub max_request_id: u64,
+
+    /// Local QUIC scheduler translation for MoQT publisher priorities.
+    ///
+    /// This does not change the publisher-priority byte on the wire.
+    pub data_priority_mapping: DataPriorityMapping,
 }
 
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             max_request_id: DEFAULT_MAX_REQUEST_ID,
+            data_priority_mapping: DataPriorityMapping::LegacyV1,
         }
     }
 }
@@ -459,7 +537,12 @@ impl Session {
         transport: Transport,
         connection_path: Option<String>,
         request_id: RequestId,
+        data_priority_mapping: DataPriorityMapping,
     ) -> (Self, Option<Publisher>, Option<Subscriber>) {
+        tracing::info!(
+            data_priority_mapping = data_priority_mapping.as_str(),
+            "configured MoQT-to-quinn data priority mapping"
+        );
         let outgoing = Queue::default().split();
         let pending_requests = PendingRequests::default();
 
@@ -472,6 +555,7 @@ impl Session {
             mlog_shared.clone(),
             request_id.clone(),
             pending_requests.clone(),
+            data_priority_mapping,
         ));
         let subscriber = Some(Subscriber::new(
             outgoing.0,
@@ -531,8 +615,12 @@ impl Session {
         });
 
         let control = session.open_bi().await?;
-        let mut sender = Writer::new(control.0);
-        let mut recver = Reader::new(control.1);
+        let (mut control_send, control_recv) = control;
+        // Keep control messages ahead of any data-stream backlog; see
+        // CONTROL_STREAM_PRIORITY. Data subgroup priorities are untouched.
+        control_send.set_priority(CONTROL_STREAM_PRIORITY);
+        let mut sender = Writer::new(control_send);
+        let mut recver = Reader::new(control_recv);
 
         let mut params = KeyValuePairs::default();
 
@@ -594,7 +682,16 @@ impl Session {
         Self::log_peer_max_request_id(peer_max);
         // Client sends even IDs (0); peer server sends odd IDs (1).
         let request_id = RequestId::new(0, peer_max, our_max_request_id, 1);
-        let session = Session::new(session, sender, recver, mlog, transport, path, request_id);
+        let session = Session::new(
+            session,
+            sender,
+            recver,
+            mlog,
+            transport,
+            path,
+            request_id,
+            config.data_priority_mapping,
+        );
         let publisher = session.1.ok_or(SessionError::Internal)?;
         let subscriber = session.2.ok_or(SessionError::Internal)?;
         Ok((session.0, publisher, subscriber))
@@ -627,8 +724,12 @@ impl Session {
         });
 
         let control = session.accept_bi().await?;
-        let mut sender = Writer::new(control.0);
-        let mut recver = Reader::new(control.1);
+        let (mut control_send, control_recv) = control;
+        // Keep control messages ahead of any data-stream backlog; see
+        // CONTROL_STREAM_PRIORITY. Data subgroup priorities are untouched.
+        control_send.set_priority(CONTROL_STREAM_PRIORITY);
+        let mut sender = Writer::new(control_send);
+        let mut recver = Reader::new(control_recv);
 
         let client: setup::Client = recver.decode().await?;
         tracing::debug!(
@@ -700,6 +801,7 @@ impl Session {
             transport,
             connection_path,
             request_id,
+            config.data_priority_mapping,
         ))
     }
 
@@ -1100,6 +1202,51 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ========================================================================
+    // control-stream priority
+    // ========================================================================
+
+    /// The generic `web_transport::SendStream` exposes `set_priority` but no
+    /// `priority()` getter, and constructing a real stream requires a live
+    /// QUIC session, so the applied value cannot be read back at unit level.
+    /// This constant-level assertion pins the invariant instead: the control
+    /// stream must strictly dominate every possible data subgroup priority
+    /// (`publisher_priority as i32`, a `u8`, so <= 255 — see
+    /// `subscribed.rs::serve_subgroup`). Live verification path: quinn qlog /
+    /// mlog control-message latency under saturated data backlog.
+    #[test]
+    fn control_stream_priority_dominates_all_data_priorities() {
+        assert_eq!(CONTROL_STREAM_PRIORITY, i32::MAX);
+        assert!(CONTROL_STREAM_PRIORITY > u8::MAX as i32);
+    }
+
+    #[test]
+    fn data_priority_mapping_preserves_legacy_and_corrects_moqt_order() {
+        assert_eq!(DataPriorityMapping::LegacyV1.to_quinn(0), 0);
+        assert_eq!(DataPriorityMapping::LegacyV1.to_quinn(1), 1);
+        assert!(
+            DataPriorityMapping::LegacyV1.to_quinn(1) > DataPriorityMapping::LegacyV1.to_quinn(0)
+        );
+
+        assert_eq!(DataPriorityMapping::MoqtV2.to_quinn(0), 255);
+        assert_eq!(DataPriorityMapping::MoqtV2.to_quinn(1), 254);
+        assert!(DataPriorityMapping::MoqtV2.to_quinn(0) > DataPriorityMapping::MoqtV2.to_quinn(1));
+        assert_eq!(DataPriorityMapping::MoqtV2.to_quinn(u8::MAX), 0);
+    }
+
+    #[test]
+    fn data_priority_mapping_parser_is_fail_closed() {
+        assert_eq!(
+            "legacy-v1".parse::<DataPriorityMapping>().unwrap(),
+            DataPriorityMapping::LegacyV1
+        );
+        assert_eq!(
+            "moqt-v2".parse::<DataPriorityMapping>().unwrap(),
+            DataPriorityMapping::MoqtV2
+        );
+        assert!("v2".parse::<DataPriorityMapping>().is_err());
+    }
 
     // ========================================================================
     // normalize_connection_path

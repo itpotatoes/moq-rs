@@ -19,10 +19,15 @@ use super::{DeliveryFilter, Publisher, SessionError, SubscribeInfo, Writer};
 
 // This file defines Publisher handling of inbound Subscriptions
 
+/// Draft-16 §10.4.3 RESET_STREAM code for an object delivery timeout.
+const DELIVERY_TIMEOUT_RESET_CODE: u32 = 0x2;
+
 #[derive(Debug)]
 struct ObjectForwarderState {
     largest_location: Option<Location>,
     stream_count: u64,
+    delivery_timeouts: u64,
+    delivery_timeout_resets: u64,
     /// Set to true when UNSUBSCRIBE is received.  When true, Drop skips sending
     /// PUBLISH_DONE or REQUEST_ERROR because the subscriber already terminated.
     unsubscribed: bool,
@@ -44,6 +49,13 @@ impl ObjectForwarderState {
 
         Ok(())
     }
+
+    fn record_delivery_timeout(&mut self, reset: bool) {
+        self.delivery_timeouts = self.delivery_timeouts.saturating_add(1);
+        if reset {
+            self.delivery_timeout_resets = self.delivery_timeout_resets.saturating_add(1);
+        }
+    }
 }
 
 impl Default for ObjectForwarderState {
@@ -51,6 +63,8 @@ impl Default for ObjectForwarderState {
         Self {
             largest_location: None,
             stream_count: 0,
+            delivery_timeouts: 0,
+            delivery_timeout_resets: 0,
             unsubscribed: false,
             closed: Ok(()),
         }
@@ -66,6 +80,10 @@ pub struct Subscribed {
     /// Tracks if SubscribeOk has been sent yet or not. Used to send
     /// PUBLISH_DONE vs REQUEST_ERROR on drop.
     ok: bool,
+
+    /// Largest location captured when SUBSCRIBE_OK was sent. The outer Option
+    /// distinguishes "not accepted" from an accepted empty track.
+    accepted_largest: Option<Option<Location>>,
 }
 
 pub(super) struct ObjectForwarder {
@@ -144,13 +162,15 @@ impl ObjectForwarder {
         &mut self,
         track: serve::TrackReader,
         delivery_filter: DeliveryFilter,
+        delivery_timeout: Option<std::time::Duration>,
     ) -> Result<(), SessionError> {
         match track.mode().await? {
             TrackReaderMode::Stream(_stream) => Err(SessionError::Serve(
                 ServeError::not_implemented_ctx("stream track reader mode"),
             )),
             TrackReaderMode::Subgroups(subgroups) => {
-                self.serve_subgroups(subgroups, delivery_filter).await
+                self.serve_subgroups(subgroups, delivery_filter, delivery_timeout)
+                    .await
             }
             TrackReaderMode::Datagrams(datagrams) => {
                 self.serve_datagrams(datagrams, delivery_filter).await
@@ -188,6 +208,17 @@ impl SubgroupOutput {
         }
     }
 
+    fn reset(&mut self, code: u32) -> bool {
+        match self {
+            Self::Stream(writer) => {
+                writer.reset(code);
+                true
+            }
+            #[cfg(test)]
+            Self::Buffer(_) => false,
+        }
+    }
+
     #[cfg(test)]
     fn into_buffer(self) -> bytes::BytesMut {
         match self {
@@ -210,13 +241,18 @@ impl Subscribed {
             info,
             forwarder,
             ok: false,
+            accepted_largest: None,
         };
 
         Ok((send, recv))
     }
 
     pub async fn serve(mut self, track: serve::TrackReader) -> Result<(), SessionError> {
-        let res = self.serve_inner(track).await;
+        let res = async {
+            self.accept(&track).await?;
+            self.serve_accepted_inner(track).await
+        }
+        .await;
         if let Err(err) = &res {
             self.close(err.clone().into())?;
         }
@@ -224,7 +260,18 @@ impl Subscribed {
         res
     }
 
-    async fn serve_inner(&mut self, track: serve::TrackReader) -> Result<(), SessionError> {
+    /// Send SUBSCRIBE_OK without starting object forwarding.
+    ///
+    /// Subscription-scoped producers use this barrier to ensure they do not
+    /// generate objects before the peer has received an accepted track alias.
+    pub async fn accept(&mut self, track: &serve::TrackReader) -> Result<(), SessionError> {
+        if self.ok {
+            return Err(SessionError::Duplicate);
+        }
+        if track.namespace != self.info.track_namespace || track.name != self.info.track_name {
+            return Err(SessionError::Internal);
+        }
+
         // Update largest location before sending SubscribeOk
         let largest_location = track.largest_location();
         self.forwarder.set_largest_location(largest_location)?;
@@ -238,6 +285,9 @@ impl Subscribed {
                 .set_largest_object(largest)
                 .map_err(|_| SessionError::Internal)?;
         }
+        if let Some(timeout_ms) = self.info.delivery_timeout_ms {
+            params.set_delivery_timeout(timeout_ms);
+        }
 
         self.forwarder
             .publisher
@@ -250,10 +300,37 @@ impl Subscribed {
             .await;
 
         self.ok = true; // So we send PUBLISH_DONE on drop
+        self.accepted_largest = Some(largest_location);
+        Ok(())
+    }
 
+    /// Forward an already accepted subscription. [`Self::accept`] must have
+    /// completed for this same track before calling this method.
+    pub async fn serve_accepted(mut self, track: serve::TrackReader) -> Result<(), SessionError> {
+        let res = self.serve_accepted_inner(track).await;
+        if let Err(err) = &res {
+            self.close(err.clone().into())?;
+        }
+        res
+    }
+
+    async fn serve_accepted_inner(
+        &mut self,
+        track: serve::TrackReader,
+    ) -> Result<(), SessionError> {
+        if track.namespace != self.info.track_namespace || track.name != self.info.track_name {
+            return Err(SessionError::Internal);
+        }
+        let largest_location = self.accepted_largest.ok_or(SessionError::Internal)?;
         let delivery_filter = self.info.delivery_filter(largest_location);
+        let delivery_timeout = self
+            .info
+            .delivery_timeout_ms
+            .map(std::time::Duration::from_millis);
 
-        self.forwarder.serve(track, delivery_filter).await
+        self.forwarder
+            .serve(track, delivery_filter, delivery_timeout)
+            .await
     }
 
     pub fn close(self, err: ServeError) -> Result<(), ServeError> {
@@ -346,6 +423,7 @@ impl ObjectForwarder {
         &mut self,
         mut subgroups: serve::SubgroupsReader,
         delivery_filter: DeliveryFilter,
+        delivery_timeout: Option<std::time::Duration>,
     ) -> Result<(), SessionError> {
         let mut tasks = FuturesUnordered::new();
         let mut done: Option<Result<(), ServeError>> = None;
@@ -368,7 +446,15 @@ impl ObjectForwarder {
                         let mlog = self.mlog.clone();
 
                         tasks.push(async move {
-                            if let Err(err) = Self::serve_subgroup(header, subgroup, publisher, state, mlog, delivery_filter).await {
+                            if let Err(err) = Self::serve_subgroup(
+                                header,
+                                subgroup,
+                                publisher,
+                                state,
+                                mlog,
+                                delivery_filter,
+                                delivery_timeout,
+                            ).await {
                                 if Subscribed::is_expected_serve_shutdown(&err) {
                                     tracing::debug!(subgroup_info = ?info, error = %err, "stopped serving subgroup");
                                 } else {
@@ -394,6 +480,7 @@ impl ObjectForwarder {
         state: State<ObjectForwarderState>,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
         delivery_filter: DeliveryFilter,
+        delivery_timeout: Option<std::time::Duration>,
     ) -> Result<(), SessionError> {
         tracing::trace!(
             "[PUBLISHER] serve_subgroup: starting - group_id={}, subgroup_id={:?}, priority={}",
@@ -408,7 +495,24 @@ impl ObjectForwarder {
             return Ok(());
         };
 
-        let mut send_stream = publisher.open_uni().await?;
+        let first_deadline = delivery_timeout.map(|timeout| first_object.received_at + timeout);
+        let mut send_stream = match first_deadline {
+            Some(deadline) => match tokio::time::timeout_at(deadline, publisher.open_uni()).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    Self::record_delivery_timeout(
+                        &state,
+                        &mlog,
+                        &header,
+                        &first_object,
+                        delivery_timeout.expect("deadline implies timeout"),
+                        false,
+                    );
+                    return Ok(());
+                }
+            },
+            None => publisher.open_uni().await?,
+        };
         tracing::trace!("[PUBLISHER] serve_subgroup: opened unidirectional stream");
 
         state
@@ -416,8 +520,15 @@ impl ObjectForwarder {
             .ok_or(ServeError::Done)?
             .record_stream_opened();
 
-        // TODO figure out u32 vs u64 priority
-        send_stream.set_priority(subgroup_reader.priority as i32);
+        let mapping = publisher.data_priority_mapping();
+        let quinn_priority = mapping.to_quinn(subgroup_reader.priority);
+        tracing::trace!(
+            publisher_priority = subgroup_reader.priority,
+            quinn_priority,
+            data_priority_mapping = mapping.as_str(),
+            "mapped MoQT publisher priority to quinn send-stream priority"
+        );
+        send_stream.set_priority(quinn_priority);
 
         let mut output = SubgroupOutput::Stream(Writer::new(send_stream));
         Self::serve_subgroup_objects(
@@ -428,6 +539,7 @@ impl ObjectForwarder {
             state,
             mlog,
             delivery_filter,
+            delivery_timeout,
         )
         .await
     }
@@ -451,6 +563,55 @@ impl ObjectForwarder {
         Ok(None)
     }
 
+    fn record_delivery_timeout(
+        state: &State<ObjectForwarderState>,
+        mlog: &Option<Arc<Mutex<mlog::MlogWriter>>>,
+        header: &data::SubgroupHeader,
+        object: &serve::SubgroupObjectReader,
+        timeout: std::time::Duration,
+        reset: bool,
+    ) {
+        if let Some(mut locked) = state.lock_mut() {
+            locked.record_delivery_timeout(reset);
+        }
+
+        let age_ms = tokio::time::Instant::now()
+            .saturating_duration_since(object.received_at)
+            .as_millis();
+        tracing::info!(
+            track_alias = header.track_alias,
+            group_id = header.group_id,
+            subgroup_id = object.subgroup_id,
+            object_id = object.object_id,
+            timeout_ms = timeout.as_millis(),
+            age_ms,
+            reset_code = DELIVERY_TIMEOUT_RESET_CODE,
+            stream_reset = reset,
+            "delivery timeout"
+        );
+
+        if let Some(mlog) = mlog {
+            if let Ok(mut guard) = mlog.lock() {
+                let event = mlog::loglevel_event(
+                    guard.elapsed_ms(),
+                    mlog::LogLevel::Info,
+                    format!(
+                        "delivery_timeout: track_alias={} group_id={} subgroup_id={} object_id={} timeout_ms={} age_ms={} reset_code={} stream_reset={}",
+                        header.track_alias,
+                        header.group_id,
+                        object.subgroup_id,
+                        object.object_id,
+                        timeout.as_millis(),
+                        age_ms,
+                        DELIVERY_TIMEOUT_RESET_CODE,
+                        reset,
+                    ),
+                );
+                let _ = guard.add_event(event);
+            }
+        }
+    }
+
     async fn serve_subgroup_objects(
         header: data::SubgroupHeader,
         mut subgroup_reader: serve::SubgroupReader,
@@ -459,28 +620,8 @@ impl ObjectForwarder {
         state: State<ObjectForwarderState>,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
         delivery_filter: DeliveryFilter,
+        delivery_timeout: Option<std::time::Duration>,
     ) -> Result<(), SessionError> {
-        tracing::trace!(
-            "[PUBLISHER] serve_subgroup: sending header - track_alias={}, group_id={}, subgroup_id={:?}, priority={}, header_type={:?}",
-            header.track_alias,
-            header.group_id,
-            header.subgroup_id,
-            header.publisher_priority,
-            header.header_type
-        );
-
-        output.encode(&header).await?;
-
-        // Log subgroup header created/sent
-        if let Some(ref mlog) = mlog {
-            if let Ok(mut mlog_guard) = mlog.lock() {
-                let time = mlog_guard.elapsed_ms();
-                let stream_id = 0; // TODO: Placeholder, need actual QUIC stream ID
-                let event = mlog::subgroup_header_created(time, stream_id, &header);
-                let _ = mlog_guard.add_event(event);
-            }
-        }
-
         let mut object_count = 0;
         let mut next_object = Some(first_object);
         loop {
@@ -519,24 +660,93 @@ impl ObjectForwarder {
                 subgroup_object.extension_headers
             );
 
-            output.encode(&subgroup_object).await?;
-
-            // Log subgroup object created/sent
-            if let Some(ref mlog) = mlog {
-                if let Ok(mut mlog_guard) = mlog.lock() {
-                    let time = mlog_guard.elapsed_ms();
-                    let stream_id = 0; // TODO: Placeholder, need actual QUIC stream ID
-                    let event = mlog::subgroup_object_ext_created(
-                        time,
-                        stream_id,
-                        subgroup_reader.group_id,
-                        subgroup_reader.subgroup_id,
-                        subgroup_object_reader.object_id,
-                        &subgroup_object,
+            let deadline =
+                delivery_timeout.map(|timeout| subgroup_object_reader.received_at + timeout);
+            let send_object = async {
+                if object_count == 0 {
+                    tracing::trace!(
+                        "[PUBLISHER] serve_subgroup: sending header - track_alias={}, group_id={}, subgroup_id={:?}, priority={}, header_type={:?}",
+                        header.track_alias,
+                        header.group_id,
+                        header.subgroup_id,
+                        header.publisher_priority,
+                        header.header_type
                     );
-                    let _ = mlog_guard.add_event(event);
+                    output.encode(&header).await?;
+
+                    if let Some(ref mlog) = mlog {
+                        if let Ok(mut mlog_guard) = mlog.lock() {
+                            let time = mlog_guard.elapsed_ms();
+                            let stream_id = 0;
+                            let event = mlog::subgroup_header_created(time, stream_id, &header);
+                            let _ = mlog_guard.add_event(event);
+                        }
+                    }
                 }
-            }
+
+                output.encode(&subgroup_object).await?;
+
+                if let Some(ref mlog) = mlog {
+                    if let Ok(mut mlog_guard) = mlog.lock() {
+                        let time = mlog_guard.elapsed_ms();
+                        let stream_id = 0;
+                        let event = mlog::subgroup_object_ext_created(
+                            time,
+                            stream_id,
+                            subgroup_reader.group_id,
+                            subgroup_reader.subgroup_id,
+                            subgroup_object_reader.object_id,
+                            &subgroup_object,
+                        );
+                        let _ = mlog_guard.add_event(event);
+                    }
+                }
+
+                let mut chunks_sent = 0;
+                let mut bytes_sent = 0;
+                while let Some(chunk) = subgroup_object_reader.read().await? {
+                    tracing::trace!(
+                        "[PUBLISHER] serve_subgroup: sending payload chunk #{} for object #{} ({} bytes)",
+                        chunks_sent + 1,
+                        object_count + 1,
+                        chunk.len()
+                    );
+                    bytes_sent += chunk.len();
+                    output.write(&chunk).await?;
+                    chunks_sent += 1;
+                }
+
+                Ok::<(usize, usize), SessionError>((bytes_sent, chunks_sent))
+            };
+
+            let sent = match delivery_timeout {
+                Some(timeout) => {
+                    match tokio::time::timeout_at(
+                        deadline.expect("timeout implies deadline"),
+                        send_object,
+                    )
+                    .await
+                    {
+                        Ok(result) => result?,
+                        Err(_) => {
+                            let reset = output.reset(DELIVERY_TIMEOUT_RESET_CODE);
+                            Self::record_delivery_timeout(
+                                &state,
+                                &mlog,
+                                &header,
+                                &subgroup_object_reader,
+                                timeout,
+                                reset,
+                            );
+                            // A timed-out subgroup is never reopened. A later
+                            // frame can proceed only if it has its own subgroup.
+                            return Ok(());
+                        }
+                    }
+                }
+                None => send_object.await?,
+            };
+            let (bytes_sent, chunks_sent) = sent;
 
             state
                 .lock_mut()
@@ -545,20 +755,6 @@ impl ObjectForwarder {
                     subgroup_reader.group_id,
                     subgroup_object_reader.object_id,
                 )?;
-
-            let mut chunks_sent = 0;
-            let mut bytes_sent = 0;
-            while let Some(chunk) = subgroup_object_reader.read().await? {
-                tracing::trace!(
-                    "[PUBLISHER] serve_subgroup: sending payload chunk #{} for object #{} ({} bytes)",
-                    chunks_sent + 1,
-                    object_count + 1,
-                    chunk.len()
-                );
-                bytes_sent += chunk.len();
-                output.write(&chunk).await?;
-                chunks_sent += 1;
-            }
 
             // Instrumentation only (see crate::accept_trace). The payload write
             // loop above awaits QUIC flow control, so this is the last point in
@@ -609,6 +805,7 @@ impl ObjectForwarder {
         mut subgroup_reader: serve::SubgroupReader,
         state: State<ObjectForwarderState>,
         delivery_filter: DeliveryFilter,
+        delivery_timeout: Option<std::time::Duration>,
     ) -> Result<bytes::BytesMut, SessionError> {
         let Some(first_object) =
             Self::next_allowed_object(&mut subgroup_reader, delivery_filter).await?
@@ -630,6 +827,7 @@ impl ObjectForwarder {
             state,
             None,
             delivery_filter,
+            delivery_timeout,
         )
         .await?;
 
@@ -828,6 +1026,7 @@ mod tests {
                 start_location: None,
                 end_group_id: None,
             },
+            None,
         )
         .await
         .unwrap();
@@ -848,6 +1047,64 @@ mod tests {
         let payload = output.copy_to_bytes(object.payload_length);
         assert_eq!(&payload[..], b"hello");
         assert!(!output.has_remaining());
+    }
+
+    #[tokio::test]
+    async fn delivery_timeout_stops_one_subgroup_without_reopening_it() {
+        use crate::coding::TrackNamespace;
+
+        let (track_writer, track_reader) =
+            serve::Track::new(TrackNamespace::from_utf8_path("test"), "video").produce();
+        let mut subgroups_writer = track_writer.subgroups().unwrap();
+        let mut subgroup_writer = subgroups_writer
+            .create(serve::Subgroup {
+                group_id: 11,
+                subgroup_id: 0,
+                priority: 1,
+            })
+            .unwrap();
+        // Keep an incomplete object open. The forwarder can encode its header
+        // but blocks waiting for payload until the hop-local timeout fires.
+        let _object_writer = subgroup_writer.create(5, None).unwrap();
+
+        let mut subgroups = match track_reader.mode().await.unwrap() {
+            TrackReaderMode::Subgroups(subgroups) => subgroups,
+            _ => panic!("expected subgroups mode"),
+        };
+        let subgroup = subgroups
+            .next()
+            .await
+            .unwrap()
+            .expect("subgroup should be available");
+        let state = State::<ObjectForwarderState>::default();
+        let header = data::SubgroupHeader {
+            header_type: data::StreamHeaderType::SubgroupIdExt,
+            track_alias: 42,
+            group_id: subgroup.group_id,
+            subgroup_id: Some(subgroup.subgroup_id),
+            publisher_priority: subgroup.priority,
+        };
+
+        let _ = ObjectForwarder::serve_subgroup_to_buffer(
+            header,
+            subgroup,
+            state.clone(),
+            DeliveryFilter {
+                forward: true,
+                start_location: None,
+                end_group_id: None,
+            },
+            Some(std::time::Duration::from_millis(1)),
+        )
+        .await
+        .unwrap();
+
+        let state = state.lock();
+        assert_eq!(state.delivery_timeouts, 1);
+        // Buffer output has no QUIC stream to reset. Production stream output
+        // records this as a reset and calls Writer::reset(0x2).
+        assert_eq!(state.delivery_timeout_resets, 0);
+        assert_eq!(state.stream_count, 1);
     }
 
     #[test]

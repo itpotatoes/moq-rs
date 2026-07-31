@@ -89,4 +89,9 @@ impl Writer {
 
         Ok(())
     }
+
+    /// Abruptly reset the underlying WebTransport/QUIC stream.
+    pub fn reset(&mut self, code: u32) {
+        self.stream.reset(code);
+    }
 }

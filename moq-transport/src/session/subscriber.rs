@@ -30,6 +30,32 @@ use super::{
 // Default timeout for waiting for subscribe aliases to become available via SUBSCRIBE_OK (1 second)
 const DEFAULT_ALIAS_WAIT_TIME_MS: u64 = 1000;
 
+/// Classify a serve-layer error raised while receiving one subgroup stream.
+///
+/// Stream-local conditions — a duplicate or late subgroup identity, an
+/// unknown/already-removed subscription, a wrong mode or size, or a closed
+/// subgroup — must end only that stream's task; other streams of the track
+/// keep serving. Only errors meaning the local consumer of the whole track is
+/// gone (`Cancel`: all readers dropped; `Done`: track writer already closed)
+/// or an internal invariant failure justify tearing down the subscription,
+/// which sends UNSUBSCRIBE for the entire track.
+fn serve_error_is_stream_local(err: &ServeError) -> bool {
+    match err {
+        ServeError::Duplicate
+        | ServeError::NotFound
+        | ServeError::NotFoundWithId(..)
+        | ServeError::Mode
+        | ServeError::Size
+        | ServeError::Closed(_)
+        | ServeError::NotImplemented(_)
+        | ServeError::NotImplementedWithId(..) => true,
+        ServeError::Cancel
+        | ServeError::Done
+        | ServeError::Internal(_)
+        | ServeError::InternalWithId(..) => false,
+    }
+}
+
 // TODO remove Clone.
 #[derive(Clone)]
 pub struct Subscriber {
@@ -361,6 +387,19 @@ impl Subscriber {
         &mut self,
         track: serve::TrackWriter,
     ) -> Result<Subscribe, ServeError> {
+        self.subscribe_open_with_params(track, Default::default()).await
+    }
+
+    /// Subscribe with explicit request parameters.
+    ///
+    /// The default [`subscribe_open`](Self::subscribe_open) path remains
+    /// byte-identical. This entry point is used by experiments that
+    /// deliberately request hop-local DELIVERY_TIMEOUT.
+    pub async fn subscribe_open_with_params(
+        &mut self,
+        track: serve::TrackWriter,
+        params: crate::coding::KeyValuePairs,
+    ) -> Result<Subscribe, ServeError> {
         let request_id = self
             .get_next_request_id()
             .map_err(|e| ServeError::internal_ctx(format!("request ID limit: {}", e)))?;
@@ -396,7 +435,17 @@ impl Subscriber {
             )));
         }
 
-        let (mut send, recv) = Subscribe::new(self.clone(), request_id, track);
+        let (mut send, recv) =
+            match Subscribe::new_with_params(self.clone(), request_id, track, params) {
+                Ok(pair) => pair,
+                Err(err) => {
+                    let _ = self.pending_requests.remove(request_id);
+                    if let Ok(mut names) = self.subscriber_names.lock() {
+                        names.remove_by_request_id(request_id);
+                    }
+                    return Err(serve::ServeError::from(err));
+                }
+            };
         match self.subscribes.lock() {
             Ok(mut subscribes) => {
                 subscribes.insert(request_id, recv);
@@ -959,6 +1008,17 @@ impl Subscriber {
             .recv_stream_inner(reader, stream_header.header_type, subgroup_header, mlog)
             .await;
         if let Err(SessionError::Serve(err)) = &res {
+            // An error scoped to this one subgroup stream must not tear down
+            // the subscription: terminate only this stream's task.
+            if serve_error_is_stream_local(err) {
+                tracing::warn!(
+                    "[SUBSCRIBER] recv_stream: stream-local error for track_alias={}: {:?}; subscription kept",
+                    track_alias,
+                    err
+                );
+                return Ok(());
+            }
+
             tracing::warn!(
                 "[SUBSCRIBER] recv_stream: stream processing error for track_alias={}: {:?}",
                 track_alias,
@@ -1117,6 +1177,11 @@ impl Subscriber {
                 ));
             }
 
+            // DELIVERY_TIMEOUT starts when this hop receives the object
+            // header, not from sender generation time or after payload
+            // completion. Capture it before opening/writing the local object.
+            let object_received_at = tokio::time::Instant::now();
+
             // Open the subgroup writer on the first object.
             if subgroup_writer.is_none() {
                 if stream_header_type.uses_first_object_id_as_subgroup_id() {
@@ -1162,16 +1227,33 @@ impl Subscriber {
             // Write the object payload.
             // TODO SLG - object_id_delta and object status are still being ignored
             let subgroup_writer = subgroup_writer.as_mut().ok_or(SessionError::Internal)?;
-            let mut object_writer = subgroup_writer.create(remaining_bytes, extension_headers)?;
+            let mut object_writer = subgroup_writer.create_at(
+                remaining_bytes,
+                extension_headers,
+                object_received_at,
+            )?;
 
             while remaining_bytes > 0 {
-                let chunk = reader.read_chunk(remaining_bytes).await?.ok_or_else(|| {
-                    tracing::error!(
-                        "[SUBSCRIBER] recv_subgroup_objects: stream ended with {} bytes remaining",
-                        remaining_bytes
-                    );
-                    SessionError::WrongSize
-                })?;
+                let chunk = match reader.read_chunk(remaining_bytes).await {
+                    Ok(Some(chunk)) => chunk,
+                    Ok(None) => {
+                        tracing::error!(
+                            "[SUBSCRIBER] recv_subgroup_objects: stream ended with {} bytes remaining",
+                            remaining_bytes
+                        );
+                        return Err(SessionError::WrongSize);
+                    }
+                    Err(err) if err.stream_reset_code() == Some(0x2) => {
+                        // Draft-16 DELIVERY_TIMEOUT deliberately resets this
+                        // subgroup stream. Mark the partially received object
+                        // as expired so a consumer never observes truncated
+                        // bytes, then continue with the next independent
+                        // subgroup stream.
+                        object_writer.abort(ServeError::Closed(0x2))?;
+                        return Ok(());
+                    }
+                    Err(err) => return Err(err),
+                };
                 remaining_bytes -= chunk.len();
                 object_writer.write(chunk)?;
             }
@@ -1369,6 +1451,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn serve_error_classification_isolates_stream_local_errors() {
+        // Stream-local: terminate only the one subgroup stream's task.
+        assert!(serve_error_is_stream_local(&ServeError::Duplicate));
+        assert!(serve_error_is_stream_local(&ServeError::NotFound));
+        assert!(serve_error_is_stream_local(&ServeError::not_found_ctx(
+            "subscribe_id=1 not found".to_string()
+        )));
+        assert!(serve_error_is_stream_local(&ServeError::Mode));
+        assert!(serve_error_is_stream_local(&ServeError::Size));
+        assert!(serve_error_is_stream_local(&ServeError::Closed(0x2)));
+
+        // Consumer gone or invariant failure: the subscription is torn down.
+        assert!(!serve_error_is_stream_local(&ServeError::Cancel));
+        assert!(!serve_error_is_stream_local(&ServeError::Done));
+        assert!(!serve_error_is_stream_local(&ServeError::internal_ctx(
+            "invariant".to_string()
+        )));
+    }
+
     #[tokio::test]
     async fn duplicate_publish_for_same_track_sends_request_error() {
         let mut subscriber = subscriber();
@@ -1468,6 +1570,28 @@ mod tests {
 
         assert!(observer.subscribes.lock().unwrap().is_empty());
         assert!(observer.track_alias_map.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_subscribe_parameters_leave_no_reserved_state() {
+        let mut subscriber = subscriber();
+        let observer = subscriber.clone();
+        let (writer, _reader) =
+            Track::new(TrackNamespace::from_utf8_path("test"), "0.mp4").produce();
+        let mut params = crate::coding::KeyValuePairs::default();
+        params.set_delivery_timeout(0);
+
+        let err = match subscriber.subscribe_open_with_params(writer, params).await {
+            Ok(_) => panic!("zero DELIVERY_TIMEOUT was accepted"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, ServeError::InternalWithId(_, _)));
+        assert!(observer.subscribes.lock().unwrap().is_empty());
+        let names = observer.subscriber_names.lock().unwrap();
+        assert!(names.by_name.is_empty());
+        assert!(names.by_request_id.is_empty());
+        drop(names);
+        assert!(observer.pending_requests.next_deadline().unwrap().is_none());
     }
 
     #[tokio::test]

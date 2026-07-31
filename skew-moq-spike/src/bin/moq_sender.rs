@@ -1,13 +1,17 @@
-// moq_sender — MoQ naive B1 publisher (the "divergence extreme").
+// moq_sender — Phase-4 MoQ publisher.
 //
 // One QUIC connection to a relay carries TWO tracks (pc, haptic) as independent
-// subgroup streams. NO priority, NO delivery timeout, NO playout timeline — the
-// naive baseline. The v5 generation uses PC 30 Hz and haptic 90 Hz with exact
-// 1:3 rational-time anchors. `frame` sends one MoQ object per logical item;
-// `equal-chunk` sends fixed-size objects and keeps logical JSONL rows.
+// tracks. B1/S1 preserve the long-lived equal-priority mapping.
+// M1 changes only PC to frame-per-subgroup. S2 keeps that mapping and adds
+// static publisher priorities; its PC DELIVERY_TIMEOUT is requested by the
+// receiver and repeated here only for frozen metadata agreement.
+// The v5 generation uses PC 30 Hz and haptic 90 Hz with exact 1:3 rational
+// anchors. `frame` sends one object per logical item; B1 `equal-chunk` is a
+// negative ablation with fixed-size objects and logical JSONL rows.
 //
 // Namespace == run_id, so concurrent/repeat runs never collide on the relay.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::borrow::Cow;
 use std::path::PathBuf;
@@ -18,11 +22,19 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use clap::Parser;
 use moq_native_ietf::{quic, tls};
-use moq_transport::{coding::TrackNamespace, serve::Tracks, session::Session};
+use moq_transport::{
+    coding::TrackNamespace,
+    serve::Tracks,
+    session::{DataPriorityMapping, Session, SessionConfig},
+};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::time::{sleep_until, Instant};
 use url::Url;
 
+use skew_moq::s3_producer::SubscriptionProducerRegistry;
+use skew_moq::s3_sender::{
+    run_namespace as run_s3_namespace, AcceptRouteMap, SenderContext as S3SenderContext,
+};
 use skew_moq::*;
 
 /// Hard budget for the accept finalizer: quiesce producers, close the tap,
@@ -69,10 +81,11 @@ impl Ending {
 /// await a handle whose result was already observed.
 type SessionJoinHandle =
     tokio::task::JoinHandle<std::result::Result<(), moq_transport::session::SessionError>>;
+type NamespaceJoinHandle = tokio::task::JoinHandle<anyhow::Result<()>>;
 
 struct Producers {
     session_run: Option<SessionJoinHandle>,
-    ns_task: Option<SessionJoinHandle>,
+    ns_task: Option<NamespaceJoinHandle>,
     /// Set when a `select!` arm consumed the corresponding handle.
     session_seen: Option<JoinOutcome>,
     ns_seen: Option<JoinOutcome>,
@@ -104,6 +117,50 @@ enum TrackSel {
     Both,
     Pc,
     Haptic,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Arm {
+    B1,
+    S1,
+    M1,
+    S2,
+    #[value(name = "s2eq")]
+    S2Eq,
+    S3,
+}
+
+impl Arm {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::B1 => "b1",
+            Self::S1 => "s1",
+            Self::M1 => "m1",
+            Self::S2 => "s2",
+            Self::S2Eq => "s2eq",
+            Self::S3 => "s3",
+        }
+    }
+
+    fn pc_frame_subgroups(self) -> bool {
+        matches!(self, Self::M1 | Self::S2 | Self::S2Eq | Self::S3)
+    }
+
+    fn pc_priority(self) -> u8 {
+        if matches!(self, Self::S2 | Self::S3) {
+            1
+        } else {
+            128
+        }
+    }
+
+    fn haptic_priority(self) -> u8 {
+        if matches!(self, Self::S2 | Self::S3) {
+            0
+        } else {
+            128
+        }
+    }
 }
 
 impl TrackSel {
@@ -173,6 +230,11 @@ struct Args {
     loss_pct: f64,
     #[arg(long, default_value_t = 0)]
     seed: u64,
+    /// Local translation from MoQT publisher priority to quinn stream
+    /// priority. legacy-v1 reproduces existing evidence; moqt-v2 implements
+    /// MoQT's lower-number-first semantics.
+    #[arg(long, default_value = "legacy-v1")]
+    data_priority_mapping: DataPriorityMapping,
     /// A2 instrumentation: emit role:"accept" records. These carry the time at
     /// which the QUIC stack accepted the object's last payload byte — a
     /// transport-accept time, not an on-the-wire time.
@@ -186,6 +248,23 @@ struct Args {
     /// baselines (the other loop never runs).
     #[arg(long, value_enum, default_value_t = TrackSel::Both)]
     tracks: TrackSel,
+    /// Phase-4 transport arm. B1/S1 preserve the historical wire mapping.
+    #[arg(long, value_enum, default_value_t = Arm::B1)]
+    arm: Arm,
+    /// S2 PC DELIVERY_TIMEOUT, repeated on TX for frozen metadata agreement.
+    /// The receiver places the actual parameter on the PC SUBSCRIBE.
+    #[arg(long)]
+    pc_delivery_timeout_ms: Option<u64>,
+    /// S3 Recovery/d7 frame directory. Required only by --arm s3.
+    #[arg(long)]
+    s3_recovery_frames_dir: Option<String>,
+    /// S3 Haptic-Critical/d6 frame directory. Required only by --arm s3.
+    #[arg(long)]
+    s3_critical_frames_dir: Option<String>,
+    /// Positive bound for closing a subscription producer after its source
+    /// reaches run end. Explicit because no production S3 default is frozen.
+    #[arg(long)]
+    s3_producer_shutdown_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -297,8 +376,154 @@ fn json_f64(value: f64) -> String {
     }
 }
 
-async fn connect(relay: &Url) -> Result<(web_transport::Session, moq_transport::session::Transport)> {
-    let tls_args = tls::Args { disable_verify: true, ..Default::default() };
+fn phase4_transport(args: &Args) -> Result<Option<Phase4TransportMeta>> {
+    if args.arm != Arm::B1 && args.payload_mode != PayloadMode::Frame {
+        anyhow::bail!(
+            "--arm {} requires --payload-mode frame; equal-chunk is a B1 negative ablation only",
+            args.arm.as_str()
+        );
+    }
+    if matches!(args.arm, Arm::S2 | Arm::S2Eq | Arm::S3)
+        && args.data_priority_mapping != DataPriorityMapping::MoqtV2
+    {
+        anyhow::bail!(
+            "--arm {} requires --data-priority-mapping moqt-v2 in the v5 generation",
+            args.arm.as_str()
+        );
+    }
+    match args.arm {
+        Arm::B1 | Arm::S1 => {
+            if args.pc_delivery_timeout_ms.is_some() {
+                anyhow::bail!("PC delivery timeout requires --arm s2");
+            }
+            Ok(None)
+        }
+        Arm::M1 => {
+            if args.pc_delivery_timeout_ms.is_some() {
+                anyhow::bail!("M1 is mapping-only and forbids PC delivery timeout");
+            }
+            Ok(Some(Phase4TransportMeta {
+                arm: "m1",
+                pc_subgroup_mapping: "frame-per-subgroup",
+                pc_publisher_priority: 128,
+                haptic_publisher_priority: 128,
+                publisher_priority_profile: "equal-128",
+                data_priority_mapping: args.data_priority_mapping.as_str(),
+                pc_delivery_timeout_ms: None,
+            }))
+        }
+        Arm::S2 | Arm::S2Eq | Arm::S3 => {
+            let timeout = args.pc_delivery_timeout_ms.with_context(|| {
+                format!(
+                    "--arm {} requires --pc-delivery-timeout-ms",
+                    args.arm.as_str()
+                )
+            })?;
+            if timeout == 0 {
+                anyhow::bail!("--pc-delivery-timeout-ms must be greater than zero");
+            }
+            if args.arm == Arm::S3 && timeout != 67 {
+                anyhow::bail!("--arm s3 inherits the frozen 67ms PC delivery timeout");
+            }
+            Ok(Some(Phase4TransportMeta {
+                arm: args.arm.as_str(),
+                pc_subgroup_mapping: "frame-per-subgroup",
+                pc_publisher_priority: args.arm.pc_priority(),
+                haptic_publisher_priority: args.arm.haptic_priority(),
+                publisher_priority_profile: if args.arm == Arm::S2Eq {
+                    "equal-128"
+                } else {
+                    "relative-haptic0-pc1"
+                },
+                data_priority_mapping: args.data_priority_mapping.as_str(),
+                pc_delivery_timeout_ms: Some(timeout),
+            }))
+        }
+    }
+}
+
+fn validate_s3_args(args: &Args) -> Result<()> {
+    let supplied = args.s3_recovery_frames_dir.is_some()
+        || args.s3_critical_frames_dir.is_some()
+        || args.s3_producer_shutdown_timeout_ms.is_some();
+    if args.arm != Arm::S3 {
+        if supplied {
+            anyhow::bail!("S3 frame/lifecycle options require --arm s3");
+        }
+        return Ok(());
+    }
+    if args.tracks != TrackSel::Both {
+        anyhow::bail!("--arm s3 requires --tracks both");
+    }
+    if args.tier != 2 {
+        anyhow::bail!("--arm s3 Normal must preserve header tier 2");
+    }
+    if args.frames_dir.is_none() || args.dummy_size.is_some() {
+        anyhow::bail!("--arm s3 requires --frames-dir d8 and forbids --dummy-size");
+    }
+    args.s3_recovery_frames_dir
+        .as_ref()
+        .context("--arm s3 requires --s3-recovery-frames-dir d7")?;
+    args.s3_critical_frames_dir
+        .as_ref()
+        .context("--arm s3 requires --s3-critical-frames-dir d6")?;
+    let timeout = args
+        .s3_producer_shutdown_timeout_ms
+        .context("--arm s3 requires --s3-producer-shutdown-timeout-ms")?;
+    if timeout == 0 {
+        anyhow::bail!("--s3-producer-shutdown-timeout-ms must be greater than zero");
+    }
+    Ok(())
+}
+
+struct S3AcceptSink {
+    logger: Arc<Mutex<JsonlLogger>>,
+    routes: AcceptRouteMap,
+}
+
+impl AcceptSink for S3AcceptSink {
+    fn write_accept(&mut self, rec: &AcceptRec) -> std::io::Result<()> {
+        let route = self
+            .routes
+            .lock()
+            .map_err(|_| std::io::Error::other("S3 accept route map poisoned"))?
+            .get(&rec.track_alias)
+            .copied()
+            .ok_or_else(|| std::io::Error::other("unknown S3 accept track alias"))?;
+        if rec.track.as_str() != route.route.name {
+            return Err(std::io::Error::other(
+                "S3 accept track name/alias route mismatch",
+            ));
+        }
+        self.logger
+            .lock()
+            .map_err(|_| std::io::Error::other("TX logger poisoned"))?
+            .try_log_accept_s3(
+                route.role,
+                route.route,
+                rec.group_id,
+                rec.subgroup_id,
+                rec.object_id,
+                rec.t_accept,
+                rec.size,
+            )
+    }
+
+    fn flush_accept(&mut self) -> std::io::Result<()> {
+        self.logger
+            .lock()
+            .map_err(|_| std::io::Error::other("TX logger poisoned"))?
+            .try_flush()
+    }
+}
+
+async fn connect(
+    relay: &Url,
+) -> Result<(web_transport::Session, moq_transport::session::Transport)> {
+    let tls_args = tls::Args {
+        disable_verify: true,
+        ..Default::default()
+    };
     let tls = tls_args.load()?;
     let bind: SocketAddr = "[::]:0".parse().unwrap();
     let quic = quic::Endpoint::new(quic::Config::new(bind, None, tls)?)?;
@@ -321,6 +546,8 @@ async fn main() -> Result<()> {
         args.chunk_bytes <= u32::MAX as usize,
         "--chunk-bytes exceeds the wire field"
     );
+    let phase4_transport = phase4_transport(&args)?;
+    validate_s3_args(&args)?;
 
     // ---- Workload ----
     let frames: Vec<Vec<u8>> = match (&args.frames_dir, args.dummy_size) {
@@ -333,14 +560,33 @@ async fn main() -> Result<()> {
     let s_bytes = registered_s_bytes(pf.frame_mean);
     let frames = Arc::new(frames);
     let pcm = Arc::new(pcm);
+    let s3_frames = if args.arm == Arm::S3 {
+        Some((
+            Arc::new(load_frames(
+                args.s3_recovery_frames_dir
+                    .as_deref()
+                    .expect("validated S3 recovery frames"),
+            )?),
+            Arc::new(load_frames(
+                args.s3_critical_frames_dir
+                    .as_deref()
+                    .expect("validated S3 critical frames"),
+            )?),
+        ))
+    } else {
+        None
+    };
     let haptic_src = std::path::Path::new(&args.haptic_wav)
-        .file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
 
     println!(
-        "[tx] frames={} S={}B haptic={}B pc={}Hz haptic={}Hz mode={} chunk={}B tracks={} -> {}",
+        "[tx] frames={} S={}B haptic={}B pc={}Hz haptic={}Hz mode={} chunk={}B tracks={} arm={} -> {}",
         frames.len(), s_bytes, pcm.len(), args.pc_rate_hz, args.haptic_rate_hz,
-        args.payload_mode.as_str(), args.chunk_bytes, args.tracks.as_str(),
-        args.out.display()
+        args.payload_mode.as_str(), args.chunk_bytes, args.tracks.as_str(), args.arm.as_str(),
+        args.out.display(),
     );
     println!(
         "[tx] preflight mean_frame={:.1}B mean_chunks={:.1} pc_objects/s={:.1} app={:.3}Mbps warning={}",
@@ -353,7 +599,7 @@ async fn main() -> Result<()> {
         args.jitter_ms, args.loss_pct, s_bytes, args.pc_rate_hz,
         args.haptic_rate_hz, args.seed,
         Some(args.duration), Some(&haptic_src), Some(args.tracks.as_str()),
-        Some(TERM_PROTOCOL_V), None,
+        Some(TERM_PROTOCOL_V), None, phase4_transport,
         Some(V5Meta {
             log_schema_version: 2,
             payload_mode: args.payload_mode,
@@ -380,8 +626,22 @@ async fn main() -> Result<()> {
     // otherwise.
     let accept_trace_enabled = args.accept_trace
         && (args.payload_mode == PayloadMode::Frame || args.chunk_trace);
+    let s3_accept_routes: AcceptRouteMap = Arc::new(Mutex::new(HashMap::new()));
     let accept_trace = if accept_trace_enabled {
-        Some(AcceptTrace::install(args.accept_trace_capacity, logger.clone())?)
+        if args.arm == Arm::S3 {
+            Some(AcceptTrace::install(
+                args.accept_trace_capacity,
+                Arc::new(Mutex::new(S3AcceptSink {
+                    logger: logger.clone(),
+                    routes: s3_accept_routes.clone(),
+                })),
+            )?)
+        } else {
+            Some(AcceptTrace::install(
+                args.accept_trace_capacity,
+                logger.clone(),
+            )?)
+        }
     } else {
         None
     };
@@ -392,8 +652,14 @@ async fn main() -> Result<()> {
     // stats 를 쓰기 전에 프로세스를 끝낼 수 있는 창이 있었다.
     let (sig_tx, mut sig_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
-        let mut term = match signal(SignalKind::terminate()) { Ok(s) => s, Err(_) => return };
-        let mut intr = match signal(SignalKind::interrupt()) { Ok(s) => s, Err(_) => return };
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let mut intr = match signal(SignalKind::interrupt()) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
         tokio::select! {
             _ = term.recv() => {}
             _ = intr.recv() => {}
@@ -412,7 +678,13 @@ async fn main() -> Result<()> {
     let outcome: Result<()> = async {
         // ---- MoQ session ----
         let (sess, tp) = connect(&args.relay).await.context("connect relay")?;
-        let (session, mut publisher, _sub) = Session::connect(sess, None, tp).await.context("SETUP")?;
+        let config = SessionConfig {
+            data_priority_mapping: args.data_priority_mapping,
+            ..SessionConfig::default()
+        };
+        let (session, mut publisher, _sub) = Session::connect_with_config(sess, None, tp, config)
+            .await
+            .context("SETUP")?;
 
         // Register each task with the finalizer *immediately* after spawning it.
         // Registering both only after the track setup left a window in which a
@@ -426,14 +698,119 @@ async fn main() -> Result<()> {
         });
 
         let namespace = TrackNamespace::from_utf8_path(&args.run_id);
+
+        if args.arm == Arm::S3 {
+            let warmup_us = Duration::from_secs_f64(args.warmup).as_micros() as u64;
+            let duration_us = Duration::from_secs_f64(args.duration).as_micros() as u64;
+            let anchor_us = now_us()
+                .checked_add(warmup_us)
+                .context("S3 run anchor overflow")?;
+            let end_us = anchor_us
+                .checked_add(duration_us)
+                .context("S3 run end overflow")?;
+            let (recovery_frames, critical_frames) =
+                s3_frames.as_ref().expect("validated S3 frames");
+            let registry = Arc::new(Mutex::new(SubscriptionProducerRegistry::new()));
+            let context = Arc::new(S3SenderContext {
+                clock: skew_moq::s3_producer::RunSlotClock::new(anchor_us),
+                end_us,
+                pc_rate_hz: args.pc_rate_hz,
+                haptic_rate_hz: args.haptic_rate_hz,
+                normal_frames: frames.clone(),
+                recovery_frames: recovery_frames.clone(),
+                critical_frames: critical_frames.clone(),
+                haptic_pcm: pcm.clone(),
+                logger: logger.clone(),
+                shutdown_timeout: Duration::from_millis(
+                    args.s3_producer_shutdown_timeout_ms
+                        .expect("validated S3 shutdown timeout"),
+                ),
+            });
+            let ns_publisher = publisher.clone();
+            let ns_registry = registry.clone();
+            let ns_routes = s3_accept_routes.clone();
+            producers.as_mut().expect("registered above").ns_task = Some(tokio::spawn(
+                run_s3_namespace(ns_publisher, namespace, context, ns_registry, ns_routes),
+            ));
+
+            let run_wait = Duration::from_micros(warmup_us.saturating_add(duration_us));
+            let step: Result<()> = {
+                let p = producers.as_mut().expect("producers set above");
+                let sr = p.session_run.as_mut().expect("session handle present");
+                let nt = p.ns_task.as_mut().expect("namespace handle present");
+                let mut session_done = None;
+                let mut ns_done = None;
+                let outcome = tokio::select! {
+                    _ = tokio::time::sleep(run_wait) => Ok(()),
+                    _ = wait_signal(&mut sig_rx) => {
+                        ending = Ending::Signal;
+                        Ok(())
+                    }
+                    r = sr => {
+                        session_done = Some(JoinOutcome::from_join_result(&r));
+                        Err(anyhow::anyhow!("session ended during S3 send: {:?}", r))
+                    }
+                    r = nt => {
+                        ns_done = Some(JoinOutcome::from_join_result(&r));
+                        Err(anyhow::anyhow!("S3 namespace ended during send: {:?}", r))
+                    }
+                };
+                if let Some(outcome) = session_done {
+                    p.session_run = None;
+                    p.session_seen = Some(outcome);
+                }
+                if let Some(outcome) = ns_done {
+                    p.ns_task = None;
+                    p.ns_seen = Some(outcome);
+                }
+                outcome
+            };
+            step?;
+
+            if ending != Ending::Signal {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs_f64(args.drain_timeout)) => {}
+                    _ = wait_signal(&mut sig_rx) => { ending = Ending::Signal; }
+                }
+            }
+            let stats = registry
+                .lock()
+                .map_err(|_| anyhow::anyhow!("S3 producer registry poisoned"))?
+                .stats()
+                .map_err(|error| anyhow::anyhow!("read S3 producer stats: {error:?}"))?;
+            pc_stats.logical_generated = stats
+                .iter()
+                .filter(|stats| stats.role == skew_moq::s3_switch::TrackRole::Pc)
+                .map(|stats| stats.objects)
+                .sum();
+            pc_stats.chunks_sent = pc_stats.logical_generated;
+            hap_stats.logical_generated = stats
+                .iter()
+                .filter(|stats| stats.role == skew_moq::s3_switch::TrackRole::Haptic)
+                .map(|stats| stats.objects)
+                .sum();
+            hap_stats.chunks_sent = hap_stats.logical_generated;
+            println!(
+                "[tx] S3 generated pc={} haptic={} across {} subscription generations",
+                pc_stats.logical_generated,
+                hap_stats.logical_generated,
+                stats.len()
+            );
+            return Ok(());
+        }
+
         let (mut tracks_w, _req, tracks_r) = Tracks::new(namespace.clone()).produce();
         let pc_tw = tracks_w.create("pc").context("create pc track")?;
         let hap_tw = tracks_w.create("haptic").context("create haptic track")?;
 
         // Announce the namespace (serves subscribes on demand).
         let mut ns_pub = publisher.clone();
-        producers.as_mut().expect("registered above").ns_task =
-            Some(tokio::spawn(async move { ns_pub.publish_namespace(tracks_r).await }));
+        producers.as_mut().expect("registered above").ns_task = Some(tokio::spawn(async move {
+            ns_pub
+                .publish_namespace(tracks_r)
+                .await
+                .map_err(anyhow::Error::from)
+        }));
         // publisher no longer needed after cloning for the namespace.
         let _ = &mut publisher;
 
@@ -442,164 +819,197 @@ async fn main() -> Result<()> {
         let anchor = Instant::now();
         let end = anchor + Duration::from_secs_f64(args.duration);
 
-    // ---- PC loop: rational PC Hz ----
-    // The whole subgroups chain lives in the task, so it fully drops when the
-    // loop ends — closing the track so the subscriber sees end-of-track.
-    let pc_task = if args.tracks.pc_on() {
-        let frames = frames.clone();
-        let logger = logger.clone();
-        let pc_rate_hz = args.pc_rate_hz;
-        let tier = args.tier;
-        let payload_mode = args.payload_mode;
-        let chunk_bytes = args.chunk_bytes;
-        let mut pc_sub = pc_tw.subgroups().context("pc subgroups")?;
-        let mut sg = pc_sub.append(128).context("pc append")?;
-        Some(tokio::spawn(async move {
-            let mut i: u64 = 0;
-            let mut stats = TrackRunStats::default();
-            while Instant::now() < end {
-                sleep_until(anchor + Duration::from_nanos(deadline_ns(i, pc_rate_hz))).await;
-                if Instant::now() >= end {
-                    break;
-                }
-                let pts = timestamp_us(i, pc_rate_hz);
-                let payload = &frames[(i as usize) % frames.len()];
-                let t_gen = now_us();
-                stats.period.observe(t_gen);
-                let object_payloads: Vec<Cow<'_, [u8]>> = match payload_mode {
-                    PayloadMode::Frame => vec![Cow::Borrowed(payload.as_slice())],
-                    PayloadMode::EqualChunk => {
-                        equal_chunks(payload, i as u32, chunk_bytes)?
-                            .into_iter()
-                            .map(Cow::Owned)
-                            .collect()
+        // ---- PC loop: rational PC Hz, with the arm-specific subgroup map ----
+        let pc_task = if args.tracks.pc_on() {
+            let frames = frames.clone();
+            let logger = logger.clone();
+            let pc_rate_hz = args.pc_rate_hz;
+            let tier = args.tier;
+            let payload_mode = args.payload_mode;
+            let chunk_bytes = args.chunk_bytes;
+            let frame_subgroups = args.arm.pc_frame_subgroups();
+            let priority = args.arm.pc_priority();
+            let mut pc_sub = pc_tw.subgroups().context("pc subgroups")?;
+            let mut long_sg = if frame_subgroups {
+                None
+            } else {
+                Some(pc_sub.append(priority).context("pc append")?)
+            };
+            Some(tokio::spawn(async move {
+                let mut i: u64 = 0;
+                let mut stats = TrackRunStats::default();
+                while Instant::now() < end {
+                    sleep_until(anchor + Duration::from_nanos(deadline_ns(i, pc_rate_hz))).await;
+                    if Instant::now() >= end {
+                        break;
                     }
-                };
-                let mut frame_obj = None;
-                for object_payload in &object_payloads {
-                    let hdr = pack_header(
-                        TRACK_PC, tier, i as u32, pts, (i + 1) as u32, t_gen,
-                        object_payload.len() as u32,
-                    );
-                    let mut buf = Vec::with_capacity(HDR + object_payload.len());
-                    buf.extend_from_slice(&hdr);
-                    buf.extend_from_slice(object_payload.as_ref());
-                    let (gid, sgid) = (sg.group_id, sg.subgroup_id);
-                    let mut obj = sg.create(buf.len(), None).context("pc create")?;
-                    let oid = obj.object_id;
-                    obj.write(Bytes::from(buf)).context("pc write")?;
-                    drop(obj);
-                    if payload_mode == PayloadMode::Frame {
-                        frame_obj = Some((gid, sgid, oid));
-                    }
-                }
-                let t_send = now_us();
-                logger.lock().unwrap().log_tx(
-                    "pc", tier, i as u32, pts, (i + 1) as u32,
-                    payload.len(), t_gen, t_send, frame_obj,
-                );
-                stats.logical_generated += 1;
-                stats.chunks_sent += object_payloads.len() as u64;
-                stats.source_payload_bytes += payload.len() as u64;
-                if payload_mode == PayloadMode::EqualChunk {
-                    stats.padding_bytes +=
-                        (object_payloads.len() * chunk_bytes - payload.len()) as u64;
-                }
-                i += 1;
-            }
-            drop(sg);
-            drop(pc_sub); // close pc track -> subscriber end-of-track
-            Ok::<TrackRunStats, anyhow::Error>(stats)
-        }))
-    } else {
-        // C3 haptic-only: never call `append`, so no subgroup stream and no
-        // object is ever put on the wire for pc. Dropping the writer closes
-        // the track, so the subscriber's pc drain ends immediately instead of
-        // blocking until --max-duration.
-        drop(pc_tw.subgroups().context("pc subgroups")?);
-        None
-    };
-
-    // ---- Haptic loop: rational 90 Hz with exact 3:1 anchors ----
-    let hap_task = if args.tracks.haptic_on() {
-        let pcm = pcm.clone();
-        let logger = logger.clone();
-        let pc_rate_hz = args.pc_rate_hz;
-        let haptic_rate_hz = args.haptic_rate_hz;
-        let payload_mode = args.payload_mode;
-        let chunk_bytes = args.chunk_bytes;
-        let mut hap_sub = hap_tw.subgroups().context("haptic subgroups")?;
-        let mut sg = hap_sub.append(128).context("haptic append")?;
-        Some(tokio::spawn(async move {
-            let mut k: u64 = 0;
-            let mut stats = TrackRunStats::default();
-            while Instant::now() < end {
-                sleep_until(
-                    anchor + Duration::from_nanos(deadline_ns(k, haptic_rate_hz))
-                ).await;
-                if Instant::now() >= end {
-                    break;
-                }
-                let (pts, event_id) = if k % ratio == 0 {
-                    let fi = k / ratio;
-                    let pts = timestamp_us(fi, pc_rate_hz);
-                    (pts, (fi + 1) as u32)
-                } else {
-                    (timestamp_us(k, haptic_rate_hz), 0u32)
-                };
-                let payload = pcm_tick_payload(
-                    &pcm, k, PCM_SAMPLE_RATE_HZ, haptic_rate_hz
-                )?;
-                let t_gen = now_us();
-                stats.period.observe(t_gen);
-                let object_payloads: Vec<Cow<'_, [u8]>> = match payload_mode {
-                    PayloadMode::Frame => vec![Cow::Borrowed(payload.as_slice())],
-                    PayloadMode::EqualChunk => equal_chunks(&payload, k as u32, chunk_bytes)?
+                    let pts = timestamp_us(i, pc_rate_hz);
+                    let payload = &frames[(i as usize) % frames.len()];
+                    let t_gen = now_us();
+                    stats.period.observe(t_gen);
+                    let object_payloads: Vec<Cow<'_, [u8]>> = match payload_mode {
+                        PayloadMode::Frame => vec![Cow::Borrowed(payload.as_slice())],
+                        PayloadMode::EqualChunk => equal_chunks(
+                            payload,
+                            i as u32,
+                            chunk_bytes,
+                        )?
                         .into_iter()
                         .map(Cow::Owned)
                         .collect(),
-                };
-                let mut frame_obj = None;
-                for object_payload in &object_payloads {
-                    let hdr = pack_header(
-                        TRACK_HAPTIC, HAPTIC_TIER_FULL, k as u32, pts, event_id,
-                        t_gen, object_payload.len() as u32,
-                    );
-                    let mut buf = Vec::with_capacity(HDR + object_payload.len());
-                    buf.extend_from_slice(&hdr);
-                    buf.extend_from_slice(object_payload.as_ref());
-                    let (gid, sgid) = (sg.group_id, sg.subgroup_id);
-                    let mut obj = sg.create(buf.len(), None).context("haptic create")?;
-                    let oid = obj.object_id;
-                    obj.write(Bytes::from(buf)).context("haptic write")?;
-                    drop(obj);
-                    if payload_mode == PayloadMode::Frame {
-                        frame_obj = Some((gid, sgid, oid));
+                    };
+                    let mut frame_sg = if frame_subgroups {
+                        Some(pc_sub.append(priority).context("pc frame append")?)
+                    } else {
+                        None
+                    };
+                    let mut frame_obj = None;
+                    for object_payload in &object_payloads {
+                        let sg = match frame_sg.as_mut() {
+                            Some(sg) => sg,
+                            None => long_sg.as_mut().expect("long subgroup exists"),
+                        };
+                        let hdr = pack_header(
+                            TRACK_PC,
+                            tier,
+                            i as u32,
+                            pts,
+                            (i + 1) as u32,
+                            t_gen,
+                            object_payload.len() as u32,
+                        );
+                        let mut buf = Vec::with_capacity(HDR + object_payload.len());
+                        buf.extend_from_slice(&hdr);
+                        buf.extend_from_slice(object_payload.as_ref());
+                        let (gid, sgid) = (sg.group_id, sg.subgroup_id);
+                        let mut obj = sg.create(buf.len(), None).context("pc create")?;
+                        let oid = obj.object_id;
+                        obj.write(Bytes::from(buf)).context("pc write")?;
+                        drop(obj);
+                        if payload_mode == PayloadMode::Frame {
+                            frame_obj = Some((gid, sgid, oid));
+                        }
                     }
+                    drop(frame_sg);
+                    logger.lock().unwrap().log_tx(
+                        "pc",
+                        tier,
+                        i as u32,
+                        pts,
+                        (i + 1) as u32,
+                        payload.len(),
+                        t_gen,
+                        now_us(),
+                        frame_obj,
+                    );
+                    stats.logical_generated += 1;
+                    stats.chunks_sent += object_payloads.len() as u64;
+                    stats.source_payload_bytes += payload.len() as u64;
+                    if payload_mode == PayloadMode::EqualChunk {
+                        stats.padding_bytes +=
+                            (object_payloads.len() * chunk_bytes - payload.len()) as u64;
+                    }
+                    i += 1;
                 }
-                logger.lock().unwrap().log_tx(
-                    "haptic", HAPTIC_TIER_FULL, k as u32, pts, event_id,
-                    payload.len(), t_gen, now_us(), frame_obj,
-                );
-                stats.logical_generated += 1;
-                stats.chunks_sent += object_payloads.len() as u64;
-                stats.source_payload_bytes += payload.len() as u64;
-                if payload_mode == PayloadMode::EqualChunk {
-                    stats.padding_bytes +=
-                        (object_payloads.len() * chunk_bytes - payload.len()) as u64;
+                drop(long_sg);
+                drop(pc_sub);
+                Ok::<TrackRunStats, anyhow::Error>(stats)
+            }))
+        } else {
+            drop(pc_tw.subgroups().context("pc subgroups")?);
+            None
+        };
+
+        // ---- Haptic loop: rational 90 Hz with exact 3:1 anchors ----
+        let hap_task = if args.tracks.haptic_on() {
+            let pcm = pcm.clone();
+            let logger = logger.clone();
+            let pc_rate_hz = args.pc_rate_hz;
+            let haptic_rate_hz = args.haptic_rate_hz;
+            let payload_mode = args.payload_mode;
+            let chunk_bytes = args.chunk_bytes;
+            let priority = args.arm.haptic_priority();
+            let mut hap_sub = hap_tw.subgroups().context("haptic subgroups")?;
+            let mut sg = hap_sub.append(priority).context("haptic append")?;
+            Some(tokio::spawn(async move {
+                let mut k: u64 = 0;
+                let mut stats = TrackRunStats::default();
+                while Instant::now() < end {
+                    sleep_until(
+                        anchor + Duration::from_nanos(deadline_ns(k, haptic_rate_hz)),
+                    )
+                    .await;
+                    if Instant::now() >= end {
+                        break;
+                    }
+                    let (pts, event_id) = if k % ratio == 0 {
+                        let fi = k / ratio;
+                        (timestamp_us(fi, pc_rate_hz), (fi + 1) as u32)
+                    } else {
+                        (timestamp_us(k, haptic_rate_hz), 0u32)
+                    };
+                    let payload =
+                        pcm_tick_payload(&pcm, k, PCM_SAMPLE_RATE_HZ, haptic_rate_hz)?;
+                    let t_gen = now_us();
+                    stats.period.observe(t_gen);
+                    let object_payloads: Vec<Cow<'_, [u8]>> = match payload_mode {
+                        PayloadMode::Frame => vec![Cow::Borrowed(payload.as_slice())],
+                        PayloadMode::EqualChunk => equal_chunks(&payload, k as u32, chunk_bytes)?
+                            .into_iter()
+                            .map(Cow::Owned)
+                            .collect(),
+                    };
+                    let mut frame_obj = None;
+                    for object_payload in &object_payloads {
+                        let hdr = pack_header(
+                            TRACK_HAPTIC,
+                            HAPTIC_TIER_FULL,
+                            k as u32,
+                            pts,
+                            event_id,
+                            t_gen,
+                            object_payload.len() as u32,
+                        );
+                        let mut buf = Vec::with_capacity(HDR + object_payload.len());
+                        buf.extend_from_slice(&hdr);
+                        buf.extend_from_slice(object_payload.as_ref());
+                        let (gid, sgid) = (sg.group_id, sg.subgroup_id);
+                        let mut obj = sg.create(buf.len(), None).context("haptic create")?;
+                        let oid = obj.object_id;
+                        obj.write(Bytes::from(buf)).context("haptic write")?;
+                        drop(obj);
+                        if payload_mode == PayloadMode::Frame {
+                            frame_obj = Some((gid, sgid, oid));
+                        }
+                    }
+                    logger.lock().unwrap().log_tx(
+                        "haptic",
+                        HAPTIC_TIER_FULL,
+                        k as u32,
+                        pts,
+                        event_id,
+                        payload.len(),
+                        t_gen,
+                        now_us(),
+                        frame_obj,
+                    );
+                    stats.logical_generated += 1;
+                    stats.chunks_sent += object_payloads.len() as u64;
+                    stats.source_payload_bytes += payload.len() as u64;
+                    if payload_mode == PayloadMode::EqualChunk {
+                        stats.padding_bytes +=
+                            (object_payloads.len() * chunk_bytes - payload.len()) as u64;
+                    }
+                    k += 1;
                 }
-                k += 1;
-            }
-            drop(sg);
-            drop(hap_sub); // close haptic track
-            Ok::<TrackRunStats, anyhow::Error>(stats)
-        }))
-    } else {
-        // C3 pc-only: see the pc branch above — zero haptic objects on the
-        // wire, track closed immediately so the subscriber does not wait.
-        drop(hap_tw.subgroups().context("haptic subgroups")?);
-        None
-    };
+                drop(sg);
+                drop(hap_sub);
+                Ok::<TrackRunStats, anyhow::Error>(stats)
+            }))
+        } else {
+            drop(hap_tw.subgroups().context("haptic subgroups")?);
+            None
+        };
 
         // Wait for both loops, a session failure, or the shutdown signal.
         // A disabled track contributes 0.
@@ -776,7 +1186,10 @@ async fn main() -> Result<()> {
     }
     println!(
         "[tx] done ({}) session_join={} ns_join={} -> {}",
-        ending.as_str(), joins.session.as_str(), joins.ns.as_str(), args.out.display()
+        ending.as_str(),
+        joins.session.as_str(),
+        joins.ns.as_str(),
+        args.out.display()
     );
 
     // Exit-code contract:

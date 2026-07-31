@@ -3,13 +3,14 @@
 
 use std::collections::hash_map;
 use std::collections::HashMap;
+use std::ops;
 use std::sync::{Arc, Mutex};
 
 use moq_transport::{
     coding::TrackNamespace,
     serve::{FullTrackName, ServeError, Track, TrackReader, TrackWriter},
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::metrics::GaugeGuard;
 
@@ -28,7 +29,64 @@ const NAMESPACE_REQUEST_CHANNEL_CAPACITY: usize = 1024;
 
 #[derive(Clone)]
 struct NamespaceSource {
-    requests: mpsc::Sender<TrackWriter>,
+    requests: mpsc::Sender<NamespaceTrackRequest>,
+}
+
+enum TrackEntry {
+    Published(TrackReader),
+    Namespace {
+        reader: TrackReader,
+        leases: usize,
+        cancel: watch::Sender<bool>,
+        identity: Arc<()>,
+    },
+}
+
+impl TrackEntry {
+    fn reader(&self) -> &TrackReader {
+        match self {
+            Self::Published(reader) | Self::Namespace { reader, .. } => reader,
+        }
+    }
+
+    fn cancel_namespace(self) {
+        if let Self::Namespace { cancel, .. } = self {
+            cancel.send_replace(true);
+        }
+    }
+}
+
+pub(crate) struct NamespaceTrackRequest {
+    pub writer: TrackWriter,
+    pub cancelled: watch::Receiver<bool>,
+}
+
+impl ops::Deref for NamespaceTrackRequest {
+    type Target = TrackWriter;
+
+    fn deref(&self) -> &Self::Target {
+        &self.writer
+    }
+}
+
+pub(crate) struct LocalTrack {
+    pub reader: TrackReader,
+    _lease: Option<LocalTrackLease>,
+}
+
+impl ops::Deref for LocalTrack {
+    type Target = TrackReader;
+
+    fn deref(&self) -> &Self::Target {
+        &self.reader
+    }
+}
+
+struct LocalTrackLease {
+    locals: Locals,
+    scope_key: ScopeKey,
+    full_name: FullTrackName,
+    identity: Arc<()>,
 }
 
 /// Relay-local registry.
@@ -39,7 +97,7 @@ struct NamespaceSource {
 #[derive(Clone)]
 pub struct Locals {
     /// Actual media tracks, indexed by (scope, full track name).
-    tracks: Arc<Mutex<HashMap<ScopeKey, HashMap<FullTrackName, TrackReader>>>>,
+    tracks: Arc<Mutex<HashMap<ScopeKey, HashMap<FullTrackName, TrackEntry>>>>,
 
     /// Namespace route sources from PUBLISH_NAMESPACE, indexed by (scope,
     /// namespace) and matched by prefix.
@@ -65,11 +123,14 @@ impl Locals {
     /// This does not register any media tracks. It only creates a request queue
     /// used when a downstream SUBSCRIBE asks for a missing track under this
     /// namespace.
-    pub async fn register_namespace(
+    pub(crate) async fn register_namespace(
         &mut self,
         scope: Option<&str>,
         namespace: TrackNamespace,
-    ) -> anyhow::Result<(LocalNamespaceRegistration, mpsc::Receiver<TrackWriter>)> {
+    ) -> anyhow::Result<(
+        LocalNamespaceRegistration,
+        mpsc::Receiver<NamespaceTrackRequest>,
+    )> {
         let scope_key = scope.unwrap_or(UNSCOPED).to_string();
         let (tx, rx) = mpsc::channel(NAMESPACE_REQUEST_CHANNEL_CAPACITY);
 
@@ -123,7 +184,7 @@ impl Locals {
             .map_err(|_| ServeError::internal_ctx("locals track registry lock poisoned"))?;
         let bucket = tracks.entry(scope_key.clone()).or_default();
         match bucket.entry(full_name.clone()) {
-            hash_map::Entry::Vacant(entry) => entry.insert(track),
+            hash_map::Entry::Vacant(entry) => entry.insert(TrackEntry::Published(track)),
             hash_map::Entry::Occupied(_) => return Err(ServeError::Duplicate.into()),
         };
 
@@ -143,11 +204,16 @@ impl Locals {
     ) -> Option<TrackReader> {
         let mut tracks = self.tracks.lock().ok()?;
         let bucket = tracks.get_mut(scope.unwrap_or(UNSCOPED))?;
-        if bucket.get(full_name).is_some_and(|track| track.is_closed()) {
-            bucket.remove(full_name);
+        if bucket
+            .get(full_name)
+            .is_some_and(|track| track.reader().is_closed())
+        {
+            if let Some(entry) = bucket.remove(full_name) {
+                entry.cancel_namespace();
+            }
             return None;
         }
-        bucket.get(full_name).cloned()
+        bucket.get(full_name).map(|entry| entry.reader().clone())
     }
 
     /// Return the best namespace route source for a requested namespace.
@@ -185,54 +251,175 @@ impl Locals {
     /// This replaces the old `TracksReader::subscribe` relay registry behavior:
     /// the actual track reader is stored in `tracks`, while PUBLISH_NAMESPACE is
     /// only a source to ask when a track is missing.
-    pub async fn get_or_request_track(
+    pub(crate) async fn get_or_request_track(
         &mut self,
         scope: Option<&str>,
         namespace: TrackNamespace,
         track_name: impl Into<moq_transport::coding::TrackName>,
-    ) -> Option<TrackReader> {
+    ) -> Option<LocalTrack> {
         let track_name = track_name.into();
         let full_name = FullTrackName {
             namespace: namespace.clone(),
             name: track_name.clone(),
         };
+        let scope_key = scope.unwrap_or(UNSCOPED).to_string();
 
-        if let Some(track) = self.retrieve_track(scope, &full_name) {
+        if let Some(track) = self.acquire_track(&scope_key, &full_name) {
             return Some(track);
         }
 
         let source = self.route_namespace(scope, &namespace)?;
 
         let (writer, reader) = Track::new(namespace.clone(), track_name.clone()).produce();
-        let reader = {
-            let scope_key = scope.unwrap_or(UNSCOPED).to_string();
+        let (track, cancelled) = {
             let mut tracks = self.tracks.lock().ok()?;
-            let bucket = tracks.entry(scope_key).or_default();
+            let bucket = tracks.entry(scope_key.clone()).or_default();
             match bucket.entry(full_name.clone()) {
                 hash_map::Entry::Vacant(entry) => {
-                    entry.insert(reader.clone());
-                    reader
+                    let (cancel, cancelled) = watch::channel(false);
+                    let identity = Arc::new(());
+                    entry.insert(TrackEntry::Namespace {
+                        reader: reader.clone(),
+                        leases: 1,
+                        cancel,
+                        identity: identity.clone(),
+                    });
+                    (
+                        LocalTrack {
+                            reader,
+                            _lease: Some(LocalTrackLease {
+                                locals: self.clone(),
+                                scope_key: scope_key.clone(),
+                                full_name: full_name.clone(),
+                                identity,
+                            }),
+                        },
+                        Some(cancelled),
+                    )
                 }
                 hash_map::Entry::Occupied(mut entry) => {
-                    if !entry.get().is_closed() {
-                        return Some(entry.get().clone());
+                    if !entry.get().reader().is_closed() {
+                        return acquire_entry(self.clone(), scope_key, full_name, entry.get_mut());
                     }
-                    entry.insert(reader.clone());
-                    reader
+                    let (cancel, cancelled) = watch::channel(false);
+                    let identity = Arc::new(());
+                    entry
+                        .insert(TrackEntry::Namespace {
+                            reader: reader.clone(),
+                            leases: 1,
+                            cancel,
+                            identity: identity.clone(),
+                        })
+                        .cancel_namespace();
+                    (
+                        LocalTrack {
+                            reader,
+                            _lease: Some(LocalTrackLease {
+                                locals: self.clone(),
+                                scope_key: scope_key.clone(),
+                                full_name: full_name.clone(),
+                                identity,
+                            }),
+                        },
+                        Some(cancelled),
+                    )
                 }
             }
         };
 
-        if source.requests.send(writer).await.is_err() {
+        let request = NamespaceTrackRequest {
+            writer,
+            cancelled: cancelled.expect("new namespace track has cancellation"),
+        };
+        if source.requests.send(request).await.is_err() {
             if let Ok(mut tracks) = self.tracks.lock() {
-                if let Some(bucket) = tracks.get_mut(scope.unwrap_or(UNSCOPED)) {
-                    bucket.remove(&full_name);
+                if let Some(bucket) = tracks.get_mut(&scope_key) {
+                    if let Some(entry) = bucket.remove(&full_name) {
+                        entry.cancel_namespace();
+                    }
                 }
             }
             return None;
         }
 
-        Some(reader)
+        Some(track)
+    }
+
+    fn acquire_track(&self, scope_key: &str, full_name: &FullTrackName) -> Option<LocalTrack> {
+        let mut tracks = self.tracks.lock().ok()?;
+        let bucket = tracks.get_mut(scope_key)?;
+        let entry = bucket.get_mut(full_name)?;
+        if entry.reader().is_closed() {
+            if let Some(entry) = bucket.remove(full_name) {
+                entry.cancel_namespace();
+            }
+            return None;
+        }
+        acquire_entry(
+            self.clone(),
+            scope_key.to_string(),
+            full_name.clone(),
+            entry,
+        )
+    }
+}
+
+fn acquire_entry(
+    locals: Locals,
+    scope_key: ScopeKey,
+    full_name: FullTrackName,
+    entry: &mut TrackEntry,
+) -> Option<LocalTrack> {
+    match entry {
+        TrackEntry::Published(reader) => Some(LocalTrack {
+            reader: reader.clone(),
+            _lease: None,
+        }),
+        TrackEntry::Namespace {
+            reader,
+            leases,
+            identity,
+            ..
+        } => {
+            *leases = leases.checked_add(1)?;
+            Some(LocalTrack {
+                reader: reader.clone(),
+                _lease: Some(LocalTrackLease {
+                    locals,
+                    scope_key,
+                    full_name,
+                    identity: identity.clone(),
+                }),
+            })
+        }
+    }
+}
+
+impl Drop for LocalTrackLease {
+    fn drop(&mut self) {
+        let Ok(mut tracks) = self.locals.tracks.lock() else {
+            return;
+        };
+        let Some(bucket) = tracks.get_mut(&self.scope_key) else {
+            return;
+        };
+        let remove = match bucket.get_mut(&self.full_name) {
+            Some(TrackEntry::Namespace {
+                leases, identity, ..
+            }) if Arc::ptr_eq(identity, &self.identity) => {
+                *leases = leases.saturating_sub(1);
+                *leases == 0
+            }
+            _ => false,
+        };
+        if remove {
+            if let Some(entry) = bucket.remove(&self.full_name) {
+                entry.cancel_namespace();
+            }
+            if bucket.is_empty() {
+                tracks.remove(&self.scope_key);
+            }
+        }
     }
 }
 
@@ -405,6 +592,96 @@ mod tests {
             no_second_request.is_err(),
             "concurrent misses should be deduplicated"
         );
+    }
+
+    #[tokio::test]
+    async fn namespace_track_cancels_upstream_after_last_downstream_lease() {
+        let mut locals = Locals::new();
+        let namespace = ns("room/123");
+        let (_registration, mut requests) = locals
+            .register_namespace(None, namespace.clone())
+            .await
+            .expect("namespace source should register");
+
+        let first = locals
+            .get_or_request_track(None, namespace.clone(), "video")
+            .await
+            .expect("first downstream should create the upstream track");
+        let second = locals
+            .get_or_request_track(None, namespace.clone(), "video")
+            .await
+            .expect("second downstream should share the upstream track");
+        let mut request = requests
+            .recv()
+            .await
+            .expect("source should receive one upstream request");
+
+        drop(first);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                request.cancelled.changed()
+            )
+            .await
+            .is_err(),
+            "one remaining downstream must preserve the upstream subscription"
+        );
+
+        drop(second);
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            request.cancelled.changed(),
+        )
+        .await
+        .expect("last downstream should cancel promptly")
+        .expect("cancellation sender should remain valid");
+        assert!(*request.cancelled.borrow());
+
+        let key = full(&namespace, "video");
+        assert!(
+            locals.retrieve_track(None, &key).is_none(),
+            "zero-lease namespace track must leave the cache"
+        );
+
+        let _third = locals
+            .get_or_request_track(None, namespace.clone(), "video")
+            .await
+            .expect("a later downstream should create a fresh upstream track");
+        requests
+            .recv()
+            .await
+            .expect("fresh downstream should issue a fresh upstream request");
+    }
+
+    #[tokio::test]
+    async fn closed_namespace_track_is_replaced_without_stale_lease_removal() {
+        let mut locals = Locals::new();
+        let namespace = ns("room/123");
+        let (_registration, mut requests) = locals
+            .register_namespace(None, namespace.clone())
+            .await
+            .expect("namespace source should register");
+
+        let stale_lease = locals
+            .get_or_request_track(None, namespace.clone(), "video")
+            .await
+            .expect("first request should create a namespace track");
+        let first_request = requests.recv().await.expect("first upstream request");
+        drop(first_request.writer);
+
+        let current_lease = locals
+            .get_or_request_track(None, namespace.clone(), "video")
+            .await
+            .expect("closed cached track should be replaced in one call");
+        let _current_request = requests.recv().await.expect("replacement upstream request");
+        drop(stale_lease);
+
+        let key = full(&namespace, "video");
+        assert!(
+            locals.retrieve_track(None, &key).is_some(),
+            "dropping a stale incarnation lease must not remove the replacement"
+        );
+        drop(current_lease);
     }
 
     #[tokio::test]

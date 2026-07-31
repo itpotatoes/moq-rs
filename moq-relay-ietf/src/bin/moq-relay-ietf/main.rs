@@ -12,7 +12,9 @@ use url::Url;
 
 use api_coordinator::{ApiCoordinator, ApiCoordinatorConfig};
 use file_coordinator::FileCoordinator;
-use moq_relay_ietf::{Coordinator, Relay, RelayConfig, SessionConfig, Web, WebConfig};
+use moq_relay_ietf::{
+    Coordinator, DataPriorityMapping, Relay, RelayConfig, SessionConfig, Web, WebConfig,
+};
 
 #[derive(Parser, Clone)]
 pub struct Cli {
@@ -35,6 +37,13 @@ pub struct Cli {
     /// Maximum request ID plus one advertised in MoQT setup.
     #[arg(long, default_value_t = 100)]
     pub max_request_id: u64,
+
+    /// Translation from MoQT publisher priority to quinn stream priority.
+    ///
+    /// legacy-v1 preserves historical evidence; moqt-v2 preserves MoQT's
+    /// lower-number-first ordering at quinn's higher-number-first scheduler.
+    #[arg(long, default_value = "legacy-v1")]
+    pub data_priority_mapping: DataPriorityMapping,
 
     /// Forward all PUBLISH_NAMESPACE messages to the provided server for auth/routing.
     /// If not provided, the relay accepts every unique namespace publish.
@@ -196,6 +205,7 @@ async fn main() -> anyhow::Result<()> {
         coordinator,
         session: SessionConfig {
             max_request_id: cli.max_request_id,
+            data_priority_mapping: cli.data_priority_mapping,
         },
     })?;
 
@@ -226,5 +236,19 @@ mod tests {
         let cli = Cli::try_parse_from(["moq-relay-ietf", "--max-request-id", "7"]).unwrap();
 
         assert_eq!(cli.max_request_id, 7);
+    }
+
+    #[test]
+    fn data_priority_mapping_flag_is_explicit_and_validated() {
+        let default_cli = Cli::try_parse_from(["moq-relay-ietf"]).unwrap();
+        assert_eq!(
+            default_cli.data_priority_mapping,
+            DataPriorityMapping::LegacyV1
+        );
+
+        let v2 =
+            Cli::try_parse_from(["moq-relay-ietf", "--data-priority-mapping", "moqt-v2"]).unwrap();
+        assert_eq!(v2.data_priority_mapping, DataPriorityMapping::MoqtV2);
+        assert!(Cli::try_parse_from(["moq-relay-ietf", "--data-priority-mapping", "v2"]).is_err());
     }
 }

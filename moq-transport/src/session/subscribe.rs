@@ -75,6 +75,10 @@ pub struct SubscribeInfo {
     /// Optional parameters
     pub params: KeyValuePairs,
 
+    /// Hop-local object forwarding budget from DELIVERY_TIMEOUT, in integer
+    /// milliseconds. Zero is forbidden by draft-16.
+    pub delivery_timeout_ms: Option<u64>,
+
     // Set to true if this is a track_status request only
     pub track_status: bool,
 }
@@ -89,6 +93,13 @@ impl SubscribeInfo {
         let start_location = filter.as_ref().and_then(|filter| filter.start_location);
         let end_group_id = filter.as_ref().and_then(|filter| filter.end_group_id);
 
+        let delivery_timeout_ms = msg.params.delivery_timeout()?;
+        if delivery_timeout_ms == Some(0) {
+            return Err(SessionError::ProtocolViolation(
+                "DELIVERY_TIMEOUT must be greater than zero".to_string(),
+            ));
+        }
+
         Ok(Self {
             id: msg.id,
             track_namespace: msg.track_namespace.clone(),
@@ -101,6 +112,7 @@ impl SubscribeInfo {
             end_group_id,
             filter,
             params: msg.params.clone(),
+            delivery_timeout_ms,
             track_status: false,
         })
     }
@@ -174,34 +186,29 @@ pub struct Subscribe {
 }
 
 impl Subscribe {
+    #[cfg(test)]
     pub(super) fn new(
         subscriber: Subscriber,
         request_id: u64,
         track: TrackWriter,
     ) -> (Subscribe, SubscribeRecv) {
+        Self::new_with_params(subscriber, request_id, track, KeyValuePairs::default())
+            .expect("default SUBSCRIBE parameters must be valid")
+    }
+
+    pub(super) fn new_with_params(
+        subscriber: Subscriber,
+        request_id: u64,
+        track: TrackWriter,
+        params: KeyValuePairs,
+    ) -> Result<(Subscribe, SubscribeRecv), SessionError> {
         let subscribe_message = message::Subscribe {
             id: request_id,
             track_namespace: track.namespace.clone(),
             track_name: track.name.clone(),
-            params: KeyValuePairs::default(),
+            params,
         };
-        let info = SubscribeInfo::new_from_subscribe(&subscribe_message).unwrap_or_else(|err| {
-            tracing::warn!(error = %err, "failed to decode outbound subscribe parameters");
-            SubscribeInfo {
-                id: request_id,
-                track_namespace: track.namespace.clone(),
-                track_name: track.name.clone(),
-                subscriber_priority: 128,
-                group_order: GroupOrder::Publisher,
-                forward: true,
-                filter_type: FilterType::AbsoluteStart,
-                start_location: None,
-                end_group_id: None,
-                filter: None,
-                params: Default::default(),
-                track_status: false,
-            }
-        });
+        let info = SubscribeInfo::new_from_subscribe(&subscribe_message)?;
 
         let (send, recv) = State::default().split();
 
@@ -216,7 +223,7 @@ impl Subscribe {
             writer: Some(track.into()),
         };
 
-        (send, recv)
+        Ok((send, recv))
     }
 
     pub(super) fn send_request(&mut self) {
@@ -327,7 +334,10 @@ impl SubscribeRecv {
             // TODO SLG - understand why both of these are needed, clock demo won't run if I comment out TrackWriteMode::Track
             TrackWriterMode::Track(track) => track.subgroups()?,
             TrackWriterMode::Subgroups(subgroups) => subgroups,
-            _ => return Err(ServeError::Mode),
+            other => {
+                self.writer = Some(other);
+                return Err(ServeError::Mode);
+            }
         };
 
         let writer = subgroups.create(serve::Subgroup {
@@ -335,11 +345,13 @@ impl SubscribeRecv {
             // When subgroup_id is not present in the header type, it implicitly means subgroup 0
             subgroup_id: header.subgroup_id.unwrap_or(0),
             priority: header.publisher_priority,
-        })?;
+        });
 
+        // Restore the track writer even when this one subgroup fails (e.g. a
+        // duplicate identity), so subsequent subgroup streams keep serving.
         self.writer = Some(subgroups.into());
 
-        Ok(writer)
+        writer
     }
 
     pub fn datagram(&mut self, datagram: data::Datagram) -> Result<(), ServeError> {
@@ -419,6 +431,20 @@ mod tests {
     }
 
     #[test]
+    fn next_group_filter_skips_the_retained_current_group() {
+        let mut params = KeyValuePairs::default();
+        params
+            .set_subscription_filter(&SubscriptionFilter::next_group_start())
+            .unwrap();
+        let info = subscribe_info_with(params);
+        let filter = info.delivery_filter(Some(Location::new(2, 3)));
+
+        assert!(!filter.allows(2, 3));
+        assert!(!filter.allows(2, 4));
+        assert!(filter.allows(3, 0));
+    }
+
+    #[test]
     fn absolute_range_filter_limits_start_and_end_group() {
         let mut params = KeyValuePairs::default();
         params
@@ -435,6 +461,25 @@ mod tests {
         assert!(filter.allows(2, 3));
         assert!(filter.allows(4, 10));
         assert!(!filter.allows(5, 0));
+    }
+
+    #[test]
+    fn delivery_timeout_is_parsed_and_zero_is_rejected() {
+        let mut params = KeyValuePairs::default();
+        params.set_delivery_timeout(67);
+        let info = subscribe_info_with(params);
+        assert_eq!(info.delivery_timeout_ms, Some(67));
+
+        let mut zero = KeyValuePairs::default();
+        zero.set_delivery_timeout(0);
+        let err = SubscribeInfo::new_from_subscribe(&message::Subscribe {
+            id: 0,
+            track_namespace: TrackNamespace::from_utf8_path("test"),
+            track_name: "track".into(),
+            params: zero,
+        })
+        .unwrap_err();
+        assert!(matches!(err, SessionError::ProtocolViolation(_)));
     }
 
     #[test]
@@ -486,5 +531,72 @@ mod tests {
             subscribe.closed().await,
             Err(ServeError::Closed(code)) if code == message::PublishDoneCode::Expired as u64
         ));
+    }
+
+    #[tokio::test]
+    async fn duplicate_subgroup_leaves_later_streams_serving() {
+        let rid = crate::session::RequestId::new(0, 100, 100, 0);
+        let subscriber = crate::session::Subscriber::new(
+            crate::session::Queue::default(),
+            None,
+            rid,
+            crate::session::PendingRequests::default(),
+        );
+        let (writer, _reader) =
+            serve::Track::new(TrackNamespace::from_utf8_path("test"), "track").produce();
+        let (_subscribe, mut recv) = Subscribe::new(subscriber, 1, writer);
+
+        let header = |group_id| data::SubgroupHeader {
+            header_type: data::StreamHeaderType::SubgroupZeroId,
+            track_alias: 10,
+            group_id,
+            subgroup_id: Some(0),
+            publisher_priority: 128,
+        };
+
+        recv.subgroup(header(0)).unwrap();
+
+        // A duplicate subgroup identity is stream-local: it fails this one
+        // stream without consuming the track writer.
+        assert!(matches!(
+            recv.subgroup(header(0)),
+            Err(ServeError::Duplicate)
+        ));
+
+        // The subscription keeps serving subsequent subgroup streams.
+        recv.subgroup(header(1)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn mode_mismatch_preserves_the_track_writer() {
+        let rid = crate::session::RequestId::new(0, 100, 100, 0);
+        let subscriber = crate::session::Subscriber::new(
+            crate::session::Queue::default(),
+            None,
+            rid,
+            crate::session::PendingRequests::default(),
+        );
+        let (writer, _reader) =
+            serve::Track::new(TrackNamespace::from_utf8_path("test"), "track").produce();
+        let (_subscribe, mut recv) = Subscribe::new(subscriber, 1, writer);
+
+        let datagrams = match recv.writer.take().unwrap() {
+            TrackWriterMode::Track(track) => track.datagrams().unwrap(),
+            _ => unreachable!("fresh subscription starts in track mode"),
+        };
+        recv.writer = Some(datagrams.into());
+
+        let header = || data::SubgroupHeader {
+            header_type: data::StreamHeaderType::SubgroupZeroId,
+            track_alias: 10,
+            group_id: 0,
+            subgroup_id: Some(0),
+            publisher_priority: 128,
+        };
+
+        // A mode mismatch is stream-local: it must not consume the writer,
+        // so a second stream sees Mode again instead of fatal Done.
+        assert!(matches!(recv.subgroup(header()), Err(ServeError::Mode)));
+        assert!(matches!(recv.subgroup(header()), Err(ServeError::Mode)));
     }
 }
