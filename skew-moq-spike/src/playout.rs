@@ -94,6 +94,16 @@ pub enum PlayoutAction {
     Drop {
         object: PlayoutObject,
         reason: &'static str,
+        /// Whether a common-timeline epoch existed **at the moment this drop
+        /// was emitted** (S3 FSM 구현계약 §2.1 정의 2·규칙 C).
+        ///
+        /// The flag is set at construction rather than derived later because
+        /// `push` runs `enforce_bounds` *before* `try_start`: a buffer-limit
+        /// drop and epoch formation can occur inside one `push`, so the
+        /// scheduler state observed after the batch would misclassify it.
+        /// Drop reasons are deliberately not enumerated in the consumer —
+        /// enumerating them is what left that gap.
+        had_epoch: bool,
     },
 }
 
@@ -102,6 +112,20 @@ impl PlayoutAction {
         match self {
             Self::Release(object) | Self::Drop { object, .. } => object,
         }
+    }
+
+    /// A terminal drop emitted while no epoch existed. Such an object never
+    /// had a valid deadline and can never be re-pushed or released, so it can
+    /// produce no controller observation other than a retroactively fabricated
+    /// one (계약 §2.1 규칙 B).
+    pub fn is_pre_epoch_drop(&self) -> bool {
+        matches!(
+            self,
+            Self::Drop {
+                had_epoch: false,
+                ..
+            }
+        )
     }
 }
 
@@ -199,6 +223,7 @@ impl PlayoutScheduler {
             return vec![PlayoutAction::Drop {
                 object,
                 reason: "invalid_track",
+                had_epoch: self.epoch.is_some(),
             }];
         }
         let identity = object.identity();
@@ -213,6 +238,10 @@ impl PlayoutScheduler {
             return vec![PlayoutAction::Drop {
                 object,
                 reason: DROP_STARTUP_TIMEOUT,
+                // `startup_failed` latches only while `epoch.is_none()`, so
+                // this is always false; read the field rather than assert it
+                // so the tag stays derived from one source.
+                had_epoch: self.epoch.is_some(),
             }];
         }
 
@@ -286,6 +315,8 @@ impl PlayoutScheduler {
                 actions.push(PlayoutAction::Drop {
                     object,
                     reason: DROP_LATE,
+                    // Past the `epoch.is_none()` guard above, so always true.
+                    had_epoch: true,
                 });
             } else {
                 actions.push(PlayoutAction::Release(object));
@@ -324,6 +355,7 @@ impl PlayoutScheduler {
     where
         F: FnMut(&PlayoutObject) -> bool,
     {
+        let had_epoch = self.epoch.is_some();
         let mut objects = Vec::new();
         for track in [TRACK_PC, TRACK_HAPTIC] {
             let keys: Vec<QueueKey> = self
@@ -349,7 +381,11 @@ impl PlayoutScheduler {
         });
         objects
             .into_iter()
-            .map(|object| PlayoutAction::Drop { object, reason })
+            .map(|object| PlayoutAction::Drop {
+                object,
+                reason,
+                had_epoch,
+            })
             .collect()
     }
 
@@ -430,6 +466,10 @@ impl PlayoutScheduler {
     }
 
     fn enforce_bounds(&mut self, track: u8) -> Vec<PlayoutAction> {
+        // `push` calls this BEFORE `try_start`, so a buffer-limit drop and
+        // epoch formation can share one `push`. Reading the epoch here is what
+        // makes 계약 §2.1 규칙 C exact for that case.
+        let had_epoch = self.epoch.is_some();
         let mut dropped = Vec::new();
         while self.buffer(track).len() > self.config.max_objects_per_track {
             if let Some(object) = self.pop_oldest(track) {
@@ -437,6 +477,7 @@ impl PlayoutScheduler {
                 dropped.push(PlayoutAction::Drop {
                     object,
                     reason: DROP_BUFFER_OBJECT_LIMIT,
+                    had_epoch,
                 });
             }
         }
@@ -456,6 +497,7 @@ impl PlayoutScheduler {
                 dropped.push(PlayoutAction::Drop {
                     object,
                     reason: DROP_BUFFER_SPAN_LIMIT,
+                    had_epoch,
                 });
             }
         }
@@ -490,6 +532,8 @@ impl PlayoutScheduler {
                 dropped.push(PlayoutAction::Drop {
                     object,
                     reason: DROP_BUFFER_SPAN_LIMIT,
+                    // Guarded by `epoch.is_none()` at the top of this fn.
+                    had_epoch: true,
                 });
             }
         }
@@ -502,6 +546,7 @@ impl PlayoutScheduler {
     }
 
     fn drop_all(&mut self, reason: &'static str) -> Vec<PlayoutAction> {
+        let had_epoch = self.epoch.is_some();
         let mut objects: Vec<PlayoutObject> = std::mem::take(&mut self.pc)
             .into_values()
             .chain(std::mem::take(&mut self.haptic).into_values())
@@ -518,7 +563,11 @@ impl PlayoutScheduler {
             .filter_map(|object| {
                 self.terminal
                     .insert(object.identity())
-                    .then_some(PlayoutAction::Drop { object, reason })
+                    .then_some(PlayoutAction::Drop {
+                        object,
+                        reason,
+                        had_epoch,
+                    })
             })
             .collect()
     }
@@ -710,7 +759,7 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             &actions[0],
-            PlayoutAction::Drop { object, reason }
+            PlayoutAction::Drop { object, reason, .. }
                 if object.header.seq == 2 && *reason == "stale_tier"
         ));
         assert_eq!(scheduler.buffered_counts(), (1, 2));

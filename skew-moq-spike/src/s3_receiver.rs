@@ -77,8 +77,41 @@ impl S3DeadlineTracker {
         map.entry(key).or_insert(AnchorArrival {
             t_recv: object.t_recv,
         });
-        if map.len() > self.max_anchors {
+        // The occupancy bound is NOT checked here. Registration happens before
+        // `scheduler.push`, so checking on insert kills the receiver at the
+        // boundary before `enforce_bounds` gets the chance to evict — and
+        // before this batch's terminal drops are forgotten. The caller runs
+        // [`Self::check_bounds`] once per event-loop iteration, after both.
+        Ok(())
+    }
+
+    /// Current occupancy of the four maps, for the bound check and its
+    /// diagnostic record: `(pc_arrivals, haptic_arrivals, pc_releases,
+    /// haptic_releases)`.
+    pub fn occupancy(&self) -> (usize, usize, usize, usize) {
+        (
+            self.pc_arrivals.len(),
+            self.haptic_arrivals.len(),
+            self.pc_releases.len(),
+            self.haptic_releases.len(),
+        )
+    }
+
+    pub fn max_anchors(&self) -> usize {
+        self.max_anchors
+    }
+
+    /// Fail loud if any map exceeded its bound. Call once per event-loop
+    /// iteration AFTER terminal cleanup (`forget_evicted` for pre-epoch drops)
+    /// and [`Self::advance`], so the check sees settled occupancy rather than
+    /// a mid-batch transient.
+    pub fn check_bounds(&self) -> Result<(), &'static str> {
+        let (pc_arr, haptic_arr, pc_rel, haptic_rel) = self.occupancy();
+        if pc_arr.max(haptic_arr) > self.max_anchors {
             return Err("S3 deadline tracker anchor bound exceeded");
+        }
+        if pc_rel.max(haptic_rel) > self.max_anchors {
+            return Err("S3 deadline tracker release bound exceeded");
         }
         Ok(())
     }
@@ -124,9 +157,7 @@ impl S3DeadlineTracker {
                 _ => return Err("deadline tracker saw an invalid release track"),
             };
             map.entry(key).or_insert(now_us);
-            if map.len() > self.max_anchors {
-                return Err("S3 deadline tracker release bound exceeded");
-            }
+            // Bound checked by [`Self::check_bounds`] after the batch settles.
         }
         Ok(())
     }

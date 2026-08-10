@@ -536,7 +536,7 @@ fn dispatch_playout_actions(
                     }
                 }
             }
-            PlayoutAction::Drop { object, reason } => {
+            PlayoutAction::Drop { object, reason, .. } => {
                 logger.lock().unwrap().try_log_drop(
                     object.track_name(),
                     h.tier,
@@ -1205,6 +1205,21 @@ fn dispatch_s3_playout_actions(
     tracker
         .note_actions(&actions, now)
         .map_err(anyhow::Error::msg)?;
+    // S3 FSM 구현계약 §2.1 규칙 B·C: an object terminally dropped while no
+    // epoch existed never had a valid deadline and can never be re-pushed or
+    // released, so the only observation it could still produce is a
+    // retroactively fabricated deadline miss. Forget it here — the one place
+    // every terminal scheduler action passes through. The drop reason is
+    // deliberately NOT consulted; the scheduler tags the epoch state at
+    // emission time (`had_epoch`) because `push` can emit a pre-epoch
+    // buffer-limit drop in the same call that forms the epoch.
+    for action in &actions {
+        if action.is_pre_epoch_drop() {
+            tracker
+                .forget_evicted(action.object())
+                .map_err(anyhow::Error::msg)?;
+        }
+    }
     for action in actions {
         let object = action.object();
         let header = object.header;
@@ -1237,7 +1252,7 @@ fn dispatch_s3_playout_actions(
                     }
                 }
             }
-            PlayoutAction::Drop { object, reason } => {
+            PlayoutAction::Drop { object, reason, .. } => {
                 logger
                     .lock()
                     .map_err(|_| anyhow::anyhow!("RX logger poisoned"))?
@@ -1313,6 +1328,9 @@ fn apply_s3_route_barrier(
             *action = PlayoutAction::Drop {
                 object,
                 reason: DROP_STALE_TIER,
+                // A staged Release implies the epoch already exists; read the
+                // scheduler rather than hard-coding it.
+                had_epoch: scheduler.is_started(),
             };
         }
         let evicted = scheduler.drop_matching(DROP_STALE_TIER, cancelled);
@@ -2028,6 +2046,38 @@ async fn run_s3_receiver(
                 continue;
             }
         };
+        // The occupancy bound is checked here, after this batch's pre-epoch
+        // terminal cleanup (in `dispatch_s3_playout_actions`) and after
+        // `advance` expired every due anchor. Checking on insert instead would
+        // abort at the boundary before the scheduler's own eviction ran.
+        // Still fail-loud, but record the occupancy first so a future
+        // violation is diagnosable from the run's own log.
+        if let Err(error) = tracker.check_bounds() {
+            let (pc_arr, haptic_arr, pc_rel, haptic_rel) = tracker.occupancy();
+            let (pc_buf, haptic_buf) = scheduler.buffered_counts();
+            if let Err(log_error) = logger
+                .lock()
+                .map_err(|_| anyhow::anyhow!("RX logger poisoned"))
+                .and_then(|mut logger| {
+                    logger
+                        .try_log_info(&format!(
+                            "\"event\":\"s3_tracker_bound\",\"error\":\"{error}\",\
+                             \"max_anchors\":{},\"pc_arrivals\":{pc_arr},\
+                             \"haptic_arrivals\":{haptic_arr},\"pc_releases\":{pc_rel},\
+                             \"haptic_releases\":{haptic_rel},\"pc_buffered\":{pc_buf},\
+                             \"haptic_buffered\":{haptic_buf},\"epoch\":{}",
+                            tracker.max_anchors(),
+                            scheduler.is_started()
+                        ))
+                        .map_err(anyhow::Error::from)
+                })
+            {
+                outcome_error = Some(log_error);
+                continue;
+            }
+            outcome_error = Some(anyhow::anyhow!(error));
+            continue;
+        }
         if pending_at_start || ingress.gate().pending_request().is_some() {
             if !observations.is_empty() {
                 if let Err(error) = logger
@@ -3523,6 +3573,7 @@ mod rx_ending_tests {
 #[cfg(test)]
 mod s3_barrier_race_tests {
     use super::*;
+    use skew_moq::playout::{DROP_BUFFER_SPAN_LIMIT, DROP_LATE, DROP_STARTUP_TIMEOUT};
     use skew_moq::s3_controller::{S3State, S3Transition, TransitionCause};
     use skew_moq::s3_switch::Routes;
 
@@ -3667,11 +3718,25 @@ mod s3_barrier_race_tests {
             scheduler_actions
         }
 
+        /// Mirrors the receiver's end-of-iteration bound check (P2): after
+        /// terminal cleanup and after `advance` expired every due anchor.
+        fn advance_tracker(&mut self, now: u64) -> Vec<S3Observation> {
+            let observations = self.tracker.advance(&self.scheduler, now).unwrap();
+            self.tracker.check_bounds().unwrap();
+            observations
+        }
+
         /// Mirrors `dispatch_s3_playout_actions` accounting. The route-map
         /// removal is the conservation check: exactly one terminal action per
         /// scheduler-entered object, never two.
         fn dispatch(&mut self, actions: &[PlayoutAction], now: u64) {
             self.tracker.note_actions(actions, now).unwrap();
+            // 계약 §2.1 규칙 B·C, same order as the receiver.
+            for action in actions {
+                if action.is_pre_epoch_drop() {
+                    self.tracker.forget_evicted(action.object()).unwrap();
+                }
+            }
             for action in actions {
                 let key = S3ObjectKey::from(action.object());
                 assert!(
@@ -3907,7 +3972,7 @@ mod s3_barrier_race_tests {
                 .iter()
                 .map(|action| match action {
                     PlayoutAction::Release(object) => (S3ObjectKey::from(object), None),
-                    PlayoutAction::Drop { object, reason } => {
+                    PlayoutAction::Drop { object, reason, .. } => {
                         (S3ObjectKey::from(object), Some(*reason))
                     }
                 })
@@ -4036,6 +4101,7 @@ mod s3_barrier_race_tests {
                 PlayoutAction::Drop {
                     object,
                     reason: DROP_STALE_TIER,
+                    ..
                 } => stale.push((object.header.track_id, object.header.pts_us)),
                 PlayoutAction::Drop { .. } => {}
             }
@@ -4263,6 +4329,330 @@ mod s3_barrier_race_tests {
         assert!(h.duplicate_dropped.is_empty());
         assert!(h.object_routes.is_empty());
         assert_eq!(h.released.len() + h.dropped.len(), h.pushed_to_scheduler);
+    }
+
+    // ---- S3 FSM 구현계약 §2.1 (2026-08-10 개정) 회귀검사 ----
+    //
+    // Before this amendment the deadline tracker registered every arriving
+    // anchor but only released entries via post-epoch haptic-keyed expiry or
+    // route-barrier eviction. Objects the scheduler terminally dropped stayed
+    // behind, which produced two observed failures: the receiver died with
+    // "anchor bound exceeded" on a run that never formed an epoch, and every
+    // S3 run that did form one opened with a forced
+    // `Normal -> Haptic-Critical` transition built from pre-epoch anchors that
+    // never had a valid deadline.
+
+    /// 회귀 1 — 증상 1. A run whose epoch never forms must not grow the
+    /// tracker without bound. The pre-amendment code stored one entry per
+    /// arriving anchor for the whole run and aborted at `max_anchors + 1`.
+    #[test]
+    fn pre_epoch_anchors_do_not_accumulate_when_the_epoch_never_forms() {
+        let mut h = Harness::new();
+        let gen0 = h.ingress.gate().active_routes();
+        let max = h.tracker.max_anchors();
+
+        // Haptic only, so no exact pair can ever start the epoch. Far more
+        // anchors than the bound, spread past both startup windows so the
+        // 2s timeout and its single re-arm both fire.
+        let mut now = 1_000;
+        for event_id in 1..=(max as u32 * 4) {
+            let pts_us = u64::from(event_id - 1) * 33_333;
+            h.push(routed(TrackRole::Haptic, gen0.haptic, pts_us, event_id, now), now);
+            now += 33_333;
+        }
+
+        assert!(!h.scheduler.is_started(), "epoch must never form");
+        h.tracker
+            .check_bounds()
+            .expect("pre-epoch cleanup must keep the tracker bounded");
+        let (pc_arrivals, haptic_arrivals, ..) = h.tracker.occupancy();
+        assert_eq!(pc_arrivals, 0);
+        assert!(
+            haptic_arrivals <= max,
+            "haptic arrivals {haptic_arrivals} exceeded bound {max}"
+        );
+    }
+
+    /// 회귀 2 — 증상 2, 계약 §2.1 규칙 B. Anchors terminally dropped before the
+    /// epoch existed must not produce controller observations once it does.
+    /// This is the forced first transition: the pre-amendment tracker replayed
+    /// them all as `deadline_miss` at the instant of activation.
+    #[test]
+    fn pre_epoch_startup_timeout_drops_produce_no_deadline_miss_after_the_epoch() {
+        let mut h = Harness::new();
+        let gen0 = h.ingress.gate().active_routes();
+
+        // Haptic-only anchors, then let both startup windows expire so they
+        // are terminally dropped as `startup_timeout`.
+        for event_id in 1..=3u32 {
+            let pts_us = u64::from(event_id - 1) * 33_333;
+            h.push(routed(TrackRole::Haptic, gen0.haptic, pts_us, event_id, 1_000), 1_000);
+        }
+        let actions = h.push(
+            routed(TrackRole::Haptic, gen0.haptic, 100_000, 4, 2_100_000),
+            2_100_000,
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, PlayoutAction::Drop {
+                    reason: DROP_STARTUP_TIMEOUT,
+                    ..
+                })),
+            "the first startup window must expire"
+        );
+        assert!(!h.scheduler.is_started());
+        // `push` buffers the new object before running `advance`, so the
+        // expiring window terminally drops it too and nothing is left
+        // registered.
+        let (_, haptic_arrivals, ..) = h.tracker.occupancy();
+        assert_eq!(haptic_arrivals, 0, "the expired window drained the tracker");
+
+        // A real exact pair now forms the epoch, and the tracker activates
+        // exactly as the receiver does.
+        h.push(
+            routed(TrackRole::Pc, gen0.pc, 200_000, 7, 2_200_000),
+            2_200_000,
+        );
+        h.push(
+            routed(TrackRole::Haptic, gen0.haptic, 200_000, 7, 2_200_100),
+            2_200_100,
+        );
+        assert!(h.scheduler.is_started(), "exact pair must start the epoch");
+        h.tracker.activate().unwrap();
+
+        // Every dropped pre-epoch anchor has a deadline in the past now, so
+        // the pre-amendment tracker emitted a `deadline_miss` for each.
+        let observations = h.advance_tracker(3_000_000);
+        assert!(
+            observations.iter().all(|observation| !observation.deadline_miss),
+            "pre-epoch losses must not reach the controller: {observations:?}"
+        );
+    }
+
+    /// 회귀 3 — 계약 §2.1 규칙 C. `push` runs `enforce_bounds` before
+    /// `try_start`, so a buffer-limit drop and epoch formation can share one
+    /// call. Classifying by drop reason, or by the scheduler state observed
+    /// after the batch, would leave that object registered.
+    #[test]
+    fn buffer_limit_drop_in_the_same_push_that_forms_the_epoch_is_forgotten() {
+        let mut config = test_playout();
+        // Small enough that the span rule fires while the epoch is still
+        // absent, using anchors the tracker actually keys on.
+        config.max_span_us = 100_000;
+        let mut h = Harness::new();
+        h.scheduler = PlayoutScheduler::new(config).unwrap();
+        let gen0 = h.ingress.gate().active_routes();
+
+        // Old haptic anchor, then a PC/haptic exact pair far enough ahead that
+        // inserting it violates the span bound and evicts the old anchor in
+        // the same `push` that starts the epoch.
+        h.push(routed(TrackRole::Haptic, gen0.haptic, 0, 1, 1_000), 1_000);
+        h.push(routed(TrackRole::Pc, gen0.pc, 900_000, 28, 1_100), 1_100);
+        let actions = h.push(
+            routed(TrackRole::Haptic, gen0.haptic, 900_000, 28, 1_200),
+            1_200,
+        );
+
+        assert!(h.scheduler.is_started(), "the exact pair starts the epoch");
+        let evicted: Vec<_> = actions
+            .iter()
+            .filter(|action| {
+                matches!(action, PlayoutAction::Drop {
+                    reason: DROP_BUFFER_SPAN_LIMIT,
+                    ..
+                })
+            })
+            .collect();
+        assert_eq!(evicted.len(), 1, "the old anchor is span-evicted: {actions:?}");
+        assert!(
+            evicted[0].is_pre_epoch_drop(),
+            "the drop was emitted before try_start, so it is pre-epoch"
+        );
+
+        h.tracker.activate().unwrap();
+        let observations = h.advance_tracker(3_000_000);
+        assert!(
+            observations.iter().all(|observation| !observation.deadline_miss),
+            "the span-evicted pre-epoch anchor must not become a miss: {observations:?}"
+        );
+    }
+
+    /// 회귀 4 — P2. The bound is checked once per iteration, after this
+    /// batch's terminal cleanup and `advance`. Checking on insert aborted at
+    /// the boundary before the scheduler's own eviction could run.
+    #[test]
+    fn arrival_at_the_buffer_bound_is_evicted_before_the_bound_check() {
+        let mut config = test_playout();
+        config.max_objects_per_track = 4;
+        let mut h = Harness::new();
+        h.scheduler = PlayoutScheduler::new(config).unwrap();
+        h.tracker = S3DeadlineTracker::new(4).unwrap();
+        let gen0 = h.ingress.gate().active_routes();
+
+        // Fill the haptic buffer to its bound and then keep going. Each new
+        // arrival evicts the oldest, so settled occupancy never exceeds it.
+        for event_id in 1..=12u32 {
+            let pts_us = u64::from(event_id - 1) * 33_333;
+            h.push(routed(TrackRole::Haptic, gen0.haptic, pts_us, event_id, 1_000), 1_000);
+            h.tracker
+                .check_bounds()
+                .expect("settled occupancy must stay within the bound");
+        }
+        let (_, haptic_arrivals, ..) = h.tracker.occupancy();
+        assert!(haptic_arrivals <= 4, "haptic arrivals {haptic_arrivals}");
+    }
+
+    /// 회귀 5 — 계약 §2.1 규칙 E, the counterexample that killed the withdrawn
+    /// PC-only expiry proposal. A PC released at its deadline whose haptic
+    /// counterpart lands within `late_tolerance` still yields a real pair
+    /// observation, NOT a deadline miss. Any future PC-only expiry rule must
+    /// keep this test passing.
+    #[test]
+    fn pc_first_with_a_late_but_tolerated_haptic_still_yields_a_pair_observation() {
+        let mut h = Harness::new();
+        let gen0 = h.ingress.gate().active_routes();
+
+        // Epoch from an exact pair at pts 0: due(pts) = 52_000 + pts.
+        h.push(routed(TrackRole::Pc, gen0.pc, 0, 1, 1_000), 1_000);
+        h.push(routed(TrackRole::Haptic, gen0.haptic, 0, 1, 2_000), 2_000);
+        assert!(h.scheduler.is_started());
+        h.tracker.activate().unwrap();
+        let actions = h.scheduler.advance(52_000);
+        h.dispatch(&actions, 52_000);
+        h.advance_tracker(52_000);
+
+        // Next anchor: PC arrives and is released at its deadline while the
+        // haptic counterpart has not arrived at all.
+        let pc_deadline = 52_000 + 100_000;
+        h.push(routed(TrackRole::Pc, gen0.pc, 100_000, 4, 60_000), 60_000);
+        let actions = h.scheduler.advance(pc_deadline);
+        h.dispatch(&actions, pc_deadline);
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, PlayoutAction::Release(object)
+                    if object.header.pts_us == 100_000)),
+            "PC is released at its own deadline: {actions:?}"
+        );
+        let observations = h.advance_tracker(pc_deadline);
+        assert!(
+            observations.is_empty(),
+            "a PC-only anchor produces nothing yet: {observations:?}"
+        );
+
+        // The haptic counterpart lands 5ms late — inside the 50ms tolerance of
+        // `test_playout`, so the scheduler still releases it.
+        let haptic_arrival = pc_deadline + 5_000;
+        let actions = h.push(
+            routed(TrackRole::Haptic, gen0.haptic, 100_000, 4, haptic_arrival),
+            haptic_arrival,
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, PlayoutAction::Release(object)
+                    if object.header.pts_us == 100_000
+                        && object.header.track_id == TRACK_HAPTIC)),
+            "a tolerated late haptic is released, not dropped: {actions:?}"
+        );
+
+        let observations = h.advance_tracker(haptic_arrival);
+        let paired: Vec<_> = observations
+            .iter()
+            .filter(|observation| observation.abs_skew_us.is_some())
+            .collect();
+        assert_eq!(paired.len(), 1, "the pair must be observed: {observations:?}");
+        assert!(!paired[0].deadline_miss, "PC met its deadline");
+        assert_eq!(paired[0].abs_skew_us, Some(5_000));
+    }
+
+    /// 회귀 6 — 계약 §2.1 규칙 D. Post-epoch drops keep their existing
+    /// observation behaviour; only pre-epoch losses are withheld. A PC dropped
+    /// as `late` after the epoch must still register as a deadline miss for
+    /// its anchor.
+    #[test]
+    fn post_epoch_late_drop_still_reports_a_deadline_miss() {
+        let mut h = Harness::new();
+        let gen0 = h.ingress.gate().active_routes();
+
+        h.push(routed(TrackRole::Pc, gen0.pc, 0, 1, 1_000), 1_000);
+        h.push(routed(TrackRole::Haptic, gen0.haptic, 0, 1, 2_000), 2_000);
+        assert!(h.scheduler.is_started());
+        h.tracker.activate().unwrap();
+        // Drain the epoch-forming pair at its own deadline so it cannot be
+        // swept up by the late sweep below.
+        let actions = h.scheduler.advance(52_000);
+        h.dispatch(&actions, 52_000);
+        h.advance_tracker(52_000);
+
+        // PC for the next anchor arrives long after its deadline plus the
+        // tolerance, so the scheduler drops it as `late` post-epoch.
+        let arrival = 52_000 + 100_000 + 500_000;
+        let actions = h.push(
+            routed(TrackRole::Pc, gen0.pc, 100_000, 4, arrival),
+            arrival,
+        );
+        let late: Vec<_> = actions
+            .iter()
+            .filter(|action| matches!(action, PlayoutAction::Drop {
+                reason: DROP_LATE,
+                ..
+            }))
+            .collect();
+        assert_eq!(late.len(), 1, "PC is dropped as late: {actions:?}");
+        assert!(
+            !late[0].is_pre_epoch_drop(),
+            "a post-epoch drop must not be treated as pre-epoch"
+        );
+
+        h.push(
+            routed(TrackRole::Haptic, gen0.haptic, 100_000, 4, arrival + 1_000),
+            arrival + 1_000,
+        );
+        let observations = h.advance_tracker(arrival + 1_000);
+        assert!(
+            observations.iter().any(|observation| observation.deadline_miss),
+            "the anchor's PC missed its deadline and must still be reported: {observations:?}"
+        );
+    }
+
+    /// 회귀 7 — 계약 §2.1 규칙 A, the amendment's safety claim. Withholding
+    /// pre-epoch losses from the controller must not remove them from
+    /// delivery/terminal accounting: every object that entered the scheduler
+    /// still yields exactly one terminal record.
+    #[test]
+    fn pre_epoch_losses_remain_in_terminal_accounting() {
+        let mut h = Harness::new();
+        let gen0 = h.ingress.gate().active_routes();
+
+        for event_id in 1..=5u32 {
+            let pts_us = u64::from(event_id - 1) * 33_333;
+            h.push(routed(TrackRole::Haptic, gen0.haptic, pts_us, event_id, 1_000), 1_000);
+        }
+        h.push(
+            routed(TrackRole::Haptic, gen0.haptic, 200_000, 7, 2_100_000),
+            2_100_000,
+        );
+
+        let startup_dropped = h
+            .dropped
+            .iter()
+            .filter(|(_, reason)| *reason == DROP_STARTUP_TIMEOUT)
+            .count();
+        assert_eq!(
+            startup_dropped, 6,
+            "every pre-epoch loss stays in terminal accounting: {:?}",
+            h.dropped
+        );
+        assert_eq!(
+            h.released.len() + h.dropped.len(),
+            h.pushed_to_scheduler,
+            "exactly one terminal record per scheduler-entered object"
+        );
+        // ...while the controller side is empty.
+        let (_, haptic_arrivals, ..) = h.tracker.occupancy();
+        assert_eq!(haptic_arrivals, 0, "no pre-epoch loss remains registered");
     }
 }
 
@@ -4580,4 +4970,5 @@ mod s3_retirement_tests {
         );
         std::fs::remove_file(&out).unwrap();
     }
+
 }
