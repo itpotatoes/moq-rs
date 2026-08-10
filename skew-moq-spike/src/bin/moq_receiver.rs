@@ -1242,6 +1242,26 @@ fn settle_tracker_batch(
     Ok(())
 }
 
+/// Which stage of [`advance_tracker_checked`] failed.
+///
+/// The two stages fail for unrelated reasons — a lost scheduler epoch is an
+/// `advance` invariant break, an occupancy overflow is a bound violation — and
+/// only the latter warrants an `s3_tracker_bound` record. Merging them into one
+/// `&'static str` would misattribute the cause in the run's own log.
+#[derive(Debug)]
+enum TrackerStepError {
+    Advance(&'static str),
+    Bound(&'static str),
+}
+
+impl TrackerStepError {
+    fn message(&self) -> &'static str {
+        match self {
+            Self::Advance(message) | Self::Bound(message) => message,
+        }
+    }
+}
+
 /// Expire every due anchor and then check the occupancy bound (P2).
 ///
 /// The order is the point: the bound is evaluated on settled occupancy, after
@@ -1251,9 +1271,11 @@ fn advance_tracker_checked(
     tracker: &mut S3DeadlineTracker,
     scheduler: &PlayoutScheduler,
     now: u64,
-) -> Result<Vec<S3Observation>, &'static str> {
-    let observations = tracker.advance(scheduler, now)?;
-    tracker.check_bounds()?;
+) -> Result<Vec<S3Observation>, TrackerStepError> {
+    let observations = tracker
+        .advance(scheduler, now)
+        .map_err(TrackerStepError::Advance)?;
+    tracker.check_bounds().map_err(TrackerStepError::Bound)?;
     Ok(observations)
 }
 
@@ -2091,31 +2113,36 @@ async fn run_s3_receiver(
         let observations = match advance_tracker_checked(&mut tracker, &scheduler, now) {
             Ok(observations) => observations,
             Err(error) => {
-                // Fail loud, but record settled occupancy first so a future
-                // bound violation is diagnosable from the run's own log.
-                let (pc_arr, haptic_arr, pc_rel, haptic_rel) = tracker.occupancy();
-                let (pc_buf, haptic_buf) = scheduler.buffered_counts();
-                if let Err(log_error) = logger
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("RX logger poisoned"))
-                    .and_then(|mut logger| {
-                        logger
-                            .try_log_info(&format!(
-                                "\"event\":\"s3_tracker_bound\",\"error\":\"{error}\",\
-                                 \"max_anchors\":{},\"pc_arrivals\":{pc_arr},\
-                                 \"haptic_arrivals\":{haptic_arr},\"pc_releases\":{pc_rel},\
-                                 \"haptic_releases\":{haptic_rel},\"pc_buffered\":{pc_buf},\
-                                 \"haptic_buffered\":{haptic_buf},\"epoch\":{}",
-                                tracker.max_anchors(),
-                                scheduler.is_started()
-                            ))
-                            .map_err(anyhow::Error::from)
-                    })
-                {
-                    outcome_error = Some(log_error);
-                    continue;
+                // Only a bound violation gets the diagnostic record; an
+                // `advance` invariant break is a different failure and must not
+                // be filed under it. Either way the run ends fail-loud, and the
+                // original error survives even if the logging itself fails.
+                if let TrackerStepError::Bound(message) = &error {
+                    let (pc_arr, haptic_arr, pc_rel, haptic_rel) = tracker.occupancy();
+                    let (pc_buf, haptic_buf) = scheduler.buffered_counts();
+                    if let Err(log_error) = logger
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("RX logger poisoned"))
+                        .and_then(|mut logger| {
+                            logger
+                                .try_log_info(&format!(
+                                    "\"event\":\"s3_tracker_bound\",\"error\":\"{message}\",\
+                                     \"max_anchors\":{},\"pc_arrivals\":{pc_arr},\
+                                     \"haptic_arrivals\":{haptic_arr},\"pc_releases\":{pc_rel},\
+                                     \"haptic_releases\":{haptic_rel},\"pc_buffered\":{pc_buf},\
+                                     \"haptic_buffered\":{haptic_buf},\"epoch\":{}",
+                                    tracker.max_anchors(),
+                                    scheduler.is_started()
+                                ))
+                                .map_err(anyhow::Error::from)
+                        })
+                    {
+                        outcome_error =
+                            Some(log_error.context(format!("S3 tracker bound: {message}")));
+                        continue;
+                    }
                 }
-                outcome_error = Some(anyhow::anyhow!(error));
+                outcome_error = Some(anyhow::anyhow!(error.message()));
                 continue;
             }
         };
@@ -3779,7 +3806,9 @@ mod s3_barrier_race_tests {
         /// The receiver's end-of-iteration expiry + bound check (P2), calling
         /// the production function so the ordering is fixed by the test.
         fn advance_tracker(&mut self, now: u64) -> Vec<S3Observation> {
-            advance_tracker_checked(&mut self.tracker, &self.scheduler, now).unwrap()
+            advance_tracker_checked(&mut self.tracker, &self.scheduler, now)
+                .map_err(|error| error.message())
+                .unwrap()
         }
 
         /// Mirrors `dispatch_s3_playout_actions` accounting. The route-map
@@ -4665,6 +4694,43 @@ mod s3_barrier_race_tests {
         assert!(
             observations.iter().any(|observation| observation.deadline_miss),
             "the anchor's PC missed its deadline and must still be reported: {observations:?}"
+        );
+    }
+
+    /// 회귀 8 — the two failure stages of `advance_tracker_checked` keep
+    /// distinct provenance. Only a bound violation may be filed as
+    /// `s3_tracker_bound`; an `advance` invariant break is a different failure
+    /// and merging them would misattribute the cause in the run's own log.
+    #[test]
+    fn tracker_step_errors_keep_advance_and_bound_provenance_apart() {
+        let mut h = Harness::new();
+        h.tracker = S3DeadlineTracker::new(1).unwrap();
+        let gen0 = h.ingress.gate().active_routes();
+
+        // Two anchors past a bound of 1, with an epoch so `advance` succeeds
+        // and only the bound check can fail.
+        h.push(routed(TrackRole::Pc, gen0.pc, 0, 1, 1_000), 1_000);
+        h.push(routed(TrackRole::Haptic, gen0.haptic, 0, 1, 2_000), 2_000);
+        assert!(h.scheduler.is_started());
+        h.tracker.activate().unwrap();
+        h.push(routed(TrackRole::Pc, gen0.pc, 100_000, 4, 3_000), 3_000);
+        h.push(routed(TrackRole::Pc, gen0.pc, 133_333, 5, 3_100), 3_100);
+
+        match advance_tracker_checked(&mut h.tracker, &h.scheduler, 3_100) {
+            Err(TrackerStepError::Bound(message)) => {
+                assert!(message.contains("bound exceeded"), "{message}");
+            }
+            other => panic!("expected a Bound error, got {other:?}"),
+        }
+
+        // An inactive tracker cannot fail either stage, so a clean run must not
+        // manufacture a bound error.
+        let mut fresh = Harness::new();
+        fresh.push(routed(TrackRole::Pc, gen0.pc, 0, 1, 1_000), 1_000);
+        assert!(
+            advance_tracker_checked(&mut fresh.tracker, &fresh.scheduler, 1_000)
+                .unwrap()
+                .is_empty()
         );
     }
 
