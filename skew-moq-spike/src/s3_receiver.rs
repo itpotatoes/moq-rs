@@ -180,6 +180,38 @@ impl S3DeadlineTracker {
         if !self.active {
             return Ok(Vec::new());
         }
+        // 계약 §2.1 정의 3·규칙 B: an anchor below the epoch anchor belongs to
+        // the stretch before the common timeline began. Its deadline is in the
+        // past by construction, so evaluating it manufactures a miss that was
+        // never measured — the forced first `Normal -> Haptic-Critical`
+        // transition. Evict without emitting.
+        //
+        // Filtering here rather than at `activate` covers both the residue
+        // present when the epoch forms and any later arrival carrying an old
+        // `pts_us`; the epoch-forming anchor itself is not below the epoch and
+        // therefore survives.
+        let epoch_pts_us = scheduler.epoch_pts_us();
+        if let Some(epoch_pts_us) = epoch_pts_us {
+            for map_keys in [
+                self.pc_arrivals
+                    .keys()
+                    .filter(|key| key.pts_us < epoch_pts_us)
+                    .copied()
+                    .collect::<Vec<_>>(),
+                self.haptic_arrivals
+                    .keys()
+                    .filter(|key| key.pts_us < epoch_pts_us)
+                    .copied()
+                    .collect::<Vec<_>>(),
+            ] {
+                for key in map_keys {
+                    self.pc_arrivals.remove(&key);
+                    self.haptic_arrivals.remove(&key);
+                    self.pc_releases.remove(&key);
+                    self.haptic_releases.remove(&key);
+                }
+            }
+        }
         let due: Vec<PairKey> = self
             .haptic_arrivals
             .keys()

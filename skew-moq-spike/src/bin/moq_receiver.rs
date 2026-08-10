@@ -4697,6 +4697,66 @@ mod s3_barrier_race_tests {
         );
     }
 
+    /// 회귀 9 — 계약 §2.1 규칙 B, the path P1 alone does NOT cover.
+    ///
+    /// Measured in the 20260810f netns pilot: an anchor can arrive before any
+    /// epoch exists and simply sit in the scheduler buffer — never terminally
+    /// dropped, so `had_epoch` tagging never sees it. When the epoch finally
+    /// forms from a LATER exact pair, every such anchor is instantly overdue
+    /// (`due_us` is in the past) and, with no PC, becomes a `deadline_miss`.
+    /// Three of them trip `miss_streak_threshold` at the exact microsecond of
+    /// activation — the forced `Normal -> Haptic-Critical` transition.
+    ///
+    /// The epoch-forming pair itself (pts == epoch pts) must survive.
+    #[test]
+    fn haptic_anchors_older_than_the_epoch_produce_no_deadline_miss() {
+        let mut h = Harness::new();
+        let gen0 = h.ingress.gate().active_routes();
+
+        // Haptic-only anchors that stay BUFFERED (well inside the 2s startup
+        // window, so no startup timeout drops them).
+        for event_id in 1..=3u32 {
+            let pts_us = u64::from(event_id - 1) * 33_333;
+            h.push(routed(TrackRole::Haptic, gen0.haptic, pts_us, event_id, 1_000), 1_000);
+        }
+        assert!(!h.scheduler.is_started(), "no exact pair yet");
+        assert!(
+            h.dropped.is_empty(),
+            "these anchors are alive in the buffer, not terminal: {:?}",
+            h.dropped
+        );
+
+        // A later exact pair forms the epoch at pts 100_000.
+        h.push(routed(TrackRole::Pc, gen0.pc, 100_000, 4, 1_500_000), 1_500_000);
+        h.push(
+            routed(TrackRole::Haptic, gen0.haptic, 100_000, 4, 1_500_100),
+            1_500_100,
+        );
+        assert!(h.scheduler.is_started());
+        h.tracker.activate().unwrap();
+
+        // Release the epoch-forming pair at its own deadline
+        // (due = 1_500_100 + 50_000 + 0).
+        let actions = h.scheduler.advance(1_550_100);
+        h.dispatch(&actions, 1_550_100);
+
+        // Every pts < 100_000 anchor is instantly overdue with no PC, and the
+        // epoch-forming anchor is due with both sides released.
+        let observations = h.advance_tracker(1_550_100);
+        assert!(
+            observations.iter().all(|observation| !observation.deadline_miss),
+            "anchors older than the epoch must not reach the controller: {observations:?}"
+        );
+        // ...while the epoch-forming pair still yields its real observation:
+        // the rule must evict the pre-epoch stretch, not silence the tracker.
+        assert_eq!(
+            observations.len(),
+            1,
+            "the epoch-forming pair must still be observed: {observations:?}"
+        );
+        assert!(observations[0].abs_skew_us.is_some(), "{observations:?}");
+    }
+
     /// 회귀 8 — the two failure stages of `advance_tracker_checked` keep
     /// distinct provenance. Only a bound violation may be filed as
     /// `s3_tracker_bound`; an `advance` invariant break is a different failure

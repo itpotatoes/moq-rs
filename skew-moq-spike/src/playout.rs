@@ -210,6 +210,14 @@ impl PlayoutScheduler {
     /// Receiver-monotonic release deadline for one source PTS after the exact
     /// startup epoch exists. S3 uses the same timeline to evaluate its frozen
     /// snapped-anchor deadline-miss definition.
+    /// `pts_us` of the anchor that started the common timeline, once it
+    /// exists. Anchors below it are *pre-epoch anchors* (S3 FSM 구현계약 §2.1
+    /// 정의 3): their deadline is by construction in the past, so it is a
+    /// retroactive construction rather than a measured one.
+    pub fn epoch_pts_us(&self) -> Option<u64> {
+        self.epoch.map(|epoch| epoch.pts_us)
+    }
+
     pub fn deadline_us(&self, pts_us: u64) -> Option<u64> {
         self.epoch.map(|_| self.due_us(pts_us))
     }
