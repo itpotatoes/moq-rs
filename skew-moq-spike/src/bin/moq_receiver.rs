@@ -205,6 +205,16 @@ struct Args {
     s3_min_paired_samples: Option<usize>,
     #[arg(long)]
     s3_max_window_samples: Option<usize>,
+    /// Occupancy bound for the S3 deadline tracker, in anchors.
+    ///
+    /// S3 FSM 구현계약 §2.1 규칙 E: PC-only anchor expiry stays unchanged
+    /// (an anchor whose haptic counterpart never arrives is never expired),
+    /// so this bound must NOT be derived from the scheduler's per-track
+    /// buffer bound the way it used to be. It is a separately recorded
+    /// parameter, sized from the registered generated anchor population.
+    /// No implicit S3 default.
+    #[arg(long)]
+    s3_deadline_max_anchors: Option<usize>,
     /// Request-to-exact-pair first-effect bound. No implicit S3 default.
     #[arg(long)]
     s3_effect_timeout_ms: Option<u64>,
@@ -319,6 +329,7 @@ struct S3RuntimeConfig {
     switch: SwitchConfig,
     initial_retry_limit: u32,
     switch_retry_limit: u32,
+    deadline_max_anchors: usize,
     test_force_misses_after_us: Option<u64>,
 }
 
@@ -334,6 +345,7 @@ fn s3_runtime_config(args: &Args) -> Result<Option<S3RuntimeConfig>> {
         || args.s3_cooldown_ms.is_some()
         || args.s3_min_paired_samples.is_some()
         || args.s3_max_window_samples.is_some()
+        || args.s3_deadline_max_anchors.is_some()
         || args.s3_effect_timeout_ms.is_some()
         || args.s3_initial_retry_limit.is_some()
         || args.s3_switch_retry_limit.is_some()
@@ -438,11 +450,23 @@ fn s3_runtime_config(args: &Args) -> Result<Option<S3RuntimeConfig>> {
         .s3_test_force_misses_after_ms
         .map(|value| ms_to_us(value, "s3-test-force-misses-after-ms"))
         .transpose()?;
+    // 계약 §2.1 규칙 E. The old code reused the scheduler's per-track buffer
+    // bound, which is only defensible if every registered anchor is expired —
+    // and PC-only anchors are not. Sizing this from the generated anchor
+    // population instead makes a violation mean "more anchors than the run can
+    // generate", i.e. a real defect, rather than ordinary PC-only residue.
+    let deadline_max_anchors = args
+        .s3_deadline_max_anchors
+        .context("--arm s3 requires --s3-deadline-max-anchors")?;
+    if deadline_max_anchors == 0 {
+        bail!("--s3-deadline-max-anchors must be > 0");
+    }
     Ok(Some(S3RuntimeConfig {
         controller,
         switch,
         initial_retry_limit,
         switch_retry_limit,
+        deadline_max_anchors,
         test_force_misses_after_us,
     }))
 }
@@ -1191,6 +1215,48 @@ async fn open_s3_subscription(
     }
 }
 
+/// Reconcile the deadline tracker with one batch of terminal scheduler
+/// actions: record releases, then forget every object that was terminally
+/// dropped while no epoch existed.
+///
+/// S3 FSM 구현계약 §2.1 규칙 B·C. Such an object never had a valid deadline and
+/// can never be re-pushed or released, so the only observation it could still
+/// produce is a retroactively fabricated deadline miss — the forced first
+/// `Normal -> Haptic-Critical` transition. The drop reason is deliberately NOT
+/// consulted: the scheduler tags the epoch state at emission time
+/// (`had_epoch`) because `push` can emit a pre-epoch buffer-limit drop in the
+/// same call that forms the epoch.
+///
+/// Extracted so the tests drive this exact code rather than a copy of it.
+fn settle_tracker_batch(
+    tracker: &mut S3DeadlineTracker,
+    actions: &[PlayoutAction],
+    now: u64,
+) -> Result<(), &'static str> {
+    tracker.note_actions(actions, now)?;
+    for action in actions {
+        if action.is_pre_epoch_drop() {
+            tracker.forget_evicted(action.object())?;
+        }
+    }
+    Ok(())
+}
+
+/// Expire every due anchor and then check the occupancy bound (P2).
+///
+/// The order is the point: the bound is evaluated on settled occupancy, after
+/// this iteration's [`settle_tracker_batch`] and after expiry, never on a
+/// mid-batch transient. Extracted for the same reason as above.
+fn advance_tracker_checked(
+    tracker: &mut S3DeadlineTracker,
+    scheduler: &PlayoutScheduler,
+    now: u64,
+) -> Result<Vec<S3Observation>, &'static str> {
+    let observations = tracker.advance(scheduler, now)?;
+    tracker.check_bounds()?;
+    Ok(observations)
+}
+
 fn dispatch_s3_playout_actions(
     actions: Vec<PlayoutAction>,
     routes: &mut HashMap<S3ObjectKey, (TrackRole, Route)>,
@@ -1202,24 +1268,7 @@ fn dispatch_s3_playout_actions(
     stats: &mut PlayoutStats,
     now: u64,
 ) -> Result<()> {
-    tracker
-        .note_actions(&actions, now)
-        .map_err(anyhow::Error::msg)?;
-    // S3 FSM 구현계약 §2.1 규칙 B·C: an object terminally dropped while no
-    // epoch existed never had a valid deadline and can never be re-pushed or
-    // released, so the only observation it could still produce is a
-    // retroactively fabricated deadline miss. Forget it here — the one place
-    // every terminal scheduler action passes through. The drop reason is
-    // deliberately NOT consulted; the scheduler tags the epoch state at
-    // emission time (`had_epoch`) because `push` can emit a pre-epoch
-    // buffer-limit drop in the same call that forms the epoch.
-    for action in &actions {
-        if action.is_pre_epoch_drop() {
-            tracker
-                .forget_evicted(action.object())
-                .map_err(anyhow::Error::msg)?;
-        }
-    }
+    settle_tracker_batch(tracker, &actions, now).map_err(anyhow::Error::msg)?;
     for action in actions {
         let object = action.object();
         let header = object.header;
@@ -1520,7 +1569,7 @@ async fn run_s3_receiver(
             runtime.initial_retry_limit,
             runtime.switch_retry_limit,
             playout.max_objects_per_track,
-            playout.max_objects_per_track,
+            runtime.deadline_max_anchors,
             runtime.test_force_misses_after_us.is_some(),
             runtime
                 .test_force_misses_after_us
@@ -1530,7 +1579,7 @@ async fn run_s3_receiver(
     let mut ingress =
         S3ReceiverIngress::new(gate, playout.max_objects_per_track).map_err(anyhow::Error::msg)?;
     let mut tracker =
-        S3DeadlineTracker::new(playout.max_objects_per_track).map_err(anyhow::Error::msg)?;
+        S3DeadlineTracker::new(runtime.deadline_max_anchors).map_err(anyhow::Error::msg)?;
     let mut scheduler = PlayoutScheduler::new(playout).map_err(anyhow::Error::msg)?;
     let mut stats = PlayoutStats::default();
     let mut object_routes: HashMap<S3ObjectKey, (TrackRole, Route)> = HashMap::new();
@@ -2039,45 +2088,37 @@ async fn run_s3_receiver(
                 }
             }
         }
-        let observations = match tracker.advance(&scheduler, now) {
+        let observations = match advance_tracker_checked(&mut tracker, &scheduler, now) {
             Ok(observations) => observations,
             Err(error) => {
+                // Fail loud, but record settled occupancy first so a future
+                // bound violation is diagnosable from the run's own log.
+                let (pc_arr, haptic_arr, pc_rel, haptic_rel) = tracker.occupancy();
+                let (pc_buf, haptic_buf) = scheduler.buffered_counts();
+                if let Err(log_error) = logger
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("RX logger poisoned"))
+                    .and_then(|mut logger| {
+                        logger
+                            .try_log_info(&format!(
+                                "\"event\":\"s3_tracker_bound\",\"error\":\"{error}\",\
+                                 \"max_anchors\":{},\"pc_arrivals\":{pc_arr},\
+                                 \"haptic_arrivals\":{haptic_arr},\"pc_releases\":{pc_rel},\
+                                 \"haptic_releases\":{haptic_rel},\"pc_buffered\":{pc_buf},\
+                                 \"haptic_buffered\":{haptic_buf},\"epoch\":{}",
+                                tracker.max_anchors(),
+                                scheduler.is_started()
+                            ))
+                            .map_err(anyhow::Error::from)
+                    })
+                {
+                    outcome_error = Some(log_error);
+                    continue;
+                }
                 outcome_error = Some(anyhow::anyhow!(error));
                 continue;
             }
         };
-        // The occupancy bound is checked here, after this batch's pre-epoch
-        // terminal cleanup (in `dispatch_s3_playout_actions`) and after
-        // `advance` expired every due anchor. Checking on insert instead would
-        // abort at the boundary before the scheduler's own eviction ran.
-        // Still fail-loud, but record the occupancy first so a future
-        // violation is diagnosable from the run's own log.
-        if let Err(error) = tracker.check_bounds() {
-            let (pc_arr, haptic_arr, pc_rel, haptic_rel) = tracker.occupancy();
-            let (pc_buf, haptic_buf) = scheduler.buffered_counts();
-            if let Err(log_error) = logger
-                .lock()
-                .map_err(|_| anyhow::anyhow!("RX logger poisoned"))
-                .and_then(|mut logger| {
-                    logger
-                        .try_log_info(&format!(
-                            "\"event\":\"s3_tracker_bound\",\"error\":\"{error}\",\
-                             \"max_anchors\":{},\"pc_arrivals\":{pc_arr},\
-                             \"haptic_arrivals\":{haptic_arr},\"pc_releases\":{pc_rel},\
-                             \"haptic_releases\":{haptic_rel},\"pc_buffered\":{pc_buf},\
-                             \"haptic_buffered\":{haptic_buf},\"epoch\":{}",
-                            tracker.max_anchors(),
-                            scheduler.is_started()
-                        ))
-                        .map_err(anyhow::Error::from)
-                })
-            {
-                outcome_error = Some(log_error);
-                continue;
-            }
-            outcome_error = Some(anyhow::anyhow!(error));
-            continue;
-        }
         if pending_at_start || ingress.gate().pending_request().is_some() {
             if !observations.is_empty() {
                 if let Err(error) = logger
@@ -3155,6 +3196,7 @@ mod rx_ending_tests {
             s3_cooldown_ms: None,
             s3_min_paired_samples: None,
             s3_max_window_samples: None,
+            s3_deadline_max_anchors: None,
             s3_effect_timeout_ms: None,
             s3_initial_retry_limit: None,
             s3_switch_retry_limit: None,
@@ -3418,6 +3460,7 @@ mod rx_ending_tests {
             s3_cooldown_ms: None,
             s3_min_paired_samples: None,
             s3_max_window_samples: None,
+            s3_deadline_max_anchors: None,
             s3_effect_timeout_ms: None,
             s3_initial_retry_limit: None,
             s3_switch_retry_limit: None,
@@ -3492,6 +3535,7 @@ mod rx_ending_tests {
             s3_cooldown_ms: None,
             s3_min_paired_samples: None,
             s3_max_window_samples: None,
+            s3_deadline_max_anchors: None,
             s3_effect_timeout_ms: None,
             s3_initial_retry_limit: None,
             s3_switch_retry_limit: None,
@@ -3550,11 +3594,25 @@ mod rx_ending_tests {
         args.s3_initial_retry_limit = Some(20);
         args.s3_switch_retry_limit = Some(2);
         assert!(playout_config(&args).is_ok());
+        // 계약 §2.1 규칙 E: the deadline-tracker bound is a separate recorded
+        // parameter, never derived from the scheduler buffer bound, and like
+        // every other S3 parameter it has no implicit default.
+        assert!(
+            s3_runtime_config(&args).is_err(),
+            "S3 must reject an implicit deadline-tracker bound"
+        );
+        args.s3_deadline_max_anchors = Some(900);
         let runtime = s3_runtime_config(&args).unwrap().unwrap();
         assert_eq!(runtime.controller.target_skew_us, 25_000);
         assert_eq!(runtime.switch.effect_timeout_us, 1_000_000);
         assert_eq!(runtime.initial_retry_limit, 20);
         assert_eq!(runtime.switch_retry_limit, 2);
+        assert_eq!(runtime.deadline_max_anchors, 900);
+        assert_ne!(
+            runtime.deadline_max_anchors,
+            playout_config(&args).unwrap().unwrap().max_objects_per_track,
+            "the bound must not be coupled to the scheduler buffer bound"
+        );
 
         args.s3_target_skew_ms = Some(30);
         assert!(s3_runtime_config(&args).is_err());
@@ -3718,25 +3776,18 @@ mod s3_barrier_race_tests {
             scheduler_actions
         }
 
-        /// Mirrors the receiver's end-of-iteration bound check (P2): after
-        /// terminal cleanup and after `advance` expired every due anchor.
+        /// The receiver's end-of-iteration expiry + bound check (P2), calling
+        /// the production function so the ordering is fixed by the test.
         fn advance_tracker(&mut self, now: u64) -> Vec<S3Observation> {
-            let observations = self.tracker.advance(&self.scheduler, now).unwrap();
-            self.tracker.check_bounds().unwrap();
-            observations
+            advance_tracker_checked(&mut self.tracker, &self.scheduler, now).unwrap()
         }
 
         /// Mirrors `dispatch_s3_playout_actions` accounting. The route-map
         /// removal is the conservation check: exactly one terminal action per
         /// scheduler-entered object, never two.
         fn dispatch(&mut self, actions: &[PlayoutAction], now: u64) {
-            self.tracker.note_actions(actions, now).unwrap();
-            // 계약 §2.1 규칙 B·C, same order as the receiver.
-            for action in actions {
-                if action.is_pre_epoch_drop() {
-                    self.tracker.forget_evicted(action.object()).unwrap();
-                }
-            }
+            // The production settlement function itself, not a copy of it.
+            settle_tracker_batch(&mut self.tracker, actions, now).unwrap();
             for action in actions {
                 let key = S3ObjectKey::from(action.object());
                 assert!(
