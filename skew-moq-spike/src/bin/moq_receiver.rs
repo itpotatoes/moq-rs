@@ -82,6 +82,23 @@ impl From<CliLatePolicy> for LatePolicy {
 struct Args {
     #[arg(long, default_value = "https://10.0.0.2:4443")]
     relay: Url,
+    /// Direct (relay-free) topology: bind here and ACCEPT one inbound session
+    /// instead of connecting out to a relay. The sender still uses `--relay`,
+    /// pointed at this address.
+    ///
+    /// Registered as the `Md` arm of the topology axis
+    /// (md/20260813_실험1_6팔_토폴로지축_설계개정.md). MoQT is an
+    /// endpoint-to-endpoint protocol — the relay is an optional fan-out
+    /// element, and `moq_transport::Session` exposes `accept` alongside
+    /// `connect`. Nothing here changes the wire format.
+    #[arg(long)]
+    listen: Option<SocketAddr>,
+    /// TLS certificate chain for `--listen`. Required with `--listen`.
+    #[arg(long)]
+    tls_cert: Option<PathBuf>,
+    /// TLS private key for `--listen`. Required with `--listen`.
+    #[arg(long)]
+    tls_key: Option<PathBuf>,
     #[arg(long)]
     run_id: String,
     #[arg(long)]
@@ -1610,19 +1627,11 @@ async fn run_s3_receiver(
     let mut stats = PlayoutStats::default();
     let mut object_routes: HashMap<S3ObjectKey, (TrackRole, Route)> = HashMap::new();
 
-    let (session, _publisher, mut subscriber) = {
-        let (webtransport, transport) = connect(&args.relay).await.context("connect S3 relay")?;
-        Session::connect_with_config(
-            webtransport,
-            None,
-            transport,
-            SessionConfig {
-                data_priority_mapping: args.data_priority_mapping,
-                ..SessionConfig::default()
-            },
-        )
-        .await
-        .context("S3 SETUP")?
+    let (session, mut subscriber) = {
+        let (webtransport, transport) = establish(&args).await.context("establish S3 session")?;
+        session_handshake(&args, webtransport, transport)
+            .await
+            .context("S3 SETUP")?
     };
     let mut session_run = tokio::spawn(session.run());
     let namespace = TrackNamespace::from_utf8_path(&args.run_id);
@@ -2356,6 +2365,90 @@ async fn connect(
     Ok((session, transport))
 }
 
+/// Direct topology: bind and accept exactly one inbound QUIC/WebTransport
+/// session. Mirror image of `connect` — the only difference is which side
+/// opens the connection.
+async fn accept_direct(
+    listen: SocketAddr,
+    cert: &PathBuf,
+    key: &PathBuf,
+) -> Result<(web_transport::Session, moq_transport::session::Transport)> {
+    let tls_args = tls::Args {
+        cert: vec![cert.clone()],
+        key: vec![key.clone()],
+        disable_verify: true,
+        ..Default::default()
+    };
+    let tls = tls_args.load()?;
+    anyhow::ensure!(
+        tls.server.is_some(),
+        "--listen requires a usable server TLS config (check --tls-cert/--tls-key)"
+    );
+    let mut quic = quic::Endpoint::new(quic::Config::new(listen, None, tls)?)?;
+    let server = quic
+        .server
+        .as_mut()
+        .context("QUIC endpoint has no server side despite server TLS config")?;
+    let (session, _cid, transport) = server
+        .accept()
+        .await
+        .context("no inbound session accepted on --listen")?;
+    Ok((session, transport))
+}
+
+/// Establish the transport session for whichever topology was selected.
+/// `relay` = connect out to a relay; `direct` = bind and accept.
+async fn establish(
+    args: &Args,
+) -> Result<(web_transport::Session, moq_transport::session::Transport)> {
+    match args.listen {
+        Some(listen) => {
+            let cert = args
+                .tls_cert
+                .as_ref()
+                .context("--listen requires --tls-cert")?;
+            let key = args.tls_key.as_ref().context("--listen requires --tls-key")?;
+            accept_direct(listen, cert, key)
+                .await
+                .context("accept direct session")
+        }
+        None => connect(&args.relay).await.context("connect relay"),
+    }
+}
+
+/// MoQ SETUP for whichever topology was selected.
+///
+/// The QUIC layer is not the whole story: the side that ACCEPTS the connection
+/// must also accept the MoQ session (decode CLIENT_SETUP, reply SERVER_SETUP).
+/// Calling `connect` on both sides makes both send CLIENT_SETUP and the
+/// handshake stalls until the connection times out.
+///
+/// `connect_with_config` yields `(Session, Publisher, Subscriber)` while
+/// `accept_with_config` yields `Option`s (roles are negotiated by the peer).
+/// This normalizes both to the subscriber the receiver actually needs.
+async fn session_handshake(
+    args: &Args,
+    sess: web_transport::Session,
+    tp: moq_transport::session::Transport,
+) -> Result<(Session, Subscriber)> {
+    let config = SessionConfig {
+        data_priority_mapping: args.data_priority_mapping,
+        ..SessionConfig::default()
+    };
+    if args.listen.is_some() {
+        let (session, _pub, sub) = Session::accept_with_config(sess, None, tp, config)
+            .await
+            .context("SETUP (accept, direct topology)")?;
+        let sub = sub.context("peer did not negotiate a publisher role; no subscriber available")?;
+        Ok((session, sub))
+    } else {
+        let (session, _pub, sub) = Session::connect_with_config(sess, None, tp, config)
+            .await
+            .context("SETUP (connect, relay topology)")?;
+        Ok((session, sub))
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -2410,18 +2503,8 @@ async fn main() -> Result<()> {
         .await;
     }
 
-    let (sess, tp) = connect(&args.relay).await.context("connect relay")?;
-    let (session, _pub, mut subscriber) = Session::connect_with_config(
-        sess,
-        None,
-        tp,
-        SessionConfig {
-            data_priority_mapping: args.data_priority_mapping,
-            ..SessionConfig::default()
-        },
-    )
-    .await
-    .context("SETUP")?;
+    let (sess, tp) = establish(&args).await?;
+    let (session, mut subscriber) = session_handshake(&args, sess, tp).await?;
     let mut session_run = tokio::spawn(session.run());
 
     let namespace = TrackNamespace::from_utf8_path(&args.run_id);
