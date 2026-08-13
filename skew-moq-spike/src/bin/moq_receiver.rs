@@ -2393,7 +2393,7 @@ async fn main() -> Result<()> {
         None, None, Some(args.tracks.as_str()), Some(TERM_PROTOCOL_V), s1_config,
         phase4_transport,
         Some(V5Meta {
-            log_schema_version: 2,
+            log_schema_version: 3,
             payload_mode: args.payload_mode,
             representation: args.representation,
             chunk_bytes: args.chunk_bytes,
@@ -5056,7 +5056,7 @@ mod s3_retirement_tests {
                 None,
                 None,
                 Some(V5Meta {
-                    log_schema_version: 2,
+                    log_schema_version: 3,
                     payload_mode: PayloadMode::Frame,
                     representation: Representation::Bin,
                     chunk_bytes: 178,

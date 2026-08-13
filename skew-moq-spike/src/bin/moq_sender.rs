@@ -607,7 +607,7 @@ async fn main() -> Result<()> {
         Some(args.duration), Some(&haptic_src), Some(args.tracks.as_str()),
         Some(TERM_PROTOCOL_V), None, phase4_transport,
         Some(V5Meta {
-            log_schema_version: 2,
+            log_schema_version: 3,
             payload_mode: args.payload_mode,
             representation: args.representation,
             chunk_bytes: args.chunk_bytes,

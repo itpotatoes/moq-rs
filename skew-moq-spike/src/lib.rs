@@ -1245,7 +1245,7 @@ mod phase1_v5_tests {
                 10, 30, 90, 1, Some(10.0), None, Some("both"),
                 Some(TERM_PROTOCOL_V), None, None,
                 Some(V5Meta {
-                    log_schema_version: 2,
+                    log_schema_version: 3,
                     payload_mode: PayloadMode::EqualChunk,
                     representation: Representation::Bin,
                     chunk_bytes: 178,

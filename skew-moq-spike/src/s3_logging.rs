@@ -498,7 +498,7 @@ mod tests {
                 pc_delivery_timeout_ms: Some(67),
             }),
             Some(V5Meta {
-                log_schema_version: 2,
+                log_schema_version: 3,
                 payload_mode: PayloadMode::Frame,
                 representation: Representation::Bin,
                 chunk_bytes: 178,
