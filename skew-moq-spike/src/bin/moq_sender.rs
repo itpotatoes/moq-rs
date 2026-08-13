@@ -204,6 +204,10 @@ struct Args {
     haptic_rate_hz: u64,
     #[arg(long, value_enum)]
     payload_mode: PayloadMode,
+    /// PC payload encoding axis of the 4-arm re-run. Required, not defaulted:
+    /// a silent default would label a draco run as bin in the meta line.
+    #[arg(long, value_enum)]
+    representation: Representation,
     #[arg(long)]
     chunk_bytes: usize,
     /// Read workloads, report object-rate/overhead estimates, and exit without
@@ -551,7 +555,7 @@ async fn main() -> Result<()> {
 
     // ---- Workload ----
     let frames: Vec<Vec<u8>> = match (&args.frames_dir, args.dummy_size) {
-        (Some(dir), _) => load_frames(dir)?,
+        (Some(dir), _) => load_frames_checked(dir, args.representation)?,
         (None, Some(n)) => vec![vec![0u8; n]],
         (None, None) => anyhow::bail!("need --frames-dir or --dummy-size"),
     };
@@ -562,15 +566,17 @@ async fn main() -> Result<()> {
     let pcm = Arc::new(pcm);
     let s3_frames = if args.arm == Arm::S3 {
         Some((
-            Arc::new(load_frames(
+            Arc::new(load_frames_checked(
                 args.s3_recovery_frames_dir
                     .as_deref()
                     .expect("validated S3 recovery frames"),
+                args.representation,
             )?),
-            Arc::new(load_frames(
+            Arc::new(load_frames_checked(
                 args.s3_critical_frames_dir
                     .as_deref()
                     .expect("validated S3 critical frames"),
+                args.representation,
             )?),
         ))
     } else {
@@ -603,6 +609,7 @@ async fn main() -> Result<()> {
         Some(V5Meta {
             log_schema_version: 2,
             payload_mode: args.payload_mode,
+            representation: args.representation,
             chunk_bytes: args.chunk_bytes,
         }),
     )?));

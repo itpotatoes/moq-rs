@@ -108,6 +108,10 @@ struct Args {
     haptic_rate_hz: u64,
     #[arg(long, value_enum)]
     payload_mode: PayloadMode,
+    /// PC payload encoding axis of the 4-arm re-run. Required, not defaulted:
+    /// a silent default would label a draco run as bin in the meta line.
+    #[arg(long, value_enum)]
+    representation: Representation,
     #[arg(long)]
     chunk_bytes: usize,
     #[arg(long)]
@@ -2391,6 +2395,7 @@ async fn main() -> Result<()> {
         Some(V5Meta {
             log_schema_version: 2,
             payload_mode: args.payload_mode,
+            representation: args.representation,
             chunk_bytes: args.chunk_bytes,
         }),
     )?));
@@ -3190,6 +3195,7 @@ mod rx_ending_tests {
             pc_rate_hz: 30,
             haptic_rate_hz: 90,
             payload_mode: PayloadMode::Frame,
+            representation: Representation::Bin,
             chunk_bytes: 178,
             reassembly_max_pending_frames: 64,
             reassembly_max_pending_bytes: 64 * 1024 * 1024,
@@ -3454,6 +3460,7 @@ mod rx_ending_tests {
             pc_rate_hz: 30,
             haptic_rate_hz: 90,
             payload_mode: PayloadMode::Frame,
+            representation: Representation::Bin,
             chunk_bytes: 178,
             reassembly_max_pending_frames: 64,
             reassembly_max_pending_bytes: 64 * 1024 * 1024,
@@ -3529,6 +3536,7 @@ mod rx_ending_tests {
             pc_rate_hz: 30,
             haptic_rate_hz: 90,
             payload_mode: PayloadMode::Frame,
+            representation: Representation::Bin,
             chunk_bytes: 178,
             reassembly_max_pending_frames: 64,
             reassembly_max_pending_bytes: 16 * 1024 * 1024,
@@ -5050,6 +5058,7 @@ mod s3_retirement_tests {
                 Some(V5Meta {
                     log_schema_version: 2,
                     payload_mode: PayloadMode::Frame,
+                    representation: Representation::Bin,
                     chunk_bytes: 178,
                 }),
             )

@@ -155,6 +155,35 @@ impl PayloadMode {
     }
 }
 
+/// PC payload encoding axis of the 4-arm re-run. Orthogonal to `PayloadMode`,
+/// which is wire segmentation. The transport carries either as opaque bytes;
+/// this only records which dataset tier the frames came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Representation {
+    #[value(name = "bin")]
+    Bin,
+    #[value(name = "draco")]
+    Draco,
+}
+
+impl Representation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bin => "bin",
+            Self::Draco => "draco",
+        }
+    }
+
+    /// Frame-file extension the tier directory must hold. A mismatch means the
+    /// declared representation does not describe the bytes actually sent.
+    pub fn frame_extension(self) -> &'static str {
+        match self {
+            Self::Bin => "bin",
+            Self::Draco => "drc",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChunkEnvelope {
     pub version: u8,
@@ -574,6 +603,34 @@ pub fn load_frames(dir: &str) -> anyhow::Result<Vec<Vec<u8>>> {
     Ok(frames)
 }
 
+/// `load_frames` plus a hard-assert that the tier directory actually holds the
+/// declared representation. The payload is opaque on the wire, so a bin tier
+/// loaded under `--representation draco` would be mislabelled with no other
+/// observable symptom.
+pub fn load_frames_checked(dir: &str, representation: Representation) -> anyhow::Result<Vec<Vec<u8>>> {
+    let want = representation.frame_extension();
+    let mut wrong = 0usize;
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        match path.extension().and_then(|x| x.to_str()) {
+            Some("bin") | Some("drc") => {
+                if path.extension().and_then(|x| x.to_str()) != Some(want) {
+                    wrong += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    if wrong > 0 {
+        anyhow::bail!(
+            "representation={} expects *.{want} frames but {dir} holds {wrong} frame(s) \
+             with the other extension",
+            representation.as_str()
+        );
+    }
+    load_frames(dir)
+}
+
 /// Read raw PCM bytes from a WAV file, asserting 8kHz / mono / 16-bit.
 pub fn load_haptic_pcm(path: &str) -> anyhow::Result<Vec<u8>> {
     let bytes = std::fs::read(path)?;
@@ -618,6 +675,7 @@ pub struct JsonlLogger {
 pub struct V5Meta {
     pub log_schema_version: u32,
     pub payload_mode: PayloadMode,
+    pub representation: Representation,
     pub chunk_bytes: usize,
 }
 
@@ -733,10 +791,11 @@ impl JsonlLogger {
         if let Some(v5) = v5 {
             writeln!(
                 w,
-                "{{\"role\":\"meta\",\"run_id\":\"{}\",\"stack\":\"{}\",\"side\":\"{}\",\"cond\":{{\"C_mbps\":{},\"rtt_ms\":{},\"jitter_ms\":{},\"loss_pct\":{}}},\"S_bytes\":{},\"schema_version\":\"v5\",\"metric_schema_version\":\"v5\",\"log_schema_version\":{},\"pc_rate_hz\":{},\"haptic_rate_hz\":{},\"payload_mode\":\"{}\",\"chunk_bytes\":{},\"seed\":{},\"clock\":\"monotonic_ns/1000\"{}{}{}{}{}{},\"threshold_profile\":\"lenient\",\"pc_late_threshold_ms\":87.0,\"haptic_late_threshold_ms\":-125.0}}",
+                "{{\"role\":\"meta\",\"run_id\":\"{}\",\"stack\":\"{}\",\"side\":\"{}\",\"cond\":{{\"C_mbps\":{},\"rtt_ms\":{},\"jitter_ms\":{},\"loss_pct\":{}}},\"S_bytes\":{},\"schema_version\":\"v5\",\"metric_schema_version\":\"v5\",\"log_schema_version\":{},\"pc_rate_hz\":{},\"haptic_rate_hz\":{},\"payload_mode\":\"{}\",\"representation\":\"{}\",\"chunk_bytes\":{},\"seed\":{},\"clock\":\"monotonic_ns/1000\"{}{}{}{}{}{},\"threshold_profile\":\"lenient\",\"pc_late_threshold_ms\":87.0,\"haptic_late_threshold_ms\":-125.0}}",
                 esc(run_id), esc(stack), esc(side), cmb, rtt_ms, jitter_ms, loss_pct,
                 s_bytes, v5.log_schema_version, fps, haptic_hz,
-                v5.payload_mode.as_str(), v5.chunk_bytes, seed,
+                v5.payload_mode.as_str(), v5.representation.as_str(),
+                v5.chunk_bytes, seed,
                 design, extra, tracks, term, phase4_transport, playout
             )?;
         } else {
@@ -1188,6 +1247,7 @@ mod phase1_v5_tests {
                 Some(V5Meta {
                     log_schema_version: 2,
                     payload_mode: PayloadMode::EqualChunk,
+                    representation: Representation::Bin,
                     chunk_bytes: 178,
                 }),
             ).unwrap();
@@ -1197,8 +1257,33 @@ mod phase1_v5_tests {
         assert!(line.contains("\"pc_rate_hz\":30"));
         assert!(line.contains("\"haptic_rate_hz\":90"));
         assert!(line.contains("\"payload_mode\":\"equal_chunk\""));
+        // Representation is a distinct axis and must survive into the meta row
+        // immediately after payload_mode, matching skew_logging.make_meta_v5.
+        assert!(line.contains("\"payload_mode\":\"equal_chunk\",\"representation\":\"bin\""));
         assert!(!line.contains("\"fps\""));
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn load_frames_checked_rejects_representation_mismatch() {
+        let dir = std::env::temp_dir().join(format!(
+            "skew-rep-check-{}-{}", std::process::id(), now_us()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f0000.bin"), b"payload").unwrap();
+        let dir_str = dir.to_str().unwrap();
+
+        // Declared bin over a bin tier: accepted.
+        assert_eq!(
+            load_frames_checked(dir_str, Representation::Bin).unwrap().len(),
+            1
+        );
+        // Declared draco over the same bin tier: rejected, because the wire
+        // payload is opaque and nothing else would reveal the mislabelling.
+        let err = load_frames_checked(dir_str, Representation::Draco).unwrap_err();
+        assert!(err.to_string().contains("representation=draco"), "{err}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
 

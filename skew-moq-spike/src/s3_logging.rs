@@ -450,7 +450,7 @@ mod tests {
     use crate::s3_controller::{S3Config, S3Controller, S3Observation, TransitionCause};
     use crate::s3_switch::{ObjectDisposition, S3SwitchGate, SwitchConfig};
     use crate::{
-        now_us, PayloadMode, Phase4TransportMeta, V5Meta, TERM_PROTOCOL_V,
+        now_us, PayloadMode, Phase4TransportMeta, Representation, V5Meta, TERM_PROTOCOL_V,
     };
 
     fn path(name: &str) -> std::path::PathBuf {
@@ -500,6 +500,7 @@ mod tests {
             Some(V5Meta {
                 log_schema_version: 2,
                 payload_mode: PayloadMode::Frame,
+                representation: Representation::Bin,
                 chunk_bytes: 178,
             }),
         )
