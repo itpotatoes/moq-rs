@@ -20,7 +20,9 @@ use moq_transport::{
     coding::{KeyValuePairs, TrackNamespace},
     message::SubscriptionFilter,
     serve::{Track, TrackReader, TrackReaderMode, Tracks},
-    session::{DataPriorityMapping, Session, SessionConfig, Subscribe, Subscriber},
+    session::{
+        DataPriorityMapping, PublishedNamespace, Session, SessionConfig, Subscribe, Subscriber,
+    },
 };
 use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
@@ -1636,6 +1638,19 @@ async fn run_s3_receiver(
     let mut session_run = tokio::spawn(session.run());
     let namespace = TrackNamespace::from_utf8_path(&args.run_id);
 
+    // 직결 토폴로지에서는 이 수신자가 송신자의 피어다 — subscribe 하기 전에
+    // 송신자의 PUBLISH_NAMESPACE 에 먼저 응답해야 한다.
+    // 핸들은 런이 끝날 때까지 살려 둔다(drop = PUBLISH_NAMESPACE_CANCEL).
+    let _announce_guard: Option<PublishedNamespace> = if args.listen.is_some() {
+        Some(
+            ack_published_namespace(&mut subscriber, &namespace, args.subscribe_timeout)
+                .await
+                .context("직결 토폴로지 announce 응답")?,
+        )
+    } else {
+        None
+    };
+
     let event_capacity = playout
         .max_objects_per_track
         .checked_mul(4)
@@ -2449,6 +2464,62 @@ async fn session_handshake(
     }
 }
 
+/// 직결(`--listen`) 토폴로지 전용: 송신자의 PUBLISH_NAMESPACE 에 응답한다.
+///
+/// **릴레이 토폴로지에서는 릴레이가 이 일을 한다.** sender 는 relay 에
+/// PUBLISH_NAMESPACE 를 보내고 relay 가 OK 로 답하며, 이 수신자는 subscribe 만
+/// 한다. 직결에서는 중간 상자가 없고 **이 수신자가 곧 송신자의 피어**이므로,
+/// inbound announce 큐(`Subscriber::published_namespace`)를 직접 배수해
+/// draft-16의 `REQUEST_OK` 를 보내야 한다.
+///
+/// 그러지 않으면 송신자의 요청이 만료되고
+/// (`moq-transport/src/session/publisher.rs:622` "PublishNamespace response
+/// timed out") 세션이 런 도중에 끊긴다. 수신자의 SUBSCRIBE 도 송신자가 아직
+/// 네임스페이스를 등록하기 전에 도착하면 `unknown_subscribed` 로 빠져 응답을
+/// 받지 못한다 — 여기서 announce 를 먼저 기다리므로 그 경쟁도 함께 닫힌다.
+///
+/// **게이트 6 에서 실측으로 드러났다.** 20 s 런과 6 s 루프백은 제어 타임아웃이
+/// 발화하기 전에 끝나 통과했고, 60 s 런에서만 3/3 실패했다. 즉 커밋 bc4cd69 의
+/// 스모크와 게이트 5 는 이 결함을 가릴 수밖에 없었다.
+async fn ack_published_namespace(
+    subscriber: &mut Subscriber,
+    namespace: &TrackNamespace,
+    timeout_s: f64,
+) -> Result<PublishedNamespace> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(timeout_s);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            bail!(
+                "직결 토폴로지: 송신자가 {timeout_s}s 안에 네임스페이스를 announce 하지 않았다"
+            );
+        }
+        match tokio::time::timeout(remaining, subscriber.published_namespace()).await {
+            Ok(Some(mut ns)) => {
+                if &ns.info.namespace != namespace {
+                    // 다른 네임스페이스는 우리 런의 것이 아니다. 응답하지 않고
+                    // drop 하면 REQUEST_ERROR 로 거절되며, 계속 기다린다.
+                    tracing::warn!(
+                        got = ?ns.info.namespace,
+                        want = ?namespace,
+                        "직결: 예상과 다른 네임스페이스 announce — 거절하고 대기"
+                    );
+                    continue;
+                }
+                ns.ok().context("PUBLISH_NAMESPACE REQUEST_OK 전송")?;
+                // **핸들을 돌려준다.** `PublishedNamespace` 는 drop 시
+                // PUBLISH_NAMESPACE_CANCEL 을 보내므로, 여기서 떨어뜨리면
+                // 송신자가 곧바로 `cancelled` 로 죽는다(루프백 실측).
+                // 호출자가 런이 끝날 때까지 붙들고 있어야 한다.
+                return Ok(ns);
+            }
+            // 큐가 닫혔다 = 세션이 끝났다. 폴링으로 숨기지 않는다.
+            Ok(None) => bail!("직결 토폴로지: announce 를 받기 전에 세션이 종료됐다"),
+            Err(_) => continue, // remaining 만료 → 다음 반복이 deadline 으로 종료
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -2509,6 +2580,19 @@ async fn main() -> Result<()> {
 
     let namespace = TrackNamespace::from_utf8_path(&args.run_id);
     let names = ["pc", "haptic"];
+
+    // 직결 토폴로지에서는 이 수신자가 송신자의 피어다 — subscribe 하기 전에
+    // 송신자의 PUBLISH_NAMESPACE 에 먼저 응답해야 한다.
+    // 핸들은 런이 끝날 때까지 살려 둔다(drop = PUBLISH_NAMESPACE_CANCEL).
+    let _announce_guard: Option<PublishedNamespace> = if args.listen.is_some() {
+        Some(
+            ack_published_namespace(&mut subscriber, &namespace, args.subscribe_timeout)
+                .await
+                .context("직결 토폴로지 announce 응답")?,
+        )
+    } else {
+        None
+    };
 
     // Subscribe to both tracks, retrying until the publisher has announced.
     // A fresh Tracks producer per attempt avoids duplicate-name residue.
@@ -3266,6 +3350,12 @@ mod rx_ending_tests {
     fn expectations_follow_tracks_and_duration() {
         let base = |tracks, duration_s| Args {
             relay: Url::parse("https://127.0.0.1:1").unwrap(),
+            // 직결(Md) 토폴로지 필드. 이 픽스처들은 릴레이 경로를 검사하므로
+            // None 이 등록된 기본이다. 필드를 추가할 때 픽스처를 함께 고치지
+            // 않으면 `verify.sh quick` 이 컴파일 단계에서 멈춘다.
+            listen: None,
+            tls_cert: None,
+            tls_key: None,
             run_id: "t".into(),
             out: PathBuf::from("/dev/null"),
             s_bytes: 1,
@@ -3531,6 +3621,12 @@ mod rx_ending_tests {
     fn s1_cli_requires_explicit_recorded_parameters() {
         let base = Args {
             relay: Url::parse("https://127.0.0.1:1").unwrap(),
+            // 직결(Md) 토폴로지 필드. 이 픽스처들은 릴레이 경로를 검사하므로
+            // None 이 등록된 기본이다. 필드를 추가할 때 픽스처를 함께 고치지
+            // 않으면 `verify.sh quick` 이 컴파일 단계에서 멈춘다.
+            listen: None,
+            tls_cert: None,
+            tls_key: None,
             run_id: "t".into(),
             out: PathBuf::from("/dev/null"),
             s_bytes: 1,
@@ -3607,6 +3703,12 @@ mod rx_ending_tests {
     fn m1_and_s2_cli_preserve_the_ablation_boundary() {
         let mut args = Args {
             relay: Url::parse("https://127.0.0.1:1").unwrap(),
+            // 직결(Md) 토폴로지 필드. 이 픽스처들은 릴레이 경로를 검사하므로
+            // None 이 등록된 기본이다. 필드를 추가할 때 픽스처를 함께 고치지
+            // 않으면 `verify.sh quick` 이 컴파일 단계에서 멈춘다.
+            listen: None,
+            tls_cert: None,
+            tls_key: None,
             run_id: "t".into(),
             out: PathBuf::from("/dev/null"),
             s_bytes: 1,
