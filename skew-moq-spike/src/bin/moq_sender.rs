@@ -408,11 +408,20 @@ fn registered_s_bytes(frame_sum: usize, frame_count: usize) -> u64 {
 /// (`MAX_T0_CAPTURE_SPAN_US`, 설계개정 §11.4); a preemption between the two
 /// reads is a scheduling quantum, not a syscall (Codex 88차 P1-3).
 ///
-/// `saturating_sub` rather than a subtraction: a non-monotonic pair must not
-/// panic mid-run, and a zero span on a backwards clock is caught downstream by
-/// the epoch itself, not by an underflow here.
-fn epoch_record(before_us: u64, after_us: u64) -> (u64, u64) {
-    (before_us, after_us.saturating_sub(before_us))
+/// A backwards pair is refused rather than saturated. `saturating_sub` turned a
+/// violated monotonic-clock invariant into `0` -- the value that means "perfect
+/// capture" -- so the one reading that proves the clock cannot be trusted would
+/// have produced the strongest possible claim about it (Codex 89차 P1). Failing
+/// here costs one run; recording it costs a run that looks ideal and is not.
+fn epoch_record(before_us: u64, after_us: u64) -> Result<(u64, u64)> {
+    let span = after_us.checked_sub(before_us).with_context(|| {
+        format!(
+            "the log clock went backwards between the two epoch reads \
+             ({before_us} then {after_us}); the monotonic clock invariant \
+             every recorded time depends on does not hold"
+        )
+    })?;
+    Ok((before_us, span))
 }
 
 fn json_f64(value: f64) -> String {
@@ -876,7 +885,7 @@ async fn main() -> Result<()> {
         let before_us = now_us();
         let anchor = Instant::now();
         let after_us = now_us();
-        let (t0_us, capture_span_us) = epoch_record(before_us, after_us);
+        let (t0_us, capture_span_us) = epoch_record(before_us, after_us)?;
         logger
             .lock()
             .unwrap()
@@ -1313,13 +1322,15 @@ mod tests {
     /// bound exists to catch.
     #[test]
     fn a_preempted_capture_records_the_earlier_read_and_the_full_span() {
-        assert_eq!(epoch_record(1_000, 1_007), (1_000, 7));
+        assert_eq!(epoch_record(1_000, 1_007).unwrap(), (1_000, 7));
         // 50 ms: a scheduling quantum, far past the registered 1 ms bound.
-        assert_eq!(epoch_record(1_000, 51_000), (1_000, 50_000));
+        assert_eq!(epoch_record(1_000, 51_000).unwrap(), (1_000, 50_000));
         // Identical reads are a real outcome on a coarse clock, not an error.
-        assert_eq!(epoch_record(1_000, 1_000), (1_000, 0));
-        // A backwards pair must not underflow-panic in the middle of a run.
-        assert_eq!(epoch_record(1_000, 999), (1_000, 0));
+        assert_eq!(epoch_record(1_000, 1_000).unwrap(), (1_000, 0));
+        // A backwards pair is refused, not saturated to the value that means
+        // "perfect capture" (89차 P1).
+        let err = epoch_record(1_000, 999).unwrap_err().to_string();
+        assert!(err.contains("went backwards"), "{err}");
     }
 
     /// The same rule over a real forced delay rather than hand-picked numbers,
@@ -1329,7 +1340,7 @@ mod tests {
         let before = now_us();
         std::thread::sleep(Duration::from_millis(5));
         let after = now_us();
-        let (t0_us, span) = epoch_record(before, after);
+        let (t0_us, span) = epoch_record(before, after).unwrap();
         assert_eq!(t0_us, before, "the epoch must be the earlier read");
         // Lower bound only: the sleep is a floor, and the scheduler may add to
         // it. Asserting an upper bound here would make the test flaky on a
