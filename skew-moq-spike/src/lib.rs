@@ -698,9 +698,9 @@ pub struct JsonlLogger {
 /// The one log generation this writer produces. Not a `V5Meta` field: a
 /// caller-supplied version could emit a schema the analyzer rejects (or, worse,
 /// a schema-3 line carrying `topology`), and no writer has a legitimate reason
-/// to pick a different one. Mirrors `skew_logging.LOG_SCHEMA_VERSION_V4` and
+/// to pick a different one. Mirrors `skew_logging.LOG_SCHEMA_VERSION_V5` and
 /// `scripts.phase1_v5_config.WRITER_LOG_SCHEMA_VERSION`.
-pub const LOG_SCHEMA_VERSION_V4: u32 = 4;
+pub const LOG_SCHEMA_VERSION_V5: u32 = 5;
 
 #[derive(Debug, Clone, Copy)]
 pub struct V5Meta {
@@ -826,7 +826,7 @@ impl JsonlLogger {
                 w,
                 "{{\"role\":\"meta\",\"run_id\":\"{}\",\"stack\":\"{}\",\"side\":\"{}\",\"cond\":{{\"C_mbps\":{},\"rtt_ms\":{},\"jitter_ms\":{},\"loss_pct\":{}}},\"S_bytes\":{},\"schema_version\":\"v5\",\"metric_schema_version\":\"v5\",\"log_schema_version\":{},\"pc_rate_hz\":{},\"haptic_rate_hz\":{},\"payload_mode\":\"{}\",\"representation\":\"{}\",\"topology\":\"{}\",\"chunk_bytes\":{},\"seed\":{},\"clock\":\"monotonic_ns/1000\"{}{}{}{}{}{},\"threshold_profile\":\"lenient\",\"pc_late_threshold_ms\":87.0,\"haptic_late_threshold_ms\":-125.0}}",
                 esc(run_id), esc(stack), esc(side), cmb, rtt_ms, jitter_ms, loss_pct,
-                s_bytes, LOG_SCHEMA_VERSION_V4, fps, haptic_hz,
+                s_bytes, LOG_SCHEMA_VERSION_V5, fps, haptic_hz,
                 v5.payload_mode.as_str(), v5.representation.as_str(),
                 v5.topology.as_str(), v5.chunk_bytes, seed,
                 design, extra, tracks, term, phase4_transport, playout
@@ -974,6 +974,33 @@ impl JsonlLogger {
     }
 
     /// Free-form info record (e.g. {"role":"info", ...}). `body` is inner JSON without braces.
+    /// A-4: record the epoch every slot deadline is hung off.
+    ///
+    /// The analyser prefers this over reconstructing t0 from PC slot 0's
+    /// `t_gen`; that reconstruction assumes zero gap between the epoch and the
+    /// first generated frame, so it overestimates t0 by the first slot's
+    /// scheduling delay and shifts every deadline `t0 + pts_k + W_obs` with it.
+    /// `capture_span_us` is how far apart the two clock readings were: this
+    /// writer reads its scheduling base (`Instant::now()`) and the log clock
+    /// (`now_us()`) separately, and a preemption between them is a scheduling
+    /// quantum, not a syscall (Codex 88차 P1-3). The analyser refuses a run
+    /// whose span exceeds the registered bound.
+    ///
+    /// Returns `io::Result` rather than swallowing: a run that failed to record
+    /// its epoch and then exited 0 would be re-analysed as a normal run through
+    /// the slot-0 fallback, which is exactly the bias A-4 removed (88차 P1-2).
+    pub fn log_measurement_start(
+        &mut self,
+        t0_us: u64,
+        capture_span_us: u64,
+    ) -> std::io::Result<()> {
+        writeln!(
+            self.w,
+            "{{\"role\":\"info\",\"event\":\"measurement_start\",\"t0_us\":{t0_us},\"capture_span_us\":{capture_span_us}}}"
+        )?;
+        self.w.flush()
+    }
+
     pub fn log_info(&mut self, body: &str) {
         let _ = writeln!(self.w, "{{\"role\":\"info\",{body}}}");
         let _ = self.w.flush();
@@ -1293,12 +1320,45 @@ mod phase1_v5_tests {
         // Representation is a distinct axis and must survive into the meta row
         // immediately after payload_mode, matching skew_logging.make_meta_v5.
         assert!(line.contains("\"payload_mode\":\"equal_chunk\",\"representation\":\"bin\""));
-        // Log schema 4: topology sits between representation and chunk_bytes,
+        // Log schema 5: topology sits between representation and chunk_bytes,
         // the same position skew_logging.make_meta_v5 writes it at, and is
         // written from the declared value with no default.
-        assert!(line.contains("\"log_schema_version\":4"));
+        assert!(line.contains("\"log_schema_version\":5"));
         assert!(line.contains("\"representation\":\"bin\",\"topology\":\"direct\",\"chunk_bytes\":178"));
         assert!(!line.contains("\"fps\""));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn measurement_start_records_the_schedule_epoch() {
+        // A-4: the MoQ sender hangs every slot deadline off one anchor, and the
+        // analyser prefers a recorded epoch over reconstructing it from PC slot
+        // 0's t_gen. Without this row the M/Md arms carry the reconstruction,
+        // which overestimates t0 by the first slot's scheduling delay.
+        let path = std::env::temp_dir().join(format!(
+            "skew-a4-{}-{}.jsonl", std::process::id(), now_us()
+        ));
+        {
+            let mut logger = JsonlLogger::new(
+                &path, "a4", "moq", "tx", None, 0.0, 0.0, 0.0,
+                10, 30, 90, 1, Some(10.0), None, Some("both"),
+                Some(TERM_PROTOCOL_V), None, None,
+                Some(V5Meta {
+                    payload_mode: PayloadMode::EqualChunk,
+                    representation: Representation::Bin,
+                    topology: Topology::Direct,
+                    chunk_bytes: 178,
+                }),
+            ).unwrap();
+            logger.log_measurement_start(1_234_567, 7).unwrap();
+        }
+        let body = std::fs::read_to_string(&path).unwrap();
+        // The capture span is part of the record: this writer reads its
+        // scheduling base and the log clock separately, so it must declare how
+        // far apart they could be rather than assert the gap away (88차 P1-3).
+        assert!(body.contains(
+            "{\"role\":\"info\",\"event\":\"measurement_start\",\"t0_us\":1234567,\"capture_span_us\":7}"
+        ), "got: {body}");
         std::fs::remove_file(path).unwrap();
     }
 

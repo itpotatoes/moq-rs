@@ -846,7 +846,21 @@ async fn main() -> Result<()> {
 
         // Warmup so the subscriber is attached before objects flow.
         tokio::time::sleep(Duration::from_secs_f64(args.warmup)).await;
+        // A-4: the schedule's base and the log clock are two readings, so the
+        // true monotonic microsecond of `anchor` lies between them. Record the
+        // *earlier* one -- the recorded epoch is then never later than the base
+        // every deadline is hung off, so deadlines can only be conservative --
+        // and record the span so the analyser can refuse a capture that was
+        // preempted (Codex 88차 P1-3). The earlier claim that the two differ by
+        // "one syscall" was wrong: a preemption here is a scheduling quantum.
+        let before_us = now_us();
         let anchor = Instant::now();
+        let after_us = now_us();
+        logger
+            .lock()
+            .unwrap()
+            .log_measurement_start(before_us, after_us.saturating_sub(before_us))
+            .context("failed to record the measurement epoch")?;
         let end = anchor + Duration::from_secs_f64(args.duration);
 
         // ---- PC loop: rational PC Hz, with the arm-specific subgroup map ----
