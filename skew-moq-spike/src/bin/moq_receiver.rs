@@ -131,6 +131,13 @@ struct Args {
     /// a silent default would label a draco run as bin in the meta line.
     #[arg(long, value_enum)]
     representation: Representation,
+    /// Forwarding structure of the arm (log schema 4). Required, not defaulted.
+    /// `--listen` implies `direct` and its absence implies `relay`, but the
+    /// value is declared rather than derived so that a runner wiring bug shows
+    /// up as a startup failure instead of a mislabelled log; the two are
+    /// cross-checked below.
+    #[arg(long, value_enum)]
+    topology: Topology,
     #[arg(long)]
     chunk_bytes: usize,
     #[arg(long)]
@@ -519,6 +526,26 @@ fn phase4_transport(args: &Args) -> Option<Phase4TransportMeta> {
             data_priority_mapping: args.data_priority_mapping.as_str(),
             pc_delivery_timeout_ms: args.pc_delivery_timeout_ms,
         }),
+    }
+}
+
+/// The declared topology must match the wiring this process actually builds.
+///
+/// `--listen` accepts an inbound session from the sender with no forwarding
+/// element in between (`Md`); its absence dials a relay (`M`). Declaring one and
+/// building the other would write a log whose `topology` is a lie, and the whole
+/// point of the axis is that `Md − M` is read off that field.
+fn validate_topology(topology: Topology, listening: bool) -> Result<()> {
+    match (topology, listening) {
+        (Topology::Direct, false) => bail!(
+            "--topology direct requires --listen: without it this receiver dials \
+             a relay, which is the relay topology"
+        ),
+        (Topology::Relay, true) => bail!(
+            "--topology relay must not be combined with --listen: --listen is the \
+             direct (relay-free) path"
+        ),
+        _ => Ok(()),
     }
 }
 
@@ -2537,6 +2564,7 @@ async fn main() -> Result<()> {
             && args.reassembly_max_age_ms > 0,
         "all reassembly bounds must be positive"
     );
+    validate_topology(args.topology, args.listen.is_some())?;
     validate_phase4_v5_args(&args)?;
     let s1_config = playout_config(&args)?;
     let s3_runtime = s3_runtime_config(&args)?;
@@ -2557,9 +2585,9 @@ async fn main() -> Result<()> {
         None, None, Some(args.tracks.as_str()), Some(TERM_PROTOCOL_V), s1_config,
         phase4_transport,
         Some(V5Meta {
-            log_schema_version: 3,
             payload_mode: args.payload_mode,
             representation: args.representation,
+            topology: args.topology,
             chunk_bytes: args.chunk_bytes,
         }),
     )?));
@@ -3344,6 +3372,53 @@ mod rx_ending_tests {
         );
     }
 
+    /// The declared topology and the wiring actually built must agree, in both
+    /// directions. A mislabelled log would silently move a run between the `Md`
+    /// and `M` arms, which is the contrast the batch measures.
+    #[test]
+    fn topology_must_match_listen_wiring() {
+        assert!(validate_topology(Topology::Direct, true).is_ok());
+        assert!(validate_topology(Topology::Relay, false).is_ok());
+
+        let err = validate_topology(Topology::Direct, false).unwrap_err().to_string();
+        assert!(err.contains("--topology direct requires --listen"), "{err}");
+        let err = validate_topology(Topology::Relay, true).unwrap_err().to_string();
+        assert!(err.contains("--topology relay must not be combined"), "{err}");
+    }
+
+    /// `--topology` has no default and no unregistered value, at the CLI layer
+    /// rather than only at `validate_topology`.  A defaulted topology would
+    /// label an `Md` run as `M` in a syntactically valid log.
+    #[test]
+    fn topology_cli_is_required_and_closed() {
+        use clap::Parser as _;
+        let base: Vec<String> = [
+            "moq_receiver", "--run-id", "t", "--out", "/dev/null",
+            "--s-bytes", "1", "--pc-rate-hz", "30", "--haptic-rate-hz", "90",
+            "--payload-mode", "frame", "--representation", "bin",
+            "--chunk-bytes", "178",
+            "--reassembly-max-pending-frames", "64",
+            "--reassembly-max-pending-bytes", "67108864",
+            "--reassembly-max-age-ms", "2000",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        assert!(Args::try_parse_from(&base).is_err(), "missing --topology parsed");
+
+        let mut bad = base.clone();
+        bad.extend(["--topology".to_string(), "sfu".to_string()]);
+        assert!(Args::try_parse_from(&bad).is_err(), "unregistered topology parsed");
+
+        for (value, expected) in [("direct", Topology::Direct), ("relay", Topology::Relay)] {
+            let mut good = base.clone();
+            good.extend(["--topology".to_string(), value.to_string()]);
+            let args = Args::try_parse_from(&good).expect("registered topology");
+            assert_eq!(args.topology, expected);
+        }
+    }
+
     /// Expectations must follow C3: a disabled track expects exactly 0, and an
     /// absent `--duration-s` leaves every expectation unknown.
     #[test]
@@ -3369,6 +3444,9 @@ mod rx_ending_tests {
             haptic_rate_hz: 90,
             payload_mode: PayloadMode::Frame,
             representation: Representation::Bin,
+            // 릴레이 경로 픽스처이므로 선언 토폴로지도 relay 다.
+            // (`listen: None` 과의 정합성은 validate_topology 가 강제한다.)
+            topology: Topology::Relay,
             chunk_bytes: 178,
             reassembly_max_pending_frames: 64,
             reassembly_max_pending_bytes: 64 * 1024 * 1024,
@@ -3640,6 +3718,9 @@ mod rx_ending_tests {
             haptic_rate_hz: 90,
             payload_mode: PayloadMode::Frame,
             representation: Representation::Bin,
+            // 릴레이 경로 픽스처이므로 선언 토폴로지도 relay 다.
+            // (`listen: None` 과의 정합성은 validate_topology 가 강제한다.)
+            topology: Topology::Relay,
             chunk_bytes: 178,
             reassembly_max_pending_frames: 64,
             reassembly_max_pending_bytes: 64 * 1024 * 1024,
@@ -3722,6 +3803,9 @@ mod rx_ending_tests {
             haptic_rate_hz: 90,
             payload_mode: PayloadMode::Frame,
             representation: Representation::Bin,
+            // 릴레이 경로 픽스처이므로 선언 토폴로지도 relay 다.
+            // (`listen: None` 과의 정합성은 validate_topology 가 강제한다.)
+            topology: Topology::Relay,
             chunk_bytes: 178,
             reassembly_max_pending_frames: 64,
             reassembly_max_pending_bytes: 16 * 1024 * 1024,
@@ -5241,9 +5325,9 @@ mod s3_retirement_tests {
                 None,
                 None,
                 Some(V5Meta {
-                    log_schema_version: 3,
                     payload_mode: PayloadMode::Frame,
                     representation: Representation::Bin,
+                    topology: Topology::Relay,
                     chunk_bytes: 178,
                 }),
             )

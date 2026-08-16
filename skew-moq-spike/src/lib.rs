@@ -166,6 +166,30 @@ pub enum Representation {
     Draco,
 }
 
+/// Forwarding structure of the arm, recorded in log schema 4
+/// (md/20260813_실험1_6팔_토폴로지축_설계개정.md §8.2).
+///
+/// `Direct` = zero forwarding elements on the shaped path (`W`, `Md`),
+/// `Relay` = one (`M`). Required with no default at every writer: a silently
+/// defaulted topology would label an `Md` run as `M`, and `Md − M` is exactly
+/// the contrast this batch is built to measure. Readers never infer it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Topology {
+    #[value(name = "direct")]
+    Direct,
+    #[value(name = "relay")]
+    Relay,
+}
+
+impl Topology {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Relay => "relay",
+        }
+    }
+}
+
 impl Representation {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -671,11 +695,20 @@ pub struct JsonlLogger {
     w: BufWriter<File>,
 }
 
+/// The one log generation this writer produces. Not a `V5Meta` field: a
+/// caller-supplied version could emit a schema the analyzer rejects (or, worse,
+/// a schema-3 line carrying `topology`), and no writer has a legitimate reason
+/// to pick a different one. Mirrors `skew_logging.LOG_SCHEMA_VERSION_V4` and
+/// `scripts.phase1_v5_config.WRITER_LOG_SCHEMA_VERSION`.
+pub const LOG_SCHEMA_VERSION_V4: u32 = 4;
+
 #[derive(Debug, Clone, Copy)]
 pub struct V5Meta {
-    pub log_schema_version: u32,
     pub payload_mode: PayloadMode,
     pub representation: Representation,
+    /// Log schema 4. Emitted between `representation` and `chunk_bytes`, the
+    /// same position `skew_logging.make_meta_v5` writes it at.
+    pub topology: Topology,
     pub chunk_bytes: usize,
 }
 
@@ -791,11 +824,11 @@ impl JsonlLogger {
         if let Some(v5) = v5 {
             writeln!(
                 w,
-                "{{\"role\":\"meta\",\"run_id\":\"{}\",\"stack\":\"{}\",\"side\":\"{}\",\"cond\":{{\"C_mbps\":{},\"rtt_ms\":{},\"jitter_ms\":{},\"loss_pct\":{}}},\"S_bytes\":{},\"schema_version\":\"v5\",\"metric_schema_version\":\"v5\",\"log_schema_version\":{},\"pc_rate_hz\":{},\"haptic_rate_hz\":{},\"payload_mode\":\"{}\",\"representation\":\"{}\",\"chunk_bytes\":{},\"seed\":{},\"clock\":\"monotonic_ns/1000\"{}{}{}{}{}{},\"threshold_profile\":\"lenient\",\"pc_late_threshold_ms\":87.0,\"haptic_late_threshold_ms\":-125.0}}",
+                "{{\"role\":\"meta\",\"run_id\":\"{}\",\"stack\":\"{}\",\"side\":\"{}\",\"cond\":{{\"C_mbps\":{},\"rtt_ms\":{},\"jitter_ms\":{},\"loss_pct\":{}}},\"S_bytes\":{},\"schema_version\":\"v5\",\"metric_schema_version\":\"v5\",\"log_schema_version\":{},\"pc_rate_hz\":{},\"haptic_rate_hz\":{},\"payload_mode\":\"{}\",\"representation\":\"{}\",\"topology\":\"{}\",\"chunk_bytes\":{},\"seed\":{},\"clock\":\"monotonic_ns/1000\"{}{}{}{}{}{},\"threshold_profile\":\"lenient\",\"pc_late_threshold_ms\":87.0,\"haptic_late_threshold_ms\":-125.0}}",
                 esc(run_id), esc(stack), esc(side), cmb, rtt_ms, jitter_ms, loss_pct,
-                s_bytes, v5.log_schema_version, fps, haptic_hz,
+                s_bytes, LOG_SCHEMA_VERSION_V4, fps, haptic_hz,
                 v5.payload_mode.as_str(), v5.representation.as_str(),
-                v5.chunk_bytes, seed,
+                v5.topology.as_str(), v5.chunk_bytes, seed,
                 design, extra, tracks, term, phase4_transport, playout
             )?;
         } else {
@@ -1245,9 +1278,9 @@ mod phase1_v5_tests {
                 10, 30, 90, 1, Some(10.0), None, Some("both"),
                 Some(TERM_PROTOCOL_V), None, None,
                 Some(V5Meta {
-                    log_schema_version: 3,
                     payload_mode: PayloadMode::EqualChunk,
                     representation: Representation::Bin,
+                    topology: Topology::Direct,
                     chunk_bytes: 178,
                 }),
             ).unwrap();
@@ -1260,6 +1293,11 @@ mod phase1_v5_tests {
         // Representation is a distinct axis and must survive into the meta row
         // immediately after payload_mode, matching skew_logging.make_meta_v5.
         assert!(line.contains("\"payload_mode\":\"equal_chunk\",\"representation\":\"bin\""));
+        // Log schema 4: topology sits between representation and chunk_bytes,
+        // the same position skew_logging.make_meta_v5 writes it at, and is
+        // written from the declared value with no default.
+        assert!(line.contains("\"log_schema_version\":4"));
+        assert!(line.contains("\"representation\":\"bin\",\"topology\":\"direct\",\"chunk_bytes\":178"));
         assert!(!line.contains("\"fps\""));
         std::fs::remove_file(path).unwrap();
     }

@@ -208,6 +208,11 @@ struct Args {
     /// a silent default would label a draco run as bin in the meta line.
     #[arg(long, value_enum)]
     representation: Representation,
+    /// Forwarding structure of the arm (log schema 4). Required, not defaulted
+    /// and not inferable here: the sender dials one address either way, so only
+    /// the runner knows whether that address is a relay or the receiver itself.
+    #[arg(long, value_enum)]
+    topology: Topology,
     #[arg(long)]
     chunk_bytes: usize,
     /// Read workloads, report object-rate/overhead estimates, and exit without
@@ -607,9 +612,9 @@ async fn main() -> Result<()> {
         Some(args.duration), Some(&haptic_src), Some(args.tracks.as_str()),
         Some(TERM_PROTOCOL_V), None, phase4_transport,
         Some(V5Meta {
-            log_schema_version: 3,
             payload_mode: args.payload_mode,
             representation: args.representation,
+            topology: args.topology,
             chunk_bytes: args.chunk_bytes,
         }),
     )?));
