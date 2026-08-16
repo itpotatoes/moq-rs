@@ -395,6 +395,26 @@ fn registered_s_bytes(frame_sum: usize, frame_count: usize) -> u64 {
     ((2 * frame_sum as u128 + frame_count as u128) / (2 * frame_count as u128)) as u64
 }
 
+/// Turn the two clock readings that bracket `Instant::now()` into the recorded
+/// epoch and its capture span.
+///
+/// The scheduling base is an `Instant`, which carries no microsecond value, so
+/// the run's epoch has to be read from the log clock either side of it. The
+/// true monotonic microsecond of the base lies somewhere in between. Recording
+/// the **earlier** reading keeps the epoch at or before the base every deadline
+/// `t0 + pts_k + W_obs` is hung off, so a deadline can only be placed early --
+/// conservative -- never late. The span is the width of that bracket, and the
+/// analyser refuses a run whose span exceeds the registered bound
+/// (`MAX_T0_CAPTURE_SPAN_US`, 설계개정 §11.4); a preemption between the two
+/// reads is a scheduling quantum, not a syscall (Codex 88차 P1-3).
+///
+/// `saturating_sub` rather than a subtraction: a non-monotonic pair must not
+/// panic mid-run, and a zero span on a backwards clock is caught downstream by
+/// the epoch itself, not by an underflow here.
+fn epoch_record(before_us: u64, after_us: u64) -> (u64, u64) {
+    (before_us, after_us.saturating_sub(before_us))
+}
+
 fn json_f64(value: f64) -> String {
     if value.is_finite() {
         format!("{value:.9}")
@@ -856,10 +876,11 @@ async fn main() -> Result<()> {
         let before_us = now_us();
         let anchor = Instant::now();
         let after_us = now_us();
+        let (t0_us, capture_span_us) = epoch_record(before_us, after_us);
         logger
             .lock()
             .unwrap()
-            .log_measurement_start(before_us, after_us.saturating_sub(before_us))
+            .log_measurement_start(t0_us, capture_span_us)
             .context("failed to record the measurement epoch")?;
         let end = anchor + Duration::from_secs_f64(args.duration);
 
@@ -1260,7 +1281,7 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::registered_s_bytes;
+    use super::{epoch_record, now_us, registered_s_bytes, Duration};
 
     #[test]
     fn registered_s_bytes_is_rounded_workload_mean() {
@@ -1281,5 +1302,41 @@ mod tests {
     #[should_panic(expected = "at least one frame")]
     fn registered_s_bytes_rejects_an_empty_frame_set() {
         registered_s_bytes(0, 0);
+    }
+
+    /// 88차 P3-12 fixture: a forced delay between the two clock reads.
+    ///
+    /// The recorded epoch must be the earlier reading and the span must be the
+    /// full observed width -- not the midpoint, and not silently clamped. A
+    /// midpoint would place deadlines *after* the scheduling base for half the
+    /// bracket, and a clamped span would hide the very preemption the analyser
+    /// bound exists to catch.
+    #[test]
+    fn a_preempted_capture_records_the_earlier_read_and_the_full_span() {
+        assert_eq!(epoch_record(1_000, 1_007), (1_000, 7));
+        // 50 ms: a scheduling quantum, far past the registered 1 ms bound.
+        assert_eq!(epoch_record(1_000, 51_000), (1_000, 50_000));
+        // Identical reads are a real outcome on a coarse clock, not an error.
+        assert_eq!(epoch_record(1_000, 1_000), (1_000, 0));
+        // A backwards pair must not underflow-panic in the middle of a run.
+        assert_eq!(epoch_record(1_000, 999), (1_000, 0));
+    }
+
+    /// The same rule over a real forced delay rather than hand-picked numbers,
+    /// so the helper is pinned against the clock it actually reads.
+    #[test]
+    fn a_real_forced_delay_is_measured_not_assumed_away() {
+        let before = now_us();
+        std::thread::sleep(Duration::from_millis(5));
+        let after = now_us();
+        let (t0_us, span) = epoch_record(before, after);
+        assert_eq!(t0_us, before, "the epoch must be the earlier read");
+        // Lower bound only: the sleep is a floor, and the scheduler may add to
+        // it. Asserting an upper bound here would make the test flaky on a
+        // loaded machine for no gain.
+        assert!(span >= 5_000, "span {span} did not cover the forced delay");
+        // MAX_T0_CAPTURE_SPAN_US is 1000 in analyze_skew_v5; a capture this
+        // wide is refused there rather than quietly scored.
+        assert!(span > 1_000);
     }
 }
