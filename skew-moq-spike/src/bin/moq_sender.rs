@@ -288,6 +288,10 @@ struct TrackRunStats {
 #[derive(Debug, Clone, Copy)]
 struct Preflight {
     frame_min: usize,
+    /// Exact integer inputs to the registered `S_bytes` rule. `frame_mean`
+    /// stays for the human-readable preflight line only.
+    frame_sum: usize,
+    frame_count: usize,
     frame_mean: f64,
     frame_max: usize,
     chunks_min: usize,
@@ -305,7 +309,8 @@ fn preflight(frames: &[Vec<u8>], args: &Args) -> Preflight {
     let mut sizes: Vec<usize> = frames.iter().map(Vec::len).collect();
     sizes.sort_unstable();
     let frame_sum: usize = sizes.iter().sum();
-    let frame_mean = frame_sum as f64 / sizes.len() as f64;
+    let frame_count = sizes.len();
+    let frame_mean = frame_sum as f64 / frame_count as f64;
     let chunks: Vec<usize> = sizes
         .iter()
         .map(|&size| match args.payload_mode {
@@ -339,6 +344,8 @@ fn preflight(frames: &[Vec<u8>], args: &Args) -> Preflight {
     };
     Preflight {
         frame_min: *sizes.first().unwrap(),
+        frame_sum,
+        frame_count,
         frame_mean,
         frame_max: *sizes.last().unwrap(),
         chunks_min: *chunks.iter().min().unwrap(),
@@ -373,8 +380,19 @@ fn preflight_info(p: Preflight) -> String {
     )
 }
 
-fn registered_s_bytes(frame_mean: f64) -> u64 {
-    frame_mean.round() as u64
+/// The registered `S_bytes` rule, in exact integer arithmetic.
+///
+/// `S_bytes = floor(sum/count + 1/2) = (2*sum + count) / (2*count)`.
+///
+/// Computed from the integer byte sum and frame count rather than from the
+/// `f64` mean: the runners derive the same number independently, and a float
+/// intermediate makes the two agree only up to `f64` precision and rounding
+/// mode. They must agree exactly, because the analyzer rejects a run whose TX
+/// and RX metadata disagree on `S_bytes` -- that is what blocked every gate-6
+/// pair. Same rule as `scripts/registered_s_bytes.py`.
+fn registered_s_bytes(frame_sum: usize, frame_count: usize) -> u64 {
+    assert!(frame_count > 0, "registered_s_bytes needs at least one frame");
+    ((2 * frame_sum as u128 + frame_count as u128) / (2 * frame_count as u128)) as u64
 }
 
 fn json_f64(value: f64) -> String {
@@ -566,7 +584,7 @@ async fn main() -> Result<()> {
     };
     let pcm = load_haptic_pcm(&args.haptic_wav)?;
     let pf = preflight(&frames, &args);
-    let s_bytes = registered_s_bytes(pf.frame_mean);
+    let s_bytes = registered_s_bytes(pf.frame_sum, pf.frame_count);
     let frames = Arc::new(frames);
     let pcm = Arc::new(pcm);
     let s3_frames = if args.arm == Arm::S3 {
@@ -1232,7 +1250,22 @@ mod tests {
 
     #[test]
     fn registered_s_bytes_is_rounded_workload_mean() {
-        assert_eq!(registered_s_bytes(457_294.6), 457_295);
-        assert_ne!(registered_s_bytes(457_294.6), 452_040);
+        // datasets/tiers/loot/d8: 137,188,376 B over 300 frames = 457,294.5867
+        assert_eq!(registered_s_bytes(137_188_376, 300), 457_295);
+        // Half-way inputs go up, not to even: this is the rule the runners
+        // implement in scripts/registered_s_bytes.py.
+        assert_eq!(registered_s_bytes(5, 2), 3);
+        assert_eq!(registered_s_bytes(3, 2), 2);
+        assert_eq!(registered_s_bytes(1, 2), 1);
+        assert_eq!(registered_s_bytes(0, 7), 0);
+        // Exact past the f64 mantissa, where the old `mean.round()` path could
+        // not be trusted to agree with integer arithmetic.
+        assert_eq!(registered_s_bytes(9_007_199_254_740_993, 1), 9_007_199_254_740_993);
+    }
+
+    #[test]
+    #[should_panic(expected = "at least one frame")]
+    fn registered_s_bytes_rejects_an_empty_frame_set() {
+        registered_s_bytes(0, 0);
     }
 }
