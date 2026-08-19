@@ -104,6 +104,37 @@ async fn wait_signal(rx: &mut tokio::sync::watch::Receiver<bool>) {
     }
 }
 
+/// Keep the static-track writers alive until the registered drain edge.
+///
+/// Dropping the final subgroup/track writer emits the track FIN.  The receiver
+/// treats a complete FIN as its normal process-exit authority, so retaining
+/// only the MoQ session is not enough: on an uncongested link it exits at the
+/// measurement edge while the sender is still in its fixed drain.  Ownership
+/// of both states lives in this future for a phase-controlled run, making the
+/// FIN edge coincide with the drain deadline (or an explicit shutdown signal)
+/// without changing subgroup mapping, priority, or object order. Legacy runs
+/// release the state before their session-only drain, preserving their existing
+/// early-FIN behavior.
+async fn hold_static_track_state_through_drain<P, H>(
+    duration: Duration,
+    mut signal: tokio::sync::watch::Receiver<bool>,
+    pc_state: P,
+    haptic_state: H,
+    hold_tracks: bool,
+) -> bool {
+    let _held_track_state = if hold_tracks {
+        Some((pc_state, haptic_state))
+    } else {
+        drop(pc_state);
+        drop(haptic_state);
+        None
+    };
+    tokio::select! {
+        _ = tokio::time::sleep(duration) => false,
+        _ = wait_signal(&mut signal) => true,
+    }
+}
+
 /// C3 single-track baseline selector. Identical surface to
 /// `webrtc_sender.py --tracks {both,pc,haptic}`.
 ///
@@ -1327,9 +1358,7 @@ async fn main() -> Result<()> {
                     }
                     i += 1;
                 }
-                drop(long_sg);
-                drop(pc_sub);
-                Ok::<TrackRunStats, anyhow::Error>(stats)
+                Ok::<_, anyhow::Error>((stats, (pc_sub, long_sg)))
             }))
         } else {
             None
@@ -1412,9 +1441,7 @@ async fn main() -> Result<()> {
                     }
                     k += 1;
                 }
-                drop(sg);
-                drop(hap_sub);
-                Ok::<TrackRunStats, anyhow::Error>(stats)
+                Ok::<_, anyhow::Error>((stats, (hap_sub, sg)))
             }))
         } else {
             None
@@ -1436,11 +1463,19 @@ async fn main() -> Result<()> {
             let outcome = tokio::select! {
                 r = async {
                     let pc = match pc_task {
-                        Some(h) => h.await??,
+                        Some(h) => {
+                            let (stats, state) = h.await??;
+                            pc_state = Some(state);
+                            stats
+                        }
                         None => TrackRunStats::default(),
                     };
                     let haptic = match hap_task {
-                        Some(h) => h.await??,
+                        Some(h) => {
+                            let (stats, state) = h.await??;
+                            haptic_state = Some(state);
+                            stats
+                        }
                         None => TrackRunStats::default(),
                     };
                     Ok::<_, anyhow::Error>((pc, haptic))
@@ -1482,12 +1517,20 @@ async fn main() -> Result<()> {
             args.drain_timeout
         );
 
-        // Keep the session up so the relay forwards the backlog to the
-        // subscriber — but let a signal cut the wait short, which is exactly
-        // what the matrix runner's `pkill` does.
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs_f64(args.drain_timeout)) => {}
-            _ = wait_signal(&mut sig_rx) => { ending = Ending::Signal; }
+        // A registered run keeps both the session and track writers up while
+        // the relay forwards backlog. Releasing the writers emits FIN and gives
+        // a complete receiver permission to exit. Legacy runs keep their old
+        // session-only drain; a signal cuts either wait short for cleanup.
+        if hold_static_track_state_through_drain(
+            Duration::from_secs_f64(args.drain_timeout),
+            sig_rx.clone(),
+            pc_state.take(),
+            haptic_state.take(),
+            phase.is_some(),
+        )
+        .await
+        {
+            ending = Ending::Signal;
         }
         Ok(())
     }
@@ -1628,7 +1671,75 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{epoch_record, now_us, registered_s_bytes, Duration};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use super::{
+        epoch_record, hold_static_track_state_through_drain, now_us, registered_s_bytes, Duration,
+    };
+
+    struct DropProbe(Arc<AtomicUsize>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn static_track_state_is_not_dropped_before_the_registered_drain_edge() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let pc = DropProbe(Arc::clone(&dropped));
+        let haptic = DropProbe(Arc::clone(&dropped));
+        let (signal_tx, signal_rx) = tokio::sync::watch::channel(false);
+
+        let drain = tokio::spawn(hold_static_track_state_through_drain(
+            Duration::from_secs(60),
+            signal_rx,
+            pc,
+            haptic,
+            true,
+        ));
+        tokio::task::yield_now().await;
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            0,
+            "track writers must remain alive throughout the registered drain",
+        );
+
+        signal_tx.send(true).unwrap();
+        assert!(drain.await.unwrap(), "the signal must cut the drain short");
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            2,
+            "track writers are released only after the drain wait returns",
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_static_track_state_keeps_the_existing_early_fin_behavior() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let pc = DropProbe(Arc::clone(&dropped));
+        let haptic = DropProbe(Arc::clone(&dropped));
+        let (signal_tx, signal_rx) = tokio::sync::watch::channel(false);
+
+        let drain = tokio::spawn(hold_static_track_state_through_drain(
+            Duration::from_secs(60),
+            signal_rx,
+            pc,
+            haptic,
+            false,
+        ));
+        tokio::task::yield_now().await;
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            2,
+            "legacy runs must still publish FIN before their session-only drain",
+        );
+
+        signal_tx.send(true).unwrap();
+        assert!(drain.await.unwrap(), "the signal must cut the drain short");
+    }
 
     #[test]
     fn registered_s_bytes_is_rounded_workload_mean() {
