@@ -150,6 +150,37 @@ impl JsonlLogger {
         self.w.flush()
     }
 
+    /// S3 warmup stays on the real Normal route but is lifecycle evidence,
+    /// not a measurement tx row. Route and object keys remain available to
+    /// the accept-trace integrity checker.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_log_warmup_tx_s3(
+        &mut self,
+        role: TrackRole,
+        route: Route,
+        tier: u16,
+        seq: u32,
+        pts_us: u64,
+        event_id: u32,
+        size: usize,
+        t_gen: u64,
+        t_send: u64,
+        object: Option<(u64, u64, u64)>,
+    ) -> Result<()> {
+        validate_route(role, route)?;
+        if !crate::is_warmup_seq(seq) || t_send < t_gen {
+            return Err(invalid("invalid S3 warmup tx object"));
+        }
+        let object = object_fields(object);
+        writeln!(
+            self.w,
+            "{{\"role\":\"info\",\"event\":\"warmup_tx\",\"track\":\"{}\",\"tier\":{tier},\"seq\":{seq},\"pts_us\":{pts_us},\"event_id\":{event_id},\"size\":{size},\"t_gen\":{t_gen},\"t_send\":{t_send}{object},{}}}",
+            role.as_str(),
+            route_fields(route),
+        )?;
+        self.w.flush()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn try_log_rx_s3(
         &mut self,
@@ -450,8 +481,7 @@ mod tests {
     use crate::s3_controller::{S3Config, S3Controller, S3Observation, TransitionCause};
     use crate::s3_switch::{ObjectDisposition, S3SwitchGate, SwitchConfig};
     use crate::{
-        now_us, PayloadMode, Phase4TransportMeta, Representation, Topology, V5Meta,
-        TERM_PROTOCOL_V,
+        now_us, PayloadMode, Phase4TransportMeta, Representation, Topology, V5Meta, TERM_PROTOCOL_V,
     };
 
     fn path(name: &str) -> std::path::PathBuf {
@@ -567,6 +597,39 @@ mod tests {
         assert!(lines[2].ends_with("\"wire_track\":\"pc-d6\",\"route_generation\":7}"));
         assert!(lines[3].contains("\"role\":\"accept\",\"track\":\"pc\""));
         assert!(lines[3].ends_with("\"wire_track\":\"pc-d6\",\"route_generation\":7}"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn warmup_tx_preserves_route_and_complete_wire_identity() {
+        let path = path("warmup-object");
+        {
+            let mut log = logger(&path);
+            log.try_log_warmup_tx_s3(
+                TrackRole::Pc,
+                Route {
+                    name: PC_NORMAL_TRACK,
+                    generation: 0,
+                },
+                2,
+                crate::warmup_seq(7).unwrap(),
+                233_333,
+                8,
+                11,
+                12,
+                13,
+                Some((14, 15, 16)),
+            )
+            .unwrap();
+        }
+        let lines: Vec<_> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert!(lines[1].contains("\"role\":\"info\",\"event\":\"warmup_tx\""));
+        assert!(lines[1].contains("\"group_id\":14,\"subgroup_id\":15,\"object_id\":16"));
+        assert!(lines[1].ends_with("\"wire_track\":\"pc\",\"route_generation\":0}"));
         std::fs::remove_file(path).unwrap();
     }
 

@@ -1126,6 +1126,26 @@ async fn drain_s3_track(
                     bad_headers.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
+                if is_warmup_seq(header.seq) {
+                    if logger
+                        .lock()
+                        .map_err(|_| DrainFail::NonSubgroup)?
+                        .try_log_warmup_rx(
+                            role.as_str(),
+                            header.tier,
+                            header.seq,
+                            header.pts_us,
+                            header.event_id,
+                            header.payload_len,
+                            header.gen_ts_us,
+                            t_recv,
+                        )
+                        .is_err()
+                    {
+                        log_failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    continue;
+                }
                 if logger
                     .lock()
                     .map_err(|_| DrainFail::NonSubgroup)?
@@ -1768,6 +1788,24 @@ async fn run_s3_receiver(
             ))?;
     }
     println!("[rx] S3 subscribed Normal pc+haptic on {}", args.run_id);
+    let readiness_components: &[&str] = match args.topology {
+        Topology::Relay => &[
+            "sender_relay_session",
+            "relay_receiver_session",
+            "pc_subscription",
+            "haptic_subscription",
+        ],
+        Topology::Direct => &[
+            "sender_receiver_session",
+            "pc_subscription",
+            "haptic_subscription",
+        ],
+    };
+    logger
+        .lock()
+        .map_err(|_| anyhow::anyhow!("RX logger poisoned"))?
+        .log_readiness(now_us(), readiness_components)
+        .context("failed to record S3 readiness components")?;
 
     let max_end_us = now_us()
         .checked_add(Duration::from_secs_f64(args.max_duration).as_micros() as u64)
@@ -2449,7 +2487,10 @@ async fn establish(
                 .tls_cert
                 .as_ref()
                 .context("--listen requires --tls-cert")?;
-            let key = args.tls_key.as_ref().context("--listen requires --tls-key")?;
+            let key = args
+                .tls_key
+                .as_ref()
+                .context("--listen requires --tls-key")?;
             accept_direct(listen, cert, key)
                 .await
                 .context("accept direct session")
@@ -2481,7 +2522,8 @@ async fn session_handshake(
         let (session, _pub, sub) = Session::accept_with_config(sess, None, tp, config)
             .await
             .context("SETUP (accept, direct topology)")?;
-        let sub = sub.context("peer did not negotiate a publisher role; no subscriber available")?;
+        let sub =
+            sub.context("peer did not negotiate a publisher role; no subscriber available")?;
         Ok((session, sub))
     } else {
         let (session, _pub, sub) = Session::connect_with_config(sess, None, tp, config)
@@ -2517,9 +2559,7 @@ async fn ack_published_namespace(
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            bail!(
-                "직결 토폴로지: 송신자가 {timeout_s}s 안에 네임스페이스를 announce 하지 않았다"
-            );
+            bail!("직결 토폴로지: 송신자가 {timeout_s}s 안에 네임스페이스를 announce 하지 않았다");
         }
         match tokio::time::timeout(remaining, subscriber.published_namespace()).await {
             Ok(Some(mut ns)) => {
@@ -2571,9 +2611,18 @@ async fn main() -> Result<()> {
     let phase4_transport = phase4_transport(&args);
 
     let logger = Arc::new(Mutex::new(JsonlLogger::new(
-        &args.out, &args.run_id, "moq", "rx", args.c_mbps, args.rtt_ms,
-        args.jitter_ms, args.loss_pct, args.s_bytes, args.pc_rate_hz,
-        args.haptic_rate_hz, args.seed,
+        &args.out,
+        &args.run_id,
+        "moq",
+        "rx",
+        args.c_mbps,
+        args.rtt_ms,
+        args.jitter_ms,
+        args.loss_pct,
+        args.s_bytes,
+        args.pc_rate_hz,
+        args.haptic_rate_hz,
+        args.seed,
         // duration_s = None **유지**: rx meta에 duration_s를 넣으면 분석기의
         // 설계 분모 출처(`_design`이 rx_meta.duration_s도 읽음)로 흡수되어
         // 기대 프레임 분모의 provenance가 바뀐다. 분모는 tx meta/CLI 주입만
@@ -2582,7 +2631,11 @@ async fn main() -> Result<()> {
         // 기록해 두면 tx 로그를 잃은 C3 rx 로그도 단독 트랙으로 분류된다.
         // term_protocol: 종료 프로토콜 세대 마커(Codex 7차 P0 — tx 소실 +
         // shutdown 결손 조합이 구세대로 오인되는 우회를 rx meta 자체로 차단).
-        None, None, Some(args.tracks.as_str()), Some(TERM_PROTOCOL_V), s1_config,
+        None,
+        None,
+        Some(args.tracks.as_str()),
+        Some(TERM_PROTOCOL_V),
+        s1_config,
         phase4_transport,
         Some(V5Meta {
             payload_mode: args.payload_mode,
@@ -2847,6 +2900,22 @@ async fn main() -> Result<()> {
             } else {
                 None
             };
+            // Warmup equal-chunk objects have their own bounded assembly
+            // state. Mixing them into the measurement reassembler would make
+            // lifecycle traffic change frames_completed/incomplete_frames.
+            let mut warmup_reassembler = if payload_mode == PayloadMode::EqualChunk {
+                match LogicalReassembler::new(
+                    chunk_bytes,
+                    reassembly_max_pending_frames,
+                    reassembly_max_pending_bytes,
+                    reassembly_max_age_us,
+                ) {
+                    Ok(value) => Some(value),
+                    Err(e) => return (name, TrackEnd::Failed, format!("{e:#}")),
+                }
+            } else {
+                None
+            };
             let mut frame_stats = ReassemblyStats::default();
             // Inner future yields the raw ServeError so the ending can be
             // classified before the error is erased.
@@ -2885,7 +2954,13 @@ async fn main() -> Result<()> {
                         bad.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
-                    let (h, logical_obj) = if let Some(r) = reassembler.as_mut() {
+                    let warmup = is_warmup_seq(h.seq);
+                    let selected_reassembler = if warmup {
+                        warmup_reassembler.as_mut()
+                    } else {
+                        reassembler.as_mut()
+                    };
+                    let (h, logical_obj) = if let Some(r) = selected_reassembler {
                         let complete = match r.feed(h, &obj[HDR..], t) {
                             Ok(value) => value,
                             Err(e) => {
@@ -2907,10 +2982,21 @@ async fn main() -> Result<()> {
                         logical.extend_from_slice(&complete.payload);
                         (h, Bytes::from(logical))
                     } else {
-                        frame_stats.chunks_received += 1;
-                        frame_stats.frames_completed += 1;
+                        if !warmup {
+                            frame_stats.chunks_received += 1;
+                            frame_stats.frames_completed += 1;
+                        }
                         (h, obj.clone())
                     };
+                    if is_warmup_seq(h.seq) {
+                        if logger.lock().unwrap().try_log_warmup_rx(
+                            track, h.tier, h.seq, h.pts_us, h.event_id,
+                            h.payload_len, h.gen_ts_us, t,
+                        ).is_err() {
+                            ingress_log_failed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        continue;
+                    }
                     logger.lock().unwrap().log_rx(
                         track, h.tier, h.seq, h.pts_us, h.event_id, h.payload_len, t, t, h.gen_ts_us,
                     );
@@ -3105,8 +3191,7 @@ async fn main() -> Result<()> {
             let verdict = classify_ending_with_timeout(
                 &reports,
                 session_run.is_finished(),
-                matches!(args.arm, Arm::S2 | Arm::S2Eq)
-                    && args.pc_delivery_timeout_ms.is_some(),
+                matches!(args.arm, Arm::S2 | Arm::S2Eq) && args.pc_delivery_timeout_ms.is_some(),
             );
             reports_out = reports;
             verdict
@@ -3403,10 +3488,17 @@ mod rx_ending_tests {
         assert!(validate_topology(Topology::Direct, true).is_ok());
         assert!(validate_topology(Topology::Relay, false).is_ok());
 
-        let err = validate_topology(Topology::Direct, false).unwrap_err().to_string();
+        let err = validate_topology(Topology::Direct, false)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("--topology direct requires --listen"), "{err}");
-        let err = validate_topology(Topology::Relay, true).unwrap_err().to_string();
-        assert!(err.contains("--topology relay must not be combined"), "{err}");
+        let err = validate_topology(Topology::Relay, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("--topology relay must not be combined"),
+            "{err}"
+        );
     }
 
     /// `--topology` has no default and no unregistered value, at the CLI layer
@@ -3416,23 +3508,45 @@ mod rx_ending_tests {
     fn topology_cli_is_required_and_closed() {
         use clap::Parser as _;
         let base: Vec<String> = [
-            "moq_receiver", "--run-id", "t", "--out", "/dev/null",
-            "--s-bytes", "1", "--pc-rate-hz", "30", "--haptic-rate-hz", "90",
-            "--payload-mode", "frame", "--representation", "bin",
-            "--chunk-bytes", "178",
-            "--reassembly-max-pending-frames", "64",
-            "--reassembly-max-pending-bytes", "67108864",
-            "--reassembly-max-age-ms", "2000",
+            "moq_receiver",
+            "--run-id",
+            "t",
+            "--out",
+            "/dev/null",
+            "--s-bytes",
+            "1",
+            "--pc-rate-hz",
+            "30",
+            "--haptic-rate-hz",
+            "90",
+            "--payload-mode",
+            "frame",
+            "--representation",
+            "bin",
+            "--chunk-bytes",
+            "178",
+            "--reassembly-max-pending-frames",
+            "64",
+            "--reassembly-max-pending-bytes",
+            "67108864",
+            "--reassembly-max-age-ms",
+            "2000",
         ]
         .iter()
         .map(|s| s.to_string())
         .collect();
 
-        assert!(Args::try_parse_from(&base).is_err(), "missing --topology parsed");
+        assert!(
+            Args::try_parse_from(&base).is_err(),
+            "missing --topology parsed"
+        );
 
         let mut bad = base.clone();
         bad.extend(["--topology".to_string(), "sfu".to_string()]);
-        assert!(Args::try_parse_from(&bad).is_err(), "unregistered topology parsed");
+        assert!(
+            Args::try_parse_from(&bad).is_err(),
+            "unregistered topology parsed"
+        );
 
         for (value, expected) in [("direct", Topology::Direct), ("relay", Topology::Relay)] {
             let mut good = base.clone();
@@ -3937,7 +4051,10 @@ mod rx_ending_tests {
         assert_eq!(runtime.deadline_max_anchors, 900);
         assert_ne!(
             runtime.deadline_max_anchors,
-            playout_config(&args).unwrap().unwrap().max_objects_per_track,
+            playout_config(&args)
+                .unwrap()
+                .unwrap()
+                .max_objects_per_track,
             "the bound must not be coupled to the scheduler buffer bound"
         );
 
@@ -4066,10 +4183,8 @@ mod s3_barrier_race_tests {
                         // terminally dropped BEFORE any tracker/route/push
                         // registration.
                         if self.scheduler.knows_identity(&routed.object) {
-                            self.duplicate_dropped.push((
-                                S3ObjectKey::from(&routed.object),
-                                DROP_DUPLICATE_IDENTITY,
-                            ));
+                            self.duplicate_dropped
+                                .push((S3ObjectKey::from(&routed.object), DROP_DUPLICATE_IDENTITY));
                             continue;
                         }
                         self.tracker.note_received(&routed.object).unwrap();
@@ -4160,7 +4275,10 @@ mod s3_barrier_race_tests {
             .unwrap();
         h.ingress.subscribe_ok(TrackRole::Pc, 3_100).unwrap();
         h.ingress.subscribe_ok(TrackRole::Haptic, 3_200).unwrap();
-        h.push(routed(TrackRole::Pc, first.target.pc, 10_000, 2, 3_300), 3_300);
+        h.push(
+            routed(TrackRole::Pc, first.target.pc, 10_000, 2, 3_300),
+            3_300,
+        );
         h.push(
             routed(TrackRole::Haptic, first.target.haptic, 10_000, 2, 3_400),
             3_400,
@@ -4176,7 +4294,10 @@ mod s3_barrier_race_tests {
             .unwrap();
         h.ingress.subscribe_ok(TrackRole::Pc, 4_100).unwrap();
         h.ingress.subscribe_ok(TrackRole::Haptic, 4_200).unwrap();
-        h.push(routed(TrackRole::Pc, second.target.pc, 20_000, 3, 4_300), 4_300);
+        h.push(
+            routed(TrackRole::Pc, second.target.pc, 20_000, 3, 4_300),
+            4_300,
+        );
         h.push(
             routed(TrackRole::Haptic, second.target.haptic, 20_000, 3, 4_400),
             4_400,
@@ -4188,7 +4309,10 @@ mod s3_barrier_race_tests {
         // current-route haptic sibling for pts 60_000 that must survive.
         h.push(routed(TrackRole::Pc, recovery.pc, 60_000, 6, 5_000), 5_000);
         h.push(routed(TrackRole::Pc, recovery.pc, 70_000, 7, 5_100), 5_100);
-        h.push(routed(TrackRole::Haptic, recovery.haptic, 60_000, 6, 5_200), 5_200);
+        h.push(
+            routed(TrackRole::Haptic, recovery.haptic, 60_000, 6, 5_200),
+            5_200,
+        );
 
         // Recovery -> Normal: only PC changes; haptic stays current.
         let third = h
@@ -4198,7 +4322,10 @@ mod s3_barrier_race_tests {
         assert!(third.pc_changed && !third.haptic_changed);
         h.ingress.subscribe_ok(TrackRole::Pc, 6_100).unwrap();
         assert!(h
-            .push(routed(TrackRole::Pc, third.target.pc, 30_000, 4, 7_000), 7_000)
+            .push(
+                routed(TrackRole::Pc, third.target.pc, 30_000, 4, 7_000),
+                7_000
+            )
             .is_empty());
 
         // The unchanged-route haptic anchor arrives LAST, with `now` beyond
@@ -4377,7 +4504,10 @@ mod s3_barrier_race_tests {
             2
         );
         assert_eq!(
-            first_pass.iter().filter(|(_, reason)| reason.is_none()).count(),
+            first_pass
+                .iter()
+                .filter(|(_, reason)| reason.is_none())
+                .count(),
             0,
             "no release survives for the cancelled route above the barrier"
         );
@@ -4518,7 +4648,10 @@ mod s3_barrier_race_tests {
 
         // First copy on the soon-cancelled current haptic route, above the
         // coming barrier: enters the scheduler buffer.
-        h.push(routed(TrackRole::Haptic, gen0.haptic, 30_000, 4, 3_000), 3_000);
+        h.push(
+            routed(TrackRole::Haptic, gen0.haptic, 30_000, 4, 3_000),
+            3_000,
+        );
         assert_eq!(h.pushed_to_scheduler, 3);
 
         // Normal -> HapticCritical (both routes change); the exact pair at
@@ -4533,7 +4666,10 @@ mod s3_barrier_race_tests {
             .unwrap();
         h.ingress.subscribe_ok(TrackRole::Pc, 4_100).unwrap();
         h.ingress.subscribe_ok(TrackRole::Haptic, 4_200).unwrap();
-        h.push(routed(TrackRole::Pc, request.target.pc, 10_000, 2, 4_300), 4_300);
+        h.push(
+            routed(TrackRole::Pc, request.target.pc, 10_000, 2, 4_300),
+            4_300,
+        );
         h.push(
             routed(TrackRole::Haptic, request.target.haptic, 10_000, 2, 4_400),
             4_400,
@@ -4611,7 +4747,10 @@ mod s3_barrier_race_tests {
         h.tracker.activate().unwrap();
 
         // First copy below the coming barrier: survives the switch buffered.
-        h.push(routed(TrackRole::Haptic, gen0.haptic, 5_000, 2, 3_000), 3_000);
+        h.push(
+            routed(TrackRole::Haptic, gen0.haptic, 5_000, 2, 3_000),
+            3_000,
+        );
 
         let request = h
             .ingress
@@ -4622,7 +4761,10 @@ mod s3_barrier_race_tests {
             .unwrap();
         h.ingress.subscribe_ok(TrackRole::Pc, 4_100).unwrap();
         h.ingress.subscribe_ok(TrackRole::Haptic, 4_200).unwrap();
-        h.push(routed(TrackRole::Pc, request.target.pc, 10_000, 3, 4_300), 4_300);
+        h.push(
+            routed(TrackRole::Pc, request.target.pc, 10_000, 3, 4_300),
+            4_300,
+        );
         h.push(
             routed(TrackRole::Haptic, request.target.haptic, 10_000, 3, 4_400),
             4_400,
@@ -4677,7 +4819,10 @@ mod s3_barrier_race_tests {
         h.tracker.activate().unwrap();
 
         // Old-route identity below the barrier survives the switch.
-        h.push(routed(TrackRole::Haptic, gen0.haptic, 5_000, 2, 3_000), 3_000);
+        h.push(
+            routed(TrackRole::Haptic, gen0.haptic, 5_000, 2, 3_000),
+            3_000,
+        );
 
         let request = h
             .ingress
@@ -4688,7 +4833,10 @@ mod s3_barrier_race_tests {
             .unwrap();
         h.ingress.subscribe_ok(TrackRole::Pc, 4_100).unwrap();
         h.ingress.subscribe_ok(TrackRole::Haptic, 4_200).unwrap();
-        h.push(routed(TrackRole::Pc, request.target.pc, 10_000, 3, 4_300), 4_300);
+        h.push(
+            routed(TrackRole::Pc, request.target.pc, 10_000, 3, 4_300),
+            4_300,
+        );
         h.push(
             routed(TrackRole::Haptic, request.target.haptic, 10_000, 3, 4_400),
             4_400,
@@ -4696,8 +4844,14 @@ mod s3_barrier_race_tests {
         let current = h.ingress.gate().active_routes();
 
         // A DISTINCT identity on the new current route.
-        h.push(routed(TrackRole::Haptic, current.haptic, 30_000, 4, 4_500), 4_500);
-        assert!(h.duplicate_dropped.is_empty(), "no duplicate drop for distinct identities");
+        h.push(
+            routed(TrackRole::Haptic, current.haptic, 30_000, 4, 4_500),
+            4_500,
+        );
+        assert!(
+            h.duplicate_dropped.is_empty(),
+            "no duplicate drop for distinct identities"
+        );
         assert_eq!(h.pushed_to_scheduler, 4);
 
         // Drain at due(30_000) = 82_000: pts 0 and pts 5_000 are within the
@@ -4737,7 +4891,10 @@ mod s3_barrier_race_tests {
         let mut now = 1_000;
         for event_id in 1..=(max as u32 * 4) {
             let pts_us = u64::from(event_id - 1) * 33_333;
-            h.push(routed(TrackRole::Haptic, gen0.haptic, pts_us, event_id, now), now);
+            h.push(
+                routed(TrackRole::Haptic, gen0.haptic, pts_us, event_id, now),
+                now,
+            );
             now += 33_333;
         }
 
@@ -4766,19 +4923,23 @@ mod s3_barrier_race_tests {
         // are terminally dropped as `startup_timeout`.
         for event_id in 1..=3u32 {
             let pts_us = u64::from(event_id - 1) * 33_333;
-            h.push(routed(TrackRole::Haptic, gen0.haptic, pts_us, event_id, 1_000), 1_000);
+            h.push(
+                routed(TrackRole::Haptic, gen0.haptic, pts_us, event_id, 1_000),
+                1_000,
+            );
         }
         let actions = h.push(
             routed(TrackRole::Haptic, gen0.haptic, 100_000, 4, 2_100_000),
             2_100_000,
         );
         assert!(
-            actions
-                .iter()
-                .any(|action| matches!(action, PlayoutAction::Drop {
+            actions.iter().any(|action| matches!(
+                action,
+                PlayoutAction::Drop {
                     reason: DROP_STARTUP_TIMEOUT,
                     ..
-                })),
+                }
+            )),
             "the first startup window must expire"
         );
         assert!(!h.scheduler.is_started());
@@ -4805,7 +4966,9 @@ mod s3_barrier_race_tests {
         // the pre-amendment tracker emitted a `deadline_miss` for each.
         let observations = h.advance_tracker(3_000_000);
         assert!(
-            observations.iter().all(|observation| !observation.deadline_miss),
+            observations
+                .iter()
+                .all(|observation| !observation.deadline_miss),
             "pre-epoch losses must not reach the controller: {observations:?}"
         );
     }
@@ -4838,13 +5001,20 @@ mod s3_barrier_race_tests {
         let evicted: Vec<_> = actions
             .iter()
             .filter(|action| {
-                matches!(action, PlayoutAction::Drop {
-                    reason: DROP_BUFFER_SPAN_LIMIT,
-                    ..
-                })
+                matches!(
+                    action,
+                    PlayoutAction::Drop {
+                        reason: DROP_BUFFER_SPAN_LIMIT,
+                        ..
+                    }
+                )
             })
             .collect();
-        assert_eq!(evicted.len(), 1, "the old anchor is span-evicted: {actions:?}");
+        assert_eq!(
+            evicted.len(),
+            1,
+            "the old anchor is span-evicted: {actions:?}"
+        );
         assert!(
             evicted[0].is_pre_epoch_drop(),
             "the drop was emitted before try_start, so it is pre-epoch"
@@ -4853,7 +5023,9 @@ mod s3_barrier_race_tests {
         h.tracker.activate().unwrap();
         let observations = h.advance_tracker(3_000_000);
         assert!(
-            observations.iter().all(|observation| !observation.deadline_miss),
+            observations
+                .iter()
+                .all(|observation| !observation.deadline_miss),
             "the span-evicted pre-epoch anchor must not become a miss: {observations:?}"
         );
     }
@@ -4874,7 +5046,10 @@ mod s3_barrier_race_tests {
         // arrival evicts the oldest, so settled occupancy never exceeds it.
         for event_id in 1..=12u32 {
             let pts_us = u64::from(event_id - 1) * 33_333;
-            h.push(routed(TrackRole::Haptic, gen0.haptic, pts_us, event_id, 1_000), 1_000);
+            h.push(
+                routed(TrackRole::Haptic, gen0.haptic, pts_us, event_id, 1_000),
+                1_000,
+            );
             h.tracker
                 .check_bounds()
                 .expect("settled occupancy must stay within the bound");
@@ -4942,7 +5117,11 @@ mod s3_barrier_race_tests {
             .iter()
             .filter(|observation| observation.abs_skew_us.is_some())
             .collect();
-        assert_eq!(paired.len(), 1, "the pair must be observed: {observations:?}");
+        assert_eq!(
+            paired.len(),
+            1,
+            "the pair must be observed: {observations:?}"
+        );
         assert!(!paired[0].deadline_miss, "PC met its deadline");
         assert_eq!(paired[0].abs_skew_us, Some(5_000));
     }
@@ -4969,16 +5148,18 @@ mod s3_barrier_race_tests {
         // PC for the next anchor arrives long after its deadline plus the
         // tolerance, so the scheduler drops it as `late` post-epoch.
         let arrival = 52_000 + 100_000 + 500_000;
-        let actions = h.push(
-            routed(TrackRole::Pc, gen0.pc, 100_000, 4, arrival),
-            arrival,
-        );
+        let actions = h.push(routed(TrackRole::Pc, gen0.pc, 100_000, 4, arrival), arrival);
         let late: Vec<_> = actions
             .iter()
-            .filter(|action| matches!(action, PlayoutAction::Drop {
-                reason: DROP_LATE,
-                ..
-            }))
+            .filter(|action| {
+                matches!(
+                    action,
+                    PlayoutAction::Drop {
+                        reason: DROP_LATE,
+                        ..
+                    }
+                )
+            })
             .collect();
         assert_eq!(late.len(), 1, "PC is dropped as late: {actions:?}");
         assert!(
@@ -4992,7 +5173,9 @@ mod s3_barrier_race_tests {
         );
         let observations = h.advance_tracker(arrival + 1_000);
         assert!(
-            observations.iter().any(|observation| observation.deadline_miss),
+            observations
+                .iter()
+                .any(|observation| observation.deadline_miss),
             "the anchor's PC missed its deadline and must still be reported: {observations:?}"
         );
     }
@@ -5017,7 +5200,10 @@ mod s3_barrier_race_tests {
         // window, so no startup timeout drops them).
         for event_id in 1..=3u32 {
             let pts_us = u64::from(event_id - 1) * 33_333;
-            h.push(routed(TrackRole::Haptic, gen0.haptic, pts_us, event_id, 1_000), 1_000);
+            h.push(
+                routed(TrackRole::Haptic, gen0.haptic, pts_us, event_id, 1_000),
+                1_000,
+            );
         }
         assert!(!h.scheduler.is_started(), "no exact pair yet");
         assert!(
@@ -5027,7 +5213,10 @@ mod s3_barrier_race_tests {
         );
 
         // A later exact pair forms the epoch at pts 100_000.
-        h.push(routed(TrackRole::Pc, gen0.pc, 100_000, 4, 1_500_000), 1_500_000);
+        h.push(
+            routed(TrackRole::Pc, gen0.pc, 100_000, 4, 1_500_000),
+            1_500_000,
+        );
         h.push(
             routed(TrackRole::Haptic, gen0.haptic, 100_000, 4, 1_500_100),
             1_500_100,
@@ -5044,7 +5233,9 @@ mod s3_barrier_race_tests {
         // epoch-forming anchor is due with both sides released.
         let observations = h.advance_tracker(1_550_100);
         assert!(
-            observations.iter().all(|observation| !observation.deadline_miss),
+            observations
+                .iter()
+                .all(|observation| !observation.deadline_miss),
             "anchors older than the epoch must not reach the controller: {observations:?}"
         );
         // ...while the epoch-forming pair still yields its real observation:
@@ -5105,7 +5296,10 @@ mod s3_barrier_race_tests {
 
         for event_id in 1..=5u32 {
             let pts_us = u64::from(event_id - 1) * 33_333;
-            h.push(routed(TrackRole::Haptic, gen0.haptic, pts_us, event_id, 1_000), 1_000);
+            h.push(
+                routed(TrackRole::Haptic, gen0.haptic, pts_us, event_id, 1_000),
+                1_000,
+            );
         }
         h.push(
             routed(TrackRole::Haptic, gen0.haptic, 200_000, 7, 2_100_000),
@@ -5360,7 +5554,8 @@ mod s3_retirement_tests {
         let bad_headers = Arc::new(AtomicU64::new(0));
         let ingress_drops = Arc::new(AtomicU64::new(0));
         let log_failed = Arc::new(AtomicU64::new(0));
-        let (writer, reader) = Track::new(TrackNamespace::from_utf8_path("/retire"), "pc").produce();
+        let (writer, reader) =
+            Track::new(TrackNamespace::from_utf8_path("/retire"), "pc").produce();
         let drain = tokio::spawn(drain_s3_track(
             TrackRole::Pc,
             cancel_pc,
@@ -5396,9 +5591,7 @@ mod s3_retirement_tests {
 
         // Both frames are terminal barrier drops — never scheduler releases.
         for routed in received {
-            let events = ingress
-                .push(routed, applied.effect_at_us + 10_000)
-                .unwrap();
+            let events = ingress.push(routed, applied.effect_at_us + 10_000).unwrap();
             assert!(
                 matches!(
                     events.as_slice(),
@@ -5419,7 +5612,9 @@ mod s3_retirement_tests {
             .expect("track end must be observed")
             .expect("drain alive");
         match ended {
-            S3WireEvent::Ended { role, route, end, .. } => {
+            S3WireEvent::Ended {
+                role, route, end, ..
+            } => {
                 assert_eq!(role, TrackRole::Pc);
                 assert_eq!(route, cancel_pc);
                 assert_eq!(end, TrackEnd::Fin);
@@ -5448,5 +5643,4 @@ mod s3_retirement_tests {
         );
         std::fs::remove_file(&out).unwrap();
     }
-
 }

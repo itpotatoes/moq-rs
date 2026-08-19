@@ -97,18 +97,10 @@ impl RunSlotClock {
         let haptic_tick = pc_slot
             .checked_mul(haptic_rate_hz / pc_rate_hz)
             .ok_or(SlotError::ArithmeticOverflow)?;
-        source_identity(
-            haptic_tick,
-            pc_slot,
-            timestamp_us(pc_slot, pc_rate_hz),
-        )
+        source_identity(haptic_tick, pc_slot, timestamp_us(pc_slot, pc_rate_hz))
     }
 
-    pub fn full_haptic_slot(
-        self,
-        now_us: u64,
-        haptic_rate_hz: u64,
-    ) -> Result<u64, SlotError> {
+    pub fn full_haptic_slot(self, now_us: u64, haptic_rate_hz: u64) -> Result<u64, SlotError> {
         self.next_slot(now_us, haptic_rate_hz)
     }
 }
@@ -210,6 +202,17 @@ impl ProducerLease {
     /// Authorize and account one object immediately before its synchronous
     /// track write. A cancelled lease fails closed.
     pub fn record_object(&self) -> Result<u64, ProducerError> {
+        self.authorize_object(true)
+    }
+
+    /// Authorize a pre-t0 object without adding it to measurement producer
+    /// counts. It still uses the active subscription lease and therefore
+    /// cannot write after cancellation.
+    pub fn authorize_warmup_object(&self) -> Result<u64, ProducerError> {
+        self.authorize_object(false)
+    }
+
+    fn authorize_object(&self, measurement: bool) -> Result<u64, ProducerError> {
         let mut state = self
             .state
             .lock()
@@ -221,10 +224,12 @@ impl ProducerLease {
         if !stats.active || self.is_cancelled() {
             return Err(ProducerError::LeaseCancelled);
         }
-        stats.objects = stats
-            .objects
-            .checked_add(1)
-            .ok_or(ProducerError::StatePoisoned)?;
+        if measurement {
+            stats.objects = stats
+                .objects
+                .checked_add(1)
+                .ok_or(ProducerError::StatePoisoned)?;
+        }
         Ok(stats.objects)
     }
 }
@@ -543,9 +548,7 @@ mod tests {
     fn essential_haptic_keeps_global_tick_and_exact_pc_identity() {
         let clock = RunSlotClock::new(1_000_000);
         let pc = clock.pc_identity(3_345_678, 30).unwrap();
-        let haptic = clock
-            .essential_haptic_identity(3_345_678, 30, 90)
-            .unwrap();
+        let haptic = clock.essential_haptic_identity(3_345_678, 30, 90).unwrap();
         assert_eq!(haptic.pts_us, pc.pts_us);
         assert_eq!(haptic.event_id, pc.event_id);
         assert_eq!(haptic.slot, pc.slot * 3);

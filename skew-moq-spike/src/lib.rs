@@ -3,11 +3,14 @@
 // unchanged.  Header "<BBHIQIQI" (32B LE), CLOCK_MONOTONIC µs clock, the snap
 // pairing rule, the PC-tier / haptic-PCM workload loaders, and the JSONL logger.
 
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
-use std::collections::{BTreeMap, HashMap, VecDeque};
 
+use anyhow::Context;
+
+pub mod phase;
 pub mod playout;
 pub mod s3_controller;
 pub mod s3_logging;
@@ -36,6 +39,21 @@ pub const CHUNK_VERSION: u8 = 1;
 /// shutdown 정확히 1개를 무조건 요구하는 근거가 된다. 프로토콜 의미가
 /// 바뀌면 올린다(1 = shutdown 레코드 각 1개 + exit_code/ending 기록).
 pub const TERM_PROTOCOL_V: u32 = 1;
+pub const WARMUP_SEQ_FLAG: u32 = 1 << 31;
+pub const WARMUP_SEQ_MASK: u32 = WARMUP_SEQ_FLAG - 1;
+
+pub fn warmup_seq(index: u64) -> anyhow::Result<u32> {
+    let index = u32::try_from(index).context("warmup sequence exceeds u32")?;
+    anyhow::ensure!(
+        index <= WARMUP_SEQ_MASK,
+        "warmup sequence uses the reserved flag bit"
+    );
+    Ok(WARMUP_SEQ_FLAG | index)
+}
+
+pub fn is_warmup_seq(seq: u32) -> bool {
+    seq & WARMUP_SEQ_FLAG != 0
+}
 
 pub fn track_name(track_id: u8) -> &'static str {
     match track_id {
@@ -94,11 +112,7 @@ pub fn validate_v5_rates(pc_rate_hz: u64, haptic_rate_hz: u64) -> anyhow::Result
     Ok(ratio)
 }
 
-pub fn anchor_tick(
-    frame_idx: u64,
-    pc_rate_hz: u64,
-    haptic_rate_hz: u64,
-) -> anyhow::Result<u64> {
+pub fn anchor_tick(frame_idx: u64, pc_rate_hz: u64, haptic_rate_hz: u64) -> anyhow::Result<u64> {
     Ok(frame_idx * validate_v5_rates(pc_rate_hz, haptic_rate_hz)?)
 }
 
@@ -222,7 +236,10 @@ pub struct ChunkEnvelope {
 impl ChunkEnvelope {
     pub fn pack(self) -> anyhow::Result<[u8; CHUNK_HDR]> {
         anyhow::ensure!(self.version == CHUNK_VERSION, "unsupported chunk version");
-        anyhow::ensure!(self.flags == 0 && self.reserved == 0, "unsupported chunk flags");
+        anyhow::ensure!(
+            self.flags == 0 && self.reserved == 0,
+            "unsupported chunk flags"
+        );
         anyhow::ensure!(self.chunk_total > 0, "chunk_total must be positive");
         anyhow::ensure!(self.chunk_idx < self.chunk_total, "chunk_idx out of range");
         let mut b = [0u8; CHUNK_HDR];
@@ -237,7 +254,10 @@ impl ChunkEnvelope {
     }
 
     pub fn unpack(buf: &[u8]) -> anyhow::Result<Self> {
-        anyhow::ensure!(buf.len() >= CHUNK_HDR, "chunk envelope is shorter than {CHUNK_HDR}B");
+        anyhow::ensure!(
+            buf.len() >= CHUNK_HDR,
+            "chunk envelope is shorter than {CHUNK_HDR}B"
+        );
         let out = Self {
             version: buf[0],
             flags: buf[1],
@@ -248,7 +268,10 @@ impl ChunkEnvelope {
             valid_bytes: u32::from_le_bytes(buf[16..20].try_into().unwrap()),
         };
         anyhow::ensure!(out.version == CHUNK_VERSION, "unsupported chunk version");
-        anyhow::ensure!(out.flags == 0 && out.reserved == 0, "unsupported chunk flags");
+        anyhow::ensure!(
+            out.flags == 0 && out.reserved == 0,
+            "unsupported chunk flags"
+        );
         anyhow::ensure!(out.chunk_total > 0, "chunk_total must be positive");
         anyhow::ensure!(out.chunk_idx < out.chunk_total, "chunk_idx out of range");
         Ok(out)
@@ -256,7 +279,11 @@ impl ChunkEnvelope {
 }
 
 /// Build fixed-size v5 object payloads (20B envelope + padded chunk).
-pub fn equal_chunks(payload: &[u8], logical_id: u32, chunk_bytes: usize) -> anyhow::Result<Vec<Vec<u8>>> {
+pub fn equal_chunks(
+    payload: &[u8],
+    logical_id: u32,
+    chunk_bytes: usize,
+) -> anyhow::Result<Vec<Vec<u8>>> {
     anyhow::ensure!(chunk_bytes > 0, "chunk_bytes must be positive");
     let total = payload.len().div_ceil(chunk_bytes).max(1);
     anyhow::ensure!(total <= u32::MAX as usize, "too many chunks");
@@ -365,7 +392,10 @@ impl LogicalReassembler {
         max_age_us: u64,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(chunk_bytes > 0, "chunk_bytes must be positive");
-        anyhow::ensure!(max_pending_frames > 0, "max_pending_frames must be positive");
+        anyhow::ensure!(
+            max_pending_frames > 0,
+            "max_pending_frames must be positive"
+        );
         anyhow::ensure!(max_pending_bytes > 0, "max_pending_bytes must be positive");
         anyhow::ensure!(max_age_us > 0, "max_age_us must be positive");
         Ok(Self {
@@ -515,7 +545,10 @@ impl LogicalReassembler {
         let mut logical_header = pending.header;
         logical_header.payload_len = payload.len() as u32;
         self.stats.frames_completed += 1;
-        Ok(Some(CompletedLogical { header: logical_header, payload }))
+        Ok(Some(CompletedLogical {
+            header: logical_header,
+            payload,
+        }))
     }
 
     pub fn finish(&mut self) -> usize {
@@ -575,7 +608,11 @@ impl PeriodStats {
     }
 
     pub fn mean_ms(&self) -> f64 {
-        if self.intervals == 0 { f64::NAN } else { self.mean_us / 1_000.0 }
+        if self.intervals == 0 {
+            f64::NAN
+        } else {
+            self.mean_us / 1_000.0
+        }
     }
 
     pub fn std_ms(&self) -> f64 {
@@ -631,7 +668,10 @@ pub fn load_frames(dir: &str) -> anyhow::Result<Vec<Vec<u8>>> {
 /// declared representation. The payload is opaque on the wire, so a bin tier
 /// loaded under `--representation draco` would be mislabelled with no other
 /// observable symptom.
-pub fn load_frames_checked(dir: &str, representation: Representation) -> anyhow::Result<Vec<Vec<u8>>> {
+pub fn load_frames_checked(
+    dir: &str,
+    representation: Representation,
+) -> anyhow::Result<Vec<Vec<u8>>> {
     let want = representation.frame_extension();
     let mut wrong = 0usize;
     for entry in std::fs::read_dir(dir)? {
@@ -893,6 +933,66 @@ impl JsonlLogger {
         let _ = self.w.flush();
     }
 
+    /// Pre-t0 objects are lifecycle evidence, never measurement tx/rx rows.
+    /// The optional MoQ identity lets accept-trace integrity join the same
+    /// transport object without admitting it to the opportunity ledger.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_log_warmup_tx(
+        &mut self,
+        track: &str,
+        tier: u16,
+        seq: u32,
+        pts_us: u64,
+        event_id: u32,
+        size: usize,
+        t_gen: u64,
+        t_send: u64,
+        object: Option<(u64, u64, u64)>,
+    ) -> std::io::Result<()> {
+        if !matches!(track, "pc" | "haptic") || !is_warmup_seq(seq) || t_send < t_gen {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid warmup tx object",
+            ));
+        }
+        let object = match object {
+            Some((group, subgroup, object)) => {
+                format!(",\"group_id\":{group},\"subgroup_id\":{subgroup},\"object_id\":{object}")
+            }
+            None => String::new(),
+        };
+        writeln!(
+            self.w,
+            "{{\"role\":\"info\",\"event\":\"warmup_tx\",\"track\":\"{track}\",\"tier\":{tier},\"seq\":{seq},\"pts_us\":{pts_us},\"event_id\":{event_id},\"size\":{size},\"t_gen\":{t_gen},\"t_send\":{t_send}{object}}}"
+        )?;
+        self.w.flush()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_log_warmup_rx(
+        &mut self,
+        track: &str,
+        tier: u16,
+        seq: u32,
+        pts_us: u64,
+        event_id: u32,
+        size: u32,
+        t_gen: u64,
+        t_recv: u64,
+    ) -> std::io::Result<()> {
+        if !matches!(track, "pc" | "haptic") || !is_warmup_seq(seq) || t_recv < t_gen {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid warmup rx object",
+            ));
+        }
+        writeln!(
+            self.w,
+            "{{\"role\":\"info\",\"event\":\"warmup_rx\",\"track\":\"{track}\",\"tier\":{tier},\"seq\":{seq},\"pts_us\":{pts_us},\"event_id\":{event_id},\"size\":{size},\"t_gen\":{t_gen},\"t_recv\":{t_recv}}}"
+        )?;
+        self.w.flush()
+    }
+
     /// Phase-4 L1-R application-release record. This is not L2 `t_play`.
     #[allow(clippy::too_many_arguments)]
     pub fn try_log_release(
@@ -1080,10 +1180,27 @@ mod phase4_jsonl_tests {
         let b1 = path("b1-meta");
         {
             JsonlLogger::new(
-                &b1, "run", "moq", "rx", None, 0.0, 0.0, 0.0,
-                10, 30, 100, 1, None, None, Some("both"),
-                Some(TERM_PROTOCOL_V), None, None, None,
-            ).unwrap();
+                &b1,
+                "run",
+                "moq",
+                "rx",
+                None,
+                0.0,
+                0.0,
+                0.0,
+                10,
+                30,
+                100,
+                1,
+                None,
+                None,
+                Some("both"),
+                Some(TERM_PROTOCOL_V),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
         }
         let b1_line = std::fs::read_to_string(&b1).unwrap();
         assert_eq!(
@@ -1104,10 +1221,27 @@ mod phase4_jsonl_tests {
         };
         {
             JsonlLogger::new(
-                &s1, "run", "moq", "rx", None, 0.0, 0.0, 0.0,
-                10, 30, 100, 1, None, None, Some("both"),
-                Some(TERM_PROTOCOL_V), Some(config), None, None,
-            ).unwrap();
+                &s1,
+                "run",
+                "moq",
+                "rx",
+                None,
+                0.0,
+                0.0,
+                0.0,
+                10,
+                30,
+                100,
+                1,
+                None,
+                None,
+                Some("both"),
+                Some(TERM_PROTOCOL_V),
+                Some(config),
+                None,
+                None,
+            )
+            .unwrap();
         }
         let s1_line = std::fs::read_to_string(&s1).unwrap();
         assert!(s1_line.starts_with(b1_line.trim_end_matches("}\n")));
@@ -1131,12 +1265,31 @@ mod phase4_jsonl_tests {
         let path = path("release-schema");
         {
             let mut log = JsonlLogger::new(
-                &path, "run", "moq", "rx", None, 0.0, 0.0, 0.0,
-                10, 30, 100, 1, None, None, Some("both"),
-                Some(TERM_PROTOCOL_V), None, None, None,
-            ).unwrap();
-            log.try_log_release("pc", 2, 7, 123_000, 8, 456_000).unwrap();
-            log.try_log_drop("haptic", 0, 9, 223_000, 0, 556_000, "late").unwrap();
+                &path,
+                "run",
+                "moq",
+                "rx",
+                None,
+                0.0,
+                0.0,
+                0.0,
+                10,
+                30,
+                100,
+                1,
+                None,
+                None,
+                Some("both"),
+                Some(TERM_PROTOCOL_V),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            log.try_log_release("pc", 2, 7, 123_000, 8, 456_000)
+                .unwrap();
+            log.try_log_drop("haptic", 0, 9, 223_000, 0, 556_000, "late")
+                .unwrap();
         }
         let lines: Vec<String> = std::fs::read_to_string(&path)
             .unwrap()
@@ -1265,7 +1418,10 @@ mod phase1_v5_tests {
         let mut r = LogicalReassembler::new(178, 8, 4096, 1_000_000).unwrap();
         let mut complete = None;
         for object in objects.iter().rev() {
-            complete = r.feed(header(7, object.len()), object, 100).unwrap().or(complete);
+            complete = r
+                .feed(header(7, object.len()), object, 100)
+                .unwrap()
+                .or(complete);
         }
         let complete = complete.expect("logical frame completed");
         assert_eq!(complete.header.payload_len as usize, source.len());
@@ -1337,20 +1493,38 @@ mod phase1_v5_tests {
     #[test]
     fn v5_meta_uses_hz_names_and_schema_gate() {
         let path = std::env::temp_dir().join(format!(
-            "skew-v5-meta-{}-{}.jsonl", std::process::id(), now_us()
+            "skew-v5-meta-{}-{}.jsonl",
+            std::process::id(),
+            now_us()
         ));
         {
             JsonlLogger::new(
-                &path, "v5", "moq", "tx", None, 0.0, 0.0, 0.0,
-                10, 30, 90, 1, Some(10.0), None, Some("both"),
-                Some(TERM_PROTOCOL_V), None, None,
+                &path,
+                "v5",
+                "moq",
+                "tx",
+                None,
+                0.0,
+                0.0,
+                0.0,
+                10,
+                30,
+                90,
+                1,
+                Some(10.0),
+                None,
+                Some("both"),
+                Some(TERM_PROTOCOL_V),
+                None,
+                None,
                 Some(V5Meta {
                     payload_mode: PayloadMode::EqualChunk,
                     representation: Representation::Bin,
                     topology: Topology::Direct,
                     chunk_bytes: 178,
                 }),
-            ).unwrap();
+            )
+            .unwrap();
         }
         let line = std::fs::read_to_string(&path).unwrap();
         assert!(line.contains("\"schema_version\":\"v5\""));
@@ -1364,7 +1538,9 @@ mod phase1_v5_tests {
         // the same position skew_logging.make_meta_v5 writes it at, and is
         // written from the declared value with no default.
         assert!(line.contains("\"log_schema_version\":5"));
-        assert!(line.contains("\"representation\":\"bin\",\"topology\":\"direct\",\"chunk_bytes\":178"));
+        assert!(
+            line.contains("\"representation\":\"bin\",\"topology\":\"direct\",\"chunk_bytes\":178")
+        );
         assert!(!line.contains("\"fps\""));
         std::fs::remove_file(path).unwrap();
     }
@@ -1375,21 +1551,36 @@ mod phase1_v5_tests {
         // analyser prefers a recorded epoch over reconstructing it from PC slot
         // 0's t_gen. Without this row the M/Md arms carry the reconstruction,
         // which overestimates t0 by the first slot's scheduling delay.
-        let path = std::env::temp_dir().join(format!(
-            "skew-a4-{}-{}.jsonl", std::process::id(), now_us()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("skew-a4-{}-{}.jsonl", std::process::id(), now_us()));
         {
             let mut logger = JsonlLogger::new(
-                &path, "a4", "moq", "tx", None, 0.0, 0.0, 0.0,
-                10, 30, 90, 1, Some(10.0), None, Some("both"),
-                Some(TERM_PROTOCOL_V), None, None,
+                &path,
+                "a4",
+                "moq",
+                "tx",
+                None,
+                0.0,
+                0.0,
+                0.0,
+                10,
+                30,
+                90,
+                1,
+                Some(10.0),
+                None,
+                Some("both"),
+                Some(TERM_PROTOCOL_V),
+                None,
+                None,
                 Some(V5Meta {
                     payload_mode: PayloadMode::EqualChunk,
                     representation: Representation::Bin,
                     topology: Topology::Direct,
                     chunk_bytes: 178,
                 }),
-            ).unwrap();
+            )
+            .unwrap();
             logger.log_measurement_start(1_234_567, 7).unwrap();
         }
         let body = std::fs::read_to_string(&path).unwrap();
@@ -1461,9 +1652,75 @@ mod phase1_v5_tests {
     }
 
     #[test]
+    fn warmup_rows_are_flagged_lifecycle_evidence() {
+        let path = std::env::temp_dir().join(format!(
+            "skew-warmup-{}-{}.jsonl",
+            std::process::id(),
+            now_us()
+        ));
+        {
+            let mut logger = JsonlLogger::new(
+                &path,
+                "warm",
+                "moq",
+                "tx",
+                None,
+                0.0,
+                0.0,
+                0.0,
+                10,
+                30,
+                90,
+                1,
+                Some(10.0),
+                None,
+                Some("both"),
+                Some(TERM_PROTOCOL_V),
+                None,
+                None,
+                Some(V5Meta {
+                    payload_mode: PayloadMode::Frame,
+                    representation: Representation::Bin,
+                    topology: Topology::Relay,
+                    chunk_bytes: 178,
+                }),
+            )
+            .unwrap();
+            let seq = warmup_seq(7).unwrap();
+            logger
+                .try_log_warmup_tx(
+                    "pc",
+                    2,
+                    seq,
+                    233_333,
+                    8,
+                    10,
+                    1_000_000,
+                    1_000_010,
+                    Some((1, 2, 3)),
+                )
+                .unwrap();
+            logger
+                .try_log_warmup_rx("haptic", 0, seq, 233_333, 8, 10, 1_000_000, 1_000_020)
+                .unwrap();
+            assert!(logger
+                .try_log_warmup_tx("pc", 2, 7, 0, 1, 10, 1, 2, None,)
+                .is_err());
+        }
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("\"event\":\"warmup_tx\""));
+        assert!(body.contains("\"seq\":2147483655"));
+        assert!(body.contains("\"group_id\":1,\"subgroup_id\":2,\"object_id\":3"));
+        assert!(body.contains("\"event\":\"warmup_rx\""));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn load_frames_checked_rejects_representation_mismatch() {
         let dir = std::env::temp_dir().join(format!(
-            "skew-rep-check-{}-{}", std::process::id(), now_us()
+            "skew-rep-check-{}-{}",
+            std::process::id(),
+            now_us()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("f0000.bin"), b"payload").unwrap();
@@ -1471,7 +1728,9 @@ mod phase1_v5_tests {
 
         // Declared bin over a bin tier: accepted.
         assert_eq!(
-            load_frames_checked(dir_str, Representation::Bin).unwrap().len(),
+            load_frames_checked(dir_str, Representation::Bin)
+                .unwrap()
+                .len(),
             1
         );
         // Declared draco over the same bin tier: rejected, because the wire

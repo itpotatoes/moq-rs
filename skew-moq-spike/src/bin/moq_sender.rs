@@ -11,9 +11,9 @@
 //
 // Namespace == run_id, so concurrent/repeat runs never collide on the relay.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -28,12 +28,12 @@ use moq_transport::{
     session::{DataPriorityMapping, Session, SessionConfig},
 };
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::time::{sleep_until, Instant};
 use url::Url;
 
 use skew_moq::s3_producer::SubscriptionProducerRegistry;
 use skew_moq::s3_sender::{
     run_namespace as run_s3_namespace, AcceptRouteMap, SenderContext as S3SenderContext,
+    SourceSchedule,
 };
 use skew_moq::*;
 
@@ -226,6 +226,13 @@ struct Args {
     /// Delay before workload starts so the subscriber can attach.
     #[arg(long, default_value_t = 1.0)]
     warmup: f64,
+    /// Confirmatory batch identity. These three phase options are all-or-none.
+    #[arg(long)]
+    batch_id: Option<String>,
+    #[arg(long)]
+    phase_control: Option<PathBuf>,
+    #[arg(long)]
+    warmup_pass: Option<PathBuf>,
     /// Extra time to keep the session up after sending, to drain backlog.
     #[arg(long, default_value_t = 10.0)]
     drain_timeout: f64,
@@ -322,18 +329,15 @@ fn preflight(frames: &[Vec<u8>], args: &Args) -> Preflight {
     let chunks_mean = chunks_sum as f64 / chunks.len() as f64;
     let pc_objects_per_s = chunks_mean * args.pc_rate_hz as f64;
     let haptic_objects_per_s = args.haptic_rate_hz as f64;
-    let source_haptic_bytes_per_s =
-        PCM_SAMPLE_RATE_HZ as f64 * PCM_BYTES_PER_SAMPLE as f64;
+    let source_haptic_bytes_per_s = PCM_SAMPLE_RATE_HZ as f64 * PCM_BYTES_PER_SAMPLE as f64;
     let source_payload_bytes_per_s =
         frame_mean * args.pc_rate_hz as f64 + source_haptic_bytes_per_s;
     let application_bytes_per_s = match args.payload_mode {
         PayloadMode::Frame => {
-            source_payload_bytes_per_s
-                + (pc_objects_per_s + haptic_objects_per_s) * HDR as f64
+            source_payload_bytes_per_s + (pc_objects_per_s + haptic_objects_per_s) * HDR as f64
         }
         PayloadMode::EqualChunk => {
-            (pc_objects_per_s + haptic_objects_per_s)
-                * (HDR + CHUNK_HDR + args.chunk_bytes) as f64
+            (pc_objects_per_s + haptic_objects_per_s) * (HDR + CHUNK_HDR + args.chunk_bytes) as f64
         }
     };
     let header_bytes_per_s = match args.payload_mode {
@@ -391,7 +395,10 @@ fn preflight_info(p: Preflight) -> String {
 /// and RX metadata disagree on `S_bytes` -- that is what blocked every gate-6
 /// pair. Same rule as `scripts/registered_s_bytes.py`.
 fn registered_s_bytes(frame_sum: usize, frame_count: usize) -> u64 {
-    assert!(frame_count > 0, "registered_s_bytes needs at least one frame");
+    assert!(
+        frame_count > 0,
+        "registered_s_bytes needs at least one frame"
+    );
     ((2 * frame_sum as u128 + frame_count as u128) / (2 * frame_count as u128)) as u64
 }
 
@@ -413,6 +420,7 @@ fn registered_s_bytes(frame_sum: usize, frame_count: usize) -> u64 {
 /// capture" -- so the one reading that proves the clock cannot be trusted would
 /// have produced the strongest possible claim about it (Codex 89차 P1). Failing
 /// here costs one run; recording it costs a run that looks ideal and is not.
+#[cfg(test)]
 fn epoch_record(before_us: u64, after_us: u64) -> Result<(u64, u64)> {
     let span = after_us.checked_sub(before_us).with_context(|| {
         format!(
@@ -532,6 +540,211 @@ fn validate_s3_args(args: &Args) -> Result<()> {
     Ok(())
 }
 
+fn validate_phase_args(args: &Args) -> Result<()> {
+    let supplied = [
+        args.batch_id.is_some(),
+        args.phase_control.is_some(),
+        args.warmup_pass.is_some(),
+    ];
+    if supplied.iter().any(|value| *value) && !supplied.iter().all(|value| *value) {
+        anyhow::bail!("--batch-id, --phase-control, and --warmup-pass are all-or-none");
+    }
+    if supplied.iter().all(|value| *value) && args.tracks != TrackSel::Both {
+        anyhow::bail!("registered warmup phase control requires --tracks both");
+    }
+    Ok(())
+}
+
+fn topology_phase_arm(topology: Topology) -> &'static str {
+    match topology {
+        Topology::Relay => "M",
+        Topology::Direct => "Md",
+    }
+}
+
+async fn sleep_monotonic_until(target_us: u64) {
+    let wait = target_us.saturating_sub(now_us());
+    if wait > 0 {
+        tokio::time::sleep(Duration::from_micros(wait)).await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_static_registered_warmup(
+    args: &Args,
+    phase: &skew_moq::phase::PhaseControl,
+    frames: &Arc<Vec<Vec<u8>>>,
+    pcm: &Arc<Vec<u8>>,
+    logger: &Arc<Mutex<JsonlLogger>>,
+    pc_sub: &mut moq_transport::serve::SubgroupsWriter,
+    pc_long_sg: &mut Option<moq_transport::serve::SubgroupWriter>,
+    haptic_sg: &mut moq_transport::serve::SubgroupWriter,
+    ratio: u64,
+) -> Result<()> {
+    let pc_count = args
+        .pc_rate_hz
+        .checked_mul(3)
+        .context("PC warmup count overflow")?;
+    let haptic_count = args
+        .haptic_rate_hz
+        .checked_mul(3)
+        .context("haptic warmup count overflow")?;
+    let frame_subgroups = args.arm.pc_frame_subgroups();
+    let pc_priority = args.arm.pc_priority();
+
+    let pc = async {
+        for index in 0..pc_count {
+            sleep_monotonic_until(
+                phase
+                    .warmup_start_us
+                    .saturating_add(timestamp_us(index, args.pc_rate_hz)),
+            )
+            .await;
+            let pts_us = timestamp_us(index, args.pc_rate_hz);
+            let seq = warmup_seq(index)?;
+            let payload = &frames[(index as usize) % frames.len()];
+            let t_gen = now_us();
+            let object_payloads: Vec<Cow<'_, [u8]>> = match args.payload_mode {
+                PayloadMode::Frame => vec![Cow::Borrowed(payload.as_slice())],
+                PayloadMode::EqualChunk => equal_chunks(payload, seq, args.chunk_bytes)?
+                    .into_iter()
+                    .map(Cow::Owned)
+                    .collect(),
+            };
+            let mut frame_sg = if frame_subgroups {
+                Some(
+                    pc_sub
+                        .append(pc_priority)
+                        .context("PC warmup frame append")?,
+                )
+            } else {
+                None
+            };
+            let mut frame_obj = None;
+            for object_payload in &object_payloads {
+                let subgroup = match frame_sg.as_mut() {
+                    Some(value) => value,
+                    None => pc_long_sg
+                        .as_mut()
+                        .context("PC warmup long subgroup missing")?,
+                };
+                let header = pack_header(
+                    TRACK_PC,
+                    args.tier,
+                    seq,
+                    pts_us,
+                    (index + 1) as u32,
+                    t_gen,
+                    object_payload.len() as u32,
+                );
+                let mut bytes = Vec::with_capacity(HDR + object_payload.len());
+                bytes.extend_from_slice(&header);
+                bytes.extend_from_slice(object_payload.as_ref());
+                let identity = (subgroup.group_id, subgroup.subgroup_id);
+                let mut object = subgroup
+                    .create(bytes.len(), None)
+                    .context("PC warmup create")?;
+                let object_id = object.object_id;
+                object
+                    .write(Bytes::from(bytes))
+                    .context("PC warmup write")?;
+                drop(object);
+                if args.payload_mode == PayloadMode::Frame {
+                    frame_obj = Some((identity.0, identity.1, object_id));
+                }
+            }
+            drop(frame_sg);
+            logger
+                .lock()
+                .map_err(|_| anyhow::anyhow!("TX logger poisoned"))?
+                .try_log_warmup_tx(
+                    "pc",
+                    args.tier,
+                    seq,
+                    pts_us,
+                    (index + 1) as u32,
+                    payload.len(),
+                    t_gen,
+                    now_us(),
+                    frame_obj,
+                )?;
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+
+    let haptic = async {
+        for tick in 0..haptic_count {
+            sleep_monotonic_until(
+                phase
+                    .warmup_start_us
+                    .saturating_add(timestamp_us(tick, args.haptic_rate_hz)),
+            )
+            .await;
+            let (pts_us, event_id) = if tick % ratio == 0 {
+                let frame = tick / ratio;
+                (timestamp_us(frame, args.pc_rate_hz), (frame + 1) as u32)
+            } else {
+                (timestamp_us(tick, args.haptic_rate_hz), 0)
+            };
+            let seq = warmup_seq(tick)?;
+            let payload = pcm_tick_payload(pcm, tick, PCM_SAMPLE_RATE_HZ, args.haptic_rate_hz)?;
+            let t_gen = now_us();
+            let object_payloads: Vec<Cow<'_, [u8]>> = match args.payload_mode {
+                PayloadMode::Frame => vec![Cow::Borrowed(payload.as_slice())],
+                PayloadMode::EqualChunk => equal_chunks(&payload, seq, args.chunk_bytes)?
+                    .into_iter()
+                    .map(Cow::Owned)
+                    .collect(),
+            };
+            let mut frame_obj = None;
+            for object_payload in &object_payloads {
+                let header = pack_header(
+                    TRACK_HAPTIC,
+                    HAPTIC_TIER_FULL,
+                    seq,
+                    pts_us,
+                    event_id,
+                    t_gen,
+                    object_payload.len() as u32,
+                );
+                let mut bytes = Vec::with_capacity(HDR + object_payload.len());
+                bytes.extend_from_slice(&header);
+                bytes.extend_from_slice(object_payload.as_ref());
+                let identity = (haptic_sg.group_id, haptic_sg.subgroup_id);
+                let mut object = haptic_sg
+                    .create(bytes.len(), None)
+                    .context("haptic warmup create")?;
+                let object_id = object.object_id;
+                object
+                    .write(Bytes::from(bytes))
+                    .context("haptic warmup write")?;
+                drop(object);
+                if args.payload_mode == PayloadMode::Frame {
+                    frame_obj = Some((identity.0, identity.1, object_id));
+                }
+            }
+            logger
+                .lock()
+                .map_err(|_| anyhow::anyhow!("TX logger poisoned"))?
+                .try_log_warmup_tx(
+                    "haptic",
+                    HAPTIC_TIER_FULL,
+                    seq,
+                    pts_us,
+                    event_id,
+                    payload.len(),
+                    t_gen,
+                    now_us(),
+                    frame_obj,
+                )?;
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+
+    tokio::try_join!(pc, haptic)?;
+    Ok(())
+}
+
 struct S3AcceptSink {
     logger: Arc<Mutex<JsonlLogger>>,
     routes: AcceptRouteMap,
@@ -604,6 +817,7 @@ async fn main() -> Result<()> {
     );
     let phase4_transport = phase4_transport(&args)?;
     validate_s3_args(&args)?;
+    validate_phase_args(&args)?;
 
     // ---- Workload ----
     let frames: Vec<Vec<u8>> = match (&args.frames_dir, args.dummy_size) {
@@ -653,11 +867,24 @@ async fn main() -> Result<()> {
     );
 
     let logger = Arc::new(Mutex::new(JsonlLogger::new(
-        &args.out, &args.run_id, "moq", "tx", args.c_mbps, args.rtt_ms,
-        args.jitter_ms, args.loss_pct, s_bytes, args.pc_rate_hz,
-        args.haptic_rate_hz, args.seed,
-        Some(args.duration), Some(&haptic_src), Some(args.tracks.as_str()),
-        Some(TERM_PROTOCOL_V), None, phase4_transport,
+        &args.out,
+        &args.run_id,
+        "moq",
+        "tx",
+        args.c_mbps,
+        args.rtt_ms,
+        args.jitter_ms,
+        args.loss_pct,
+        s_bytes,
+        args.pc_rate_hz,
+        args.haptic_rate_hz,
+        args.seed,
+        Some(args.duration),
+        Some(&haptic_src),
+        Some(args.tracks.as_str()),
+        Some(TERM_PROTOCOL_V),
+        None,
+        phase4_transport,
         Some(V5Meta {
             payload_mode: args.payload_mode,
             representation: args.representation,
@@ -667,9 +894,10 @@ async fn main() -> Result<()> {
     )?));
     logger.lock().unwrap().log_info(&preflight_info(pf));
     if args.preflight_only {
-        logger.lock().unwrap().try_log_info(
-            "\"event\":\"shutdown\",\"ending\":\"preflight_only\",\"exit_code\":0"
-        )?;
+        logger
+            .lock()
+            .unwrap()
+            .try_log_info("\"event\":\"shutdown\",\"ending\":\"preflight_only\",\"exit_code\":0")?;
         println!("[tx] preflight-only complete -> {}", args.out.display());
         return Ok(());
     }
@@ -683,8 +911,8 @@ async fn main() -> Result<()> {
     // a transport-accept time, not an on-the-wire time. It follows send
     // backpressure under congestion and degenerates to a handoff time
     // otherwise.
-    let accept_trace_enabled = args.accept_trace
-        && (args.payload_mode == PayloadMode::Frame || args.chunk_trace);
+    let accept_trace_enabled =
+        args.accept_trace && (args.payload_mode == PayloadMode::Frame || args.chunk_trace);
     let s3_accept_routes: AcceptRouteMap = Arc::new(Mutex::new(HashMap::new()));
     let accept_trace = if accept_trace_enabled {
         if args.arm == Arm::S3 {
@@ -759,20 +987,19 @@ async fn main() -> Result<()> {
         let namespace = TrackNamespace::from_utf8_path(&args.run_id);
 
         if args.arm == Arm::S3 {
-            let warmup_us = Duration::from_secs_f64(args.warmup).as_micros() as u64;
             let duration_us = Duration::from_secs_f64(args.duration).as_micros() as u64;
-            let anchor_us = now_us()
-                .checked_add(warmup_us)
-                .context("S3 run anchor overflow")?;
-            let end_us = anchor_us
-                .checked_add(duration_us)
-                .context("S3 run end overflow")?;
             let (recovery_frames, critical_frames) =
                 s3_frames.as_ref().expect("validated S3 frames");
             let registry = Arc::new(Mutex::new(SubscriptionProducerRegistry::new()));
+            // The initial subscriptions must exist before the runner can
+            // observe readiness and publish phase-control. Producers therefore
+            // wait on this one-shot schedule authority instead of inventing an
+            // anchor at subscription time.
+            let (schedule_tx, schedule_rx) = tokio::sync::watch::channel(None);
+            let (measurement_tx, measurement_rx) = tokio::sync::watch::channel(false);
             let context = Arc::new(S3SenderContext {
-                clock: skew_moq::s3_producer::RunSlotClock::new(anchor_us),
-                end_us,
+                schedule: schedule_rx,
+                measurement_gate: measurement_rx,
                 pc_rate_hz: args.pc_rate_hz,
                 haptic_rate_hz: args.haptic_rate_hz,
                 normal_frames: frames.clone(),
@@ -792,7 +1019,71 @@ async fn main() -> Result<()> {
                 run_s3_namespace(ns_publisher, namespace, context, ns_registry, ns_routes),
             ));
 
-            let run_wait = Duration::from_micros(warmup_us.saturating_add(duration_us));
+            let run_sequence = async {
+                let (schedule, phase) = if let (Some(batch_id), Some(phase_path)) =
+                    (args.batch_id.as_deref(), args.phase_control.as_ref())
+                {
+                    let phase = skew_moq::phase::wait_phase_control(
+                        phase_path.clone(),
+                        batch_id,
+                        &args.run_id,
+                        topology_phase_arm(args.topology),
+                        Duration::from_secs(30),
+                    )
+                    .await?;
+                    let end_us = phase
+                        .t0_us
+                        .checked_add(duration_us)
+                        .context("S3 registered run end overflow")?;
+                    (
+                        SourceSchedule {
+                            warmup_start_us: Some(phase.warmup_start_us),
+                            measurement_start_us: phase.t0_us,
+                            end_us,
+                        },
+                        Some(phase),
+                    )
+                } else {
+                    let warmup_us = Duration::from_secs_f64(args.warmup).as_micros() as u64;
+                    let measurement_start_us = now_us()
+                        .checked_add(warmup_us)
+                        .context("S3 legacy run anchor overflow")?;
+                    let end_us = measurement_start_us
+                        .checked_add(duration_us)
+                        .context("S3 legacy run end overflow")?;
+                    (
+                        SourceSchedule {
+                            warmup_start_us: None,
+                            measurement_start_us,
+                            end_us,
+                        },
+                        None,
+                    )
+                };
+                schedule_tx
+                    .send(Some(schedule))
+                    .map_err(|_| anyhow::anyhow!("S3 schedule consumers closed"))?;
+                if let Some(phase) = &phase {
+                    skew_moq::phase::require_warmup_pass(
+                        args.warmup_pass
+                            .clone()
+                            .expect("validated warmup pass path"),
+                        phase,
+                    )
+                    .await?;
+                }
+                sleep_monotonic_until(schedule.measurement_start_us).await;
+                logger
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("TX logger poisoned"))?
+                    .log_measurement_start(schedule.measurement_start_us, 0)
+                    .context("failed to record the S3 measurement epoch")?;
+                measurement_tx
+                    .send(true)
+                    .map_err(|_| anyhow::anyhow!("S3 measurement gate consumers closed"))?;
+                sleep_monotonic_until(schedule.end_us).await;
+                Ok::<(), anyhow::Error>(())
+            };
             let step: Result<()> = {
                 let p = producers.as_mut().expect("producers set above");
                 let sr = p.session_run.as_mut().expect("session handle present");
@@ -800,7 +1091,7 @@ async fn main() -> Result<()> {
                 let mut session_done = None;
                 let mut ns_done = None;
                 let outcome = tokio::select! {
-                    _ = tokio::time::sleep(run_wait) => Ok(()),
+                    result = run_sequence => result,
                     _ = wait_signal(&mut sig_rx) => {
                         ending = Ending::Signal;
                         Ok(())
@@ -873,25 +1164,85 @@ async fn main() -> Result<()> {
         // publisher no longer needed after cloning for the namespace.
         let _ = &mut publisher;
 
-        // Warmup so the subscriber is attached before objects flow.
-        tokio::time::sleep(Duration::from_secs_f64(args.warmup)).await;
-        // A-4: the schedule's base and the log clock are two readings, so the
-        // true monotonic microsecond of `anchor` lies between them. Record the
-        // *earlier* one -- the recorded epoch is then never later than the base
-        // every deadline is hung off, so deadlines can only be conservative --
-        // and record the span so the analyser can refuse a capture that was
-        // preempted (Codex 88차 P1-3). The earlier claim that the two differ by
-        // "one syscall" was wrong: a preemption here is a scheduling quantum.
-        let before_us = now_us();
-        let anchor = Instant::now();
-        let after_us = now_us();
-        let (t0_us, capture_span_us) = epoch_record(before_us, after_us)?;
+        // Establish the real subgroup mapping before readiness. In registered
+        // mode these exact writers span warmup and measurement, so the t0 edge
+        // neither drains backlog nor creates a different transport route.
+        let mut pc_state = if args.tracks.pc_on() {
+            let mut subgroups = pc_tw.subgroups().context("pc subgroups")?;
+            let long = if args.arm.pc_frame_subgroups() {
+                None
+            } else {
+                Some(
+                    subgroups
+                        .append(args.arm.pc_priority())
+                        .context("pc append")?,
+                )
+            };
+            Some((subgroups, long))
+        } else {
+            drop(pc_tw.subgroups().context("pc subgroups")?);
+            None
+        };
+        let mut haptic_state = if args.tracks.haptic_on() {
+            let mut subgroups = hap_tw.subgroups().context("haptic subgroups")?;
+            let subgroup = subgroups
+                .append(args.arm.haptic_priority())
+                .context("haptic append")?;
+            Some((subgroups, subgroup))
+        } else {
+            drop(hap_tw.subgroups().context("haptic subgroups")?);
+            None
+        };
+
+        let phase = if let (Some(batch_id), Some(path)) =
+            (args.batch_id.as_deref(), args.phase_control.as_ref())
+        {
+            Some(
+                skew_moq::phase::wait_phase_control(
+                    path.clone(),
+                    batch_id,
+                    &args.run_id,
+                    topology_phase_arm(args.topology),
+                    Duration::from_secs(30),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let t0_us = if let Some(phase) = &phase {
+            let (pc_sub, pc_long_sg) = pc_state
+                .as_mut()
+                .context("registered warmup requires the PC track")?;
+            let (_, haptic_sg) = haptic_state
+                .as_mut()
+                .context("registered warmup requires the haptic track")?;
+            send_static_registered_warmup(
+                &args, phase, &frames, &pcm, &logger, pc_sub, pc_long_sg, haptic_sg, ratio,
+            )
+            .await?;
+            skew_moq::phase::require_warmup_pass(
+                args.warmup_pass
+                    .clone()
+                    .expect("validated warmup pass path"),
+                phase,
+            )
+            .await?;
+            sleep_monotonic_until(phase.t0_us).await;
+            phase.t0_us
+        } else {
+            tokio::time::sleep(Duration::from_secs_f64(args.warmup)).await;
+            now_us()
+        };
         logger
             .lock()
             .unwrap()
-            .log_measurement_start(t0_us, capture_span_us)
+            .log_measurement_start(t0_us, 0)
             .context("failed to record the measurement epoch")?;
-        let end = anchor + Duration::from_secs_f64(args.duration);
+        let duration_us = Duration::from_secs_f64(args.duration).as_micros() as u64;
+        let end_us = t0_us
+            .checked_add(duration_us)
+            .context("static run end overflow")?;
 
         // ---- PC loop: rational PC Hz, with the arm-specific subgroup map ----
         let pc_task = if args.tracks.pc_on() {
@@ -903,18 +1254,13 @@ async fn main() -> Result<()> {
             let chunk_bytes = args.chunk_bytes;
             let frame_subgroups = args.arm.pc_frame_subgroups();
             let priority = args.arm.pc_priority();
-            let mut pc_sub = pc_tw.subgroups().context("pc subgroups")?;
-            let mut long_sg = if frame_subgroups {
-                None
-            } else {
-                Some(pc_sub.append(priority).context("pc append")?)
-            };
+            let (mut pc_sub, mut long_sg) = pc_state.take().expect("PC state validated");
             Some(tokio::spawn(async move {
                 let mut i: u64 = 0;
                 let mut stats = TrackRunStats::default();
-                while Instant::now() < end {
-                    sleep_until(anchor + Duration::from_nanos(deadline_ns(i, pc_rate_hz))).await;
-                    if Instant::now() >= end {
+                while now_us() < end_us {
+                    sleep_monotonic_until(t0_us.saturating_add(timestamp_us(i, pc_rate_hz))).await;
+                    if now_us() >= end_us {
                         break;
                     }
                     let pts = timestamp_us(i, pc_rate_hz);
@@ -923,14 +1269,10 @@ async fn main() -> Result<()> {
                     stats.period.observe(t_gen);
                     let object_payloads: Vec<Cow<'_, [u8]>> = match payload_mode {
                         PayloadMode::Frame => vec![Cow::Borrowed(payload.as_slice())],
-                        PayloadMode::EqualChunk => equal_chunks(
-                            payload,
-                            i as u32,
-                            chunk_bytes,
-                        )?
-                        .into_iter()
-                        .map(Cow::Owned)
-                        .collect(),
+                        PayloadMode::EqualChunk => equal_chunks(payload, i as u32, chunk_bytes)?
+                            .into_iter()
+                            .map(Cow::Owned)
+                            .collect(),
                     };
                     let mut frame_sg = if frame_subgroups {
                         Some(pc_sub.append(priority).context("pc frame append")?)
@@ -990,7 +1332,6 @@ async fn main() -> Result<()> {
                 Ok::<TrackRunStats, anyhow::Error>(stats)
             }))
         } else {
-            drop(pc_tw.subgroups().context("pc subgroups")?);
             None
         };
 
@@ -1002,18 +1343,14 @@ async fn main() -> Result<()> {
             let haptic_rate_hz = args.haptic_rate_hz;
             let payload_mode = args.payload_mode;
             let chunk_bytes = args.chunk_bytes;
-            let priority = args.arm.haptic_priority();
-            let mut hap_sub = hap_tw.subgroups().context("haptic subgroups")?;
-            let mut sg = hap_sub.append(priority).context("haptic append")?;
+            let (hap_sub, mut sg) = haptic_state.take().expect("haptic state validated");
             Some(tokio::spawn(async move {
                 let mut k: u64 = 0;
                 let mut stats = TrackRunStats::default();
-                while Instant::now() < end {
-                    sleep_until(
-                        anchor + Duration::from_nanos(deadline_ns(k, haptic_rate_hz)),
-                    )
-                    .await;
-                    if Instant::now() >= end {
+                while now_us() < end_us {
+                    sleep_monotonic_until(t0_us.saturating_add(timestamp_us(k, haptic_rate_hz)))
+                        .await;
+                    if now_us() >= end_us {
                         break;
                     }
                     let (pts, event_id) = if k % ratio == 0 {
@@ -1022,8 +1359,7 @@ async fn main() -> Result<()> {
                     } else {
                         (timestamp_us(k, haptic_rate_hz), 0u32)
                     };
-                    let payload =
-                        pcm_tick_payload(&pcm, k, PCM_SAMPLE_RATE_HZ, haptic_rate_hz)?;
+                    let payload = pcm_tick_payload(&pcm, k, PCM_SAMPLE_RATE_HZ, haptic_rate_hz)?;
                     let t_gen = now_us();
                     stats.period.observe(t_gen);
                     let object_payloads: Vec<Cow<'_, [u8]>> = match payload_mode {
@@ -1081,7 +1417,6 @@ async fn main() -> Result<()> {
                 Ok::<TrackRunStats, anyhow::Error>(stats)
             }))
         } else {
-            drop(hap_tw.subgroups().context("haptic subgroups")?);
             None
         };
 
@@ -1140,8 +1475,11 @@ async fn main() -> Result<()> {
         }
         println!(
             "[tx] sent pc={} haptic={} chunks={}/{}; draining {}s",
-            pc_stats.logical_generated, hap_stats.logical_generated,
-            pc_stats.chunks_sent, hap_stats.chunks_sent, args.drain_timeout
+            pc_stats.logical_generated,
+            hap_stats.logical_generated,
+            pc_stats.chunks_sent,
+            hap_stats.chunks_sent,
+            args.drain_timeout
         );
 
         // Keep the session up so the relay forwards the backlog to the
@@ -1304,7 +1642,10 @@ mod tests {
         assert_eq!(registered_s_bytes(0, 7), 0);
         // Exact past the f64 mantissa, where the old `mean.round()` path could
         // not be trusted to agree with integer arithmetic.
-        assert_eq!(registered_s_bytes(9_007_199_254_740_993, 1), 9_007_199_254_740_993);
+        assert_eq!(
+            registered_s_bytes(9_007_199_254_740_993, 1),
+            9_007_199_254_740_993
+        );
     }
 
     #[test]

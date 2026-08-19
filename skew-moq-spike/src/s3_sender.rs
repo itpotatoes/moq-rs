@@ -13,10 +13,12 @@ use bytes::Bytes;
 use moq_transport::coding::TrackNamespace;
 use moq_transport::serve::TrackWriter;
 use moq_transport::session::Publisher;
+use tokio::sync::watch;
 use tokio::task::JoinSet;
 
 use crate::s3_producer::{
-    serve_subscription_producer, ProducerLease, RunSlotClock, SubscriptionProducerRegistry,
+    serve_subscription_producer, ProducerLease, RunSlotClock, SlotError,
+    SubscriptionProducerRegistry,
 };
 use crate::s3_switch::{
     Route, TrackRole, HAPTIC_ESSENTIAL_TRACK, HAPTIC_FULL_TRACK, PC_HAPTIC_CRITICAL_TRACK,
@@ -38,9 +40,54 @@ pub struct AcceptRoute {
 
 pub type AcceptRouteMap = Arc<Mutex<HashMap<u64, AcceptRoute>>>;
 
-pub struct SenderContext {
-    pub clock: RunSlotClock,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceSchedule {
+    pub warmup_start_us: Option<u64>,
+    pub measurement_start_us: u64,
     pub end_us: u64,
+}
+
+impl SourceSchedule {
+    fn validate(self) -> anyhow::Result<()> {
+        if let Some(start) = self.warmup_start_us {
+            if self.measurement_start_us.checked_sub(start)
+                != Some(crate::phase::WARMUP_DURATION_US)
+            {
+                bail!("S3 registered warmup must be exactly 3,000,000 us");
+            }
+        }
+        if self.end_us <= self.measurement_start_us {
+            bail!("S3 end must be after the common measurement anchor");
+        }
+        Ok(())
+    }
+
+    fn measurement_clock(self) -> RunSlotClock {
+        RunSlotClock::new(self.measurement_start_us)
+    }
+}
+
+fn initial_measurement_slot(
+    schedule: SourceSchedule,
+    route_generation: u64,
+    observed_at_us: u64,
+    rate_hz: u64,
+) -> Result<u64, SlotError> {
+    if schedule.warmup_start_us.is_some() && route_generation == 0 {
+        // The registered initial Normal/full routes own the common t0 and must
+        // emit measurement identity zero even when the gate wakes a few us
+        // late. Switched routes and every legacy run retain catch-up semantics.
+        Ok(0)
+    } else {
+        schedule
+            .measurement_clock()
+            .next_slot(observed_at_us, rate_hz)
+    }
+}
+
+pub struct SenderContext {
+    pub schedule: watch::Receiver<Option<SourceSchedule>>,
+    pub measurement_gate: watch::Receiver<bool>,
     pub pc_rate_hz: u64,
     pub haptic_rate_hz: u64,
     pub normal_frames: Arc<Vec<Vec<u8>>>,
@@ -55,9 +102,6 @@ impl SenderContext {
     pub fn validate(&self) -> anyhow::Result<()> {
         validate_v5_rates(self.pc_rate_hz, self.haptic_rate_hz)
             .context("S3 requires the v5 30:90 Hz rate contract")?;
-        if self.end_us <= self.clock.anchor_us {
-            bail!("S3 end must be after the common run anchor");
-        }
         if self.shutdown_timeout.is_zero() {
             bail!("S3 producer shutdown timeout must be greater than zero");
         }
@@ -71,6 +115,32 @@ impl SenderContext {
             bail!("S3 haptic PCM must not be empty");
         }
         Ok(())
+    }
+
+    async fn await_schedule(&self) -> anyhow::Result<SourceSchedule> {
+        let mut schedule = self.schedule.clone();
+        loop {
+            if let Some(value) = *schedule.borrow_and_update() {
+                value.validate()?;
+                return Ok(value);
+            }
+            schedule
+                .changed()
+                .await
+                .context("S3 source schedule authority closed")?;
+        }
+    }
+
+    async fn await_measurement_gate(&self) -> anyhow::Result<()> {
+        let mut gate = self.measurement_gate.clone();
+        loop {
+            if *gate.borrow_and_update() {
+                return Ok(());
+            }
+            gate.changed()
+                .await
+                .context("S3 measurement gate authority closed")?;
+        }
     }
 }
 
@@ -157,6 +227,85 @@ async fn sleep_until_us(target_us: u64) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn write_pc_object(
+    subgroups: &mut moq_transport::serve::SubgroupsWriter,
+    lease: &ProducerLease,
+    context: &SenderContext,
+    route: Route,
+    tier: u16,
+    frames: &Arc<Vec<Vec<u8>>>,
+    slot: u64,
+    seq: u32,
+    pts_us: u64,
+    event_id: u32,
+    warmup: bool,
+) -> anyhow::Result<()> {
+    let payload = &frames[(slot as usize) % frames.len()];
+    let t_gen = now_us();
+    let header = pack_header(
+        TRACK_PC,
+        tier,
+        seq,
+        pts_us,
+        event_id,
+        t_gen,
+        payload.len() as u32,
+    );
+    let mut bytes = Vec::with_capacity(HDR + payload.len());
+    bytes.extend_from_slice(&header);
+    bytes.extend_from_slice(payload);
+    if warmup {
+        lease
+            .authorize_warmup_object()
+            .map_err(|error| anyhow!("authorize S3 PC warmup object: {error:?}"))?;
+    } else {
+        lease
+            .record_object()
+            .map_err(|error| anyhow!("authorize S3 PC object: {error:?}"))?;
+    }
+    let mut subgroup = subgroups.append(S3_PC_PRIORITY).context("S3 PC append")?;
+    let identity = (subgroup.group_id, subgroup.subgroup_id);
+    let mut object = subgroup.create(bytes.len(), None).context("S3 PC create")?;
+    let object_id = object.object_id;
+    object.write(Bytes::from(bytes)).context("S3 PC write")?;
+    drop(object);
+    drop(subgroup);
+    let t_send = now_us();
+    let mut logger = context
+        .logger
+        .lock()
+        .map_err(|_| anyhow!("TX logger poisoned"))?;
+    if warmup {
+        logger.try_log_warmup_tx_s3(
+            TrackRole::Pc,
+            route,
+            tier,
+            seq,
+            pts_us,
+            event_id,
+            payload.len(),
+            t_gen,
+            t_send,
+            Some((identity.0, identity.1, object_id)),
+        )?;
+    } else {
+        logger.try_log_tx_s3(
+            TrackRole::Pc,
+            route,
+            tier,
+            seq,
+            pts_us,
+            event_id,
+            payload.len(),
+            t_gen,
+            t_send,
+            Some((identity.0, identity.1, object_id)),
+        )?;
+    }
+    Ok(())
+}
+
 fn haptic_payload(context: &SenderContext, tick: u64) -> anyhow::Result<Vec<u8>> {
     pcm_tick_payload(
         &context.haptic_pcm,
@@ -177,79 +326,85 @@ async fn produce_pc(
     let frames = frames_for_route(&context, route.name)
         .context("missing S3 PC frames")?
         .clone();
-    let mut slot = context
-        .clock
-        .next_slot(now_us(), context.pc_rate_hz)
-        .map_err(|error| anyhow!("derive initial PC slot: {error:?}"))?;
+    let schedule = context.await_schedule().await?;
     let mut subgroups = writer.subgroups().context("S3 PC subgroups")?;
     let mut count = 0u64;
 
+    if route.name == PC_NORMAL_TRACK {
+        if let Some(warmup_start_us) = schedule.warmup_start_us {
+            let warmup_clock = RunSlotClock::new(warmup_start_us);
+            let mut slot = warmup_clock
+                .next_slot(now_us(), context.pc_rate_hz)
+                .map_err(|error| anyhow!("derive initial PC warmup slot: {error:?}"))?;
+            loop {
+                let pts_us = timestamp_us(slot, context.pc_rate_hz);
+                let target_us = warmup_start_us.saturating_add(pts_us);
+                if target_us >= schedule.measurement_start_us {
+                    break;
+                }
+                sleep_until_us(target_us).await;
+                if lease.is_cancelled() {
+                    return Ok(count);
+                }
+                write_pc_object(
+                    &mut subgroups,
+                    &lease,
+                    &context,
+                    route,
+                    tier,
+                    &frames,
+                    slot,
+                    crate::warmup_seq(slot)?,
+                    pts_us,
+                    u32::try_from(slot.checked_add(1).context("S3 PC warmup event overflow")?)
+                        .context("S3 PC warmup event overflow")?,
+                    true,
+                )?;
+                slot = slot.checked_add(1).context("S3 PC warmup slot overflow")?;
+            }
+        }
+    }
+    context.await_measurement_gate().await?;
+    if lease.is_cancelled() {
+        return Ok(count);
+    }
+    let mut slot =
+        initial_measurement_slot(schedule, route.generation, now_us(), context.pc_rate_hz)
+            .map_err(|error| anyhow!("derive initial PC slot: {error:?}"))?;
+
     loop {
         let pts_us = timestamp_us(slot, context.pc_rate_hz);
-        let target_us = context.clock.anchor_us.saturating_add(pts_us);
-        if target_us >= context.end_us {
+        let target_us = schedule.measurement_start_us.saturating_add(pts_us);
+        if target_us >= schedule.end_us {
             break;
         }
         sleep_until_us(target_us).await;
-        if now_us() >= context.end_us || lease.is_cancelled() {
+        if now_us() >= schedule.end_us || lease.is_cancelled() {
             break;
         }
         let seq = u32::try_from(slot).context("S3 PC sequence overflow")?;
         let event_id = u32::try_from(slot.checked_add(1).context("S3 PC event overflow")?)
             .context("S3 PC event overflow")?;
-        let payload = &frames[(slot as usize) % frames.len()];
-        let t_gen = now_us();
-        let header = pack_header(
-            TRACK_PC,
+        write_pc_object(
+            &mut subgroups,
+            &lease,
+            &context,
+            route,
             tier,
+            &frames,
+            slot,
             seq,
             pts_us,
             event_id,
-            t_gen,
-            payload.len() as u32,
-        );
-        let mut bytes = Vec::with_capacity(HDR + payload.len());
-        bytes.extend_from_slice(&header);
-        bytes.extend_from_slice(payload);
-
-        // No writer/history mutation may occur after cancellation.
-        lease
-            .record_object()
-            .map_err(|error| anyhow!("authorize S3 PC object: {error:?}"))?;
-        let mut subgroup = subgroups.append(S3_PC_PRIORITY).context("S3 PC append")?;
-        let identity = (subgroup.group_id, subgroup.subgroup_id);
-        let mut object = subgroup.create(bytes.len(), None).context("S3 PC create")?;
-        let object_id = object.object_id;
-        object.write(Bytes::from(bytes)).context("S3 PC write")?;
-        drop(object);
-        drop(subgroup);
-        context
-            .logger
-            .lock()
-            .map_err(|_| anyhow!("TX logger poisoned"))?
-            .try_log_tx_s3(
-                TrackRole::Pc,
-                route,
-                tier,
-                seq,
-                pts_us,
-                event_id,
-                payload.len(),
-                t_gen,
-                now_us(),
-                Some((identity.0, identity.1, object_id)),
-            )?;
+            false,
+        )?;
         count += 1;
         slot = slot.checked_add(1).context("S3 PC slot overflow")?;
     }
     Ok(count)
 }
 
-fn exact_frame_for_tick(
-    tick: u64,
-    pc_rate_hz: u64,
-    haptic_rate_hz: u64,
-) -> Option<u64> {
+fn exact_frame_for_tick(tick: u64, pc_rate_hz: u64, haptic_rate_hz: u64) -> Option<u64> {
     let ratio = validate_v5_rates(pc_rate_hz, haptic_rate_hz).ok()?;
     (tick % ratio == 0).then_some(tick / ratio)
 }
@@ -262,6 +417,7 @@ async fn write_haptic_object(
     tick: u64,
     pts_us: u64,
     event_id: u32,
+    warmup: bool,
 ) -> anyhow::Result<()> {
     let payload = haptic_payload(context, tick)?;
     let t_gen = now_us();
@@ -278,9 +434,15 @@ async fn write_haptic_object(
     bytes.extend_from_slice(&header);
     bytes.extend_from_slice(&payload);
 
-    lease
-        .record_object()
-        .map_err(|error| anyhow!("authorize S3 haptic object: {error:?}"))?;
+    if warmup {
+        lease
+            .authorize_warmup_object()
+            .map_err(|error| anyhow!("authorize S3 haptic warmup object: {error:?}"))?;
+    } else {
+        lease
+            .record_object()
+            .map_err(|error| anyhow!("authorize S3 haptic object: {error:?}"))?;
+    }
     let identity = (subgroup.group_id, subgroup.subgroup_id);
     let mut object = subgroup
         .create(bytes.len(), None)
@@ -290,11 +452,13 @@ async fn write_haptic_object(
         .write(Bytes::from(bytes))
         .context("S3 haptic write")?;
     drop(object);
-    context
+    let t_send = now_us();
+    let mut logger = context
         .logger
         .lock()
-        .map_err(|_| anyhow!("TX logger poisoned"))?
-        .try_log_tx_s3(
+        .map_err(|_| anyhow!("TX logger poisoned"))?;
+    if warmup {
+        logger.try_log_warmup_tx_s3(
             TrackRole::Haptic,
             lease.route(),
             HAPTIC_TIER_FULL,
@@ -303,9 +467,23 @@ async fn write_haptic_object(
             event_id,
             payload.len(),
             t_gen,
-            now_us(),
+            t_send,
             Some((identity.0, identity.1, object_id)),
         )?;
+    } else {
+        logger.try_log_tx_s3(
+            TrackRole::Haptic,
+            lease.route(),
+            HAPTIC_TIER_FULL,
+            seq,
+            pts_us,
+            event_id,
+            payload.len(),
+            t_gen,
+            t_send,
+            Some((identity.0, identity.1, object_id)),
+        )?;
+    }
     Ok(())
 }
 
@@ -320,20 +498,72 @@ async fn produce_haptic(
         .append(S3_HAPTIC_PRIORITY)
         .context("S3 haptic append")?;
     let mut count = 0u64;
+    let schedule = context.await_schedule().await?;
 
+    if !essential {
+        if let Some(warmup_start_us) = schedule.warmup_start_us {
+            let warmup_clock = RunSlotClock::new(warmup_start_us);
+            let mut tick = warmup_clock
+                .full_haptic_slot(now_us(), context.haptic_rate_hz)
+                .map_err(|error| anyhow!("derive initial haptic warmup slot: {error:?}"))?;
+            loop {
+                let nominal_pts = timestamp_us(tick, context.haptic_rate_hz);
+                let target_us = warmup_start_us.saturating_add(nominal_pts);
+                if target_us >= schedule.measurement_start_us {
+                    break;
+                }
+                sleep_until_us(target_us).await;
+                if lease.is_cancelled() {
+                    return Ok(count);
+                }
+                let (pts_us, event_id) =
+                    match exact_frame_for_tick(tick, context.pc_rate_hz, context.haptic_rate_hz) {
+                        Some(frame) => (
+                            timestamp_us(frame, context.pc_rate_hz),
+                            u32::try_from(
+                                frame
+                                    .checked_add(1)
+                                    .context("full haptic warmup event overflow")?,
+                            )
+                            .context("full haptic warmup event overflow")?,
+                        ),
+                        None => (nominal_pts, 0),
+                    };
+                write_haptic_object(
+                    &mut subgroup,
+                    &lease,
+                    &context,
+                    crate::warmup_seq(tick)?,
+                    tick,
+                    pts_us,
+                    event_id,
+                    true,
+                )
+                .await?;
+                tick = tick.checked_add(1).context("haptic warmup slot overflow")?;
+            }
+        }
+    }
+    context.await_measurement_gate().await?;
+    if lease.is_cancelled() {
+        return Ok(count);
+    }
     if essential {
-        let mut frame = context
-            .clock
-            .next_slot(now_us(), context.pc_rate_hz)
-            .map_err(|error| anyhow!("derive essential PC slot: {error:?}"))?;
+        let mut frame = initial_measurement_slot(
+            schedule,
+            lease.route().generation,
+            now_us(),
+            context.pc_rate_hz,
+        )
+        .map_err(|error| anyhow!("derive essential PC slot: {error:?}"))?;
         loop {
             let pts_us = timestamp_us(frame, context.pc_rate_hz);
-            let target_us = context.clock.anchor_us.saturating_add(pts_us);
-            if target_us >= context.end_us {
+            let target_us = schedule.measurement_start_us.saturating_add(pts_us);
+            if target_us >= schedule.end_us {
                 break;
             }
             sleep_until_us(target_us).await;
-            if now_us() >= context.end_us || lease.is_cancelled() {
+            if now_us() >= schedule.end_us || lease.is_cancelled() {
                 break;
             }
             let tick = anchor_tick(frame, context.pc_rate_hz, context.haptic_rate_hz)
@@ -345,41 +575,59 @@ async fn produce_haptic(
                     .context("essential haptic event overflow")?,
             )
             .context("essential haptic event overflow")?;
-            write_haptic_object(&mut subgroup, &lease, &context, seq, tick, pts_us, event_id)
-                .await?;
+            write_haptic_object(
+                &mut subgroup,
+                &lease,
+                &context,
+                seq,
+                tick,
+                pts_us,
+                event_id,
+                false,
+            )
+            .await?;
             count += 1;
             frame = frame.checked_add(1).context("essential PC slot overflow")?;
         }
     } else {
-        let mut tick = context
-            .clock
-            .full_haptic_slot(now_us(), context.haptic_rate_hz)
-            .map_err(|error| anyhow!("derive full haptic slot: {error:?}"))?;
+        let mut tick = initial_measurement_slot(
+            schedule,
+            lease.route().generation,
+            now_us(),
+            context.haptic_rate_hz,
+        )
+        .map_err(|error| anyhow!("derive full haptic slot: {error:?}"))?;
         loop {
             let nominal_pts = timestamp_us(tick, context.haptic_rate_hz);
-            let target_us = context.clock.anchor_us.saturating_add(nominal_pts);
-            if target_us >= context.end_us {
+            let target_us = schedule.measurement_start_us.saturating_add(nominal_pts);
+            if target_us >= schedule.end_us {
                 break;
             }
             sleep_until_us(target_us).await;
-            if now_us() >= context.end_us || lease.is_cancelled() {
+            if now_us() >= schedule.end_us || lease.is_cancelled() {
                 break;
             }
-            let (pts_us, event_id) = match exact_frame_for_tick(
-                tick,
-                context.pc_rate_hz,
-                context.haptic_rate_hz,
-            ) {
-                Some(frame) => (
-                    timestamp_us(frame, context.pc_rate_hz),
-                    u32::try_from(frame.checked_add(1).context("full haptic event overflow")?)
-                        .context("full haptic event overflow")?,
-                ),
-                None => (nominal_pts, 0),
-            };
+            let (pts_us, event_id) =
+                match exact_frame_for_tick(tick, context.pc_rate_hz, context.haptic_rate_hz) {
+                    Some(frame) => (
+                        timestamp_us(frame, context.pc_rate_hz),
+                        u32::try_from(frame.checked_add(1).context("full haptic event overflow")?)
+                            .context("full haptic event overflow")?,
+                    ),
+                    None => (nominal_pts, 0),
+                };
             let seq = u32::try_from(tick).context("full haptic sequence overflow")?;
-            write_haptic_object(&mut subgroup, &lease, &context, seq, tick, pts_us, event_id)
-                .await?;
+            write_haptic_object(
+                &mut subgroup,
+                &lease,
+                &context,
+                seq,
+                tick,
+                pts_us,
+                event_id,
+                false,
+            )
+            .await?;
             count += 1;
             tick = tick.checked_add(1).context("full haptic slot overflow")?;
         }
@@ -533,6 +781,37 @@ mod tests {
                 .unwrap()
                 .1
                 .generation,
+            1
+        );
+    }
+
+    #[test]
+    fn registered_initial_routes_start_at_zero_but_switches_and_legacy_catch_up() {
+        let registered = SourceSchedule {
+            warmup_start_us: Some(1_000_000),
+            measurement_start_us: 4_000_000,
+            end_us: 14_000_000,
+        };
+        assert_eq!(
+            initial_measurement_slot(registered, 0, 4_000_001, 30).unwrap(),
+            0
+        );
+        assert_eq!(
+            initial_measurement_slot(registered, 0, 4_000_001, 90).unwrap(),
+            0
+        );
+        assert_eq!(
+            initial_measurement_slot(registered, 1, 4_000_001, 30).unwrap(),
+            1
+        );
+
+        let legacy = SourceSchedule {
+            warmup_start_us: None,
+            measurement_start_us: 4_000_000,
+            end_us: 14_000_000,
+        };
+        assert_eq!(
+            initial_measurement_slot(legacy, 0, 4_000_001, 30).unwrap(),
             1
         );
     }
