@@ -46,6 +46,14 @@ const ACCEPT_DRAIN_BUDGET: Duration = Duration::from_secs(2);
 /// gone before the tap closes (A2-c R2), but a stuck one must not wedge us.
 const PRODUCER_JOIN_BUDGET: Duration = Duration::from_secs(2);
 
+/// After the registered drain edge a direct publisher must leave its session
+/// alive long enough for the receiver to consume the track FINs and close the
+/// peer session.  The receiver already has a 60 s post-drain safety margin;
+/// using the same bound here keeps the handoff finite without extending the
+/// 60 s measurement or 90 s drain. Relay runs retain their existing teardown:
+/// the relay, rather than this sender session, owns the downstream FIN handoff.
+const REGISTERED_DIRECT_FIN_HANDOFF_BUDGET: Duration = Duration::from_secs(60);
+
 /// Last-resort watchdog. If the finalizer itself wedges — e.g. inside a
 /// synchronous sink write, which `abort` cannot preempt — exit anyway so the
 /// runner's `pkill` + `wait` cannot hang forever. Deliberately much larger than
@@ -132,6 +140,32 @@ async fn hold_static_track_state_through_drain<P, H>(
     tokio::select! {
         _ = tokio::time::sleep(duration) => false,
         _ = wait_signal(&mut signal) => true,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DirectFinHandoff<T> {
+    PeerClosed(T),
+    Signal,
+    TimedOut,
+}
+
+/// Wait for the direct receiver to consume the released track FINs and close
+/// its peer session. The caller supplies the session future so this race stays
+/// unit-testable without opening a socket. A signal remains authoritative and
+/// a missing peer close never becomes an unbounded matrix hang.
+async fn wait_registered_direct_fin_handoff<F, T>(
+    budget: Duration,
+    mut signal: tokio::sync::watch::Receiver<bool>,
+    peer_close: F,
+) -> DirectFinHandoff<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::select! {
+        result = peer_close => DirectFinHandoff::PeerClosed(result),
+        _ = wait_signal(&mut signal) => DirectFinHandoff::Signal,
+        _ = tokio::time::sleep(budget) => DirectFinHandoff::TimedOut,
     }
 }
 
@@ -1521,16 +1555,48 @@ async fn main() -> Result<()> {
         // the relay forwards backlog. Releasing the writers emits FIN and gives
         // a complete receiver permission to exit. Legacy runs keep their old
         // session-only drain; a signal cuts either wait short for cleanup.
-        if hold_static_track_state_through_drain(
+        let drain_signalled = hold_static_track_state_through_drain(
             Duration::from_secs_f64(args.drain_timeout),
             sig_rx.clone(),
             pc_state.take(),
             haptic_state.take(),
             phase.is_some(),
         )
-        .await
-        {
+        .await;
+        if drain_signalled {
             ending = Ending::Signal;
+        } else if phase.is_some() && args.topology == Topology::Direct {
+            // Dropping the writer state above emits FIN. In a direct arm the
+            // finalizer must not immediately abort `session.run()`: that can
+            // close QUIC before the receiver observes the FIN and converts a
+            // complete 1800/5400 delivery into `session_ended` rc=5. The peer
+            // closes after draining both tracks, which is the positive handoff
+            // acknowledgement. Relay arms intentionally keep their existing
+            // teardown because their sender session is not the downstream
+            // receiver session.
+            let p = producers.as_mut().expect("producers set above");
+            let sr = p
+                .session_run
+                .as_mut()
+                .context("direct session handle missing")?;
+            match wait_registered_direct_fin_handoff(
+                REGISTERED_DIRECT_FIN_HANDOFF_BUDGET,
+                sig_rx.clone(),
+                &mut *sr,
+            )
+            .await
+            {
+                DirectFinHandoff::PeerClosed(result) => {
+                    p.session_seen = Some(JoinOutcome::from_join_result(&result));
+                    p.session_run = None;
+                }
+                DirectFinHandoff::Signal => ending = Ending::Signal,
+                DirectFinHandoff::TimedOut => {
+                    anyhow::bail!(
+                        "direct receiver did not close after registered track FIN handoff"
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -1675,7 +1741,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        epoch_record, hold_static_track_state_through_drain, now_us, registered_s_bytes, Duration,
+        epoch_record, hold_static_track_state_through_drain, now_us, registered_s_bytes,
+        wait_registered_direct_fin_handoff, DirectFinHandoff, Duration,
     };
 
     struct DropProbe(Arc<AtomicUsize>);
@@ -1739,6 +1806,37 @@ mod tests {
 
         signal_tx.send(true).unwrap();
         assert!(drain.await.unwrap(), "the signal must cut the drain short");
+    }
+
+    #[tokio::test]
+    async fn registered_direct_fin_handoff_observes_peer_close() {
+        let (_signal_tx, signal_rx) = tokio::sync::watch::channel(false);
+        let outcome =
+            wait_registered_direct_fin_handoff(Duration::from_secs(1), signal_rx, async { 7u8 })
+                .await;
+        assert!(matches!(outcome, DirectFinHandoff::PeerClosed(7)));
+    }
+
+    #[tokio::test]
+    async fn registered_direct_fin_handoff_remains_bounded_and_signal_aware() {
+        let (signal_tx, signal_rx) = tokio::sync::watch::channel(false);
+        signal_tx.send(true).unwrap();
+        let signalled = wait_registered_direct_fin_handoff(
+            Duration::from_secs(1),
+            signal_rx,
+            std::future::pending::<u8>(),
+        )
+        .await;
+        assert!(matches!(signalled, DirectFinHandoff::Signal));
+
+        let (_signal_tx, signal_rx) = tokio::sync::watch::channel(false);
+        let timed_out = wait_registered_direct_fin_handoff(
+            Duration::from_millis(1),
+            signal_rx,
+            std::future::pending::<u8>(),
+        )
+        .await;
+        assert!(matches!(timed_out, DirectFinHandoff::TimedOut));
     }
 
     #[test]
