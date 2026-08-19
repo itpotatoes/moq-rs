@@ -2712,6 +2712,29 @@ async fn main() -> Result<()> {
         );
     }
     println!("[rx] subscribed pc+haptic on {}", args.run_id);
+    // rev7 §7.1 readiness is the complete application path, not the UDP
+    // listener used by the launcher. A successful two-track SUBSCRIBE through
+    // the relay proves both MoQ sessions; direct mode proves the accepted
+    // sender/receiver session. Keep the exact component set in the JSONL so
+    // the production driver can derive latency from its paired start anchor.
+    let readiness_components: &[&str] = match args.topology {
+        Topology::Relay => &[
+            "sender_relay_session",
+            "relay_receiver_session",
+            "pc_subscription",
+            "haptic_subscription",
+        ],
+        Topology::Direct => &[
+            "sender_receiver_session",
+            "pc_subscription",
+            "haptic_subscription",
+        ],
+    };
+    logger
+        .lock()
+        .unwrap()
+        .log_readiness(now_us(), readiness_components)
+        .context("failed to record readiness components")?;
 
     // Stage A bridge (optional): spawn the Python renderer/audio helper and forward
     // received objects (header+payload) over a non-blocking, drop-on-full channel so

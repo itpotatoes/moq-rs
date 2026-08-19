@@ -1001,6 +1001,46 @@ impl JsonlLogger {
         self.w.flush()
     }
 
+    /// Record the application readiness edge used by rev7 §7.1.
+    ///
+    /// The components are explicit because a UDP listener is not a MoQ-ready
+    /// run: the registered M arm needs both sessions and both subscriptions,
+    /// while Md needs its direct session and both subscriptions.  Identifiers
+    /// are deliberately restricted so this hand-built JSON cannot be escaped
+    /// into a different receipt.
+    pub fn log_readiness(&mut self, t_us: u64, components: &[&str]) -> std::io::Result<()> {
+        if components.is_empty()
+            || components.iter().any(|value| {
+                value.is_empty()
+                    || !value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            })
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "readiness components must be non-empty identifiers",
+            ));
+        }
+        let mut unique = std::collections::BTreeSet::new();
+        if !components.iter().all(|value| unique.insert(*value)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "readiness components must be unique",
+            ));
+        }
+        let encoded = components
+            .iter()
+            .map(|value| format!("\"{value}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        writeln!(
+            self.w,
+            "{{\"role\":\"info\",\"event\":\"readiness\",\"t_us\":{t_us},\"components\":[{encoded}]}}"
+        )?;
+        self.w.flush()
+    }
+
     pub fn log_info(&mut self, body: &str) {
         let _ = writeln!(self.w, "{{\"role\":\"info\",{body}}}");
         let _ = self.w.flush();
@@ -1358,6 +1398,64 @@ mod phase1_v5_tests {
         // far apart they could be rather than assert the gap away (88차 P1-3).
         assert!(body.contains(
             "{\"role\":\"info\",\"event\":\"measurement_start\",\"t0_us\":1234567,\"capture_span_us\":7}"
+        ), "got: {body}");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn readiness_records_exact_components_and_rejects_ambiguous_names() {
+        let path = std::env::temp_dir().join(format!(
+            "skew-readiness-{}-{}.jsonl",
+            std::process::id(),
+            now_us()
+        ));
+        {
+            let mut logger = JsonlLogger::new(
+                &path,
+                "ready",
+                "moq",
+                "rx",
+                None,
+                0.0,
+                0.0,
+                0.0,
+                10,
+                30,
+                90,
+                1,
+                Some(10.0),
+                None,
+                Some("both"),
+                Some(TERM_PROTOCOL_V),
+                None,
+                None,
+                Some(V5Meta {
+                    payload_mode: PayloadMode::EqualChunk,
+                    representation: Representation::Bin,
+                    topology: Topology::Direct,
+                    chunk_bytes: 178,
+                }),
+            )
+            .unwrap();
+            logger
+                .log_readiness(
+                    1_234_567,
+                    &[
+                        "sender_receiver_session",
+                        "pc_subscription",
+                        "haptic_subscription",
+                    ],
+                )
+                .unwrap();
+            assert!(logger.log_readiness(2, &[]).is_err());
+            assert!(logger
+                .log_readiness(2, &["pc_subscription", "pc_subscription"])
+                .is_err());
+            assert!(logger.log_readiness(2, &["pc subscription"]).is_err());
+        }
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains(
+            "{\"role\":\"info\",\"event\":\"readiness\",\"t_us\":1234567,\"components\":[\"sender_receiver_session\",\"pc_subscription\",\"haptic_subscription\"]}"
         ), "got: {body}");
         std::fs::remove_file(path).unwrap();
     }
