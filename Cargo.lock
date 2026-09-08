@@ -1387,6 +1387,7 @@ dependencies = [
  "futures",
  "hex",
  "hyper-serve",
+ "libc",
  "metrics",
  "metrics-exporter-prometheus",
  "moq-api",

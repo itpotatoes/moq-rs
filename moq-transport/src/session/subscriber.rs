@@ -1227,11 +1227,26 @@ impl Subscriber {
             // Write the object payload.
             // TODO SLG - object_id_delta and object status are still being ignored
             let subgroup_writer = subgroup_writer.as_mut().ok_or(SessionError::Internal)?;
+            // Capture before create_at publishes the reader to forwarding tasks.
+            // This is buffer registration, not the first byte on the wire.
+            let trace_registered = crate::object_trace::timestamp();
             let mut object_writer = subgroup_writer.create_at(
                 remaining_bytes,
                 extension_headers,
                 object_received_at,
             )?;
+            crate::object_trace::emit_at(
+                crate::object_trace::Boundary::ReceiveRegistered,
+                &object_writer.info, subgroup_header.track_alias, trace_registered,
+            );
+            let mut receive_trace = crate::object_trace::ReceiveScope::new(
+                &object_writer.info, subgroup_header.track_alias,
+            );
+            if remaining_bytes == 0 {
+                receive_trace.finish_at(
+                    crate::object_trace::Boundary::ReceiveComplete, trace_registered,
+                );
+            }
 
             while remaining_bytes > 0 {
                 let chunk = match reader.read_chunk(remaining_bytes).await {
@@ -1249,12 +1264,19 @@ impl Subscriber {
                         // as expired so a consumer never observes truncated
                         // bytes, then continue with the next independent
                         // subgroup stream.
+                        receive_trace.finish(crate::object_trace::Boundary::ReceiveTimeout);
                         object_writer.abort(ServeError::Closed(0x2))?;
                         return Ok(());
                     }
                     Err(err) => return Err(err),
                 };
                 remaining_bytes -= chunk.len();
+                receive_trace.received(chunk.len());
+                if remaining_bytes == 0 {
+                    // All payload bytes have been read; stamp before publishing
+                    // the last chunk so forwarding completion cannot race ahead.
+                    receive_trace.finish(crate::object_trace::Boundary::ReceiveComplete);
+                }
                 object_writer.write(chunk)?;
             }
 

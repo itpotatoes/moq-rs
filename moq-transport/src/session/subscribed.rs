@@ -571,6 +571,10 @@ impl ObjectForwarder {
         timeout: std::time::Duration,
         reset: bool,
     ) {
+        crate::object_trace::emit(
+            crate::object_trace::Boundary::ForwardTimeout,
+            &object.info, header.track_alias,
+        );
         if let Some(mut locked) = state.lock_mut() {
             locked.record_delivery_timeout(reset);
         }
@@ -660,9 +664,16 @@ impl ObjectForwarder {
                 subgroup_object.extension_headers
             );
 
+            let mut forward_trace = crate::object_trace::ForwardScope::new(
+                &subgroup_object_reader.info, header.track_alias,
+            );
             let deadline =
                 delivery_timeout.map(|timeout| subgroup_object_reader.received_at + timeout);
             let send_object = async {
+                crate::object_trace::emit(
+                    crate::object_trace::Boundary::ForwardStart,
+                    &subgroup_object_reader.info, header.track_alias,
+                );
                 if object_count == 0 {
                     tracing::trace!(
                         "[PUBLISHER] serve_subgroup: sending header - track_alias={}, group_id={}, subgroup_id={:?}, priority={}, header_type={:?}",
@@ -738,6 +749,7 @@ impl ObjectForwarder {
                                 timeout,
                                 reset,
                             );
+                            forward_trace.disarm();
                             // A timed-out subgroup is never reopened. A later
                             // frame can proceed only if it has its own subgroup.
                             return Ok(());
@@ -747,6 +759,11 @@ impl ObjectForwarder {
                 None => send_object.await?,
             };
             let (bytes_sent, chunks_sent) = sent;
+            crate::object_trace::emit(
+                crate::object_trace::Boundary::ForwardAccepted,
+                &subgroup_object_reader.info, header.track_alias,
+            );
+            forward_trace.disarm();
 
             state
                 .lock_mut()

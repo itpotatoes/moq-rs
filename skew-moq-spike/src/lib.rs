@@ -11,6 +11,7 @@ use std::path::Path;
 use anyhow::Context;
 
 pub mod phase;
+pub mod receive_trace;
 pub mod playout;
 pub mod s3_controller;
 pub mod s3_logging;

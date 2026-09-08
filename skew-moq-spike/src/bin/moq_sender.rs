@@ -1259,6 +1259,30 @@ async fn main() -> Result<()> {
             None
         };
 
+        // Sender-side readiness edge (plan §3.1 start timing; ledger
+        // `readiness_us`). The sender can prove its own MoQ SETUP and that the
+        // track writers exist; it cannot observe the receiver's SUBSCRIBE, so
+        // the subscription components stay on the receiver's readiness row.
+        // Recorded before any warmup or phase wait so the edge is the same in
+        // smoke and registered runs. No data-path change.
+        {
+            let mut components: Vec<&str> = vec![match args.topology {
+                Topology::Relay => "sender_relay_session",
+                Topology::Direct => "sender_receiver_session",
+            }];
+            if pc_state.is_some() {
+                components.push("pc_track_writer");
+            }
+            if haptic_state.is_some() {
+                components.push("haptic_track_writer");
+            }
+            logger
+                .lock()
+                .unwrap()
+                .log_readiness(now_us(), &components)
+                .context("failed to record sender readiness components")?;
+        }
+
         let phase = if let (Some(batch_id), Some(path)) =
             (args.batch_id.as_deref(), args.phase_control.as_ref())
         {

@@ -14,6 +14,7 @@ pub mod data;
 pub mod error;
 pub mod message;
 pub mod mlog;
+pub mod object_trace;
 pub mod serve;
 pub mod session;
 pub mod setup;

@@ -105,6 +105,9 @@ struct Args {
     run_id: String,
     #[arg(long)]
     out: PathBuf,
+    /// Optional bounded raw receive-object trace. B1/frame verification only.
+    #[arg(long)]
+    receive_trace: Option<PathBuf>,
     #[arg(long)]
     s_bytes: u64,
     #[arg(long)]
@@ -2606,6 +2609,10 @@ async fn main() -> Result<()> {
     );
     validate_topology(args.topology, args.listen.is_some())?;
     validate_phase4_v5_args(&args)?;
+    if args.receive_trace.is_some() {
+        anyhow::ensure!(args.arm == Arm::B1 && args.payload_mode == PayloadMode::Frame,
+            "--receive-trace supports only B1/frame verification");
+    }
     let s1_config = playout_config(&args)?;
     let s3_runtime = s3_runtime_config(&args)?;
     let phase4_transport = phase4_transport(&args);
@@ -2655,6 +2662,8 @@ async fn main() -> Result<()> {
         .await;
     }
 
+    let receive_trace = args.receive_trace.as_ref()
+        .map(|path| receive_trace::Trace::start(path, &args.run_id)).transpose()?;
     let (sess, tp) = establish(&args).await?;
     let (session, mut subscriber) = session_handshake(&args, sess, tp).await?;
     let mut session_run = tokio::spawn(session.run());
@@ -3139,6 +3148,7 @@ async fn main() -> Result<()> {
     let pc_wire = wire_stats[0].lock().unwrap().clone();
     let hap_wire = wire_stats[1].lock().unwrap().clone();
 
+    let session_already_joined = matches!(&drained, Drained::SessionArm(_));
     let mut reports_out: Vec<DrainReport> = Vec::new();
     let (ending, detail) = match drained {
         Drained::Timeout => (
@@ -3260,6 +3270,22 @@ async fn main() -> Result<()> {
     }
 
     session_run.abort();
+    if let Some(trace) = receive_trace {
+        // Trace-only teardown: let receive scopes emit interruption on cancellation.
+        // A consumed select result must never be polled twice. The sealed trace
+        // remains a callback interval, not a claim of whole-runtime quiescence.
+        if !session_already_joined {
+            match tokio::time::timeout(Duration::from_secs(2), &mut session_run).await {
+                Ok(Ok(_)) => {},
+                Ok(Err(error)) if error.is_cancelled() => {},
+                _ => record_io_failed = true,
+            }
+        }
+        if let Err(error) = trace.finish(ending.as_str()) {
+            eprintln!("[rx] receive trace finalize failed: {error:#}");
+            record_io_failed = true;
+        }
+    }
     // Let the Stage A bridge flush its final frame counts, then reap it.
     if let Some(mut child) = bridge_child {
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -3570,6 +3596,7 @@ mod rx_ending_tests {
             tls_key: None,
             run_id: "t".into(),
             out: PathBuf::from("/dev/null"),
+            receive_trace: None,
             s_bytes: 1,
             c_mbps: None,
             rtt_ms: 0.0,
@@ -3844,6 +3871,7 @@ mod rx_ending_tests {
             tls_key: None,
             run_id: "t".into(),
             out: PathBuf::from("/dev/null"),
+            receive_trace: None,
             s_bytes: 1,
             c_mbps: None,
             rtt_ms: 0.0,
@@ -3929,6 +3957,7 @@ mod rx_ending_tests {
             tls_key: None,
             run_id: "t".into(),
             out: PathBuf::from("/dev/null"),
+            receive_trace: None,
             s_bytes: 1,
             c_mbps: None,
             rtt_ms: 0.0,

@@ -3,6 +3,7 @@
 
 mod api_coordinator;
 mod file_coordinator;
+mod object_trace;
 
 use std::sync::Arc;
 use std::{net, path::PathBuf};
@@ -33,6 +34,13 @@ pub struct Cli {
     /// Directory to write mlog files (one per connection)
     #[arg(long)]
     pub mlog_dir: Option<PathBuf>,
+
+    /// Bounded object boundary trace (verification only; Linux; new path only).
+    #[arg(long, requires = "object_trace_run_id")]
+    pub object_trace: Option<PathBuf>,
+
+    #[arg(long, requires = "object_trace")]
+    pub object_trace_run_id: Option<String>,
 
     /// Maximum request ID plus one advertised in MoQT setup.
     #[arg(long, default_value_t = 100)]
@@ -224,12 +232,34 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    relay.run().await
+    if let Some(path) = &cli.object_trace {
+        // Only the opt-in verification mode intercepts SIGTERM. The harness
+        // sends it after endpoints finish, then checks the sealed trace footer.
+        let trace = object_trace::Trace::start(path, cli.object_trace_run_id.as_deref().unwrap())?;
+        let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        let (ending, result) = tokio::select! {
+            result = relay.run() => ("relay_returned", result),
+            _ = terminate.recv() => ("sigterm", Ok(())),
+        };
+        trace.finish(ending)?;
+        result
+    } else {
+        relay.run().await
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn object_trace_is_opt_in_and_requires_identity() {
+        assert!(Cli::try_parse_from(["moq-relay-ietf"]).unwrap().object_trace.is_none());
+        assert!(Cli::try_parse_from(["moq-relay-ietf", "--object-trace", "/tmp/trace"]).is_err());
+        assert!(Cli::try_parse_from(["moq-relay-ietf", "--object-trace-run-id", "run"]).is_err());
+        assert!(Cli::try_parse_from(["moq-relay-ietf", "--object-trace", "/tmp/trace",
+                                    "--object-trace-run-id", "run"]).is_ok());
+    }
 
     #[test]
     fn max_request_id_flag_overrides_default() {

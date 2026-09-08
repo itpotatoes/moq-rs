@@ -930,4 +930,48 @@ mod tests {
         assert!(subgroup.read_next().await.unwrap().is_none());
         assert!(reader.next().await.unwrap().is_none());
     }
+
+    #[tokio::test]
+    async fn event_pair_partial_timeout_preserves_the_next_frame_subgroup() {
+        let (track_writer, track_reader) =
+            Track::new(TrackNamespace::from_utf8_path("fault-probe"), "pc").produce();
+        let mut writer = track_writer.subgroups().unwrap();
+        let mut first = writer.append(128).unwrap();
+        let mut partial = first.create(8, None).unwrap();
+        partial.write(Bytes::from_static(b"part")).unwrap();
+        partial.abort(ServeError::Closed(DELIVERY_TIMEOUT_RESET_CODE)).unwrap();
+        drop(first);
+        let mut second = writer.append(128).unwrap();
+        second.write(Bytes::from_static(b"complete")).unwrap();
+        drop(second);
+        drop(writer);
+        let mut reader = match track_reader.mode().await.unwrap() {
+            TrackReaderMode::Subgroups(reader) => reader,
+            _ => panic!("expected subgroup mode"),
+        };
+        let mut failed = reader.next().await.unwrap().unwrap();
+        assert!(failed.read_next().await.unwrap().is_none());
+        let mut survivor = reader.next().await.unwrap().unwrap();
+        assert_eq!(survivor.read_next().await.unwrap().unwrap().as_ref(), b"complete");
+        assert!(reader.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn event_pair_truncated_writer_never_returns_a_complete_partial_payload() {
+        let (track_writer, track_reader) =
+            Track::new(TrackNamespace::from_utf8_path("fault-probe"), "pc").produce();
+        let mut writer = track_writer.subgroups().unwrap();
+        let mut subgroup = writer.append(128).unwrap();
+        let mut partial = subgroup.create(8, None).unwrap();
+        partial.write(Bytes::from_static(b"part")).unwrap();
+        drop(partial); // sender-side buffer abandoned before promised size
+        drop(subgroup);
+        drop(writer);
+        let mut reader = match track_reader.mode().await.unwrap() {
+            TrackReaderMode::Subgroups(reader) => reader,
+            _ => panic!("expected subgroup mode"),
+        };
+        let mut subgroup = reader.next().await.unwrap().unwrap();
+        assert!(matches!(subgroup.read_next().await, Err(ServeError::Size)));
+    }
 }
