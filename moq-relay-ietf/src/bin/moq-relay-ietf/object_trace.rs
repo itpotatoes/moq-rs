@@ -96,17 +96,18 @@ pub struct Trace {
 }
 
 impl Trace {
-    pub fn start(path: &Path, run_id: &str) -> anyhow::Result<Self> {
+    pub fn start(path: &Path, run_id: &str, capacity: usize) -> anyhow::Result<Self> {
+        anyhow::ensure!(capacity > 0, "object trace capacity must be positive");
         anyhow::ensure!(cfg!(target_os = "linux"), "object trace requires Linux CLOCK_MONOTONIC");
         let file = OpenOptions::new().write(true).create_new(true).open(path)?;
         let mut writer = BufWriter::new(file);
         writeln!(writer, "{}", json!({"role":"trace_meta", "schema":"relay-object-trace-v1",
             "run_id":run_id, "pid":std::process::id(),
-            "clock":"monotonic_ns/1000", "capacity":CAPACITY,
+            "clock":"monotonic_ns/1000", "capacity":capacity,
             "receive_progress":true,
             "scope":"sealed_callback_interval_not_producer_quiescence"}))?;
         writer.flush()?;
-        let recorder = Arc::new(Recorder::new(CAPACITY));
+        let recorder = Arc::new(Recorder::new(capacity));
         moq_transport::object_trace::install(recorder.clone())
             .map_err(|_| anyhow::anyhow!("object trace already installed"))?;
         Ok(Self { recorder, writer })
@@ -231,7 +232,7 @@ mod tests {
     fn existing_evidence_is_never_overwritten() {
         let (path, mut file) = new_test_file();
         file.write_all(b"preserved").unwrap();
-        assert!(Trace::start(&path, "run").is_err());
+        assert!(Trace::start(&path, "run", 4096).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"preserved");
         std::fs::remove_file(path).unwrap();
     }

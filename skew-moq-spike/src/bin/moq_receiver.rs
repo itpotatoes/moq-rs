@@ -108,6 +108,11 @@ struct Args {
     /// Optional bounded raw receive-object trace. B1/frame verification only.
     #[arg(long)]
     receive_trace: Option<PathBuf>,
+    /// Preallocated receive-trace record bound (registered + complete per
+    /// object, plus timeout/interrupt boundaries). The runner sizes it from
+    /// the planned object count; overflow is counted and fails the seal.
+    #[arg(long, default_value_t = 4096)]
+    receive_trace_capacity: usize,
     #[arg(long)]
     s_bytes: u64,
     #[arg(long)]
@@ -2663,7 +2668,7 @@ async fn main() -> Result<()> {
     }
 
     let receive_trace = args.receive_trace.as_ref()
-        .map(|path| receive_trace::Trace::start(path, &args.run_id)).transpose()?;
+        .map(|path| receive_trace::Trace::start(path, &args.run_id, args.receive_trace_capacity)).transpose()?;
     let (sess, tp) = establish(&args).await?;
     let (session, mut subscriber) = session_handshake(&args, sess, tp).await?;
     let mut session_run = tokio::spawn(session.run());
@@ -3597,6 +3602,7 @@ mod rx_ending_tests {
             run_id: "t".into(),
             out: PathBuf::from("/dev/null"),
             receive_trace: None,
+            receive_trace_capacity: 4096,
             s_bytes: 1,
             c_mbps: None,
             rtt_ms: 0.0,
@@ -3872,6 +3878,7 @@ mod rx_ending_tests {
             run_id: "t".into(),
             out: PathBuf::from("/dev/null"),
             receive_trace: None,
+            receive_trace_capacity: 4096,
             s_bytes: 1,
             c_mbps: None,
             rtt_ms: 0.0,
@@ -3958,6 +3965,7 @@ mod rx_ending_tests {
             run_id: "t".into(),
             out: PathBuf::from("/dev/null"),
             receive_trace: None,
+            receive_trace_capacity: 4096,
             s_bytes: 1,
             c_mbps: None,
             rtt_ms: 0.0,

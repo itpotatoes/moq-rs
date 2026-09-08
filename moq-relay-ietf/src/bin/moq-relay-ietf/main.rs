@@ -41,6 +41,10 @@ pub struct Cli {
 
     #[arg(long, requires = "object_trace")]
     pub object_trace_run_id: Option<String>,
+    /// Preallocated relay object-trace record bound (four boundaries per
+    /// forwarded object). Sized by the runner from the planned object count.
+    #[arg(long, default_value_t = 4096)]
+    pub object_trace_capacity: usize,
 
     /// Maximum request ID plus one advertised in MoQT setup.
     #[arg(long, default_value_t = 100)]
@@ -235,7 +239,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(path) = &cli.object_trace {
         // Only the opt-in verification mode intercepts SIGTERM. The harness
         // sends it after endpoints finish, then checks the sealed trace footer.
-        let trace = object_trace::Trace::start(path, cli.object_trace_run_id.as_deref().unwrap())?;
+        let trace = object_trace::Trace::start(path, cli.object_trace_run_id.as_deref().unwrap(), cli.object_trace_capacity)?;
         let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         let (ending, result) = tokio::select! {
             result = relay.run() => ("relay_returned", result),
