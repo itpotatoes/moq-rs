@@ -533,6 +533,7 @@ mod tests {
                 representation: Representation::Bin,
                 topology: Topology::Relay,
                 chunk_bytes: 178,
+                queue_policy: None,
             }),
         )
         .unwrap()

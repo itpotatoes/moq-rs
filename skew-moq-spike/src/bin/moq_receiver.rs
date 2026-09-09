@@ -193,6 +193,11 @@ struct Args {
     /// Phase-4 arm. B1 remains the default and preserves the historical path.
     #[arg(long, value_enum, default_value_t = Arm::B1)]
     arm: Arm,
+    /// Stage-5 queue policy. `separate` (default) subscribes pc+haptic;
+    /// `shared_fifo` (B1/frame only) subscribes the single "mixed" track and
+    /// demultiplexes by the 32-byte header track_id into unchanged rx rows.
+    #[arg(long, value_enum, default_value_t = QueuePolicy::Separate)]
+    queue_policy: QueuePolicy,
     /// Fixed S1 playout offset. The governing design permits only 50/100 ms
     /// before the pilot selects one; S1 requires an explicit choice.
     #[arg(long)]
@@ -557,6 +562,28 @@ fn validate_topology(topology: Topology, listening: bool) -> Result<()> {
     }
 }
 
+/// Stage-5 boundary: shared_fifo is a B1/frame-only control configuration.
+/// The raw receive trace (`--receive-trace`) stays available: it records
+/// transport boundaries per WIRE track (`track`/`track_hex` = "mixed",
+/// group/subgroup/object_id) without decoding the header, so P1 is traced
+/// exactly like P2/P3 and joins to TX rows through `transport_track`.
+fn validate_queue_policy(
+    queue_policy: QueuePolicy,
+    arm: Arm,
+    payload_mode: PayloadMode,
+) -> Result<()> {
+    if queue_policy != QueuePolicy::SharedFifo {
+        return Ok(());
+    }
+    if arm != Arm::B1 {
+        bail!("--queue-policy shared_fifo requires --arm b1");
+    }
+    if payload_mode != PayloadMode::Frame {
+        bail!("--queue-policy shared_fifo requires --payload-mode frame");
+    }
+    Ok(())
+}
+
 fn validate_phase4_v5_args(args: &Args) -> Result<()> {
     if args.arm != Arm::B1 && args.payload_mode != PayloadMode::Frame {
         bail!(
@@ -727,6 +754,85 @@ struct SubscribeStats {
 }
 
 /// Mirror of the sender's `--tracks`, used only for expectations.
+/// Stage-5 queue policy (mirror of the sender flag).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
+enum QueuePolicy {
+    Separate,
+    #[value(name = "shared_fifo")]
+    SharedFifo,
+}
+
+impl QueuePolicy {
+    fn as_str(self) -> &'static str {
+        match self {
+            QueuePolicy::Separate => "separate",
+            QueuePolicy::SharedFifo => "shared_fifo",
+        }
+    }
+
+    /// Wire tracks to subscribe. `mixed` carries both logical tracks.
+    fn wire_tracks(self) -> &'static [&'static str] {
+        match self {
+            QueuePolicy::Separate => &["pc", "haptic"],
+            QueuePolicy::SharedFifo => &[SHARED_FIFO_TRACK],
+        }
+    }
+}
+
+const SHARED_FIFO_TRACK: &str = "mixed";
+
+/// Logical-track slot (0 == pc, 1 == haptic) used for counters/wire stats.
+fn track_slot(track: &str) -> usize {
+    if track == "pc" {
+        0
+    } else {
+        1
+    }
+}
+
+/// Header-level demultiplex. On a pc/haptic subscription the header must name
+/// that same track (unchanged R3b rule). On the shared "mixed" subscription
+/// either logical track is admitted and the row is logged under the header's
+/// track, so rx rows are identical to the separate policy. Anything else is a
+/// header failure, never a row.
+fn demux_track(subscribed: &'static str, track_id: u8) -> Option<&'static str> {
+    let track = track_name(track_id);
+    if subscribed == SHARED_FIFO_TRACK {
+        matches!(track, "pc" | "haptic").then_some(track)
+    } else {
+        (track == subscribed).then_some(subscribed)
+    }
+}
+
+/// Per-logical-track reports from the per-wire-track drain ends. A "mixed"
+/// end is one subgroup stream carrying both tracks, so its FIN/cancel/fail
+/// verdict applies to pc and haptic alike, each against its own design count.
+fn expand_reports(
+    ends: Vec<(&'static str, TrackEnd, String)>,
+    n_pc: u64,
+    n_hap: u64,
+    args: &Args,
+) -> Vec<DrainReport> {
+    let mut reports = Vec::new();
+    for (name, end, detail) in ends {
+        let logical: &[&'static str] = if name == SHARED_FIFO_TRACK {
+            &["pc", "haptic"]
+        } else {
+            &[name]
+        };
+        for track in logical {
+            reports.push(DrainReport {
+                name: track,
+                end,
+                received: if *track == "pc" { n_pc } else { n_hap },
+                expected: expected_for(track, args),
+                detail: detail.clone(),
+            });
+        }
+    }
+    reports
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum RxTrackSel {
     Both,
@@ -2618,6 +2724,7 @@ async fn main() -> Result<()> {
         anyhow::ensure!(args.arm == Arm::B1 && args.payload_mode == PayloadMode::Frame,
             "--receive-trace supports only B1/frame verification");
     }
+    validate_queue_policy(args.queue_policy, args.arm, args.payload_mode)?;
     let s1_config = playout_config(&args)?;
     let s3_runtime = s3_runtime_config(&args)?;
     let phase4_transport = phase4_transport(&args);
@@ -2654,6 +2761,7 @@ async fn main() -> Result<()> {
             representation: args.representation,
             topology: args.topology,
             chunk_bytes: args.chunk_bytes,
+            queue_policy: Some(args.queue_policy.as_str()),
         }),
     )?));
 
@@ -2674,7 +2782,7 @@ async fn main() -> Result<()> {
     let mut session_run = tokio::spawn(session.run());
 
     let namespace = TrackNamespace::from_utf8_path(&args.run_id);
-    let names = ["pc", "haptic"];
+    let names = args.queue_policy.wire_tracks();
 
     // 직결 토폴로지에서는 이 수신자가 송신자의 피어다 — subscribe 하기 전에
     // 송신자의 PUBLISH_NAMESPACE 에 먼저 응답해야 한다.
@@ -2709,7 +2817,7 @@ async fn main() -> Result<()> {
         // announce-ordering race and is retryable.
         let mut fatal: Option<anyhow::Error> = None;
         let mut ok = true;
-        for name in names {
+        for &name in names {
             let tw = match sub_tracks.create(name) {
                 Some(tw) => tw,
                 None => {
@@ -2778,29 +2886,28 @@ async fn main() -> Result<()> {
             sub_stats.retries, sub_stats.waited_ms
         );
     }
-    println!("[rx] subscribed pc+haptic on {}", args.run_id);
+    println!("[rx] subscribed {} on {}", names.join("+"), args.run_id);
     // rev7 §7.1 readiness is the complete application path, not the UDP
     // listener used by the launcher. A successful two-track SUBSCRIBE through
     // the relay proves both MoQ sessions; direct mode proves the accepted
     // sender/receiver session. Keep the exact component set in the JSONL so
     // the production driver can derive latency from its paired start anchor.
-    let readiness_components: &[&str] = match args.topology {
-        Topology::Relay => &[
-            "sender_relay_session",
-            "relay_receiver_session",
-            "pc_subscription",
-            "haptic_subscription",
-        ],
-        Topology::Direct => &[
-            "sender_receiver_session",
-            "pc_subscription",
-            "haptic_subscription",
-        ],
+    // shared_fifo has one subscription, so its component is "mixed_subscription".
+    let mut readiness_components: Vec<&str> = match args.topology {
+        Topology::Relay => vec!["sender_relay_session", "relay_receiver_session"],
+        Topology::Direct => vec!["sender_receiver_session"],
     };
+    match args.queue_policy {
+        QueuePolicy::Separate => {
+            readiness_components.push("pc_subscription");
+            readiness_components.push("haptic_subscription");
+        }
+        QueuePolicy::SharedFifo => readiness_components.push("mixed_subscription"),
+    }
     logger
         .lock()
         .unwrap()
-        .log_readiness(now_us(), readiness_components)
+        .log_readiness(now_us(), &readiness_components)
         .context("failed to record readiness components")?;
 
     // Stage A bridge (optional): spawn the Python renderer/audio helper and forward
@@ -2875,31 +2982,38 @@ async fn main() -> Result<()> {
         (None, None)
     };
 
-    // Drain each track: parse header, log rx, (optionally) forward for render/audio.
-    let counts: Vec<Arc<AtomicU64>> = names.iter().map(|_| Arc::new(AtomicU64::new(0))).collect();
-    let wire_stats: Vec<Arc<Mutex<ReassemblyStats>>> = names
-        .iter()
+    // Drain each wire track: parse header, log rx, (optionally) forward for
+    // render/audio. Counters and wire stats are per LOGICAL track (0 == pc,
+    // 1 == haptic); a "mixed" drain feeds both slots by header track_id.
+    let counts: Vec<Arc<AtomicU64>> = (0..2).map(|_| Arc::new(AtomicU64::new(0))).collect();
+    let wire_stats: Vec<Arc<Mutex<ReassemblyStats>>> = (0..2)
         .map(|_| Arc::new(Mutex::new(ReassemblyStats::default())))
         .collect();
     // Header-integrity counters (R3b). A mismatch means the rx log cannot be
     // trusted as a measurement, so it is counted, recorded, and exits non-zero.
     let bad_headers = Arc::new(AtomicU64::new(0));
     let mut drains = Vec::new();
-    for (idx, (name, received_track)) in received.into_iter().enumerate() {
+    for (name, received_track) in received.into_iter() {
         let logger = logger.clone();
-        let count = counts[idx].clone();
+        let counts = counts.clone();
         let bad = bad_headers.clone();
         let ftx = ftx.clone();
         let s1_tx = s1_tx.clone();
         let ingress_drops = ingress_drops.clone();
         let ingress_log_failed = ingress_log_failed.clone();
-        let wire_stats_out = wire_stats[idx].clone();
+        let wire_stats_out = wire_stats.clone();
+        // Logical slots this drain owns: its own for pc/haptic, both for mixed.
+        let owned_slots: Vec<usize> = if name == SHARED_FIFO_TRACK {
+            vec![0, 1]
+        } else {
+            vec![track_slot(name)]
+        };
         let payload_mode = args.payload_mode;
         let chunk_bytes = args.chunk_bytes;
         let reassembly_max_pending_frames = args.reassembly_max_pending_frames;
         let reassembly_max_pending_bytes = args.reassembly_max_pending_bytes;
         let reassembly_max_age_us = args.reassembly_max_age_ms.saturating_mul(1_000);
-        let fwd = (name == "pc" && args.render) || (name == "haptic" && args.audio);
+        let (render, audio) = (args.render, args.audio);
         drains.push(tokio::spawn(async move {
             let mut reassembler = if payload_mode == PayloadMode::EqualChunk {
                 match LogicalReassembler::new(
@@ -2930,7 +3044,7 @@ async fn main() -> Result<()> {
             } else {
                 None
             };
-            let mut frame_stats = ReassemblyStats::default();
+            let mut frame_stats = [ReassemblyStats::default(), ReassemblyStats::default()];
             // Inner future yields the raw ServeError so the ending can be
             // classified before the error is erased.
             let inner = async {
@@ -2949,17 +3063,21 @@ async fn main() -> Result<()> {
                         bad.fetch_add(1, Ordering::Relaxed);
                         continue;
                     };
-                    let track = track_name(h.track_id);
                     if h.version != VERSION {
                         eprintln!("[rx] {name}: header version {} != {VERSION}", h.version);
                         bad.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
-                    if track != name {
-                        eprintln!("[rx] {name}: header track '{track}' does not match the subscribed track");
+                    let Some(track) = demux_track(name, h.track_id) else {
+                        eprintln!(
+                            "[rx] {name}: header track '{}' does not match the subscribed track",
+                            track_name(h.track_id)
+                        );
                         bad.fetch_add(1, Ordering::Relaxed);
                         continue;
-                    }
+                    };
+                    let slot = track_slot(track);
+                    let fwd = (track == "pc" && render) || (track == "haptic" && audio);
                     if obj.len() != HDR + h.payload_len as usize {
                         eprintln!(
                             "[rx] {name}: object length {} != {HDR} + declared payload_len {}",
@@ -2997,8 +3115,8 @@ async fn main() -> Result<()> {
                         (h, Bytes::from(logical))
                     } else {
                         if !warmup {
-                            frame_stats.chunks_received += 1;
-                            frame_stats.frames_completed += 1;
+                            frame_stats[slot].chunks_received += 1;
+                            frame_stats[slot].frames_completed += 1;
                         }
                         (h, obj.clone())
                     };
@@ -3014,7 +3132,7 @@ async fn main() -> Result<()> {
                     logger.lock().unwrap().log_rx(
                         track, h.tier, h.seq, h.pts_us, h.event_id, h.payload_len, t, t, h.gen_ts_us,
                     );
-                    count.fetch_add(1, Ordering::Relaxed);
+                    counts[slot].fetch_add(1, Ordering::Relaxed);
                     if let Some(tx) = &s1_tx {
                         let scheduled = PlayoutObject {
                             header: h,
@@ -3061,10 +3179,13 @@ async fn main() -> Result<()> {
             // only `Done` is a FIN, `Cancel`/`Closed` stay ambiguous.
             let result = inner.await;
             if let Some(r) = reassembler.as_mut() {
+                // equal_chunk is separate-policy only: exactly one owned slot.
                 r.finish();
-                *wire_stats_out.lock().unwrap() = r.stats.clone();
+                *wire_stats_out[owned_slots[0]].lock().unwrap() = r.stats.clone();
             } else {
-                *wire_stats_out.lock().unwrap() = frame_stats;
+                for &slot in &owned_slots {
+                    *wire_stats_out[slot].lock().unwrap() = frame_stats[slot].clone();
+                }
             }
             match result {
                 Ok(()) => (name, TrackEnd::Fin, String::new()),
@@ -3173,19 +3294,7 @@ async fn main() -> Result<()> {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
             }
-            let reports: Vec<DrainReport> = ends
-                .into_iter()
-                .map(|(name, end, detail)| {
-                    let received = if name == "pc" { n_pc } else { n_hap };
-                    DrainReport {
-                        name,
-                        end,
-                        received,
-                        expected: expected_for(name, &args),
-                        detail,
-                    }
-                })
-                .collect();
+            let reports = expand_reports(ends, n_pc, n_hap, &args);
             for r in &reports {
                 println!(
                     "[rx] track {}: end={:?} received={} expected={:?} {}",
@@ -3338,6 +3447,136 @@ mod rx_ending_tests {
             expected,
             detail: String::new(),
         }
+    }
+
+    fn stage5_cli(extra: &[&str]) -> Vec<String> {
+        let mut base: Vec<String> = [
+            "moq_receiver", "--run-id", "t", "--out", "/dev/null", "--s-bytes", "1",
+            "--pc-rate-hz", "30", "--haptic-rate-hz", "90", "--payload-mode", "frame",
+            "--representation", "bin", "--chunk-bytes", "178",
+            "--reassembly-max-pending-frames", "64", "--reassembly-max-pending-bytes",
+            "67108864", "--reassembly-max-age-ms", "2000", "--topology", "relay",
+            "--duration-s", "1",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        base.extend(extra.iter().map(|s| s.to_string()));
+        base
+    }
+
+    /// Stage-5 P1: a mixed object sequence (1 PC : 3 haptic) is demultiplexed
+    /// by header track_id into the same logical pc/haptic rows the separate
+    /// policy writes, and the counters/report expansion follow the same split.
+    #[test]
+    fn shared_fifo_demux_splits_a_mixed_sequence_into_pc_and_haptic_rows() {
+        let sequence = [TRACK_PC, TRACK_HAPTIC, TRACK_HAPTIC, TRACK_HAPTIC, TRACK_PC, TRACK_HAPTIC];
+        let demuxed: Vec<&str> = sequence
+            .iter()
+            .map(|&id| demux_track(SHARED_FIFO_TRACK, id).expect("mixed admits both tracks"))
+            .collect();
+        assert_eq!(demuxed, ["pc", "haptic", "haptic", "haptic", "pc", "haptic"]);
+        let mut counts = [0u64; 2];
+        for track in &demuxed {
+            counts[track_slot(track)] += 1;
+        }
+        assert_eq!(counts, [2, 4]);
+        // Unknown track ids are header failures on every subscription.
+        assert_eq!(demux_track(SHARED_FIFO_TRACK, 9), None);
+        // The separate policy keeps the unchanged R3b rule: a header naming
+        // the other track is rejected, not re-routed.
+        assert_eq!(demux_track("pc", TRACK_PC), Some("pc"));
+        assert_eq!(demux_track("pc", TRACK_HAPTIC), None);
+        assert_eq!(demux_track("haptic", TRACK_HAPTIC), Some("haptic"));
+        assert_eq!(demux_track("haptic", TRACK_PC), None);
+
+        let args = Args::try_parse_from(stage5_cli(&["--queue-policy", "shared_fifo"]))
+            .expect("shared_fifo parses");
+        assert_eq!(args.queue_policy, QueuePolicy::SharedFifo);
+        assert_eq!(args.queue_policy.wire_tracks(), ["mixed"]);
+        let reports = expand_reports(
+            vec![(SHARED_FIFO_TRACK, TrackEnd::Fin, String::new())],
+            counts[0],
+            counts[1],
+            &args,
+        );
+        let summary: Vec<(&str, TrackEnd, u64, Option<u64>)> = reports
+            .iter()
+            .map(|r| (r.name, r.end, r.received, r.expected))
+            .collect();
+        // One mixed FIN yields one report per logical track against its own
+        // design count (1 s at 30/90 Hz), so completeness stays per track.
+        assert_eq!(
+            summary,
+            [("pc", TrackEnd::Fin, 2, Some(30)), ("haptic", TrackEnd::Fin, 4, Some(90))]
+        );
+        let (ending, _) = classify_ending(&reports, false);
+        assert_eq!(ending, RxEnding::Normal);
+        let full = expand_reports(
+            vec![(SHARED_FIFO_TRACK, TrackEnd::Cancelled, "x".into())],
+            30,
+            90,
+            &args,
+        );
+        assert_eq!(classify_ending(&full, false).0, RxEnding::Normal);
+        let short = expand_reports(
+            vec![(SHARED_FIFO_TRACK, TrackEnd::Cancelled, "x".into())],
+            30,
+            89,
+            &args,
+        );
+        assert_eq!(classify_ending(&short, false).0, RxEnding::CancelledIncomplete);
+
+        // The separate policy is untouched: default flag, two wire tracks,
+        // one report per drain.
+        let args = Args::try_parse_from(stage5_cli(&[])).expect("default parses");
+        assert_eq!(args.queue_policy, QueuePolicy::Separate);
+        assert_eq!(args.queue_policy.wire_tracks(), ["pc", "haptic"]);
+        let reports = expand_reports(
+            vec![
+                ("pc", TrackEnd::Fin, String::new()),
+                ("haptic", TrackEnd::Fin, String::new()),
+            ],
+            30,
+            90,
+            &args,
+        );
+        assert_eq!(reports.len(), 2);
+        assert_eq!((reports[0].name, reports[0].received), ("pc", 30));
+        assert_eq!((reports[1].name, reports[1].received), ("haptic", 90));
+    }
+
+    #[test]
+    fn shared_fifo_is_rejected_outside_b1_frame_but_accepts_the_receive_trace() {
+        use QueuePolicy::{Separate, SharedFifo};
+        validate_queue_policy(SharedFifo, Arm::B1, PayloadMode::Frame).unwrap();
+        for arm in [Arm::S1, Arm::M1, Arm::S2, Arm::S2Eq, Arm::S3] {
+            let err = validate_queue_policy(SharedFifo, arm, PayloadMode::Frame)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("requires --arm b1"), "{err}");
+            // separate never rejects anything.
+            validate_queue_policy(Separate, arm, PayloadMode::EqualChunk).unwrap();
+        }
+        let err = validate_queue_policy(SharedFifo, Arm::B1, PayloadMode::EqualChunk)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--payload-mode frame"), "{err}");
+        assert!(Args::try_parse_from(stage5_cli(&["--queue-policy", "mixed"])).is_err());
+
+        // Instrumentation parity (registered policy: all traces on for every
+        // policy): a shared_fifo configuration WITH the raw receive trace must
+        // pass the same validation gates main() applies before opening logs.
+        let args = Args::try_parse_from(stage5_cli(&[
+            "--queue-policy", "shared_fifo", "--receive-trace", "/dev/null/trace.jsonl",
+            "--receive-trace-capacity", "512",
+        ]))
+        .expect("shared_fifo with receive trace parses");
+        assert_eq!(args.queue_policy, QueuePolicy::SharedFifo);
+        assert!(args.receive_trace.is_some());
+        assert!(args.arm == Arm::B1 && args.payload_mode == PayloadMode::Frame);
+        validate_phase4_v5_args(&args).unwrap();
+        validate_queue_policy(args.queue_policy, args.arm, args.payload_mode).unwrap();
     }
 
     /// Path 1 — normal FIN, complete reception. The only rc=0 case.
@@ -3631,6 +3870,7 @@ mod rx_ending_tests {
             subscribe_timeout: 10.0,
             subscribe_retry_ms: 100,
             arm: Arm::B1,
+            queue_policy: QueuePolicy::Separate,
             d_play_ms: None,
             startup_timeout_ms: None,
             startup_rearm_limit: None,
@@ -3907,6 +4147,7 @@ mod rx_ending_tests {
             subscribe_timeout: 10.0,
             subscribe_retry_ms: 100,
             arm: Arm::S1,
+            queue_policy: QueuePolicy::Separate,
             d_play_ms: Some(50),
             startup_timeout_ms: Some(100),
             startup_rearm_limit: Some(1),
@@ -3994,6 +4235,7 @@ mod rx_ending_tests {
             subscribe_timeout: 10.0,
             subscribe_retry_ms: 100,
             arm: Arm::M1,
+            queue_policy: QueuePolicy::Separate,
             d_play_ms: Some(50),
             startup_timeout_ms: Some(100),
             startup_rearm_limit: Some(1),
@@ -5583,6 +5825,7 @@ mod s3_retirement_tests {
                     representation: Representation::Bin,
                     topology: Topology::Relay,
                     chunk_bytes: 178,
+                    queue_policy: None,
                 }),
             )
             .unwrap(),

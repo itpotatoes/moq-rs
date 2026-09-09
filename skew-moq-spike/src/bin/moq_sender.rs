@@ -228,6 +228,214 @@ impl Arm {
     }
 }
 
+/// Stage-5 cause-separation queue policy (plan 단계 5, decision 2026-09-08).
+/// `separate` is the historical two-track wiring (P2 with equal-128, P3 with
+/// haptic-first). `shared_fifo` (P1) sends both tracks' objects through ONE
+/// track ("mixed") and ONE long-lived subgroup — a single QUIC stream — in
+/// generation order; the receiver demultiplexes by the header `track_id`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
+enum QueuePolicy {
+    Separate,
+    #[value(name = "shared_fifo")]
+    SharedFifo,
+}
+
+impl QueuePolicy {
+    fn as_str(self) -> &'static str {
+        match self {
+            QueuePolicy::Separate => "separate",
+            QueuePolicy::SharedFifo => "shared_fifo",
+        }
+    }
+}
+
+/// B1 static publisher-priority profile. `equal-128` is the historical B1
+/// (P2); `haptic-first` (P3) is priority only — haptic 0 / PC 1, the S2
+/// numbers — on B1's long-lived subgroups, with no PC delivery timeout.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
+enum PublisherPriorityProfile {
+    #[value(name = "equal-128")]
+    Equal128,
+    #[value(name = "haptic-first")]
+    HapticFirst,
+}
+
+impl PublisherPriorityProfile {
+    /// Meta vocabulary shared with S2/S2Eq so the same numbers carry the same
+    /// `publisher_priority_profile` string across arms.
+    fn meta_str(self) -> &'static str {
+        match self {
+            PublisherPriorityProfile::Equal128 => "equal-128",
+            PublisherPriorityProfile::HapticFirst => "relative-haptic0-pc1",
+        }
+    }
+}
+
+/// Publisher priority of the single shared-FIFO subgroup. One stream has one
+/// priority; the historical B1 value keeps P1 comparable with P2.
+const SHARED_FIFO_PRIORITY: u8 = 128;
+
+/// Wire track name that carries both logical tracks under `shared_fifo`.
+const SHARED_FIFO_TRACK: &str = "mixed";
+
+/// Static subgroup priorities `(pc, haptic)` for this run. Non-B1 arms keep
+/// their frozen `Arm` mapping; B1 selects P2 (128/128) or P3 (1/0).
+fn resolved_priorities(arm: Arm, profile: PublisherPriorityProfile) -> (u8, u8) {
+    match (arm, profile) {
+        (Arm::B1, PublisherPriorityProfile::HapticFirst) => (1, 0),
+        _ => (arm.pc_priority(), arm.haptic_priority()),
+    }
+}
+
+/// Stage-5 CLI boundary. Both options are opt-in and B1-only so no other arm
+/// (S1/M1/S2/S2Eq/S3) can change behaviour through them. `profile` is the
+/// explicit CLI value (`None` == default equal-128).
+fn validate_stage5_policy(
+    arm: Arm,
+    payload_mode: PayloadMode,
+    tracks: TrackSel,
+    queue_policy: QueuePolicy,
+    profile: Option<PublisherPriorityProfile>,
+    mapping: DataPriorityMapping,
+) -> Result<()> {
+    if queue_policy == QueuePolicy::SharedFifo {
+        if arm != Arm::B1 {
+            anyhow::bail!("--queue-policy shared_fifo requires --arm b1");
+        }
+        if payload_mode != PayloadMode::Frame {
+            anyhow::bail!("--queue-policy shared_fifo requires --payload-mode frame");
+        }
+        if tracks != TrackSel::Both {
+            anyhow::bail!("--queue-policy shared_fifo requires --tracks both");
+        }
+    }
+    if let Some(profile) = profile {
+        if arm != Arm::B1 {
+            anyhow::bail!("--publisher-priority-profile requires --arm b1");
+        }
+        if profile == PublisherPriorityProfile::HapticFirst {
+            if queue_policy == QueuePolicy::SharedFifo {
+                anyhow::bail!(
+                    "--publisher-priority-profile haptic-first cannot combine with \
+                     --queue-policy shared_fifo: a single stream has one priority"
+                );
+            }
+            if mapping != DataPriorityMapping::MoqtV2 {
+                anyhow::bail!(
+                    "--publisher-priority-profile haptic-first requires \
+                     --data-priority-mapping moqt-v2 (lower number first)"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// B1 transport metadata. The historical B1 (separate, equal-128) records
+/// nothing here so its meta line keeps the pre-stage-5 shape; either stage-5
+/// deviation records the mapping and the priorities actually applied.
+fn b1_transport_meta(
+    queue_policy: QueuePolicy,
+    profile: PublisherPriorityProfile,
+    mapping: DataPriorityMapping,
+) -> Option<Phase4TransportMeta> {
+    if queue_policy == QueuePolicy::Separate && profile == PublisherPriorityProfile::Equal128 {
+        return None;
+    }
+    let (pc, haptic) = resolved_priorities(Arm::B1, profile);
+    Some(Phase4TransportMeta {
+        arm: "b1",
+        pc_subgroup_mapping: match queue_policy {
+            QueuePolicy::Separate => "long-lived-subgroup",
+            QueuePolicy::SharedFifo => "shared-single-subgroup",
+        },
+        pc_publisher_priority: pc,
+        haptic_publisher_priority: haptic,
+        publisher_priority_profile: profile.meta_str(),
+        data_priority_mapping: mapping.as_str(),
+        pc_delivery_timeout_ms: None,
+    })
+}
+
+/// Append target of the shared FIFO. Abstracted so the ordering rule can be
+/// unit-tested without a MoQ session.
+trait SharedFifoWriter {
+    fn identity(&self) -> (u64, u64);
+    fn append(&mut self, bytes: Vec<u8>) -> Result<u64>;
+}
+
+impl SharedFifoWriter for moq_transport::serve::SubgroupWriter {
+    fn identity(&self) -> (u64, u64) {
+        (self.group_id, self.subgroup_id)
+    }
+
+    fn append(&mut self, bytes: Vec<u8>) -> Result<u64> {
+        let mut object = self.create(bytes.len(), None).context("mixed create")?;
+        let object_id = object.object_id;
+        object.write(Bytes::from(bytes)).context("mixed write")?;
+        Ok(object_id)
+    }
+}
+
+type SharedSubgroup = Arc<Mutex<moq_transport::serve::SubgroupWriter>>;
+
+/// Timing of one shared-FIFO append.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SharedFifoAppend {
+    /// Monotonic µs immediately before the lock attempt: payload bytes are
+    /// already copied into the object buffer, only the header is missing.
+    t_ready: u64,
+    /// Monotonic µs sampled under the lock; the header's `gen_ts_us`.
+    t_gen: u64,
+    /// MoQ identity `(group_id, subgroup_id, object_id)` of the appended object.
+    identity: (u64, u64, u64),
+}
+
+/// Shared-FIFO ordering rule and exact lock boundary.
+///
+/// Outside the lock (before `t_ready`): the caller has allocated the object
+/// buffer and copied the full payload after a 32-byte header placeholder
+/// (`object_buffer`), so the payload copy — up to one PC frame, ~460 kB —
+/// never happens while the other producer waits.
+///
+/// Under the lock: `t_gen = now_us()`, pack the 32-byte header into the
+/// placeholder, then `create` + `write` on the single subgroup. Nothing else.
+/// Because `t_gen` and the append share one critical section, `object_id`
+/// order equals `t_gen` order across the PC and haptic producers.
+///
+/// `t_gen - t_ready` is therefore the lock wait, which `t_recv - t_gen` does
+/// not contain; it is exported on the tx row as `t_ready`. The guard never
+/// spans an await; the QUIC send happens later in the session task.
+fn shared_fifo_append<W: SharedFifoWriter>(
+    shared: &Mutex<W>,
+    mut bytes: Vec<u8>,
+    header: impl FnOnce(u64) -> [u8; HDR],
+) -> Result<SharedFifoAppend> {
+    anyhow::ensure!(bytes.len() >= HDR, "shared FIFO object buffer lacks the header placeholder");
+    let t_ready = now_us();
+    let mut writer = shared
+        .lock()
+        .map_err(|_| anyhow::anyhow!("shared FIFO subgroup poisoned"))?;
+    let t_gen = now_us();
+    bytes[..HDR].copy_from_slice(&header(t_gen));
+    let (group_id, subgroup_id) = writer.identity();
+    let object_id = writer.append(bytes)?;
+    Ok(SharedFifoAppend {
+        t_ready,
+        t_gen,
+        identity: (group_id, subgroup_id, object_id),
+    })
+}
+
+/// Object buffer for `shared_fifo_append`: a zeroed 32-byte header
+/// placeholder followed by the payload copy. Built OUTSIDE the FIFO lock.
+fn object_buffer(payload: &[u8]) -> Vec<u8> {
+    let mut bytes = vec![0u8; HDR];
+    bytes.reserve_exact(payload.len());
+    bytes.extend_from_slice(payload);
+    bytes
+}
+
 impl TrackSel {
     fn as_str(self) -> &'static str {
         match self {
@@ -332,6 +540,14 @@ struct Args {
     /// Phase-4 transport arm. B1/S1 preserve the historical wire mapping.
     #[arg(long, value_enum, default_value_t = Arm::B1)]
     arm: Arm,
+    /// Stage-5 queue policy. `separate` (default) is the current behaviour;
+    /// `shared_fifo` needs --arm b1, --payload-mode frame, --tracks both.
+    #[arg(long, value_enum, default_value_t = QueuePolicy::Separate)]
+    queue_policy: QueuePolicy,
+    /// Stage-5 B1 priority profile. Absent == `equal-128` (current B1).
+    /// `haptic-first` is priority only (haptic 0 / PC 1, moqt-v2), no timeout.
+    #[arg(long, value_enum)]
+    publisher_priority_profile: Option<PublisherPriorityProfile>,
     /// S2 PC DELIVERY_TIMEOUT, repeated on TX for frozen metadata agreement.
     /// The receiver places the actual parameter on the PC SUBSCRIBE.
     #[arg(long)]
@@ -525,6 +741,13 @@ fn phase4_transport(args: &Args) -> Result<Option<Phase4TransportMeta>> {
             if args.pc_delivery_timeout_ms.is_some() {
                 anyhow::bail!("PC delivery timeout requires --arm s2");
             }
+            if args.arm == Arm::B1 {
+                return Ok(b1_transport_meta(
+                    args.queue_policy,
+                    priority_profile(args),
+                    args.data_priority_mapping,
+                ));
+            }
             Ok(None)
         }
         Arm::M1 => {
@@ -569,6 +792,11 @@ fn phase4_transport(args: &Args) -> Result<Option<Phase4TransportMeta>> {
             }))
         }
     }
+}
+
+fn priority_profile(args: &Args) -> PublisherPriorityProfile {
+    args.publisher_priority_profile
+        .unwrap_or(PublisherPriorityProfile::Equal128)
 }
 
 fn validate_s3_args(args: &Args) -> Result<()> {
@@ -635,15 +863,24 @@ async fn sleep_monotonic_until(target_us: u64) {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Where registered warmup objects are written. They must take the exact
+/// route the measurement objects take, so the t0 edge changes nothing.
+enum WarmupRoute<'a> {
+    Separate {
+        pc_sub: &'a mut moq_transport::serve::SubgroupsWriter,
+        pc_long_sg: &'a mut Option<moq_transport::serve::SubgroupWriter>,
+        haptic_sg: &'a mut moq_transport::serve::SubgroupWriter,
+    },
+    Shared(&'a SharedSubgroup),
+}
+
 async fn send_static_registered_warmup(
     args: &Args,
     phase: &skew_moq::phase::PhaseControl,
     frames: &Arc<Vec<Vec<u8>>>,
     pcm: &Arc<Vec<u8>>,
     logger: &Arc<Mutex<JsonlLogger>>,
-    pc_sub: &mut moq_transport::serve::SubgroupsWriter,
-    pc_long_sg: &mut Option<moq_transport::serve::SubgroupWriter>,
-    haptic_sg: &mut moq_transport::serve::SubgroupWriter,
+    route: WarmupRoute<'_>,
     ratio: u64,
 ) -> Result<()> {
     let pc_count = args
@@ -655,7 +892,16 @@ async fn send_static_registered_warmup(
         .checked_mul(3)
         .context("haptic warmup count overflow")?;
     let frame_subgroups = args.arm.pc_frame_subgroups();
-    let pc_priority = args.arm.pc_priority();
+    let (pc_priority, _) = resolved_priorities(args.arm, priority_profile(args));
+    let (mut pc_sub, mut pc_long_sg, mut haptic_sg, shared) = match route {
+        WarmupRoute::Separate {
+            pc_sub,
+            pc_long_sg,
+            haptic_sg,
+        } => (Some(pc_sub), Some(pc_long_sg), Some(haptic_sg), None),
+        WarmupRoute::Shared(shared) => (None, None, None, Some(shared)),
+    };
+    let transport_track = shared.map(|_| SHARED_FIFO_TRACK);
 
     let pc = async {
         for index in 0..pc_count {
@@ -668,6 +914,16 @@ async fn send_static_registered_warmup(
             let pts_us = timestamp_us(index, args.pc_rate_hz);
             let seq = warmup_seq(index)?;
             let payload = &frames[(index as usize) % frames.len()];
+            let (t_gen, frame_obj) = if let Some(shared) = shared {
+                let appended = shared_fifo_append(shared, object_buffer(payload), |t_gen| {
+                    pack_header(TRACK_PC, args.tier, seq, pts_us, (index + 1) as u32, t_gen, payload.len() as u32)
+                })?;
+                (appended.t_gen, Some(appended.identity))
+            } else {
+            let pc_sub = pc_sub.as_deref_mut().context("PC warmup subgroups missing")?;
+            let pc_long_sg = pc_long_sg
+                .as_deref_mut()
+                .context("PC warmup long subgroup slot missing")?;
             let t_gen = now_us();
             let object_payloads: Vec<Cow<'_, [u8]>> = match args.payload_mode {
                 PayloadMode::Frame => vec![Cow::Borrowed(payload.as_slice())],
@@ -719,10 +975,12 @@ async fn send_static_registered_warmup(
                 }
             }
             drop(frame_sg);
+            (t_gen, frame_obj)
+            };
             logger
                 .lock()
                 .map_err(|_| anyhow::anyhow!("TX logger poisoned"))?
-                .try_log_warmup_tx(
+                .try_log_warmup_tx_transport(
                     "pc",
                     args.tier,
                     seq,
@@ -732,6 +990,7 @@ async fn send_static_registered_warmup(
                     t_gen,
                     now_us(),
                     frame_obj,
+                    transport_track,
                 )?;
         }
         Ok::<(), anyhow::Error>(())
@@ -753,6 +1012,15 @@ async fn send_static_registered_warmup(
             };
             let seq = warmup_seq(tick)?;
             let payload = pcm_tick_payload(pcm, tick, PCM_SAMPLE_RATE_HZ, args.haptic_rate_hz)?;
+            let (t_gen, frame_obj) = if let Some(shared) = shared {
+                let appended = shared_fifo_append(shared, object_buffer(&payload), |t_gen| {
+                    pack_header(TRACK_HAPTIC, HAPTIC_TIER_FULL, seq, pts_us, event_id, t_gen, payload.len() as u32)
+                })?;
+                (appended.t_gen, Some(appended.identity))
+            } else {
+            let haptic_sg = haptic_sg
+                .as_deref_mut()
+                .context("haptic warmup subgroup missing")?;
             let t_gen = now_us();
             let object_payloads: Vec<Cow<'_, [u8]>> = match args.payload_mode {
                 PayloadMode::Frame => vec![Cow::Borrowed(payload.as_slice())],
@@ -788,10 +1056,12 @@ async fn send_static_registered_warmup(
                     frame_obj = Some((identity.0, identity.1, object_id));
                 }
             }
+            (t_gen, frame_obj)
+            };
             logger
                 .lock()
                 .map_err(|_| anyhow::anyhow!("TX logger poisoned"))?
-                .try_log_warmup_tx(
+                .try_log_warmup_tx_transport(
                     "haptic",
                     HAPTIC_TIER_FULL,
                     seq,
@@ -801,6 +1071,7 @@ async fn send_static_registered_warmup(
                     t_gen,
                     now_us(),
                     frame_obj,
+                    transport_track,
                 )?;
         }
         Ok::<(), anyhow::Error>(())
@@ -880,9 +1151,19 @@ async fn main() -> Result<()> {
         args.chunk_bytes <= u32::MAX as usize,
         "--chunk-bytes exceeds the wire field"
     );
+    validate_stage5_policy(
+        args.arm,
+        args.payload_mode,
+        args.tracks,
+        args.queue_policy,
+        args.publisher_priority_profile,
+        args.data_priority_mapping,
+    )?;
     let phase4_transport = phase4_transport(&args)?;
     validate_s3_args(&args)?;
     validate_phase_args(&args)?;
+    let (pc_priority, haptic_priority) = resolved_priorities(args.arm, priority_profile(&args));
+    let shared_fifo = args.queue_policy == QueuePolicy::SharedFifo;
 
     // ---- Workload ----
     let frames: Vec<Vec<u8>> = match (&args.frames_dir, args.dummy_size) {
@@ -920,9 +1201,10 @@ async fn main() -> Result<()> {
         .to_string();
 
     println!(
-        "[tx] frames={} S={}B haptic={}B pc={}Hz haptic={}Hz mode={} chunk={}B tracks={} arm={} -> {}",
+        "[tx] frames={} S={}B haptic={}B pc={}Hz haptic={}Hz mode={} chunk={}B tracks={} arm={} queue_policy={} priority pc={} haptic={} -> {}",
         frames.len(), s_bytes, pcm.len(), args.pc_rate_hz, args.haptic_rate_hz,
         args.payload_mode.as_str(), args.chunk_bytes, args.tracks.as_str(), args.arm.as_str(),
+        args.queue_policy.as_str(), pc_priority, haptic_priority,
         args.out.display(),
     );
     println!(
@@ -955,6 +1237,7 @@ async fn main() -> Result<()> {
             representation: args.representation,
             topology: args.topology,
             chunk_bytes: args.chunk_bytes,
+            queue_policy: Some(args.queue_policy.as_str()),
         }),
     )?));
     logger.lock().unwrap().log_info(&preflight_info(pf));
@@ -1215,8 +1498,24 @@ async fn main() -> Result<()> {
         }
 
         let (mut tracks_w, _req, tracks_r) = Tracks::new(namespace.clone()).produce();
-        let pc_tw = tracks_w.create("pc").context("create pc track")?;
-        let hap_tw = tracks_w.create("haptic").context("create haptic track")?;
+        // shared_fifo publishes ONLY the "mixed" track; separate keeps pc+haptic.
+        let (pc_tw, hap_tw, mixed_tw) = if shared_fifo {
+            (
+                None,
+                None,
+                Some(
+                    tracks_w
+                        .create(SHARED_FIFO_TRACK)
+                        .context("create mixed track")?,
+                ),
+            )
+        } else {
+            (
+                Some(tracks_w.create("pc").context("create pc track")?),
+                Some(tracks_w.create("haptic").context("create haptic track")?),
+                None,
+            )
+        };
 
         // Announce the namespace (serves subscribes on demand).
         let mut ns_pub = publisher.clone();
@@ -1232,32 +1531,52 @@ async fn main() -> Result<()> {
         // Establish the real subgroup mapping before readiness. In registered
         // mode these exact writers span warmup and measurement, so the t0 edge
         // neither drains backlog nor creates a different transport route.
-        let mut pc_state = if args.tracks.pc_on() {
-            let mut subgroups = pc_tw.subgroups().context("pc subgroups")?;
-            let long = if args.arm.pc_frame_subgroups() {
+        let mut pc_state = match pc_tw {
+            Some(pc_tw) if args.tracks.pc_on() => {
+                let mut subgroups = pc_tw.subgroups().context("pc subgroups")?;
+                let long = if args.arm.pc_frame_subgroups() {
+                    None
+                } else {
+                    Some(subgroups.append(pc_priority).context("pc append")?)
+                };
+                Some((subgroups, long))
+            }
+            Some(pc_tw) => {
+                drop(pc_tw.subgroups().context("pc subgroups")?);
                 None
-            } else {
-                Some(
-                    subgroups
-                        .append(args.arm.pc_priority())
-                        .context("pc append")?,
-                )
+            }
+            None => None,
+        };
+        let mut haptic_state = match hap_tw {
+            Some(hap_tw) if args.tracks.haptic_on() => {
+                let mut subgroups = hap_tw.subgroups().context("haptic subgroups")?;
+                let subgroup = subgroups
+                    .append(haptic_priority)
+                    .context("haptic append")?;
+                Some((subgroups, subgroup))
+            }
+            Some(hap_tw) => {
+                drop(hap_tw.subgroups().context("haptic subgroups")?);
+                None
+            }
+            None => None,
+        };
+        // shared_fifo: ONE long-lived subgroup, shared by both producer loops
+        // behind a lock; both loops hold a clone and the state below is what
+        // the drain edge releases (last owner drop == FIN).
+        let mut shared_state: Option<(moq_transport::serve::SubgroupsWriter, SharedSubgroup)> =
+            match mixed_tw {
+                Some(mixed_tw) => {
+                    let mut subgroups = mixed_tw.subgroups().context("mixed subgroups")?;
+                    let subgroup = subgroups
+                        .append(SHARED_FIFO_PRIORITY)
+                        .context("mixed append")?;
+                    Some((subgroups, Arc::new(Mutex::new(subgroup))))
+                }
+                None => None,
             };
-            Some((subgroups, long))
-        } else {
-            drop(pc_tw.subgroups().context("pc subgroups")?);
-            None
-        };
-        let mut haptic_state = if args.tracks.haptic_on() {
-            let mut subgroups = hap_tw.subgroups().context("haptic subgroups")?;
-            let subgroup = subgroups
-                .append(args.arm.haptic_priority())
-                .context("haptic append")?;
-            Some((subgroups, subgroup))
-        } else {
-            drop(hap_tw.subgroups().context("haptic subgroups")?);
-            None
-        };
+        let shared_subgroup: Option<SharedSubgroup> =
+            shared_state.as_ref().map(|(_, shared)| shared.clone());
 
         // Sender-side readiness edge (plan §3.1 start timing; ledger
         // `readiness_us`). The sender can prove its own MoQ SETUP and that the
@@ -1275,6 +1594,9 @@ async fn main() -> Result<()> {
             }
             if haptic_state.is_some() {
                 components.push("haptic_track_writer");
+            }
+            if shared_state.is_some() {
+                components.push("mixed_track_writer");
             }
             logger
                 .lock()
@@ -1300,16 +1622,24 @@ async fn main() -> Result<()> {
             None
         };
         let t0_us = if let Some(phase) = &phase {
-            let (pc_sub, pc_long_sg) = pc_state
-                .as_mut()
-                .context("registered warmup requires the PC track")?;
-            let (_, haptic_sg) = haptic_state
-                .as_mut()
-                .context("registered warmup requires the haptic track")?;
-            send_static_registered_warmup(
-                &args, phase, &frames, &pcm, &logger, pc_sub, pc_long_sg, haptic_sg, ratio,
-            )
-            .await?;
+            let route = match shared_subgroup.as_ref() {
+                Some(shared) => WarmupRoute::Shared(shared),
+                None => {
+                    let (pc_sub, pc_long_sg) = pc_state
+                        .as_mut()
+                        .context("registered warmup requires the PC track")?;
+                    let (_, haptic_sg) = haptic_state
+                        .as_mut()
+                        .context("registered warmup requires the haptic track")?;
+                    WarmupRoute::Separate {
+                        pc_sub,
+                        pc_long_sg,
+                        haptic_sg,
+                    }
+                }
+            };
+            send_static_registered_warmup(&args, phase, &frames, &pcm, &logger, route, ratio)
+                .await?;
             skew_moq::phase::require_warmup_pass(
                 args.warmup_pass
                     .clone()
@@ -1342,8 +1672,12 @@ async fn main() -> Result<()> {
             let payload_mode = args.payload_mode;
             let chunk_bytes = args.chunk_bytes;
             let frame_subgroups = args.arm.pc_frame_subgroups();
-            let priority = args.arm.pc_priority();
-            let (mut pc_sub, mut long_sg) = pc_state.take().expect("PC state validated");
+            let priority = pc_priority;
+            let mut state = pc_state.take();
+            let shared = shared_subgroup.clone();
+            if state.is_none() && shared.is_none() {
+                anyhow::bail!("PC state validated");
+            }
             Some(tokio::spawn(async move {
                 let mut i: u64 = 0;
                 let mut stats = TrackRunStats::default();
@@ -1354,49 +1688,67 @@ async fn main() -> Result<()> {
                     }
                     let pts = timestamp_us(i, pc_rate_hz);
                     let payload = &frames[(i as usize) % frames.len()];
-                    let t_gen = now_us();
-                    stats.period.observe(t_gen);
-                    let object_payloads: Vec<Cow<'_, [u8]>> = match payload_mode {
-                        PayloadMode::Frame => vec![Cow::Borrowed(payload.as_slice())],
-                        PayloadMode::EqualChunk => equal_chunks(payload, i as u32, chunk_bytes)?
-                            .into_iter()
-                            .map(Cow::Owned)
-                            .collect(),
-                    };
-                    let mut frame_sg = if frame_subgroups {
-                        Some(pc_sub.append(priority).context("pc frame append")?)
+                    // (t_gen, MoQ identity, objects written, padding bytes)
+                    let (t_gen, t_ready, frame_obj, objects, padding) = if let Some(shared) = &shared {
+                        // shared_fifo (frame mode only): payload copy outside,
+                        // t_gen + header + append under the FIFO lock.
+                        let buffer = object_buffer(payload);
+                        let appended = shared_fifo_append(shared, buffer, |t_gen| {
+                            pack_header(TRACK_PC, tier, i as u32, pts, (i + 1) as u32, t_gen, payload.len() as u32)
+                        })?;
+                        (appended.t_gen, Some(appended.t_ready), Some(appended.identity), 1u64, 0u64)
                     } else {
-                        None
-                    };
-                    let mut frame_obj = None;
-                    for object_payload in &object_payloads {
-                        let sg = match frame_sg.as_mut() {
-                            Some(sg) => sg,
-                            None => long_sg.as_mut().expect("long subgroup exists"),
+                        let (pc_sub, long_sg) = state.as_mut().expect("separate PC state");
+                        let t_gen = now_us();
+                        let object_payloads: Vec<Cow<'_, [u8]>> = match payload_mode {
+                            PayloadMode::Frame => vec![Cow::Borrowed(payload.as_slice())],
+                            PayloadMode::EqualChunk => equal_chunks(payload, i as u32, chunk_bytes)?
+                                .into_iter()
+                                .map(Cow::Owned)
+                                .collect(),
                         };
-                        let hdr = pack_header(
-                            TRACK_PC,
-                            tier,
-                            i as u32,
-                            pts,
-                            (i + 1) as u32,
-                            t_gen,
-                            object_payload.len() as u32,
-                        );
-                        let mut buf = Vec::with_capacity(HDR + object_payload.len());
-                        buf.extend_from_slice(&hdr);
-                        buf.extend_from_slice(object_payload.as_ref());
-                        let (gid, sgid) = (sg.group_id, sg.subgroup_id);
-                        let mut obj = sg.create(buf.len(), None).context("pc create")?;
-                        let oid = obj.object_id;
-                        obj.write(Bytes::from(buf)).context("pc write")?;
-                        drop(obj);
-                        if payload_mode == PayloadMode::Frame {
-                            frame_obj = Some((gid, sgid, oid));
+                        let mut frame_sg = if frame_subgroups {
+                            Some(pc_sub.append(priority).context("pc frame append")?)
+                        } else {
+                            None
+                        };
+                        let mut frame_obj = None;
+                        for object_payload in &object_payloads {
+                            let sg = match frame_sg.as_mut() {
+                                Some(sg) => sg,
+                                None => long_sg.as_mut().expect("long subgroup exists"),
+                            };
+                            let hdr = pack_header(
+                                TRACK_PC,
+                                tier,
+                                i as u32,
+                                pts,
+                                (i + 1) as u32,
+                                t_gen,
+                                object_payload.len() as u32,
+                            );
+                            let mut buf = Vec::with_capacity(HDR + object_payload.len());
+                            buf.extend_from_slice(&hdr);
+                            buf.extend_from_slice(object_payload.as_ref());
+                            let (gid, sgid) = (sg.group_id, sg.subgroup_id);
+                            let mut obj = sg.create(buf.len(), None).context("pc create")?;
+                            let oid = obj.object_id;
+                            obj.write(Bytes::from(buf)).context("pc write")?;
+                            drop(obj);
+                            if payload_mode == PayloadMode::Frame {
+                                frame_obj = Some((gid, sgid, oid));
+                            }
                         }
-                    }
-                    drop(frame_sg);
-                    logger.lock().unwrap().log_tx(
+                        drop(frame_sg);
+                        let padding = if payload_mode == PayloadMode::EqualChunk {
+                            (object_payloads.len() * chunk_bytes - payload.len()) as u64
+                        } else {
+                            0
+                        };
+                        (t_gen, None, frame_obj, object_payloads.len() as u64, padding)
+                    };
+                    stats.period.observe(t_gen);
+                    logger.lock().unwrap().log_tx_transport(
                         "pc",
                         tier,
                         i as u32,
@@ -1406,17 +1758,16 @@ async fn main() -> Result<()> {
                         t_gen,
                         now_us(),
                         frame_obj,
+                        shared.as_ref().map(|_| SHARED_FIFO_TRACK),
+                        t_ready,
                     );
                     stats.logical_generated += 1;
-                    stats.chunks_sent += object_payloads.len() as u64;
+                    stats.chunks_sent += objects;
                     stats.source_payload_bytes += payload.len() as u64;
-                    if payload_mode == PayloadMode::EqualChunk {
-                        stats.padding_bytes +=
-                            (object_payloads.len() * chunk_bytes - payload.len()) as u64;
-                    }
+                    stats.padding_bytes += padding;
                     i += 1;
                 }
-                Ok::<_, anyhow::Error>((stats, (pc_sub, long_sg)))
+                Ok::<_, anyhow::Error>((stats, state))
             }))
         } else {
             None
@@ -1430,7 +1781,11 @@ async fn main() -> Result<()> {
             let haptic_rate_hz = args.haptic_rate_hz;
             let payload_mode = args.payload_mode;
             let chunk_bytes = args.chunk_bytes;
-            let (hap_sub, mut sg) = haptic_state.take().expect("haptic state validated");
+            let mut state = haptic_state.take();
+            let shared = shared_subgroup.clone();
+            if state.is_none() && shared.is_none() {
+                anyhow::bail!("haptic state validated");
+            }
             Some(tokio::spawn(async move {
                 let mut k: u64 = 0;
                 let mut stats = TrackRunStats::default();
@@ -1447,39 +1802,57 @@ async fn main() -> Result<()> {
                         (timestamp_us(k, haptic_rate_hz), 0u32)
                     };
                     let payload = pcm_tick_payload(&pcm, k, PCM_SAMPLE_RATE_HZ, haptic_rate_hz)?;
-                    let t_gen = now_us();
-                    stats.period.observe(t_gen);
-                    let object_payloads: Vec<Cow<'_, [u8]>> = match payload_mode {
-                        PayloadMode::Frame => vec![Cow::Borrowed(payload.as_slice())],
-                        PayloadMode::EqualChunk => equal_chunks(&payload, k as u32, chunk_bytes)?
-                            .into_iter()
-                            .map(Cow::Owned)
-                            .collect(),
-                    };
-                    let mut frame_obj = None;
-                    for object_payload in &object_payloads {
-                        let hdr = pack_header(
-                            TRACK_HAPTIC,
-                            HAPTIC_TIER_FULL,
-                            k as u32,
-                            pts,
-                            event_id,
-                            t_gen,
-                            object_payload.len() as u32,
-                        );
-                        let mut buf = Vec::with_capacity(HDR + object_payload.len());
-                        buf.extend_from_slice(&hdr);
-                        buf.extend_from_slice(object_payload.as_ref());
-                        let (gid, sgid) = (sg.group_id, sg.subgroup_id);
-                        let mut obj = sg.create(buf.len(), None).context("haptic create")?;
-                        let oid = obj.object_id;
-                        obj.write(Bytes::from(buf)).context("haptic write")?;
-                        drop(obj);
-                        if payload_mode == PayloadMode::Frame {
-                            frame_obj = Some((gid, sgid, oid));
+                    let (t_gen, t_ready, frame_obj, objects, padding) = if let Some(shared) = &shared {
+                        let buffer = object_buffer(&payload);
+                        let appended = shared_fifo_append(shared, buffer, |t_gen| {
+                            pack_header(
+                                TRACK_HAPTIC, HAPTIC_TIER_FULL, k as u32, pts, event_id, t_gen,
+                                payload.len() as u32,
+                            )
+                        })?;
+                        (appended.t_gen, Some(appended.t_ready), Some(appended.identity), 1u64, 0u64)
+                    } else {
+                        let (_, sg) = state.as_mut().expect("separate haptic state");
+                        let t_gen = now_us();
+                        let object_payloads: Vec<Cow<'_, [u8]>> = match payload_mode {
+                            PayloadMode::Frame => vec![Cow::Borrowed(payload.as_slice())],
+                            PayloadMode::EqualChunk => equal_chunks(&payload, k as u32, chunk_bytes)?
+                                .into_iter()
+                                .map(Cow::Owned)
+                                .collect(),
+                        };
+                        let mut frame_obj = None;
+                        for object_payload in &object_payloads {
+                            let hdr = pack_header(
+                                TRACK_HAPTIC,
+                                HAPTIC_TIER_FULL,
+                                k as u32,
+                                pts,
+                                event_id,
+                                t_gen,
+                                object_payload.len() as u32,
+                            );
+                            let mut buf = Vec::with_capacity(HDR + object_payload.len());
+                            buf.extend_from_slice(&hdr);
+                            buf.extend_from_slice(object_payload.as_ref());
+                            let (gid, sgid) = (sg.group_id, sg.subgroup_id);
+                            let mut obj = sg.create(buf.len(), None).context("haptic create")?;
+                            let oid = obj.object_id;
+                            obj.write(Bytes::from(buf)).context("haptic write")?;
+                            drop(obj);
+                            if payload_mode == PayloadMode::Frame {
+                                frame_obj = Some((gid, sgid, oid));
+                            }
                         }
-                    }
-                    logger.lock().unwrap().log_tx(
+                        let padding = if payload_mode == PayloadMode::EqualChunk {
+                            (object_payloads.len() * chunk_bytes - payload.len()) as u64
+                        } else {
+                            0
+                        };
+                        (t_gen, None, frame_obj, object_payloads.len() as u64, padding)
+                    };
+                    stats.period.observe(t_gen);
+                    logger.lock().unwrap().log_tx_transport(
                         "haptic",
                         HAPTIC_TIER_FULL,
                         k as u32,
@@ -1489,17 +1862,16 @@ async fn main() -> Result<()> {
                         t_gen,
                         now_us(),
                         frame_obj,
+                        shared.as_ref().map(|_| SHARED_FIFO_TRACK),
+                        t_ready,
                     );
                     stats.logical_generated += 1;
-                    stats.chunks_sent += object_payloads.len() as u64;
+                    stats.chunks_sent += objects;
                     stats.source_payload_bytes += payload.len() as u64;
-                    if payload_mode == PayloadMode::EqualChunk {
-                        stats.padding_bytes +=
-                            (object_payloads.len() * chunk_bytes - payload.len()) as u64;
-                    }
+                    stats.padding_bytes += padding;
                     k += 1;
                 }
-                Ok::<_, anyhow::Error>((stats, (hap_sub, sg)))
+                Ok::<_, anyhow::Error>((stats, state))
             }))
         } else {
             None
@@ -1523,7 +1895,7 @@ async fn main() -> Result<()> {
                     let pc = match pc_task {
                         Some(h) => {
                             let (stats, state) = h.await??;
-                            pc_state = Some(state);
+                            pc_state = state;
                             stats
                         }
                         None => TrackRunStats::default(),
@@ -1531,7 +1903,7 @@ async fn main() -> Result<()> {
                     let haptic = match hap_task {
                         Some(h) => {
                             let (stats, state) = h.await??;
-                            haptic_state = Some(state);
+                            haptic_state = state;
                             stats
                         }
                         None => TrackRunStats::default(),
@@ -1579,10 +1951,14 @@ async fn main() -> Result<()> {
         // the relay forwards backlog. Releasing the writers emits FIN and gives
         // a complete receiver permission to exit. Legacy runs keep their old
         // session-only drain; a signal cuts either wait short for cleanup.
+        // The producer loops' clones of the shared subgroup are gone once
+        // they were joined above, so `shared_state` is the last owner and
+        // releasing it at the drain edge emits the "mixed" FIN.
+        drop(shared_subgroup);
         let drain_signalled = hold_static_track_state_through_drain(
             Duration::from_secs_f64(args.drain_timeout),
             sig_rx.clone(),
-            pc_state.take(),
+            (pc_state.take(), shared_state.take()),
             haptic_state.take(),
             phase.is_some(),
         )
@@ -1765,9 +2141,180 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        epoch_record, hold_static_track_state_through_drain, now_us, registered_s_bytes,
-        wait_registered_direct_fin_handoff, DirectFinHandoff, Duration,
+        b1_transport_meta, epoch_record, hold_static_track_state_through_drain, now_us,
+        object_buffer, registered_s_bytes, resolved_priorities, shared_fifo_append,
+        validate_stage5_policy, wait_registered_direct_fin_handoff, Arm, DataPriorityMapping,
+        DirectFinHandoff, Duration, PayloadMode, PublisherPriorityProfile, QueuePolicy,
+        SharedFifoWriter, TrackSel, HDR,
     };
+    use std::sync::Mutex;
+
+    /// In-memory stand-in for the mixed subgroup: records every appended
+    /// object in append order and hands out sequential object ids.
+    struct RecordingWriter {
+        objects: Vec<Vec<u8>>,
+    }
+
+    impl SharedFifoWriter for RecordingWriter {
+        fn identity(&self) -> (u64, u64) {
+            (7, 0)
+        }
+        fn append(&mut self, bytes: Vec<u8>) -> Result<u64, anyhow::Error> {
+            self.objects.push(bytes);
+            Ok(self.objects.len() as u64 - 1)
+        }
+    }
+
+    /// Stage-5 P1 ordering rule: object_id order == t_gen order across two
+    /// concurrent producers, because t_gen is sampled under the same lock
+    /// that serialises the append.
+    #[test]
+    fn shared_fifo_append_orders_object_ids_by_t_gen_across_producers() {
+        const PER_PRODUCER: u64 = 400;
+        let shared = Arc::new(Mutex::new(RecordingWriter { objects: Vec::new() }));
+        let producers: Vec<_> = [0u8, 1u8]
+            .into_iter()
+            .map(|track| {
+                let shared = Arc::clone(&shared);
+                std::thread::spawn(move || {
+                    let mut ids = Vec::new();
+                    for _ in 0..PER_PRODUCER {
+                        // Payload copied outside the lock; header carries t_gen.
+                        let appended = shared_fifo_append(&shared, object_buffer(&[track]), |t_gen| {
+                            let mut header = [0u8; HDR];
+                            header[..8].copy_from_slice(&t_gen.to_le_bytes());
+                            header
+                        })
+                        .unwrap();
+                        let (gid, sgid, oid) = appended.identity;
+                        assert_eq!((gid, sgid), (7, 0));
+                        assert!(appended.t_ready <= appended.t_gen);
+                        ids.push((oid, appended.t_gen));
+                        std::thread::yield_now();
+                    }
+                    ids
+                })
+            })
+            .collect();
+        let mut returned: Vec<(u64, u64)> = producers
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
+        returned.sort_unstable();
+        let writer = shared.lock().unwrap();
+        assert_eq!(writer.objects.len() as u64, 2 * PER_PRODUCER);
+        let mut previous = 0u64;
+        let mut per_track = [0u64; 2];
+        for (oid, bytes) in writer.objects.iter().enumerate() {
+            let t_gen = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+            assert!(t_gen >= previous, "object {oid}: t_gen {t_gen} < previous {previous}");
+            previous = t_gen;
+            assert_eq!(bytes.len(), HDR + 1, "header placeholder + 1-byte payload");
+            per_track[bytes[HDR] as usize] += 1;
+            // The identity handed back to the caller is the one recorded.
+            assert_eq!(returned[oid], (oid as u64, t_gen));
+        }
+        assert_eq!(per_track, [PER_PRODUCER, PER_PRODUCER]);
+    }
+
+    /// Lock-wait boundary: `t_ready` precedes the lock attempt and `t_gen`
+    /// is taken under the lock, so a contender that has to wait for a holder
+    /// shows `t_gen - t_ready` at least as long as the hold.
+    #[test]
+    fn shared_fifo_t_ready_precedes_t_gen_and_exposes_the_lock_wait() {
+        const HOLD: Duration = Duration::from_millis(30);
+        let shared = Arc::new(Mutex::new(RecordingWriter { objects: Vec::new() }));
+        // Uncontended: t_ready <= t_gen and both are real monotonic readings.
+        let before = now_us();
+        let free = shared_fifo_append(&shared, object_buffer(&[9, 9, 9]), |_| [0u8; HDR]).unwrap();
+        assert!(before <= free.t_ready && free.t_ready <= free.t_gen && free.t_gen <= now_us());
+        assert_eq!(free.identity, (7, 0, 0));
+        assert_eq!(shared.lock().unwrap().objects[0][HDR..], [9, 9, 9]);
+
+        // Contended: hold the lock for HOLD while the contender is already
+        // past its t_ready sample.
+        let holder = shared.lock().unwrap();
+        let contender = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                shared_fifo_append(&shared, object_buffer(&[1]), |_| [0u8; HDR]).unwrap()
+            })
+        };
+        std::thread::sleep(HOLD);
+        drop(holder);
+        let waited = contender.join().unwrap();
+        let lock_wait_us = waited.t_gen - waited.t_ready;
+        // Lower bound only: the contender may have started its wait a little
+        // after the hold began, but it cannot have acquired the lock before
+        // the hold ended, and thread start-up only shortens the measured wait
+        // if it exceeds HOLD — which a 30 ms hold rules out on a sane host.
+        assert!(
+            lock_wait_us >= (HOLD.as_micros() as u64) / 2,
+            "lock wait {lock_wait_us}us did not reflect a {HOLD:?} hold"
+        );
+        assert_eq!(waited.identity, (7, 0, 1));
+    }
+
+    #[test]
+    fn stage5_policy_is_b1_frame_both_only_and_rejects_mixed_priority() {
+        use DataPriorityMapping::{LegacyV1, MoqtV2};
+        use PayloadMode::{EqualChunk, Frame};
+        use PublisherPriorityProfile::{Equal128, HapticFirst};
+        use QueuePolicy::{Separate, SharedFifo};
+        let ok = |arm, mode, tracks, q, p, m| validate_stage5_policy(arm, mode, tracks, q, p, m);
+        // Defaults never reject any arm.
+        for arm in [Arm::B1, Arm::S1, Arm::M1, Arm::S2, Arm::S2Eq, Arm::S3] {
+            ok(arm, Frame, TrackSel::Both, Separate, None, MoqtV2).unwrap();
+        }
+        ok(Arm::B1, Frame, TrackSel::Both, SharedFifo, None, LegacyV1).unwrap();
+        ok(Arm::B1, Frame, TrackSel::Both, Separate, Some(HapticFirst), MoqtV2).unwrap();
+        ok(Arm::B1, Frame, TrackSel::Both, Separate, Some(Equal128), LegacyV1).unwrap();
+        let err = |r: Result<(), anyhow::Error>| r.unwrap_err().to_string();
+        assert!(err(ok(Arm::S1, Frame, TrackSel::Both, SharedFifo, None, MoqtV2))
+            .contains("requires --arm b1"));
+        assert!(err(ok(Arm::B1, EqualChunk, TrackSel::Both, SharedFifo, None, MoqtV2))
+            .contains("--payload-mode frame"));
+        assert!(err(ok(Arm::B1, Frame, TrackSel::Pc, SharedFifo, None, MoqtV2))
+            .contains("--tracks both"));
+        assert!(err(ok(Arm::S2, Frame, TrackSel::Both, Separate, Some(Equal128), MoqtV2))
+            .contains("requires --arm b1"));
+        assert!(err(ok(Arm::S2, Frame, TrackSel::Both, Separate, Some(HapticFirst), MoqtV2))
+            .contains("requires --arm b1"));
+        assert!(err(ok(Arm::B1, Frame, TrackSel::Both, SharedFifo, Some(HapticFirst), MoqtV2))
+            .contains("one priority"));
+        assert!(err(ok(Arm::B1, Frame, TrackSel::Both, Separate, Some(HapticFirst), LegacyV1))
+            .contains("moqt-v2"));
+    }
+
+    #[test]
+    fn b1_priorities_and_meta_follow_the_profile_without_touching_other_arms() {
+        use PublisherPriorityProfile::{Equal128, HapticFirst};
+        assert_eq!(resolved_priorities(Arm::B1, Equal128), (128, 128));
+        assert_eq!(resolved_priorities(Arm::B1, HapticFirst), (1, 0));
+        // Non-B1 arms ignore the profile entirely.
+        assert_eq!(resolved_priorities(Arm::S2, HapticFirst), (1, 0));
+        assert_eq!(resolved_priorities(Arm::S2Eq, HapticFirst), (128, 128));
+        assert_eq!(resolved_priorities(Arm::S1, HapticFirst), (128, 128));
+        assert_eq!(resolved_priorities(Arm::M1, HapticFirst), (128, 128));
+
+        // Historical B1 records no phase4 transport block at all.
+        assert!(b1_transport_meta(QueuePolicy::Separate, Equal128, DataPriorityMapping::MoqtV2)
+            .is_none());
+        let p3 = b1_transport_meta(QueuePolicy::Separate, HapticFirst, DataPriorityMapping::MoqtV2)
+            .unwrap();
+        assert_eq!(p3.arm, "b1");
+        assert_eq!(p3.pc_subgroup_mapping, "long-lived-subgroup");
+        assert_eq!((p3.pc_publisher_priority, p3.haptic_publisher_priority), (1, 0));
+        assert_eq!(p3.publisher_priority_profile, "relative-haptic0-pc1");
+        assert_eq!(p3.data_priority_mapping, "moqt-v2");
+        assert_eq!(p3.pc_delivery_timeout_ms, None);
+        let p1 = b1_transport_meta(QueuePolicy::SharedFifo, Equal128, DataPriorityMapping::MoqtV2)
+            .unwrap();
+        assert_eq!(p1.pc_subgroup_mapping, "shared-single-subgroup");
+        assert_eq!((p1.pc_publisher_priority, p1.haptic_publisher_priority), (128, 128));
+        assert_eq!(p1.publisher_priority_profile, "equal-128");
+        assert_eq!(p1.pc_delivery_timeout_ms, None);
+    }
 
     struct DropProbe(Arc<AtomicUsize>);
 

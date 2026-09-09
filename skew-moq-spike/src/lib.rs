@@ -751,6 +751,11 @@ pub struct V5Meta {
     /// same position `skew_logging.make_meta_v5` writes it at.
     pub topology: Topology,
     pub chunk_bytes: usize,
+    /// Stage-5 cause-separation queue policy (`separate` | `shared_fifo`).
+    /// `None` keeps the historical meta line byte-identical (S3 logging and
+    /// older fixtures); the static sender/receiver always record it so a
+    /// consumer can rely on the key in both modes.
+    pub queue_policy: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -863,14 +868,18 @@ impl JsonlLogger {
             None => String::new(),
         };
         if let Some(v5) = v5 {
+            let queue_policy = match v5.queue_policy {
+                Some(policy) => format!(",\"queue_policy\":\"{}\"", esc(policy)),
+                None => String::new(),
+            };
             writeln!(
                 w,
-                "{{\"role\":\"meta\",\"run_id\":\"{}\",\"stack\":\"{}\",\"side\":\"{}\",\"cond\":{{\"C_mbps\":{},\"rtt_ms\":{},\"jitter_ms\":{},\"loss_pct\":{}}},\"S_bytes\":{},\"schema_version\":\"v5\",\"metric_schema_version\":\"v5\",\"log_schema_version\":{},\"pc_rate_hz\":{},\"haptic_rate_hz\":{},\"payload_mode\":\"{}\",\"representation\":\"{}\",\"topology\":\"{}\",\"chunk_bytes\":{},\"seed\":{},\"clock\":\"monotonic_ns/1000\"{}{}{}{}{}{},\"threshold_profile\":\"lenient\",\"pc_late_threshold_ms\":87.0,\"haptic_late_threshold_ms\":-125.0}}",
+                "{{\"role\":\"meta\",\"run_id\":\"{}\",\"stack\":\"{}\",\"side\":\"{}\",\"cond\":{{\"C_mbps\":{},\"rtt_ms\":{},\"jitter_ms\":{},\"loss_pct\":{}}},\"S_bytes\":{},\"schema_version\":\"v5\",\"metric_schema_version\":\"v5\",\"log_schema_version\":{},\"pc_rate_hz\":{},\"haptic_rate_hz\":{},\"payload_mode\":\"{}\",\"representation\":\"{}\",\"topology\":\"{}\",\"chunk_bytes\":{},\"seed\":{},\"clock\":\"monotonic_ns/1000\"{}{}{}{}{}{}{},\"threshold_profile\":\"lenient\",\"pc_late_threshold_ms\":87.0,\"haptic_late_threshold_ms\":-125.0}}",
                 esc(run_id), esc(stack), esc(side), cmb, rtt_ms, jitter_ms, loss_pct,
                 s_bytes, LOG_SCHEMA_VERSION_V5, fps, haptic_hz,
                 v5.payload_mode.as_str(), v5.representation.as_str(),
                 v5.topology.as_str(), v5.chunk_bytes, seed,
-                design, extra, tracks, term, phase4_transport, playout
+                design, extra, tracks, term, phase4_transport, playout, queue_policy
             )?;
         } else {
             writeln!(
@@ -903,13 +912,52 @@ impl JsonlLogger {
         t_send: u64,
         obj: Option<(u64, u64, u64)>,
     ) {
+        self.log_tx_transport(
+            track, tier, seq, pts_us, event_id, size, t_gen, t_send, obj, None, None,
+        );
+    }
+
+    /// tx record with an explicit wire track. `transport_track` is `None` for
+    /// the separate-track policy (byte-identical to `log_tx`) and
+    /// `Some("mixed")` for the stage-5 shared FIFO, where the logical `track`
+    /// (pc/haptic, from the 32-byte header) differs from the MoQ track that
+    /// carried the object. Accept records name the wire track, so the accept
+    /// join must prefer `transport_track` when present.
+    ///
+    /// `t_ready` (shared_fifo only, else absent) is the monotonic time the
+    /// producer had its payload ready and started waiting for the FIFO lock;
+    /// `t_gen` is sampled under the lock, so `t_gen - t_ready` is the lock
+    /// wait that `t_recv - t_gen` does not contain.
+    #[allow(clippy::too_many_arguments)]
+    pub fn log_tx_transport(
+        &mut self,
+        track: &str,
+        tier: u16,
+        seq: u32,
+        pts_us: u64,
+        event_id: u32,
+        size: usize,
+        t_gen: u64,
+        t_send: u64,
+        obj: Option<(u64, u64, u64)>,
+        transport_track: Option<&str>,
+        t_ready: Option<u64>,
+    ) {
         let objf = match obj {
             Some((g, sg, o)) => format!(",\"group_id\":{g},\"subgroup_id\":{sg},\"object_id\":{o}"),
             None => String::new(),
         };
+        let transport = match transport_track {
+            Some(name) => format!(",\"transport_track\":\"{}\"", esc(name)),
+            None => String::new(),
+        };
+        let ready = match t_ready {
+            Some(t) => format!(",\"t_ready\":{t}"),
+            None => String::new(),
+        };
         let _ = writeln!(
             self.w,
-            "{{\"role\":\"tx\",\"track\":\"{track}\",\"tier\":{tier},\"seq\":{seq},\"pts_us\":{pts_us},\"event_id\":{event_id},\"size\":{size},\"t_gen\":{t_gen},\"t_send\":{t_send}{objf}}}"
+            "{{\"role\":\"tx\",\"track\":\"{track}\",\"tier\":{tier},\"seq\":{seq},\"pts_us\":{pts_us},\"event_id\":{event_id},\"size\":{size},\"t_gen\":{t_gen},\"t_send\":{t_send}{objf}{transport}{ready}}}"
         );
         let _ = self.w.flush();
     }
@@ -950,6 +998,26 @@ impl JsonlLogger {
         t_send: u64,
         object: Option<(u64, u64, u64)>,
     ) -> std::io::Result<()> {
+        self.try_log_warmup_tx_transport(
+            track, tier, seq, pts_us, event_id, size, t_gen, t_send, object, None,
+        )
+    }
+
+    /// Warmup tx record with an explicit wire track (see `log_tx_transport`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_log_warmup_tx_transport(
+        &mut self,
+        track: &str,
+        tier: u16,
+        seq: u32,
+        pts_us: u64,
+        event_id: u32,
+        size: usize,
+        t_gen: u64,
+        t_send: u64,
+        object: Option<(u64, u64, u64)>,
+        transport_track: Option<&str>,
+    ) -> std::io::Result<()> {
         if !matches!(track, "pc" | "haptic") || !is_warmup_seq(seq) || t_send < t_gen {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -962,9 +1030,13 @@ impl JsonlLogger {
             }
             None => String::new(),
         };
+        let transport = match transport_track {
+            Some(name) => format!(",\"transport_track\":\"{}\"", esc(name)),
+            None => String::new(),
+        };
         writeln!(
             self.w,
-            "{{\"role\":\"info\",\"event\":\"warmup_tx\",\"track\":\"{track}\",\"tier\":{tier},\"seq\":{seq},\"pts_us\":{pts_us},\"event_id\":{event_id},\"size\":{size},\"t_gen\":{t_gen},\"t_send\":{t_send}{object}}}"
+            "{{\"role\":\"info\",\"event\":\"warmup_tx\",\"track\":\"{track}\",\"tier\":{tier},\"seq\":{seq},\"pts_us\":{pts_us},\"event_id\":{event_id},\"size\":{size},\"t_gen\":{t_gen},\"t_send\":{t_send}{object}{transport}}}"
         )?;
         self.w.flush()
     }
@@ -1523,6 +1595,7 @@ mod phase1_v5_tests {
                     representation: Representation::Bin,
                     topology: Topology::Direct,
                     chunk_bytes: 178,
+                    queue_policy: None,
                 }),
             )
             .unwrap();
@@ -1579,6 +1652,7 @@ mod phase1_v5_tests {
                     representation: Representation::Bin,
                     topology: Topology::Direct,
                     chunk_bytes: 178,
+                    queue_policy: None,
                 }),
             )
             .unwrap();
@@ -1626,6 +1700,7 @@ mod phase1_v5_tests {
                     representation: Representation::Bin,
                     topology: Topology::Direct,
                     chunk_bytes: 178,
+                    queue_policy: None,
                 }),
             )
             .unwrap();
@@ -1684,6 +1759,7 @@ mod phase1_v5_tests {
                     representation: Representation::Bin,
                     topology: Topology::Relay,
                     chunk_bytes: 178,
+                    queue_policy: None,
                 }),
             )
             .unwrap();
