@@ -17,6 +17,7 @@ pub mod s3_controller;
 pub mod s3_logging;
 pub mod s3_producer;
 pub mod s3_receiver;
+pub mod s3np;
 pub mod s3_sender;
 pub mod s3_switch;
 
@@ -756,6 +757,67 @@ pub struct V5Meta {
     /// older fixtures); the static sender/receiver always record it so a
     /// consumer can rely on the key in both modes.
     pub queue_policy: Option<&'static str>,
+    /// Plan 단계 9 event-pair NON-preserving control. `None` on every other
+    /// arm keeps the meta line byte-identical; `Some` is what lets accounting
+    /// prove that an `s3np` run is not an `s3` run and vice versa.
+    pub s3np: Option<S3npMeta>,
+}
+
+/// `s3np` policy attestation carried on BOTH endpoints' `role:"meta"` row.
+///
+/// The digest is stored raw rather than as a `&str` so `V5Meta` stays `Copy`
+/// and no meta writer has to own a heap string; it is hex-formatted once, at
+/// write time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct S3npMeta {
+    /// SHA-256 of the replayed tier-schedule document.
+    pub tier_schedule_sha256: [u8; 32],
+    /// Number of entries in that schedule, including the offset-0 initial state.
+    pub tier_schedule_switches: usize,
+    /// The fixed playout offset. The receiver applies it; the sender repeats it
+    /// for frozen metadata agreement, exactly as S2 repeats
+    /// `pc_delivery_timeout_ms`, so accounting can attest both sides agree.
+    pub d_play_us: u64,
+    /// Receiver-only release parameters; `None` on the sender, which schedules
+    /// nothing.
+    pub release: Option<S3npReleaseMeta>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct S3npReleaseMeta {
+    pub late_tolerance_us: u64,
+    pub late_policy: &'static str,
+    pub max_objects_per_track: usize,
+    pub max_span_us: u64,
+}
+
+fn hex32(bytes: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+fn s3np_meta_fields(meta: S3npMeta) -> String {
+    let release = match meta.release {
+        Some(release) => format!(
+            ",\"playout_clock\":\"sender_t_gen_monotonic_us\",\"late_tolerance_us\":{},\"late_policy\":\"{}\",\"buffer_max_objects_per_track\":{},\"buffer_max_span_us\":{}",
+            release.late_tolerance_us,
+            esc(release.late_policy),
+            release.max_objects_per_track,
+            release.max_span_us,
+        ),
+        None => String::new(),
+    };
+    format!(
+        ",\"s3np_release_rule\":\"{}\",\"tier_schedule_sha256\":\"{}\",\"tier_schedule_switches\":{},\"d_play_us\":{}{}",
+        esc(crate::s3np::RELEASE_RULE),
+        hex32(&meta.tier_schedule_sha256),
+        meta.tier_schedule_switches,
+        meta.d_play_us,
+        release,
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -872,14 +934,26 @@ impl JsonlLogger {
                 Some(policy) => format!(",\"queue_policy\":\"{}\"", esc(policy)),
                 None => String::new(),
             };
+            // `s3np` is mutually exclusive with the S1 common-timeline block:
+            // its release rule has no startup/rearm window, so recording those
+            // keys would claim a parameter that was never applied.
+            if v5.s3np.is_some() && !playout.is_empty() {
+                anyhow::bail!(
+                    "s3np metadata cannot be combined with the S1 common-timeline playout block"
+                );
+            }
+            let s3np = match v5.s3np {
+                Some(meta) => s3np_meta_fields(meta),
+                None => String::new(),
+            };
             writeln!(
                 w,
-                "{{\"role\":\"meta\",\"run_id\":\"{}\",\"stack\":\"{}\",\"side\":\"{}\",\"cond\":{{\"C_mbps\":{},\"rtt_ms\":{},\"jitter_ms\":{},\"loss_pct\":{}}},\"S_bytes\":{},\"schema_version\":\"v5\",\"metric_schema_version\":\"v5\",\"log_schema_version\":{},\"pc_rate_hz\":{},\"haptic_rate_hz\":{},\"payload_mode\":\"{}\",\"representation\":\"{}\",\"topology\":\"{}\",\"chunk_bytes\":{},\"seed\":{},\"clock\":\"monotonic_ns/1000\"{}{}{}{}{}{}{},\"threshold_profile\":\"lenient\",\"pc_late_threshold_ms\":87.0,\"haptic_late_threshold_ms\":-125.0}}",
+                "{{\"role\":\"meta\",\"run_id\":\"{}\",\"stack\":\"{}\",\"side\":\"{}\",\"cond\":{{\"C_mbps\":{},\"rtt_ms\":{},\"jitter_ms\":{},\"loss_pct\":{}}},\"S_bytes\":{},\"schema_version\":\"v5\",\"metric_schema_version\":\"v5\",\"log_schema_version\":{},\"pc_rate_hz\":{},\"haptic_rate_hz\":{},\"payload_mode\":\"{}\",\"representation\":\"{}\",\"topology\":\"{}\",\"chunk_bytes\":{},\"seed\":{},\"clock\":\"monotonic_ns/1000\"{}{}{}{}{}{}{}{},\"threshold_profile\":\"lenient\",\"pc_late_threshold_ms\":87.0,\"haptic_late_threshold_ms\":-125.0}}",
                 esc(run_id), esc(stack), esc(side), cmb, rtt_ms, jitter_ms, loss_pct,
                 s_bytes, LOG_SCHEMA_VERSION_V5, fps, haptic_hz,
                 v5.payload_mode.as_str(), v5.representation.as_str(),
                 v5.topology.as_str(), v5.chunk_bytes, seed,
-                design, extra, tracks, term, phase4_transport, playout, queue_policy
+                design, extra, tracks, term, phase4_transport, playout, queue_policy, s3np
             )?;
         } else {
             writeln!(
@@ -1596,6 +1670,7 @@ mod phase1_v5_tests {
                     topology: Topology::Direct,
                     chunk_bytes: 178,
                     queue_policy: None,
+                    s3np: None,
                 }),
             )
             .unwrap();
@@ -1653,6 +1728,7 @@ mod phase1_v5_tests {
                     topology: Topology::Direct,
                     chunk_bytes: 178,
                     queue_policy: None,
+                    s3np: None,
                 }),
             )
             .unwrap();
@@ -1701,6 +1777,7 @@ mod phase1_v5_tests {
                     topology: Topology::Direct,
                     chunk_bytes: 178,
                     queue_policy: None,
+                    s3np: None,
                 }),
             )
             .unwrap();
@@ -1760,6 +1837,7 @@ mod phase1_v5_tests {
                     topology: Topology::Relay,
                     chunk_bytes: 178,
                     queue_policy: None,
+                    s3np: None,
                 }),
             )
             .unwrap();

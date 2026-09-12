@@ -50,6 +50,14 @@ enum Arm {
     #[value(name = "s2eq")]
     S2Eq,
     S3,
+    /// Plan 단계 9 method 6: the event-pair NON-preserving control. Same
+    /// subscriptions, priorities and PC DELIVERY_TIMEOUT as S2, but the
+    /// receiver releases each track on its OWN timeline
+    /// (`t_release = t_gen + D_play`) instead of on a common timeline anchored
+    /// on the first exact PC/haptic anchor pair. No FSM, no tier switching, no
+    /// cross-track deadline coupling.
+    #[value(name = "s3np")]
+    S3np,
 }
 
 impl Arm {
@@ -61,6 +69,7 @@ impl Arm {
             Self::S2 => "s2",
             Self::S2Eq => "s2eq",
             Self::S3 => "s3",
+            Self::S3np => "s3np",
         }
     }
 }
@@ -275,6 +284,13 @@ struct Args {
     /// Inject the frozen three-miss trigger after controller activation.
     #[arg(long, hide = true)]
     s3_test_force_misses_after_ms: Option<u64>,
+    /// `--arm s3np` only: the same tier-schedule document the sender replays.
+    /// The receiver does not use its contents — it applies no tier policy — but
+    /// it parses and digests it so BOTH endpoints' metadata name the schedule
+    /// that was in force, and so a wiring mistake fails at startup rather than
+    /// producing an unattributable run.
+    #[arg(long)]
+    tier_schedule: Option<PathBuf>,
 }
 
 fn ms_to_us(value: u64, name: &str) -> Result<u64> {
@@ -309,7 +325,7 @@ fn playout_config(args: &Args) -> Result<Option<PlayoutConfig>> {
                 bail!("PC delivery timeout requires --arm s2");
             }
         }
-        Arm::S2 | Arm::S2Eq | Arm::S3 => {
+        Arm::S2 | Arm::S2Eq | Arm::S3 | Arm::S3np => {
             let timeout = args.pc_delivery_timeout_ms.with_context(|| {
                 format!(
                     "--arm {} requires --pc-delivery-timeout-ms",
@@ -319,10 +335,20 @@ fn playout_config(args: &Args) -> Result<Option<PlayoutConfig>> {
             if timeout == 0 {
                 bail!("--pc-delivery-timeout-ms must be greater than zero");
             }
-            if args.arm == Arm::S3 && timeout != 67 {
-                bail!("--arm s3 inherits the frozen 67ms PC delivery timeout");
+            if matches!(args.arm, Arm::S3 | Arm::S3np) && timeout != 67 {
+                bail!(
+                    "--arm {} inherits the frozen 67ms PC delivery timeout",
+                    args.arm.as_str()
+                );
             }
         }
+    }
+    // s3np owns a DIFFERENT release rule, so it must not build a
+    // `PlayoutConfig`: that type carries the exact-pair startup window, which
+    // is the one thing the non-preserving control is defined not to use.
+    // `s3np_release_config` validates and returns its own parameters.
+    if args.arm == Arm::S3np {
+        return Ok(None);
     }
 
     let arm = args.arm.as_str();
@@ -363,6 +389,59 @@ fn playout_config(args: &Args) -> Result<Option<PlayoutConfig>> {
     if config.startup_rearm_limit != 1 {
         bail!("--startup-rearm-limit must be the governing-design value 1");
     }
+    config.validate().map_err(anyhow::Error::msg)?;
+    Ok(Some(config))
+}
+
+/// Validate and build the `s3np` pairing-free release configuration.
+///
+/// Refused for every other arm, and — for `s3np` — the two *pairing-only*
+/// scheduler options are refused rather than accepted and ignored:
+/// `--startup-timeout-ms` and `--startup-rearm-limit` bound the search for the
+/// first exact PC/haptic anchor pair, which this arm never performs. Accepting
+/// them would let a run record a parameter it did not apply.
+fn s3np_release_config(args: &Args) -> Result<Option<skew_moq::s3np::ReleaseConfig>> {
+    if args.arm != Arm::S3np {
+        return Ok(None);
+    }
+    if args.tracks != RxTrackSel::Both {
+        bail!("--arm s3np requires --tracks both");
+    }
+    if args.queue_policy != QueuePolicy::Separate {
+        bail!("--arm s3np requires --queue-policy separate");
+    }
+    if args.startup_timeout_ms.is_some() || args.startup_rearm_limit.is_some() {
+        bail!(
+            "--startup-timeout-ms/--startup-rearm-limit bound the exact anchor-PAIR \
+             startup window, which --arm s3np never performs; omit them"
+        );
+    }
+    let d_play_ms = args
+        .d_play_ms
+        .context("--arm s3np requires --d-play-ms")?;
+    if !matches!(d_play_ms, 50 | 100) {
+        bail!("--d-play-ms must be a governing-design candidate: 50 or 100");
+    }
+    let config = skew_moq::s3np::ReleaseConfig {
+        d_play_us: ms_to_us(d_play_ms, "d-play-ms")?,
+        late_tolerance_us: ms_to_us(
+            args.late_tolerance_ms
+                .context("--arm s3np requires --late-tolerance-ms")?,
+            "late-tolerance-ms",
+        )?,
+        late_policy: args
+            .late_policy
+            .context("--arm s3np requires --late-policy")?
+            .into(),
+        max_objects_per_track: args
+            .buffer_max_objects_per_track
+            .context("--arm s3np requires --buffer-max-objects-per-track")?,
+        max_span_us: ms_to_us(
+            args.buffer_max_span_ms
+                .context("--arm s3np requires --buffer-max-span-ms")?,
+            "buffer-max-span-ms",
+        )?,
+    };
     config.validate().map_err(anyhow::Error::msg)?;
     Ok(Some(config))
 }
@@ -526,7 +605,7 @@ fn phase4_transport(args: &Args) -> Option<Phase4TransportMeta> {
             data_priority_mapping: args.data_priority_mapping.as_str(),
             pc_delivery_timeout_ms: None,
         }),
-        Arm::S2 | Arm::S2Eq | Arm::S3 => Some(Phase4TransportMeta {
+        Arm::S2 | Arm::S2Eq | Arm::S3 | Arm::S3np => Some(Phase4TransportMeta {
             arm: args.arm.as_str(),
             pc_subgroup_mapping: "frame-per-subgroup",
             pc_publisher_priority: if args.arm == Arm::S2Eq { 128 } else { 1 },
@@ -591,7 +670,7 @@ fn validate_phase4_v5_args(args: &Args) -> Result<()> {
             args.arm.as_str()
         );
     }
-    if matches!(args.arm, Arm::S2 | Arm::S2Eq | Arm::S3)
+    if matches!(args.arm, Arm::S2 | Arm::S2Eq | Arm::S3 | Arm::S3np)
         && args.data_priority_mapping != DataPriorityMapping::MoqtV2
     {
         bail!(
@@ -706,6 +785,57 @@ async fn run_playout_scheduler(
             let actions = scheduler.advance(now_us());
             dispatch_playout_actions(actions, &logger, bridge.as_ref(), render, audio, &mut stats)?;
         }
+    }
+    Ok(stats)
+}
+
+/// Plan 단계 9 method 6 release loop: the same ingress queue, the same
+/// `role:"release"`/`role:"drop"` rows and the same bounded-buffer vocabulary as
+/// [`run_playout_scheduler`], with exactly ONE difference — the deadline of an
+/// object is `t_gen + D_play` on its own track, so nothing waits for an exact
+/// PC/haptic anchor pair and no deadline miss on one track can affect the other.
+///
+/// There is no startup window to fail, so there is also no
+/// `finish_without_epoch` path: on producer end every buffered object already
+/// has a deadline and the loop below drains them deterministically.
+async fn run_s3np_release_scheduler(
+    config: skew_moq::s3np::ReleaseConfig,
+    mut input: mpsc::Receiver<PlayoutObject>,
+    logger: Arc<Mutex<JsonlLogger>>,
+    bridge: Option<mpsc::Sender<Bytes>>,
+    render: bool,
+    audio: bool,
+) -> Result<PlayoutStats> {
+    let mut scheduler =
+        skew_moq::s3np::PerTrackReleaseScheduler::new(config).map_err(anyhow::Error::msg)?;
+    let mut stats = PlayoutStats::default();
+
+    loop {
+        let actions = if let Some(wakeup) = scheduler.next_wakeup_us() {
+            let wait = Duration::from_micros(wakeup.saturating_sub(now_us()));
+            tokio::select! {
+                item = input.recv() => match item {
+                    Some(item) => scheduler.push(item, now_us()),
+                    None => break,
+                },
+                _ = tokio::time::sleep(wait) => scheduler.advance(now_us()),
+            }
+        } else {
+            match input.recv().await {
+                Some(item) => scheduler.push(item, now_us()),
+                None => break,
+            }
+        };
+        dispatch_playout_actions(actions, &logger, bridge.as_ref(), render, audio, &mut stats)?;
+    }
+
+    while !scheduler.is_empty() {
+        let Some(wakeup) = scheduler.next_wakeup_us() else {
+            break;
+        };
+        tokio::time::sleep(Duration::from_micros(wakeup.saturating_sub(now_us()))).await;
+        let actions = scheduler.advance(now_us());
+        dispatch_playout_actions(actions, &logger, bridge.as_ref(), render, audio, &mut stats)?;
     }
     Ok(stats)
 }
@@ -2726,8 +2856,35 @@ async fn main() -> Result<()> {
     }
     validate_queue_policy(args.queue_policy, args.arm, args.payload_mode)?;
     let s1_config = playout_config(&args)?;
+    let s3np_config = s3np_release_config(&args)?;
     let s3_runtime = s3_runtime_config(&args)?;
     let phase4_transport = phase4_transport(&args);
+    let s3np_meta = match (&s3np_config, &args.tier_schedule) {
+        (Some(config), Some(path)) => {
+            let document = std::fs::read_to_string(path)
+                .with_context(|| format!("read tier schedule {}", path.display()))?;
+            let schedule = skew_moq::s3np::TierSchedule::parse(&document)
+                .map_err(|error| anyhow::anyhow!("invalid tier schedule: {error:?}"))?;
+            let sha256: [u8; 32] = {
+                use sha2::{Digest, Sha256};
+                Sha256::digest(document.as_bytes()).into()
+            };
+            Some(S3npMeta {
+                tier_schedule_sha256: sha256,
+                tier_schedule_switches: schedule.switches().len(),
+                d_play_us: config.d_play_us,
+                release: Some(S3npReleaseMeta {
+                    late_tolerance_us: config.late_tolerance_us,
+                    late_policy: config.late_policy.as_str(),
+                    max_objects_per_track: config.max_objects_per_track,
+                    max_span_us: config.max_span_us,
+                }),
+            })
+        }
+        (Some(_), None) => bail!("--arm s3np requires --tier-schedule"),
+        (None, Some(_)) => bail!("--tier-schedule requires --arm s3np"),
+        (None, None) => None,
+    };
 
     let logger = Arc::new(Mutex::new(JsonlLogger::new(
         &args.out,
@@ -2762,6 +2919,7 @@ async fn main() -> Result<()> {
             topology: args.topology,
             chunk_bytes: args.chunk_bytes,
             queue_policy: Some(args.queue_policy.as_str()),
+            s3np: s3np_meta,
         }),
     )?));
 
@@ -2833,10 +2991,12 @@ async fn main() -> Result<()> {
                 }
             };
             let mut params = KeyValuePairs::default();
-            if name == "pc" && matches!(args.arm, Arm::S2 | Arm::S2Eq) {
+            // s3np keeps S2's PC DELIVERY_TIMEOUT: the control differs from S3
+            // by event-pair preservation, not by transport policy.
+            if name == "pc" && matches!(args.arm, Arm::S2 | Arm::S2Eq | Arm::S3np) {
                 params.set_delivery_timeout(
                     args.pc_delivery_timeout_ms
-                        .expect("S2 timeout validated before connecting"),
+                        .expect("S2/s3np timeout validated before connecting"),
                 );
             }
             match subscriber.subscribe_open_with_params(tw, params).await {
@@ -2954,7 +3114,11 @@ async fn main() -> Result<()> {
     // buffers. B1 never creates this task and keeps its original direct path.
     let ingress_drops = Arc::new(AtomicU64::new(0));
     let ingress_log_failed = Arc::new(AtomicU64::new(0));
-    let (s1_tx, mut s1_task) = if let Some(config) = s1_config {
+    // Exactly one scheduler task exists: the common-timeline one for
+    // S1/M1/S2/S2Eq, or the per-track pairing-free one for s3np. B1 creates
+    // neither and keeps its original direct path. `scheduler_budget_us` is the
+    // bounded shutdown drain, derived from whichever parameter set applies.
+    let (s1_tx, mut s1_task, scheduler_budget_us) = if let Some(config) = s1_config {
         let capacity = config
             .max_objects_per_track
             .checked_mul(2)
@@ -2977,9 +3141,43 @@ async fn main() -> Result<()> {
             config.max_objects_per_track,
             config.max_span_us / 1_000,
         );
-        (Some(tx), Some(task))
+        let budget_us = config
+            .d_play_us
+            .saturating_add(config.max_span_us)
+            .saturating_add(config.late_tolerance_us)
+            .saturating_add(250_000);
+        (Some(tx), Some(task), Some(budget_us))
+    } else if let Some(config) = s3np_config {
+        let capacity = config
+            .max_objects_per_track
+            .checked_mul(2)
+            .context("s3np ingress capacity overflow")?;
+        let (tx, rx) = mpsc::channel::<PlayoutObject>(capacity);
+        let task = tokio::spawn(run_s3np_release_scheduler(
+            config,
+            rx,
+            logger.clone(),
+            ftx.clone(),
+            args.render,
+            args.audio,
+        ));
+        println!(
+            "[rx] s3np per-track release: rule={} D_play={}ms late={}ms policy={} objects/track={} span={}ms",
+            skew_moq::s3np::RELEASE_RULE,
+            config.d_play_us / 1_000,
+            config.late_tolerance_us / 1_000,
+            config.late_policy.as_str(),
+            config.max_objects_per_track,
+            config.max_span_us / 1_000,
+        );
+        let budget_us = config
+            .d_play_us
+            .saturating_add(config.max_span_us)
+            .saturating_add(config.late_tolerance_us)
+            .saturating_add(250_000);
+        (Some(tx), Some(task), Some(budget_us))
     } else {
-        (None, None)
+        (None, None, None)
     };
 
     // Drain each wire track: parse header, log rx, (optionally) forward for
@@ -3244,12 +3442,7 @@ async fn main() -> Result<()> {
     let mut scheduler_finalize_failed = false;
     let mut s1_stats = PlayoutStats::default();
     if let Some(mut task) = s1_task.take() {
-        let config = s1_config.expect("S1 task has config");
-        let budget_us = config
-            .d_play_us
-            .saturating_add(config.max_span_us)
-            .saturating_add(config.late_tolerance_us)
-            .saturating_add(250_000);
+        let budget_us = scheduler_budget_us.expect("a scheduler task has a shutdown budget");
         match tokio::time::timeout(Duration::from_micros(budget_us), &mut task).await {
             Ok(Ok(Ok(stats))) => s1_stats = stats,
             Ok(Ok(Err(e))) => {
@@ -3315,7 +3508,8 @@ async fn main() -> Result<()> {
             let verdict = classify_ending_with_timeout(
                 &reports,
                 session_run.is_finished(),
-                matches!(args.arm, Arm::S2 | Arm::S2Eq) && args.pc_delivery_timeout_ms.is_some(),
+                matches!(args.arm, Arm::S2 | Arm::S2Eq | Arm::S3np)
+                    && args.pc_delivery_timeout_ms.is_some(),
             );
             reports_out = reports;
             verdict
@@ -3896,6 +4090,7 @@ mod rx_ending_tests {
             s3_switch_retry_limit: None,
             s3_test_mode: false,
             s3_test_force_misses_after_ms: None,
+            tier_schedule: None,
         };
 
         let a = base(RxTrackSel::Both, Some(60.0));
@@ -4173,6 +4368,7 @@ mod rx_ending_tests {
             s3_switch_retry_limit: None,
             s3_test_mode: false,
             s3_test_force_misses_after_ms: None,
+            tier_schedule: None,
         };
         let cfg = playout_config(&base).unwrap().unwrap();
         assert_eq!(cfg.d_play_us, 50_000);
@@ -4261,6 +4457,7 @@ mod rx_ending_tests {
             s3_switch_retry_limit: None,
             s3_test_mode: false,
             s3_test_force_misses_after_ms: None,
+            tier_schedule: None,
         };
 
         assert!(playout_config(&args).is_ok());
@@ -4339,6 +4536,158 @@ mod rx_ending_tests {
 
         args.s3_target_skew_ms = Some(30);
         assert!(s3_runtime_config(&args).is_err());
+
+        // ---- s3np: the event-pair NON-preserving control ------------------
+        //
+        // Same transport policy as S2, a different RELEASE rule, and the two
+        // pairing-only scheduler options refused rather than recorded.
+        let mut np = args;
+        np.arm = Arm::S3np;
+        np.pc_delivery_timeout_ms = Some(67);
+        np.d_play_ms = Some(50);
+        np.late_tolerance_ms = Some(5);
+        np.buffer_max_objects_per_track = Some(64);
+        np.buffer_max_span_ms = Some(250);
+        np.late_policy = Some(CliLatePolicy::DropLate);
+        np.startup_timeout_ms = None;
+        np.startup_rearm_limit = None;
+        // Every S3 controller option is refused: s3np runs no FSM.
+        assert!(
+            s3_runtime_config(&np).is_err(),
+            "s3np must refuse S3 controller options"
+        );
+        let s3_only = [
+            "s3_window_ms",
+            "s3_ewma_alpha",
+            "s3_miss_streak_threshold",
+            "s3_violation_ratio_threshold",
+            "s3_target_skew_ms",
+            "s3_recovery_fraction",
+            "s3_haptic_critical_stable_ms",
+            "s3_recovery_stable_ms",
+            "s3_cooldown_ms",
+            "s3_min_paired_samples",
+            "s3_max_window_samples",
+            "s3_deadline_max_anchors",
+            "s3_effect_timeout_ms",
+            "s3_initial_retry_limit",
+            "s3_switch_retry_limit",
+        ];
+        assert_eq!(s3_only.len(), 15, "every S3 option stays s3-exclusive");
+        np.s3_window_ms = None;
+        np.s3_ewma_alpha = None;
+        np.s3_miss_streak_threshold = None;
+        np.s3_violation_ratio_threshold = None;
+        np.s3_target_skew_ms = None;
+        np.s3_recovery_fraction = None;
+        np.s3_haptic_critical_stable_ms = None;
+        np.s3_recovery_stable_ms = None;
+        np.s3_cooldown_ms = None;
+        np.s3_min_paired_samples = None;
+        np.s3_max_window_samples = None;
+        np.s3_deadline_max_anchors = None;
+        np.s3_effect_timeout_ms = None;
+        np.s3_initial_retry_limit = None;
+        np.s3_switch_retry_limit = None;
+        assert!(s3_runtime_config(&np).unwrap().is_none());
+
+        assert!(validate_phase4_v5_args(&np).is_ok());
+        let meta = phase4_transport(&np).unwrap();
+        assert_eq!(meta.arm, "s3np");
+        assert_eq!(meta.pc_subgroup_mapping, "frame-per-subgroup");
+        assert_eq!(meta.pc_publisher_priority, 1);
+        assert_eq!(meta.haptic_publisher_priority, 0);
+        assert_eq!(meta.publisher_priority_profile, "relative-haptic0-pc1");
+        assert_eq!(meta.pc_delivery_timeout_ms, Some(67));
+
+        // No common-timeline config is built, so no startup window can be
+        // recorded as if it had been applied.
+        assert!(playout_config(&np).unwrap().is_none());
+        let release = s3np_release_config(&np).unwrap().unwrap();
+        assert_eq!(release.d_play_us, 50_000);
+        assert_eq!(release.late_tolerance_us, 5_000);
+        assert_eq!(release.max_objects_per_track, 64);
+        assert_eq!(release.max_span_us, 250_000);
+
+        // Each refusal is checked in place and then undone: `Args` is not
+        // `Clone`, and a per-case fixture copy would be the only reason to make
+        // it so.
+        let cases: [(&str, fn(&mut Args), fn(&mut Args)); 10] = [
+            (
+                "startup window",
+                |a| a.startup_timeout_ms = Some(2_000),
+                |a| a.startup_timeout_ms = None,
+            ),
+            (
+                "startup rearm",
+                |a| a.startup_rearm_limit = Some(1),
+                |a| a.startup_rearm_limit = None,
+            ),
+            (
+                "non-candidate D_play",
+                |a| a.d_play_ms = Some(75),
+                |a| a.d_play_ms = Some(50),
+            ),
+            (
+                "missing D_play",
+                |a| a.d_play_ms = None,
+                |a| a.d_play_ms = Some(50),
+            ),
+            (
+                "missing late tolerance",
+                |a| a.late_tolerance_ms = None,
+                |a| a.late_tolerance_ms = Some(5),
+            ),
+            (
+                "missing late policy",
+                |a| a.late_policy = None,
+                |a| a.late_policy = Some(CliLatePolicy::DropLate),
+            ),
+            (
+                "missing buffer object bound",
+                |a| a.buffer_max_objects_per_track = None,
+                |a| a.buffer_max_objects_per_track = Some(64),
+            ),
+            (
+                "missing buffer span bound",
+                |a| a.buffer_max_span_ms = None,
+                |a| a.buffer_max_span_ms = Some(250),
+            ),
+            (
+                "single track",
+                |a| a.tracks = RxTrackSel::Pc,
+                |a| a.tracks = RxTrackSel::Both,
+            ),
+            (
+                "shared FIFO",
+                |a| a.queue_policy = QueuePolicy::SharedFifo,
+                |a| a.queue_policy = QueuePolicy::Separate,
+            ),
+        ];
+        for (label, break_it, restore) in cases {
+            break_it(&mut np);
+            assert!(
+                s3np_release_config(&np).is_err(),
+                "s3np must refuse {label}"
+            );
+            restore(&mut np);
+            assert!(s3np_release_config(&np).is_ok(), "restore failed: {label}");
+        }
+
+        // The control inherits S3's frozen PC delivery timeout; a different
+        // value would silently turn the comparison into a timeout ablation.
+        np.pc_delivery_timeout_ms = Some(100);
+        assert!(playout_config(&np)
+            .unwrap_err()
+            .to_string()
+            .contains("67ms"));
+        np.pc_delivery_timeout_ms = Some(67);
+
+        // And no other arm builds the s3np release config.
+        np.arm = Arm::S2;
+        np.startup_timeout_ms = Some(2_000);
+        np.startup_rearm_limit = Some(1);
+        assert!(s3np_release_config(&np).unwrap().is_none());
     }
 }
 
@@ -5826,6 +6175,7 @@ mod s3_retirement_tests {
                     topology: Topology::Relay,
                     chunk_bytes: 178,
                     queue_policy: None,
+                    s3np: None,
                 }),
             )
             .unwrap(),

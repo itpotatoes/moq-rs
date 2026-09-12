@@ -193,6 +193,13 @@ enum Arm {
     #[value(name = "s2eq")]
     S2Eq,
     S3,
+    /// Plan 단계 9 method 6: the event-pair NON-preserving control. Same wire
+    /// configuration as S2 (frame-per-subgroup PC, haptic 0 / PC 1, PC
+    /// DELIVERY_TIMEOUT) and the same PC tiers and haptic density as the
+    /// paired S3 run, replayed OPEN-LOOP from `--tier-schedule`. The S3 FSM is
+    /// not run, and the receiver releases each track on its own timeline.
+    #[value(name = "s3np")]
+    S3np,
 }
 
 impl Arm {
@@ -204,15 +211,19 @@ impl Arm {
             Self::S2 => "s2",
             Self::S2Eq => "s2eq",
             Self::S3 => "s3",
+            Self::S3np => "s3np",
         }
     }
 
     fn pc_frame_subgroups(self) -> bool {
-        matches!(self, Self::M1 | Self::S2 | Self::S2Eq | Self::S3)
+        matches!(
+            self,
+            Self::M1 | Self::S2 | Self::S2Eq | Self::S3 | Self::S3np
+        )
     }
 
     fn pc_priority(self) -> u8 {
-        if matches!(self, Self::S2 | Self::S3) {
+        if matches!(self, Self::S2 | Self::S3 | Self::S3np) {
             1
         } else {
             128
@@ -220,7 +231,7 @@ impl Arm {
     }
 
     fn haptic_priority(self) -> u8 {
-        if matches!(self, Self::S2 | Self::S3) {
+        if matches!(self, Self::S2 | Self::S3 | Self::S3np) {
             0
         } else {
             128
@@ -562,6 +573,52 @@ struct Args {
     /// reaches run end. Explicit because no production S3 default is frozen.
     #[arg(long)]
     s3_producer_shutdown_timeout_ms: Option<u64>,
+    /// `--arm s3np` only: the tier/haptic-density schedule extracted from the
+    /// paired S3 run by `scripts/event_pair_tier_schedule.py`. Applied
+    /// open-loop, so `s3np` matches that run's PC quality and haptic data rate
+    /// without running the S3 FSM.
+    #[arg(long)]
+    tier_schedule: Option<PathBuf>,
+    /// `--arm s3np` only: the receiver's fixed playout offset, repeated here
+    /// for frozen metadata agreement exactly as `--pc-delivery-timeout-ms` is
+    /// on S2. The sender does not schedule playout; recording the value lets
+    /// accounting attest that both endpoints ran the same policy.
+    #[arg(long)]
+    d_play_ms: Option<u64>,
+}
+
+/// Open-loop tier/haptic-density replay for `--arm s3np` (plan 단계 9 method 6).
+///
+/// The paired S3 run's *applied* schedule is replayed verbatim, so the two arms
+/// send the same PC tiers and the same haptic tick density at the same offsets
+/// from `measurement_start`. Nothing here observes the network, and no S3
+/// controller, switch gate, or subscription producer exists in this arm: that is
+/// the point of the control.
+///
+/// What the replay CANNOT reproduce exactly is documented in
+/// `md/20260912_짝비보존_대조_구현.md`: S3 switches tier by make-before-break
+/// subscription (the target route emits barrier-only objects while the old route
+/// is still current), so S3 transiently sends more PC bytes around a switch than
+/// this single-track replay does.
+struct TierReplay {
+    schedule: skew_moq::s3np::TierSchedule,
+    sha256: [u8; 32],
+    /// Replayed `pc_tier` → frame source. Frozen S3 mapping: 2 → d8
+    /// (`--frames-dir`), 3 → d7 (Recovery), 4 → d6 (Haptic-Critical).
+    normal: Arc<Vec<Vec<u8>>>,
+    recovery: Arc<Vec<Vec<u8>>>,
+    critical: Arc<Vec<Vec<u8>>>,
+}
+
+impl TierReplay {
+    fn frames(&self, pc_tier: u16) -> &Vec<Vec<u8>> {
+        match pc_tier {
+            skew_moq::s3np::PC_TIER_RECOVERY => &self.recovery,
+            skew_moq::s3np::PC_TIER_CRITICAL => &self.critical,
+            // `TierSchedule::parse` admits only 2/3/4, so this is Normal.
+            _ => &self.normal,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -728,7 +785,7 @@ fn phase4_transport(args: &Args) -> Result<Option<Phase4TransportMeta>> {
             args.arm.as_str()
         );
     }
-    if matches!(args.arm, Arm::S2 | Arm::S2Eq | Arm::S3)
+    if matches!(args.arm, Arm::S2 | Arm::S2Eq | Arm::S3 | Arm::S3np)
         && args.data_priority_mapping != DataPriorityMapping::MoqtV2
     {
         anyhow::bail!(
@@ -764,7 +821,7 @@ fn phase4_transport(args: &Args) -> Result<Option<Phase4TransportMeta>> {
                 pc_delivery_timeout_ms: None,
             }))
         }
-        Arm::S2 | Arm::S2Eq | Arm::S3 => {
+        Arm::S2 | Arm::S2Eq | Arm::S3 | Arm::S3np => {
             let timeout = args.pc_delivery_timeout_ms.with_context(|| {
                 format!(
                     "--arm {} requires --pc-delivery-timeout-ms",
@@ -774,8 +831,13 @@ fn phase4_transport(args: &Args) -> Result<Option<Phase4TransportMeta>> {
             if timeout == 0 {
                 anyhow::bail!("--pc-delivery-timeout-ms must be greater than zero");
             }
-            if args.arm == Arm::S3 && timeout != 67 {
-                anyhow::bail!("--arm s3 inherits the frozen 67ms PC delivery timeout");
+            // s3np is the S3 control, so it inherits the same frozen timeout:
+            // a different value would make the comparison a timeout ablation.
+            if matches!(args.arm, Arm::S3 | Arm::S3np) && timeout != 67 {
+                anyhow::bail!(
+                    "--arm {} inherits the frozen 67ms PC delivery timeout",
+                    args.arm.as_str()
+                );
             }
             Ok(Some(Phase4TransportMeta {
                 arm: args.arm.as_str(),
@@ -799,36 +861,74 @@ fn priority_profile(args: &Args) -> PublisherPriorityProfile {
         .unwrap_or(PublisherPriorityProfile::Equal128)
 }
 
+/// S3 and its non-preserving control both need the three PC tier directories,
+/// tier 2 on the Normal header, and both tracks. Only S3 owns subscription
+/// producers, and only s3np owns the replay/metadata-echo options, so each
+/// arm's exclusive flags stay refused everywhere else.
 fn validate_s3_args(args: &Args) -> Result<()> {
-    let supplied = args.s3_recovery_frames_dir.is_some()
-        || args.s3_critical_frames_dir.is_some()
-        || args.s3_producer_shutdown_timeout_ms.is_some();
-    if args.arm != Arm::S3 {
-        if supplied {
-            anyhow::bail!("S3 frame/lifecycle options require --arm s3");
+    let tier_dirs = args.s3_recovery_frames_dir.is_some() || args.s3_critical_frames_dir.is_some();
+    let s3_only = args.s3_producer_shutdown_timeout_ms.is_some();
+    let s3np_only = args.tier_schedule.is_some() || args.d_play_ms.is_some();
+    if !matches!(args.arm, Arm::S3 | Arm::S3np) {
+        if tier_dirs {
+            anyhow::bail!("S3 PC tier frame directories require --arm s3 or --arm s3np");
+        }
+        if s3_only {
+            anyhow::bail!("S3 lifecycle options require --arm s3");
+        }
+        if s3np_only {
+            anyhow::bail!("--tier-schedule and --d-play-ms require --arm s3np");
         }
         return Ok(());
     }
+    let arm = args.arm.as_str();
+    if args.arm == Arm::S3 && s3np_only {
+        anyhow::bail!(
+            "--tier-schedule and --d-play-ms require --arm s3np; S3 runs its own FSM \
+             and must never replay a recorded schedule"
+        );
+    }
+    if args.arm == Arm::S3np && s3_only {
+        anyhow::bail!(
+            "--s3-producer-shutdown-timeout-ms requires --arm s3; s3np publishes the \
+             static two-track mapping and owns no subscription producers"
+        );
+    }
     if args.tracks != TrackSel::Both {
-        anyhow::bail!("--arm s3 requires --tracks both");
+        anyhow::bail!("--arm {arm} requires --tracks both");
     }
     if args.tier != 2 {
-        anyhow::bail!("--arm s3 Normal must preserve header tier 2");
+        anyhow::bail!("--arm {arm} Normal must preserve header tier 2");
     }
     if args.frames_dir.is_none() || args.dummy_size.is_some() {
-        anyhow::bail!("--arm s3 requires --frames-dir d8 and forbids --dummy-size");
+        anyhow::bail!("--arm {arm} requires --frames-dir d8 and forbids --dummy-size");
     }
     args.s3_recovery_frames_dir
         .as_ref()
-        .context("--arm s3 requires --s3-recovery-frames-dir d7")?;
+        .with_context(|| format!("--arm {arm} requires --s3-recovery-frames-dir d7"))?;
     args.s3_critical_frames_dir
         .as_ref()
-        .context("--arm s3 requires --s3-critical-frames-dir d6")?;
-    let timeout = args
-        .s3_producer_shutdown_timeout_ms
-        .context("--arm s3 requires --s3-producer-shutdown-timeout-ms")?;
-    if timeout == 0 {
-        anyhow::bail!("--s3-producer-shutdown-timeout-ms must be greater than zero");
+        .with_context(|| format!("--arm {arm} requires --s3-critical-frames-dir d6"))?;
+    if args.arm == Arm::S3 {
+        let timeout = args
+            .s3_producer_shutdown_timeout_ms
+            .context("--arm s3 requires --s3-producer-shutdown-timeout-ms")?;
+        if timeout == 0 {
+            anyhow::bail!("--s3-producer-shutdown-timeout-ms must be greater than zero");
+        }
+        return Ok(());
+    }
+    args.tier_schedule
+        .as_ref()
+        .context("--arm s3np requires --tier-schedule")?;
+    let d_play_ms = args
+        .d_play_ms
+        .context("--arm s3np requires --d-play-ms (the receiver value, for metadata agreement)")?;
+    if !matches!(d_play_ms, 50 | 100) {
+        anyhow::bail!("--d-play-ms must be a governing-design candidate: 50 or 100");
+    }
+    if args.queue_policy != QueuePolicy::Separate {
+        anyhow::bail!("--arm s3np requires --queue-policy separate");
     }
     Ok(())
 }
@@ -1176,7 +1276,9 @@ async fn main() -> Result<()> {
     let s_bytes = registered_s_bytes(pf.frame_sum, pf.frame_count);
     let frames = Arc::new(frames);
     let pcm = Arc::new(pcm);
-    let s3_frames = if args.arm == Arm::S3 {
+    // S3 and its s3np control read the same three tier directories. S3 hands
+    // them to its subscription producers; s3np selects between them per slot.
+    let s3_frames = if matches!(args.arm, Arm::S3 | Arm::S3np) {
         Some((
             Arc::new(load_frames_checked(
                 args.s3_recovery_frames_dir
@@ -1191,6 +1293,42 @@ async fn main() -> Result<()> {
                 args.representation,
             )?),
         ))
+    } else {
+        None
+    };
+    let tier_replay: Option<Arc<TierReplay>> = if args.arm == Arm::S3np {
+        let path = args
+            .tier_schedule
+            .as_ref()
+            .expect("validated s3np tier schedule");
+        let document = std::fs::read_to_string(path)
+            .with_context(|| format!("read tier schedule {}", path.display()))?;
+        let schedule = skew_moq::s3np::TierSchedule::parse(&document)
+            .map_err(|error| anyhow::anyhow!("invalid tier schedule: {error:?}"))?;
+        // The replay window must cover the run being generated, or the tail of
+        // the run would silently hold the last recorded state beyond anything
+        // the source S3 run observed.
+        let duration_us = Duration::from_secs_f64(args.duration).as_micros() as u64;
+        if schedule.duration_us() != duration_us {
+            anyhow::bail!(
+                "tier schedule covers {}us but this run is {}us; the replay must \
+                 come from a source S3 run of the same registered duration",
+                schedule.duration_us(),
+                duration_us
+            );
+        }
+        let sha256: [u8; 32] = {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(document.as_bytes()).into()
+        };
+        let (recovery, critical) = s3_frames.as_ref().expect("validated S3 tier frames");
+        Some(Arc::new(TierReplay {
+            schedule,
+            sha256,
+            normal: frames.clone(),
+            recovery: recovery.clone(),
+            critical: critical.clone(),
+        }))
     } else {
         None
     };
@@ -1238,6 +1376,17 @@ async fn main() -> Result<()> {
             topology: args.topology,
             chunk_bytes: args.chunk_bytes,
             queue_policy: Some(args.queue_policy.as_str()),
+            s3np: tier_replay.as_ref().map(|replay| S3npMeta {
+                tier_schedule_sha256: replay.sha256,
+                tier_schedule_switches: replay.schedule.switches().len(),
+                d_play_us: args
+                    .d_play_ms
+                    .expect("validated s3np d-play echo")
+                    .saturating_mul(1_000),
+                // The sender schedules no playout; only the receiver records
+                // the release parameters it actually applied.
+                release: None,
+            }),
         }),
     )?));
     logger.lock().unwrap().log_info(&preflight_info(pf));
@@ -1675,6 +1824,7 @@ async fn main() -> Result<()> {
             let priority = pc_priority;
             let mut state = pc_state.take();
             let shared = shared_subgroup.clone();
+            let replay = tier_replay.clone();
             if state.is_none() && shared.is_none() {
                 anyhow::bail!("PC state validated");
             }
@@ -1687,7 +1837,18 @@ async fn main() -> Result<()> {
                         break;
                     }
                     let pts = timestamp_us(i, pc_rate_hz);
-                    let payload = &frames[(i as usize) % frames.len()];
+                    // s3np: the replayed tier for this slot, looked up on the
+                    // NOMINAL slot offset (== pts) so the switch instant is
+                    // deterministic and within one frame period of the recorded
+                    // S3 switch time. Every other arm keeps its fixed tier.
+                    let (tier, frame_set): (u16, &Vec<Vec<u8>>) = match &replay {
+                        Some(replay) => {
+                            let pc_tier = replay.schedule.state_at(pts).pc_tier;
+                            (pc_tier, replay.frames(pc_tier))
+                        }
+                        None => (tier, &frames),
+                    };
+                    let payload = &frame_set[(i as usize) % frame_set.len()];
                     // (t_gen, MoQ identity, objects written, padding bytes)
                     let (t_gen, t_ready, frame_obj, objects, padding) = if let Some(shared) = &shared {
                         // shared_fifo (frame mode only): payload copy outside,
@@ -1783,6 +1944,7 @@ async fn main() -> Result<()> {
             let chunk_bytes = args.chunk_bytes;
             let mut state = haptic_state.take();
             let shared = shared_subgroup.clone();
+            let replay = tier_replay.clone();
             if state.is_none() && shared.is_none() {
                 anyhow::bail!("haptic state validated");
             }
@@ -1794,6 +1956,21 @@ async fn main() -> Result<()> {
                         .await;
                     if now_us() >= end_us {
                         break;
+                    }
+                    // s3np Essential density: emit only the exact anchor tick
+                    // 3i, which is precisely the tick set S3's
+                    // `haptic-essential` route produces. Identity, PCM slice
+                    // and header are unchanged; only the non-anchor ticks are
+                    // not generated, so the haptic data rate matches S3's.
+                    if let Some(replay) = &replay {
+                        let density = replay
+                            .schedule
+                            .state_at(timestamp_us(k, haptic_rate_hz))
+                            .haptic_density;
+                        if density == skew_moq::s3np::HapticDensity::Essential && k % ratio != 0 {
+                            k += 1;
+                            continue;
+                        }
                     }
                     let (pts, event_id) = if k % ratio == 0 {
                         let fi = k / ratio;
@@ -2142,11 +2319,13 @@ mod tests {
 
     use super::{
         b1_transport_meta, epoch_record, hold_static_track_state_through_drain, now_us,
-        object_buffer, registered_s_bytes, resolved_priorities, shared_fifo_append,
-        validate_stage5_policy, wait_registered_direct_fin_handoff, Arm, DataPriorityMapping,
-        DirectFinHandoff, Duration, PayloadMode, PublisherPriorityProfile, QueuePolicy,
-        SharedFifoWriter, TrackSel, HDR,
+        object_buffer, phase4_transport, registered_s_bytes, resolved_priorities,
+        shared_fifo_append, validate_s3_args, validate_stage5_policy,
+        wait_registered_direct_fin_handoff, Args, Arm, DataPriorityMapping, DirectFinHandoff,
+        Duration, PayloadMode, PublisherPriorityProfile, QueuePolicy, Representation,
+        SharedFifoWriter, Topology, TrackSel, Url, HDR,
     };
+    use std::path::PathBuf;
     use std::sync::Mutex;
 
     /// In-memory stand-in for the mixed subgroup: records every appended
@@ -2314,6 +2493,170 @@ mod tests {
         assert_eq!((p1.pc_publisher_priority, p1.haptic_publisher_priority), (128, 128));
         assert_eq!(p1.publisher_priority_profile, "equal-128");
         assert_eq!(p1.pc_delivery_timeout_ms, None);
+    }
+
+    /// Minimal `Args` fixture for the arm-boundary validators. Every field is
+    /// explicit so that adding a CLI option fails here instead of silently
+    /// defaulting inside a boundary test.
+    fn arm_args(arm: Arm) -> Args {
+        Args {
+            relay: Url::parse("https://127.0.0.1:1").unwrap(),
+            run_id: "t".into(),
+            out: PathBuf::from("/dev/null"),
+            duration: 60.0,
+            frames_dir: Some("datasets/d8".into()),
+            dummy_size: None,
+            tier: 2,
+            haptic_wav: "datasets/haptic.wav".into(),
+            pc_rate_hz: 30,
+            haptic_rate_hz: 90,
+            payload_mode: PayloadMode::Frame,
+            representation: Representation::Bin,
+            topology: Topology::Relay,
+            chunk_bytes: 178,
+            preflight_only: false,
+            chunk_trace: false,
+            warmup: 1.0,
+            batch_id: None,
+            phase_control: None,
+            warmup_pass: None,
+            drain_timeout: 10.0,
+            c_mbps: None,
+            rtt_ms: 0.0,
+            jitter_ms: 0.0,
+            loss_pct: 0.0,
+            seed: 0,
+            data_priority_mapping: DataPriorityMapping::MoqtV2,
+            accept_trace: true,
+            accept_trace_capacity: 65536,
+            tracks: TrackSel::Both,
+            arm,
+            queue_policy: QueuePolicy::Separate,
+            publisher_priority_profile: None,
+            pc_delivery_timeout_ms: None,
+            s3_recovery_frames_dir: None,
+            s3_critical_frames_dir: None,
+            s3_producer_shutdown_timeout_ms: None,
+            tier_schedule: None,
+            d_play_ms: None,
+        }
+    }
+
+    #[test]
+    fn s3np_shares_s2_transport_policy_and_stays_exclusive_from_s3() {
+        // Wire policy: identical to S2, so S3 − S3NP isolates event-pair
+        // preservation rather than priority, mapping, or timeout.
+        assert!(Arm::S3np.pc_frame_subgroups());
+        assert_eq!(
+            (Arm::S3np.pc_priority(), Arm::S3np.haptic_priority()),
+            (Arm::S2.pc_priority(), Arm::S2.haptic_priority())
+        );
+        assert_eq!(Arm::S3np.as_str(), "s3np");
+        assert_eq!(
+            resolved_priorities(Arm::S3np, PublisherPriorityProfile::HapticFirst),
+            (1, 0),
+            "the B1-only profile must not move the s3np priorities"
+        );
+
+        let mut args = arm_args(Arm::S3np);
+        args.s3_recovery_frames_dir = Some("datasets/d7".into());
+        args.s3_critical_frames_dir = Some("datasets/d6".into());
+        args.tier_schedule = Some(PathBuf::from("schedule.json"));
+        args.d_play_ms = Some(50);
+        // The frozen 67 ms PC delivery timeout is inherited, not chosen.
+        assert!(phase4_transport(&args).is_err(), "timeout is required");
+        args.pc_delivery_timeout_ms = Some(100);
+        assert!(phase4_transport(&args)
+            .unwrap_err()
+            .to_string()
+            .contains("67ms"));
+        args.pc_delivery_timeout_ms = Some(67);
+        let meta = phase4_transport(&args).unwrap().unwrap();
+        assert_eq!(meta.arm, "s3np");
+        assert_eq!(meta.pc_subgroup_mapping, "frame-per-subgroup");
+        assert_eq!((meta.pc_publisher_priority, meta.haptic_publisher_priority), (1, 0));
+        assert_eq!(meta.publisher_priority_profile, "relative-haptic0-pc1");
+        assert_eq!(meta.pc_delivery_timeout_ms, Some(67));
+        // v5 requires the MoQT priority mapping for every prioritised arm.
+        args.data_priority_mapping = DataPriorityMapping::LegacyV1;
+        assert!(phase4_transport(&args).is_err());
+        args.data_priority_mapping = DataPriorityMapping::MoqtV2;
+        assert!(validate_s3_args(&args).is_ok());
+
+        // Exclusivity both ways: S3 never replays a schedule, s3np never owns
+        // subscription producers, and neither set leaks onto another arm.
+        args.s3_producer_shutdown_timeout_ms = Some(2_000);
+        assert!(validate_s3_args(&args)
+            .unwrap_err()
+            .to_string()
+            .contains("requires --arm s3"));
+        args.s3_producer_shutdown_timeout_ms = None;
+
+        let mut s3 = arm_args(Arm::S3);
+        s3.pc_delivery_timeout_ms = Some(67);
+        s3.s3_recovery_frames_dir = Some("datasets/d7".into());
+        s3.s3_critical_frames_dir = Some("datasets/d6".into());
+        s3.s3_producer_shutdown_timeout_ms = Some(2_000);
+        assert!(validate_s3_args(&s3).is_ok());
+        s3.tier_schedule = Some(PathBuf::from("schedule.json"));
+        assert!(validate_s3_args(&s3)
+            .unwrap_err()
+            .to_string()
+            .contains("--arm s3np"));
+        s3.tier_schedule = None;
+        s3.d_play_ms = Some(50);
+        assert!(validate_s3_args(&s3).is_err());
+
+        let mut s2 = arm_args(Arm::S2);
+        s2.pc_delivery_timeout_ms = Some(67);
+        s2.tier_schedule = Some(PathBuf::from("schedule.json"));
+        assert!(validate_s3_args(&s2).is_err());
+        s2.tier_schedule = None;
+        s2.d_play_ms = Some(50);
+        assert!(validate_s3_args(&s2).is_err());
+        s2.d_play_ms = None;
+        s2.s3_recovery_frames_dir = Some("datasets/d7".into());
+        assert!(validate_s3_args(&s2).is_err());
+
+        // Required s3np inputs, each individually.
+        let mut missing = arm_args(Arm::S3np);
+        missing.pc_delivery_timeout_ms = Some(67);
+        missing.s3_recovery_frames_dir = Some("datasets/d7".into());
+        missing.s3_critical_frames_dir = Some("datasets/d6".into());
+        missing.d_play_ms = Some(50);
+        assert!(validate_s3_args(&missing)
+            .unwrap_err()
+            .to_string()
+            .contains("--tier-schedule"));
+        missing.tier_schedule = Some(PathBuf::from("schedule.json"));
+        missing.d_play_ms = None;
+        assert!(validate_s3_args(&missing).is_err());
+        missing.d_play_ms = Some(75);
+        assert!(validate_s3_args(&missing)
+            .unwrap_err()
+            .to_string()
+            .contains("50 or 100"));
+        missing.d_play_ms = Some(50);
+        missing.s3_critical_frames_dir = None;
+        assert!(validate_s3_args(&missing)
+            .unwrap_err()
+            .to_string()
+            .contains("d6"));
+        missing.s3_critical_frames_dir = Some("datasets/d6".into());
+        missing.tier = 3;
+        assert!(validate_s3_args(&missing)
+            .unwrap_err()
+            .to_string()
+            .contains("header tier 2"));
+        missing.tier = 2;
+        missing.tracks = TrackSel::Pc;
+        assert!(validate_s3_args(&missing)
+            .unwrap_err()
+            .to_string()
+            .contains("--tracks both"));
+        missing.tracks = TrackSel::Both;
+        missing.queue_policy = QueuePolicy::SharedFifo;
+        assert!(validate_s3_args(&missing).is_err());
     }
 
     struct DropProbe(Arc<AtomicUsize>);
