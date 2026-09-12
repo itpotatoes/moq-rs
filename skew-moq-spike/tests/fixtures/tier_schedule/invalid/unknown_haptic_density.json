@@ -1,0 +1,19 @@
+{
+  "duration_us": 60000000,
+  "generation": "event-pair-plan-20260905-v1",
+  "haptic_rate_hz": 90,
+  "measurement_start_us": 1000000000,
+  "pc_rate_hz": 30,
+  "schema": "event-pair-s3np-tier-schedule-v1",
+  "source_arm": "s3",
+  "source_run_id": "epp9_src_s3_rep1",
+  "source_rx_sha256": "31dbd5964127ef42307d43394accec8654a26ac5a8bee7691489e45fdfcf8fd2",
+  "source_tx_sha256": "0af20cd3230ba5936a4b6d5ff82ecfce24a0377a0083dc4f2de9bacef2c22b94",
+  "switches": [
+    {
+      "haptic_density": "sparse",
+      "pc_tier": 2,
+      "t_offset_us": 0
+    }
+  ]
+}

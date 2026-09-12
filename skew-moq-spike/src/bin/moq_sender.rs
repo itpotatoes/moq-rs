@@ -585,6 +585,32 @@ struct Args {
     /// accounting attest that both endpoints ran the same policy.
     #[arg(long)]
     d_play_ms: Option<u64>,
+    /// `--arm s3np` only: the receiver's release rule, echoed here for the same
+    /// reason as `--d-play-ms`. The sender applies no release policy at all; the
+    /// echo exists so a single-endpoint audit cannot confuse the registered
+    /// primary rule with its sensitivity variant. No default: the receiver has
+    /// none either.
+    #[arg(long, value_enum)]
+    s3np_release_rule: Option<CliReleaseRule>,
+}
+
+/// CLI mirror of `skew_moq::s3np::ReleaseRule`. Kept a separate type so clap's
+/// value names are part of the CLI contract rather than of the library.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
+enum CliReleaseRule {
+    #[value(name = "per_track_epoch")]
+    PerTrackEpoch,
+    #[value(name = "absolute_t_gen")]
+    AbsoluteTGen,
+}
+
+impl From<CliReleaseRule> for skew_moq::s3np::ReleaseRule {
+    fn from(value: CliReleaseRule) -> Self {
+        match value {
+            CliReleaseRule::PerTrackEpoch => Self::PerTrackEpoch,
+            CliReleaseRule::AbsoluteTGen => Self::AbsoluteTGen,
+        }
+    }
 }
 
 /// Open-loop tier/haptic-density replay for `--arm s3np` (plan 단계 9 method 6).
@@ -868,7 +894,9 @@ fn priority_profile(args: &Args) -> PublisherPriorityProfile {
 fn validate_s3_args(args: &Args) -> Result<()> {
     let tier_dirs = args.s3_recovery_frames_dir.is_some() || args.s3_critical_frames_dir.is_some();
     let s3_only = args.s3_producer_shutdown_timeout_ms.is_some();
-    let s3np_only = args.tier_schedule.is_some() || args.d_play_ms.is_some();
+    let s3np_only = args.tier_schedule.is_some()
+        || args.d_play_ms.is_some()
+        || args.s3np_release_rule.is_some();
     if !matches!(args.arm, Arm::S3 | Arm::S3np) {
         if tier_dirs {
             anyhow::bail!("S3 PC tier frame directories require --arm s3 or --arm s3np");
@@ -877,15 +905,17 @@ fn validate_s3_args(args: &Args) -> Result<()> {
             anyhow::bail!("S3 lifecycle options require --arm s3");
         }
         if s3np_only {
-            anyhow::bail!("--tier-schedule and --d-play-ms require --arm s3np");
+            anyhow::bail!(
+                "--tier-schedule, --d-play-ms and --s3np-release-rule require --arm s3np"
+            );
         }
         return Ok(());
     }
     let arm = args.arm.as_str();
     if args.arm == Arm::S3 && s3np_only {
         anyhow::bail!(
-            "--tier-schedule and --d-play-ms require --arm s3np; S3 runs its own FSM \
-             and must never replay a recorded schedule"
+            "--tier-schedule, --d-play-ms and --s3np-release-rule require --arm s3np; \
+             S3 runs its own FSM and must never replay a recorded schedule"
         );
     }
     if args.arm == Arm::S3np && s3_only {
@@ -927,6 +957,9 @@ fn validate_s3_args(args: &Args) -> Result<()> {
     if !matches!(d_play_ms, 50 | 100) {
         anyhow::bail!("--d-play-ms must be a governing-design candidate: 50 or 100");
     }
+    // Fail closed: there is no default release rule anywhere in this arm.
+    args.s3np_release_rule
+        .context("--arm s3np requires --s3np-release-rule {per_track_epoch|absolute_t_gen}")?;
     if args.queue_policy != QueuePolicy::Separate {
         anyhow::bail!("--arm s3np requires --queue-policy separate");
     }
@@ -1317,6 +1350,20 @@ async fn main() -> Result<()> {
                 duration_us
             );
         }
+        // The replay's source rates are already pinned to the v5 contract by
+        // the parser; cross-check them against THIS run so a rate mismatch
+        // cannot silently change the anchor rule under a valid schedule.
+        if schedule.pc_rate_hz() != args.pc_rate_hz
+            || schedule.haptic_rate_hz() != args.haptic_rate_hz
+        {
+            anyhow::bail!(
+                "tier schedule was extracted from a {}/{} Hz run but this run is {}/{} Hz",
+                schedule.pc_rate_hz(),
+                schedule.haptic_rate_hz(),
+                args.pc_rate_hz,
+                args.haptic_rate_hz
+            );
+        }
         let sha256: [u8; 32] = {
             use sha2::{Digest, Sha256};
             Sha256::digest(document.as_bytes()).into()
@@ -1378,11 +1425,25 @@ async fn main() -> Result<()> {
             queue_policy: Some(args.queue_policy.as_str()),
             s3np: tier_replay.as_ref().map(|replay| S3npMeta {
                 tier_schedule_sha256: replay.sha256,
+                tier_schedule_generation: replay.schedule.generation().to_string(),
+                tier_schedule_source_run_id: replay.schedule.source_run_id().to_string(),
+                tier_schedule_source_tx_sha256: replay
+                    .schedule
+                    .source_tx_sha256()
+                    .to_string(),
+                tier_schedule_source_rx_sha256: replay
+                    .schedule
+                    .source_rx_sha256()
+                    .to_string(),
                 tier_schedule_switches: replay.schedule.switches().len(),
                 d_play_us: args
                     .d_play_ms
                     .expect("validated s3np d-play echo")
                     .saturating_mul(1_000),
+                release_rule: skew_moq::s3np::ReleaseRule::from(
+                    args.s3np_release_rule.expect("validated s3np release rule"),
+                )
+                .as_str(),
                 // The sender schedules no playout; only the receiver records
                 // the release parameters it actually applied.
                 release: None,
@@ -2320,7 +2381,7 @@ mod tests {
     use super::{
         b1_transport_meta, epoch_record, hold_static_track_state_through_drain, now_us,
         object_buffer, phase4_transport, registered_s_bytes, resolved_priorities,
-        shared_fifo_append, validate_s3_args, validate_stage5_policy,
+        shared_fifo_append, validate_s3_args, validate_stage5_policy, CliReleaseRule,
         wait_registered_direct_fin_handoff, Args, Arm, DataPriorityMapping, DirectFinHandoff,
         Duration, PayloadMode, PublisherPriorityProfile, QueuePolicy, Representation,
         SharedFifoWriter, Topology, TrackSel, Url, HDR,
@@ -2539,6 +2600,7 @@ mod tests {
             s3_producer_shutdown_timeout_ms: None,
             tier_schedule: None,
             d_play_ms: None,
+            s3np_release_rule: None,
         }
     }
 
@@ -2563,6 +2625,7 @@ mod tests {
         args.s3_critical_frames_dir = Some("datasets/d6".into());
         args.tier_schedule = Some(PathBuf::from("schedule.json"));
         args.d_play_ms = Some(50);
+        args.s3np_release_rule = Some(CliReleaseRule::PerTrackEpoch);
         // The frozen 67 ms PC delivery timeout is inherited, not chosen.
         assert!(phase4_transport(&args).is_err(), "timeout is required");
         args.pc_delivery_timeout_ms = Some(100);
@@ -2606,6 +2669,9 @@ mod tests {
         s3.tier_schedule = None;
         s3.d_play_ms = Some(50);
         assert!(validate_s3_args(&s3).is_err());
+        s3.d_play_ms = None;
+        s3.s3np_release_rule = Some(CliReleaseRule::PerTrackEpoch);
+        assert!(validate_s3_args(&s3).is_err());
 
         let mut s2 = arm_args(Arm::S2);
         s2.pc_delivery_timeout_ms = Some(67);
@@ -2615,6 +2681,9 @@ mod tests {
         s2.d_play_ms = Some(50);
         assert!(validate_s3_args(&s2).is_err());
         s2.d_play_ms = None;
+        s2.s3np_release_rule = Some(CliReleaseRule::PerTrackEpoch);
+        assert!(validate_s3_args(&s2).is_err());
+        s2.s3np_release_rule = None;
         s2.s3_recovery_frames_dir = Some("datasets/d7".into());
         assert!(validate_s3_args(&s2).is_err());
 
@@ -2624,11 +2693,19 @@ mod tests {
         missing.s3_recovery_frames_dir = Some("datasets/d7".into());
         missing.s3_critical_frames_dir = Some("datasets/d6".into());
         missing.d_play_ms = Some(50);
+        missing.s3np_release_rule = Some(CliReleaseRule::AbsoluteTGen);
         assert!(validate_s3_args(&missing)
             .unwrap_err()
             .to_string()
             .contains("--tier-schedule"));
         missing.tier_schedule = Some(PathBuf::from("schedule.json"));
+        // Fail closed: neither endpoint has a default release rule.
+        missing.s3np_release_rule = None;
+        assert!(validate_s3_args(&missing)
+            .unwrap_err()
+            .to_string()
+            .contains("--s3np-release-rule"));
+        missing.s3np_release_rule = Some(CliReleaseRule::PerTrackEpoch);
         missing.d_play_ms = None;
         assert!(validate_s3_args(&missing).is_err());
         missing.d_play_ms = Some(75);

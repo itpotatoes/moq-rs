@@ -1,0 +1,114 @@
+{
+  "applied_switch_rows": 3,
+  "duration_us": 14000000,
+  "generation": "event-pair-plan-20260905-v1",
+  "haptic_rate_hz": 90,
+  "measurement_start_us": 118294901529,
+  "pc_rate_hz": 30,
+  "post_measurement_applies": 0,
+  "pre_measurement_applies": 0,
+  "redundant_applies": 0,
+  "schema": "event-pair-s3np-tier-schedule-v1",
+  "source_arm": "s3",
+  "source_run_id": "p4v5_s3_forced_local_rep1",
+  "source_rx_sha256": "31dbd5964127ef42307d43394accec8654a26ac5a8bee7691489e45fdfcf8fd2",
+  "source_tx_sha256": "0af20cd3230ba5936a4b6d5ff82ecfce24a0377a0083dc4f2de9bacef2c22b94",
+  "source_workload": {
+    "by_track_tier": {
+      "haptic:0": {
+        "bytes": 182520,
+        "objects": 1027
+      },
+      "pc:2": {
+        "bytes": 66849512,
+        "objects": 148
+      },
+      "pc:3": {
+        "bytes": 18045072,
+        "objects": 154
+      },
+      "pc:4": {
+        "bytes": 3625720,
+        "objects": 127
+      }
+    },
+    "intervals": [
+      {
+        "end_offset_us": 573205,
+        "haptic_bytes": 9422,
+        "haptic_density": "full",
+        "haptic_objects": 53,
+        "haptic_objects_per_s": 92.462557,
+        "pc_bytes": 8103136,
+        "pc_objects": 19,
+        "pc_objects_per_s": 33.146954,
+        "pc_tier": 2,
+        "span_us": 573205,
+        "t_offset_us": 0
+      },
+      {
+        "end_offset_us": 4706516,
+        "haptic_bytes": 23764,
+        "haptic_density": "essential",
+        "haptic_objects": 134,
+        "haptic_objects_per_s": 32.41953,
+        "pc_bytes": 4552872,
+        "pc_objects": 127,
+        "pc_objects_per_s": 30.725972,
+        "pc_tier": 4,
+        "span_us": 4133311,
+        "t_offset_us": 573205
+      },
+      {
+        "end_offset_us": 9753871,
+        "haptic_bytes": 81422,
+        "haptic_density": "full",
+        "haptic_objects": 458,
+        "haptic_objects_per_s": 90.740596,
+        "pc_bytes": 18223736,
+        "pc_objects": 154,
+        "pc_objects_per_s": 30.51103,
+        "pc_tier": 3,
+        "span_us": 5047355,
+        "t_offset_us": 4706516
+      },
+      {
+        "end_offset_us": 14000000,
+        "haptic_bytes": 67912,
+        "haptic_density": "full",
+        "haptic_objects": 382,
+        "haptic_objects_per_s": 89.964295,
+        "pc_bytes": 57640560,
+        "pc_objects": 129,
+        "pc_objects_per_s": 30.380613,
+        "pc_tier": 2,
+        "span_us": 4246129,
+        "t_offset_us": 9753871
+      }
+    ],
+    "note": "generated objects/bytes as recorded by the SOURCE S3 sender; includes make-before-break duplicate route objects, so it is the comparison basis for workload equality, not a claim of it",
+    "objects_outside_measurement_window": 0
+  },
+  "switches": [
+    {
+      "haptic_density": "full",
+      "pc_tier": 2,
+      "t_offset_us": 0
+    },
+    {
+      "haptic_density": "essential",
+      "pc_tier": 4,
+      "t_offset_us": 573205
+    },
+    {
+      "haptic_density": "full",
+      "pc_tier": 3,
+      "t_offset_us": 4706516
+    },
+    {
+      "haptic_density": "full",
+      "pc_tier": 2,
+      "t_offset_us": 9753871
+    }
+  ]
+}

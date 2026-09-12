@@ -744,7 +744,9 @@ pub struct JsonlLogger {
 /// `scripts.phase1_v5_config.WRITER_LOG_SCHEMA_VERSION`.
 pub const LOG_SCHEMA_VERSION_V5: u32 = 5;
 
-#[derive(Debug, Clone, Copy)]
+/// Not `Copy`: `S3npMeta` owns the replayed schedule's provenance strings, and
+/// every construction site builds this inline and passes it once.
+#[derive(Debug, Clone)]
 pub struct V5Meta {
     pub payload_mode: PayloadMode,
     pub representation: Representation,
@@ -765,19 +767,34 @@ pub struct V5Meta {
 
 /// `s3np` policy attestation carried on BOTH endpoints' `role:"meta"` row.
 ///
-/// The digest is stored raw rather than as a `&str` so `V5Meta` stays `Copy`
-/// and no meta writer has to own a heap string; it is hex-formatted once, at
-/// write time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Two things must be provable from either log alone: **which arm ran**, and
+/// **which registered S3 run's trajectory was replayed**. The schedule digest
+/// plus the source run id and source-log digests tie an `s3np` run to the S3 run
+/// of its block; the release rule distinguishes the registered primary rule from
+/// its sensitivity variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct S3npMeta {
-    /// SHA-256 of the replayed tier-schedule document.
+    /// SHA-256 of the replayed tier-schedule document, as raw bytes;
+    /// hex-formatted once, at write time.
     pub tier_schedule_sha256: [u8; 32],
+    /// `generation` recorded in that document.
+    pub tier_schedule_generation: String,
+    /// `run_id` of the S3 run the schedule was extracted from.
+    pub tier_schedule_source_run_id: String,
+    /// The source S3 run's TX/RX log digests, copied from the document so an
+    /// analysis holding only the s3np log can still name its source evidence.
+    pub tier_schedule_source_tx_sha256: String,
+    pub tier_schedule_source_rx_sha256: String,
     /// Number of entries in that schedule, including the offset-0 initial state.
     pub tier_schedule_switches: usize,
     /// The fixed playout offset. The receiver applies it; the sender repeats it
     /// for frozen metadata agreement, exactly as S2 repeats
     /// `pc_delivery_timeout_ms`, so accounting can attest both sides agree.
     pub d_play_us: u64,
+    /// `s3np::ReleaseRule::as_str()`. Recorded on both endpoints: the receiver
+    /// applies it, the sender echoes it so a single-log audit cannot confuse the
+    /// primary rule with its sensitivity variant.
+    pub release_rule: &'static str,
     /// Receiver-only release parameters; `None` on the sender, which schedules
     /// nothing.
     pub release: Option<S3npReleaseMeta>,
@@ -785,6 +802,8 @@ pub struct S3npMeta {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct S3npReleaseMeta {
+    /// `s3np::ReleaseRule::playout_clock()`.
+    pub playout_clock: &'static str,
     pub late_tolerance_us: u64,
     pub late_policy: &'static str,
     pub max_objects_per_track: usize,
@@ -799,10 +818,11 @@ fn hex32(bytes: &[u8; 32]) -> String {
     out
 }
 
-fn s3np_meta_fields(meta: S3npMeta) -> String {
+fn s3np_meta_fields(meta: &S3npMeta) -> String {
     let release = match meta.release {
         Some(release) => format!(
-            ",\"playout_clock\":\"sender_t_gen_monotonic_us\",\"late_tolerance_us\":{},\"late_policy\":\"{}\",\"buffer_max_objects_per_track\":{},\"buffer_max_span_us\":{}",
+            ",\"playout_clock\":\"{}\",\"late_tolerance_us\":{},\"late_policy\":\"{}\",\"buffer_max_objects_per_track\":{},\"buffer_max_span_us\":{}",
+            esc(release.playout_clock),
             release.late_tolerance_us,
             esc(release.late_policy),
             release.max_objects_per_track,
@@ -811,9 +831,13 @@ fn s3np_meta_fields(meta: S3npMeta) -> String {
         None => String::new(),
     };
     format!(
-        ",\"s3np_release_rule\":\"{}\",\"tier_schedule_sha256\":\"{}\",\"tier_schedule_switches\":{},\"d_play_us\":{}{}",
-        esc(crate::s3np::RELEASE_RULE),
+        ",\"s3np_release_rule\":\"{}\",\"tier_schedule_sha256\":\"{}\",\"tier_schedule_generation\":\"{}\",\"tier_schedule_source_run_id\":\"{}\",\"tier_schedule_source_tx_sha256\":\"{}\",\"tier_schedule_source_rx_sha256\":\"{}\",\"tier_schedule_switches\":{},\"d_play_us\":{}{}",
+        esc(meta.release_rule),
         hex32(&meta.tier_schedule_sha256),
+        esc(&meta.tier_schedule_generation),
+        esc(&meta.tier_schedule_source_run_id),
+        esc(&meta.tier_schedule_source_tx_sha256),
+        esc(&meta.tier_schedule_source_rx_sha256),
         meta.tier_schedule_switches,
         meta.d_play_us,
         release,
@@ -942,7 +966,7 @@ impl JsonlLogger {
                     "s3np metadata cannot be combined with the S1 common-timeline playout block"
                 );
             }
-            let s3np = match v5.s3np {
+            let s3np = match &v5.s3np {
                 Some(meta) => s3np_meta_fields(meta),
                 None => String::new(),
             };
@@ -1154,6 +1178,39 @@ impl JsonlLogger {
         writeln!(
             self.w,
             "{{\"role\":\"release\",\"track\":\"{track}\",\"tier\":{tier},\"seq\":{seq},\"pts_us\":{pts_us},\"event_id\":{event_id},\"t_release\":{t_release}}}"
+        )?;
+        self.w.flush()
+    }
+
+    /// One `s3np` track's own timeline anchor, recorded when it forms.
+    ///
+    /// This cannot go on `role:"meta"`: metadata is written before the
+    /// subscription exists, while the anchor is by definition the first object
+    /// actually observed on that track. It is therefore its own append-only
+    /// row, additive to every existing schema and written only by `--arm s3np`
+    /// under the per-track release rule. `t_epoch` is the scheduler observation
+    /// time — the same notion of "now" the S1 scheduler uses when it forms the
+    /// common epoch from the first exact pair — and `epoch_offset_us` is the
+    /// constant `t_epoch - pts_us` added to every `pts` on this track.
+    pub fn try_log_s3np_track_epoch(
+        &mut self,
+        track: &str,
+        pts_us: u64,
+        t_epoch: u64,
+        epoch_offset_us: u64,
+        d_play_us: u64,
+        release_rule: &str,
+    ) -> std::io::Result<()> {
+        if !matches!(track, "pc" | "haptic") {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "s3np track epoch must name pc or haptic",
+            ));
+        }
+        writeln!(
+            self.w,
+            "{{\"role\":\"info\",\"event\":\"s3np_track_epoch\",\"track\":\"{track}\",\"pts_us\":{pts_us},\"t_epoch\":{t_epoch},\"epoch_offset_us\":{epoch_offset_us},\"d_play_us\":{d_play_us},\"s3np_release_rule\":\"{}\"}}",
+            esc(release_rule)
         )?;
         self.w.flush()
     }

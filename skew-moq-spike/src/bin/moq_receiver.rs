@@ -74,6 +74,29 @@ impl Arm {
     }
 }
 
+/// CLI mirror of `skew_moq::s3np::ReleaseRule`. A separate type so clap's value
+/// names are part of the CLI contract rather than of the library.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
+enum CliReleaseRule {
+    /// Registered PRIMARY rule: each track anchors on its own first observed
+    /// object, then releases at `E_k + pts + D_play`.
+    #[value(name = "per_track_epoch")]
+    PerTrackEpoch,
+    /// Sensitivity variant: absolute `t_gen + D_play`, which does not absorb the
+    /// one-way delay and is therefore a tighter baseline than S1-S3's.
+    #[value(name = "absolute_t_gen")]
+    AbsoluteTGen,
+}
+
+impl From<CliReleaseRule> for skew_moq::s3np::ReleaseRule {
+    fn from(value: CliReleaseRule) -> Self {
+        match value {
+            CliReleaseRule::PerTrackEpoch => Self::PerTrackEpoch,
+            CliReleaseRule::AbsoluteTGen => Self::AbsoluteTGen,
+        }
+    }
+}
+
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum CliLatePolicy {
     ReleaseLate,
@@ -284,6 +307,12 @@ struct Args {
     /// Inject the frozen three-miss trigger after controller activation.
     #[arg(long, hide = true)]
     s3_test_force_misses_after_ms: Option<u64>,
+    /// `--arm s3np` only: which pairing-free release rule to apply. There is
+    /// deliberately NO default — the two rules use different deadline baselines,
+    /// and a silent default would make an s3np run's comparability to S3
+    /// unrecoverable from the log.
+    #[arg(long, value_enum)]
+    s3np_release_rule: Option<CliReleaseRule>,
     /// `--arm s3np` only: the same tier-schedule document the sender replays.
     /// The receiver does not use its contents — it applies no tier policy — but
     /// it parses and digests it so BOTH endpoints' metadata name the schedule
@@ -291,6 +320,20 @@ struct Args {
     /// producing an unattributable run.
     #[arg(long)]
     tier_schedule: Option<PathBuf>,
+}
+
+/// `--duration-s` as exact integer microseconds. A fractional microsecond would
+/// make the schedule/run window comparison depend on float rounding, so it is
+/// refused rather than rounded.
+fn duration_us_exact(duration_s: f64) -> Result<u64> {
+    if !duration_s.is_finite() || duration_s <= 0.0 {
+        bail!("--duration-s must be finite and positive");
+    }
+    let micros = duration_s * 1_000_000.0;
+    if (micros - micros.round()).abs() > 1e-6 {
+        bail!("--duration-s {duration_s} is not an exact microsecond count");
+    }
+    Ok(micros.round() as u64)
 }
 
 fn ms_to_us(value: u64, name: &str) -> Result<u64> {
@@ -402,6 +445,9 @@ fn playout_config(args: &Args) -> Result<Option<PlayoutConfig>> {
 /// them would let a run record a parameter it did not apply.
 fn s3np_release_config(args: &Args) -> Result<Option<skew_moq::s3np::ReleaseConfig>> {
     if args.arm != Arm::S3np {
+        if args.s3np_release_rule.is_some() {
+            bail!("--s3np-release-rule requires --arm s3np");
+        }
         return Ok(None);
     }
     if args.tracks != RxTrackSel::Both {
@@ -423,6 +469,15 @@ fn s3np_release_config(args: &Args) -> Result<Option<skew_moq::s3np::ReleaseConf
         bail!("--d-play-ms must be a governing-design candidate: 50 or 100");
     }
     let config = skew_moq::s3np::ReleaseConfig {
+        // Fail closed. Every other s3np parameter is explicit for the same
+        // reason; the release rule is the one that decides what the arm MEANS.
+        rule: args
+            .s3np_release_rule
+            .context(
+                "--arm s3np requires --s3np-release-rule {per_track_epoch|absolute_t_gen}; \
+                 there is no default because the two rules are not interchangeable",
+            )?
+            .into(),
         d_play_us: ms_to_us(d_play_ms, "d-play-ms")?,
         late_tolerance_us: ms_to_us(
             args.late_tolerance_ms
@@ -810,6 +865,32 @@ async fn run_s3np_release_scheduler(
         skew_moq::s3np::PerTrackReleaseScheduler::new(config).map_err(anyhow::Error::msg)?;
     let mut stats = PlayoutStats::default();
 
+    // Each track's anchor is recorded the moment it forms. It cannot live on the
+    // `role:"meta"` row (written before any object exists), so it is its own
+    // append-only row; without it the applied timeline is not reconstructible
+    // from the log.
+    fn log_epochs(
+        scheduler: &mut skew_moq::s3np::PerTrackReleaseScheduler,
+        logger: &Arc<Mutex<JsonlLogger>>,
+        config: skew_moq::s3np::ReleaseConfig,
+    ) -> Result<()> {
+        for epoch in scheduler.take_new_epochs() {
+            logger
+                .lock()
+                .map_err(|_| anyhow::anyhow!("RX logger poisoned"))?
+                .try_log_s3np_track_epoch(
+                    epoch.track_name(),
+                    epoch.pts_us,
+                    epoch.monotonic_us,
+                    epoch.offset_us,
+                    config.d_play_us,
+                    config.rule.as_str(),
+                )
+                .context("failed to record an s3np track epoch")?;
+        }
+        Ok(())
+    }
+
     loop {
         let actions = if let Some(wakeup) = scheduler.next_wakeup_us() {
             let wait = Duration::from_micros(wakeup.saturating_sub(now_us()));
@@ -826,6 +907,7 @@ async fn run_s3np_release_scheduler(
                 None => break,
             }
         };
+        log_epochs(&mut scheduler, &logger, config)?;
         dispatch_playout_actions(actions, &logger, bridge.as_ref(), render, audio, &mut stats)?;
     }
 
@@ -2865,15 +2947,48 @@ async fn main() -> Result<()> {
                 .with_context(|| format!("read tier schedule {}", path.display()))?;
             let schedule = skew_moq::s3np::TierSchedule::parse(&document)
                 .map_err(|error| anyhow::anyhow!("invalid tier schedule: {error:?}"))?;
+            // The receiver applies no tier policy, but it must refuse a schedule
+            // that does not describe THIS run: the sender makes the same check,
+            // and a one-sided check would let a mismatched pair start.
+            if schedule.pc_rate_hz() != args.pc_rate_hz
+                || schedule.haptic_rate_hz() != args.haptic_rate_hz
+            {
+                bail!(
+                    "tier schedule was extracted from a {}/{} Hz run but this run is {}/{} Hz",
+                    schedule.pc_rate_hz(),
+                    schedule.haptic_rate_hz(),
+                    args.pc_rate_hz,
+                    args.haptic_rate_hz
+                );
+            }
+            let duration_s = args.duration_s.context(
+                "--arm s3np requires --duration-s so the replayed window can be checked \
+                 against the schedule",
+            )?;
+            let duration_us = duration_us_exact(duration_s)?;
+            if schedule.duration_us() != duration_us {
+                bail!(
+                    "tier schedule covers {}us but this run is {}us; the replay must come \
+                     from a source S3 run of the same registered duration",
+                    schedule.duration_us(),
+                    duration_us
+                );
+            }
             let sha256: [u8; 32] = {
                 use sha2::{Digest, Sha256};
                 Sha256::digest(document.as_bytes()).into()
             };
             Some(S3npMeta {
                 tier_schedule_sha256: sha256,
+                tier_schedule_generation: schedule.generation().to_string(),
+                tier_schedule_source_run_id: schedule.source_run_id().to_string(),
+                tier_schedule_source_tx_sha256: schedule.source_tx_sha256().to_string(),
+                tier_schedule_source_rx_sha256: schedule.source_rx_sha256().to_string(),
                 tier_schedule_switches: schedule.switches().len(),
                 d_play_us: config.d_play_us,
+                release_rule: config.rule.as_str(),
                 release: Some(S3npReleaseMeta {
+                    playout_clock: config.rule.playout_clock(),
                     late_tolerance_us: config.late_tolerance_us,
                     late_policy: config.late_policy.as_str(),
                     max_objects_per_track: config.max_objects_per_track,
@@ -3163,7 +3278,7 @@ async fn main() -> Result<()> {
         ));
         println!(
             "[rx] s3np per-track release: rule={} D_play={}ms late={}ms policy={} objects/track={} span={}ms",
-            skew_moq::s3np::RELEASE_RULE,
+            config.rule.as_str(),
             config.d_play_us / 1_000,
             config.late_tolerance_us / 1_000,
             config.late_policy.as_str(),
@@ -4090,6 +4205,7 @@ mod rx_ending_tests {
             s3_switch_retry_limit: None,
             s3_test_mode: false,
             s3_test_force_misses_after_ms: None,
+            s3np_release_rule: None,
             tier_schedule: None,
         };
 
@@ -4368,6 +4484,7 @@ mod rx_ending_tests {
             s3_switch_retry_limit: None,
             s3_test_mode: false,
             s3_test_force_misses_after_ms: None,
+            s3np_release_rule: None,
             tier_schedule: None,
         };
         let cfg = playout_config(&base).unwrap().unwrap();
@@ -4457,6 +4574,7 @@ mod rx_ending_tests {
             s3_switch_retry_limit: None,
             s3_test_mode: false,
             s3_test_force_misses_after_ms: None,
+            s3np_release_rule: None,
             tier_schedule: None,
         };
 
@@ -4551,6 +4669,13 @@ mod rx_ending_tests {
         np.late_policy = Some(CliLatePolicy::DropLate);
         np.startup_timeout_ms = None;
         np.startup_rearm_limit = None;
+        // Fail closed: the rule must be stated. Nothing about the two rules is
+        // interchangeable, so an omitted flag is an error, not a default.
+        assert!(s3np_release_config(&np)
+            .unwrap_err()
+            .to_string()
+            .contains("--s3np-release-rule"));
+        np.s3np_release_rule = Some(CliReleaseRule::PerTrackEpoch);
         // Every S3 controller option is refused: s3np runs no FSM.
         assert!(
             s3_runtime_config(&np).is_err(),
@@ -4604,15 +4729,31 @@ mod rx_ending_tests {
         // recorded as if it had been applied.
         assert!(playout_config(&np).unwrap().is_none());
         let release = s3np_release_config(&np).unwrap().unwrap();
+        assert_eq!(release.rule, skew_moq::s3np::ReleaseRule::PerTrackEpoch);
+        assert_eq!(
+            release.rule.as_str(),
+            "per_track_first_object_epoch_plus_d_play"
+        );
+        assert_eq!(release.rule.playout_clock(), "receiver_monotonic_us");
         assert_eq!(release.d_play_us, 50_000);
         assert_eq!(release.late_tolerance_us, 5_000);
         assert_eq!(release.max_objects_per_track, 64);
         assert_eq!(release.max_span_us, 250_000);
 
+        // The sensitivity variant is selectable and records a DIFFERENT rule
+        // name and clock, so no analysis can conflate the two.
+        np.s3np_release_rule = Some(CliReleaseRule::AbsoluteTGen);
+        let variant = s3np_release_config(&np).unwrap().unwrap();
+        assert_eq!(variant.rule, skew_moq::s3np::ReleaseRule::AbsoluteTGen);
+        assert_eq!(variant.rule.as_str(), "absolute_t_gen_plus_d_play");
+        assert_eq!(variant.rule.playout_clock(), "sender_t_gen_monotonic_us");
+        assert_ne!(variant.rule.as_str(), release.rule.as_str());
+        np.s3np_release_rule = Some(CliReleaseRule::PerTrackEpoch);
+
         // Each refusal is checked in place and then undone: `Args` is not
         // `Clone`, and a per-case fixture copy would be the only reason to make
         // it so.
-        let cases: [(&str, fn(&mut Args), fn(&mut Args)); 10] = [
+        let cases: [(&str, fn(&mut Args), fn(&mut Args)); 11] = [
             (
                 "startup window",
                 |a| a.startup_timeout_ms = Some(2_000),
@@ -4663,6 +4804,11 @@ mod rx_ending_tests {
                 |a| a.queue_policy = QueuePolicy::SharedFifo,
                 |a| a.queue_policy = QueuePolicy::Separate,
             ),
+            (
+                "missing release rule",
+                |a| a.s3np_release_rule = None,
+                |a| a.s3np_release_rule = Some(CliReleaseRule::PerTrackEpoch),
+            ),
         ];
         for (label, break_it, restore) in cases {
             break_it(&mut np);
@@ -4683,10 +4829,16 @@ mod rx_ending_tests {
             .contains("67ms"));
         np.pc_delivery_timeout_ms = Some(67);
 
-        // And no other arm builds the s3np release config.
+        // And no other arm builds the s3np release config — nor may it claim
+        // the release rule.
         np.arm = Arm::S2;
         np.startup_timeout_ms = Some(2_000);
         np.startup_rearm_limit = Some(1);
+        assert!(s3np_release_config(&np)
+            .unwrap_err()
+            .to_string()
+            .contains("requires --arm s3np"));
+        np.s3np_release_rule = None;
         assert!(s3np_release_config(&np).unwrap().is_none());
     }
 }
