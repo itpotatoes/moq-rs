@@ -775,13 +775,22 @@ fn validate_phase4_v5_args(args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// Released objects whose measured lateness is more negative than this are a
+/// clock or scheduler defect, not a fast release: an object cannot legitimately
+/// be handed out materially before its own deadline. Counted and reported so the
+/// analyzer can reject such a run instead of averaging the impossible values in.
+const MAX_NEGATIVE_LATENESS_US: i64 = 1_000;
+
 #[derive(Debug, Default)]
 struct PlayoutStats {
     released: u64,
     dropped: u64,
     bridge_observer_dropped: u64,
+    /// Releases with `t_release - t_due < -MAX_NEGATIVE_LATENESS_US`.
+    negative_lateness: u64,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_playout_actions(
     actions: Vec<PlayoutAction>,
     logger: &Arc<Mutex<JsonlLogger>>,
@@ -789,13 +798,31 @@ fn dispatch_playout_actions(
     render: bool,
     audio: bool,
     stats: &mut PlayoutStats,
+    // The scheduled release instant of each action, from the scheduler that
+    // emitted it (stage-9 decision 9-6 `t_due`).
+    due_us: &dyn Fn(&PlayoutAction) -> Option<u64>,
 ) -> std::io::Result<()> {
     for action in actions {
+        let t_due = due_us(&action);
         let object = action.object();
         let h = object.header;
         let action_time = now_us().max(object.t_recv);
         match action {
             PlayoutAction::Release(object) => {
+                if let Some(t_due) = t_due {
+                    let lateness = action_time as i64 - t_due as i64;
+                    if lateness < -MAX_NEGATIVE_LATENESS_US {
+                        stats.negative_lateness += 1;
+                        debug_assert!(
+                            false,
+                            "released {}us before its deadline: t_release={action_time} \
+                             t_due={t_due} track={} seq={}",
+                            -lateness,
+                            object.track_name(),
+                            h.seq
+                        );
+                    }
+                }
                 logger.lock().unwrap().try_log_release(
                     object.track_name(),
                     h.tier,
@@ -803,6 +830,7 @@ fn dispatch_playout_actions(
                     h.pts_us,
                     h.event_id,
                     action_time,
+                    t_due,
                 )?;
                 stats.released += 1;
                 let observe =
@@ -827,12 +855,61 @@ fn dispatch_playout_actions(
                     h.event_id,
                     action_time,
                     reason,
+                    t_due,
                 )?;
                 stats.dropped += 1;
             }
         }
     }
     Ok(())
+}
+
+/// Record each armed common timeline (stage-9 decision 9-6 evidence). Shared by
+/// the static S1/M1/S2/S3R loop and the S3 receiver, which use the same
+/// scheduler, so one timeline can never be logged under two different shapes.
+fn log_common_epochs(
+    scheduler: &mut PlayoutScheduler,
+    logger: &Arc<Mutex<JsonlLogger>>,
+    config: PlayoutConfig,
+) -> Result<()> {
+    for epoch in scheduler.take_new_epochs() {
+        logger
+            .lock()
+            .map_err(|_| anyhow::anyhow!("RX logger poisoned"))?
+            .try_log_timeline_epoch(
+                "common",
+                epoch.monotonic_us,
+                epoch.anchor_pts_us,
+                epoch.anchor_event_id,
+                config.d_play_us,
+                epoch.rearm_index,
+            )
+            .context("failed to record the common playout timeline epoch")?;
+    }
+    Ok(())
+}
+
+/// `dispatch_playout_actions` with the common-timeline scheduler supplying each
+/// action's `t_due`.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_common_actions(
+    actions: Vec<PlayoutAction>,
+    scheduler: &PlayoutScheduler,
+    logger: &Arc<Mutex<JsonlLogger>>,
+    bridge: &Option<mpsc::Sender<Bytes>>,
+    render: bool,
+    audio: bool,
+    stats: &mut PlayoutStats,
+) -> std::io::Result<()> {
+    dispatch_playout_actions(
+        actions,
+        logger,
+        bridge.as_ref(),
+        render,
+        audio,
+        stats,
+        &|action| scheduler.action_due_us(action),
+    )
 }
 
 async fn run_playout_scheduler(
@@ -862,12 +939,13 @@ async fn run_playout_scheduler(
                 None => break,
             }
         };
-        dispatch_playout_actions(actions, &logger, bridge.as_ref(), render, audio, &mut stats)?;
+        log_common_epochs(&mut scheduler, &logger, config)?;
+        dispatch_common_actions(actions, &scheduler, &logger, &bridge, render, audio, &mut stats)?;
     }
 
     if !scheduler.is_started() {
         let actions = scheduler.finish_without_epoch();
-        dispatch_playout_actions(actions, &logger, bridge.as_ref(), render, audio, &mut stats)?;
+        dispatch_common_actions(actions, &scheduler, &logger, &bridge, render, audio, &mut stats)?;
     } else {
         // Producer ended: deterministically drain the bounded timeline, then
         // return so logger finalization cannot race a detached scheduler task.
@@ -877,7 +955,7 @@ async fn run_playout_scheduler(
             };
             tokio::time::sleep(Duration::from_micros(wakeup.saturating_sub(now_us()))).await;
             let actions = scheduler.advance(now_us());
-            dispatch_playout_actions(actions, &logger, bridge.as_ref(), render, audio, &mut stats)?;
+            dispatch_common_actions(actions, &scheduler, &logger, &bridge, render, audio, &mut stats)?;
         }
     }
     Ok(stats)
@@ -917,15 +995,19 @@ async fn run_s3np_release_scheduler(
             logger
                 .lock()
                 .map_err(|_| anyhow::anyhow!("RX logger poisoned"))?
-                .try_log_s3np_track_epoch(
+                // Same row shape as the common timeline, scoped per track: the
+                // analyzer reads one `timeline_epoch` vocabulary for every arm.
+                // `rearm_index` is always 0 — a per-track anchor is the first
+                // object observed on that track and is never re-armed.
+                .try_log_timeline_epoch(
                     epoch.track_name(),
-                    epoch.pts_us,
                     epoch.monotonic_us,
-                    epoch.offset_us,
+                    epoch.pts_us,
+                    epoch.event_id,
                     config.d_play_us,
-                    config.rule.as_str(),
+                    0,
                 )
-                .context("failed to record an s3np track epoch")?;
+                .context("failed to record an s3np track timeline epoch")?;
         }
         Ok(())
     }
@@ -947,7 +1029,15 @@ async fn run_s3np_release_scheduler(
             }
         };
         log_epochs(&mut scheduler, &logger, config)?;
-        dispatch_playout_actions(actions, &logger, bridge.as_ref(), render, audio, &mut stats)?;
+        dispatch_playout_actions(
+            actions,
+            &logger,
+            bridge.as_ref(),
+            render,
+            audio,
+            &mut stats,
+            &|action| scheduler.action_due_us(action),
+        )?;
     }
 
     while !scheduler.is_empty() {
@@ -956,7 +1046,15 @@ async fn run_s3np_release_scheduler(
         };
         tokio::time::sleep(Duration::from_micros(wakeup.saturating_sub(now_us()))).await;
         let actions = scheduler.advance(now_us());
-        dispatch_playout_actions(actions, &logger, bridge.as_ref(), render, audio, &mut stats)?;
+        dispatch_playout_actions(
+            actions,
+            &logger,
+            bridge.as_ref(),
+            render,
+            audio,
+            &mut stats,
+            &|action| scheduler.action_due_us(action),
+        )?;
     }
     Ok(stats)
 }
@@ -1547,6 +1645,9 @@ async fn drain_s3_track(
                                 header.event_id,
                                 now_us().max(routed.object.t_recv),
                                 "ingress_queue_full",
+                                // Never admitted to the scheduler, so no
+                                // deadline was ever evaluated for it.
+                                None,
                             )
                             .is_err()
                         {
@@ -1714,6 +1815,7 @@ fn advance_tracker_checked(
     Ok(observations)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_s3_playout_actions(
     actions: Vec<PlayoutAction>,
     routes: &mut HashMap<S3ObjectKey, (TrackRole, Route)>,
@@ -1724,9 +1826,12 @@ fn dispatch_s3_playout_actions(
     audio: bool,
     stats: &mut PlayoutStats,
     now: u64,
+    // Stage-9 decision 9-6 `t_due`, from the scheduler that emitted the action.
+    due_us: &dyn Fn(&PlayoutAction) -> Option<u64>,
 ) -> Result<()> {
     settle_tracker_batch(tracker, &actions, now).map_err(anyhow::Error::msg)?;
     for action in actions {
+        let t_due = due_us(&action);
         let object = action.object();
         let header = object.header;
         let key = S3ObjectKey::from(object);
@@ -1746,7 +1851,14 @@ fn dispatch_s3_playout_actions(
                         header.pts_us,
                         header.event_id,
                         now.max(object.t_recv),
+                        t_due,
                     )?;
+                if let Some(t_due) = t_due {
+                    if (now.max(object.t_recv) as i64 - t_due as i64) < -MAX_NEGATIVE_LATENESS_US {
+                        stats.negative_lateness += 1;
+                        debug_assert!(false, "S3 released an object before its deadline");
+                    }
+                }
                 stats.released += 1;
                 let observe = (header.track_id == TRACK_PC && render)
                     || (header.track_id == TRACK_HAPTIC && audio);
@@ -1771,6 +1883,7 @@ fn dispatch_s3_playout_actions(
                         header.event_id,
                         now.max(object.t_recv),
                         reason,
+                        t_due,
                     )?;
                 stats.dropped += 1;
             }
@@ -2288,6 +2401,9 @@ async fn run_s3_receiver(
                                                     header.event_id,
                                                     now.max(routed.object.t_recv),
                                                     DROP_DUPLICATE_IDENTITY,
+                                                    // Identity integrity, not a
+                                                    // scheduling decision.
+                                                    None,
                                                 )
                                                 .map_err(anyhow::Error::from)
                                         })
@@ -2329,6 +2445,9 @@ async fn run_s3_receiver(
                                                 header.event_id,
                                                 now.max(routed.object.t_recv),
                                                 reason,
+                                                // Route/tier integrity, not a
+                                                // scheduling decision.
+                                                None,
                                             )
                                             .map_err(anyhow::Error::from)
                                     })
@@ -2480,6 +2599,12 @@ async fn run_s3_receiver(
         }
 
         scheduler_actions.extend(scheduler.advance(now));
+        // Same common-timeline epoch row as S1/M1/S2/S3R: S3 uses the same
+        // scheduler, so its `t_due` is verifiable the same way.
+        if let Err(error) = log_common_epochs(&mut scheduler, &logger, playout) {
+            outcome_error = Some(error);
+            continue;
+        }
         if let Err(error) = dispatch_s3_playout_actions(
             scheduler_actions,
             &mut object_routes,
@@ -2490,6 +2615,7 @@ async fn run_s3_receiver(
             args.audio,
             &mut stats,
             now,
+            &|action| scheduler.action_due_us(action),
         ) {
             outcome_error = Some(error);
             continue;
@@ -2672,6 +2798,8 @@ async fn run_s3_receiver(
                     header.event_id,
                     now_us().max(routed.object.t_recv),
                     reason,
+                    // Route/tier integrity, not a scheduling decision.
+                    None,
                 )?;
             stats.dropped += 1;
         }
@@ -2729,6 +2857,7 @@ async fn run_s3_receiver(
                 false,
                 &mut stats,
                 now,
+                &|action| scheduler.action_due_us(action),
             )?;
         }
     } else {
@@ -2744,6 +2873,8 @@ async fn run_s3_receiver(
             false,
             &mut stats,
             now,
+            // No epoch was ever armed, so no object had a deadline.
+            &|_| None,
         )?;
     }
 
@@ -2761,10 +2892,11 @@ async fn run_s3_receiver(
             .lock()
             .map_err(|_| anyhow::anyhow!("RX logger poisoned"))?;
         logger.try_log_info(&format!(
-            "\"recv_pc\":{n_pc},\"recv_haptic\":{n_haptic},\"bad_headers\":{n_bad},\"s1_released\":{},\"s1_dropped\":{},\"s1_ingress_dropped\":{n_ingress_drop},\"s1_bridge_observer_dropped\":{}",
+            "\"recv_pc\":{n_pc},\"recv_haptic\":{n_haptic},\"bad_headers\":{n_bad},\"s1_released\":{},\"s1_dropped\":{},\"s1_ingress_dropped\":{n_ingress_drop},\"s1_bridge_observer_dropped\":{},\"s1_negative_lateness\":{}",
             stats.released,
             stats.dropped,
             stats.bridge_observer_dropped,
+            stats.negative_lateness,
         ))?;
         logger.try_log_info(&format!(
             "\"event\":\"shutdown\",\"ending\":\"{}\",\"exit_code\":{},\"bad_headers\":{},\"subscribe_retries\":0,\"subscribe_wait_ms\":0,\"tracks\":[],\"detail\":\"{}\"",
@@ -3523,6 +3655,9 @@ async fn main() -> Result<()> {
                                 let logged = logger.lock().unwrap().try_log_drop(
                                     scheduled.track_name(), h.tier, h.seq, h.pts_us, h.event_id,
                                     now_us().max(scheduled.t_recv), "ingress_queue_full",
+                                    // Never admitted to the scheduler, so no
+                                    // deadline was ever evaluated for it.
+                                    None,
                                 );
                                 if logged.is_err() {
                                     ingress_log_failed.fetch_add(1, Ordering::Relaxed);
@@ -3538,6 +3673,7 @@ async fn main() -> Result<()> {
                                 let _ = logger.lock().unwrap().try_log_drop(
                                     scheduled.track_name(), h.tier, h.seq, h.pts_us, h.event_id,
                                     now_us().max(scheduled.t_recv), "scheduler_closed",
+                                    None,
                                 );
                                 ingress_log_failed.fetch_add(1, Ordering::Relaxed);
                             }
@@ -3717,7 +3853,7 @@ async fn main() -> Result<()> {
         };
         if lg
             .try_log_info(&format!(
-                "\"recv_pc\":{n_pc},\"recv_haptic\":{n_hap},\"bad_headers\":{n_bad},\"pc_chunks_received\":{},\"haptic_chunks_received\":{},\"frames_completed\":{},\"incomplete_frames\":{},\"duplicate_chunks\":{},\"invalid_chunks\":{},\"reassembly_peak_frames\":{},\"reassembly_peak_bytes\":{},\"s1_released\":{},\"s1_dropped\":{},\"s1_ingress_dropped\":{},\"s1_bridge_observer_dropped\":{}",
+                "\"recv_pc\":{n_pc},\"recv_haptic\":{n_hap},\"bad_headers\":{n_bad},\"pc_chunks_received\":{},\"haptic_chunks_received\":{},\"frames_completed\":{},\"incomplete_frames\":{},\"duplicate_chunks\":{},\"invalid_chunks\":{},\"reassembly_peak_frames\":{},\"reassembly_peak_bytes\":{},\"s1_released\":{},\"s1_dropped\":{},\"s1_ingress_dropped\":{},\"s1_bridge_observer_dropped\":{},\"s1_negative_lateness\":{}",
                 pc_wire.chunks_received,
                 hap_wire.chunks_received,
                 pc_wire.frames_completed + hap_wire.frames_completed,
@@ -3730,6 +3866,7 @@ async fn main() -> Result<()> {
                 s1_stats.dropped,
                 ingress_drops.load(Ordering::Relaxed),
                 s1_stats.bridge_observer_dropped,
+                s1_stats.negative_lateness,
             ))
             .is_err()
         {

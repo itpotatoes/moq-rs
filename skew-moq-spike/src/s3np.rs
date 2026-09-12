@@ -432,6 +432,8 @@ pub struct TrackEpoch {
     pub track_id: u8,
     /// `pts_us` of the first object observed on this track.
     pub pts_us: u64,
+    /// `event_id` of that first object (0 for a non-anchor haptic tick).
+    pub event_id: u32,
     /// Scheduler observation time of that object — the same notion of "now"
     /// `PlayoutScheduler` uses when it forms the common epoch from the first
     /// exact pair.
@@ -540,6 +542,18 @@ impl PerTrackReleaseScheduler {
         std::mem::take(&mut self.new_epochs)
     }
 
+    /// The scheduled release instant an emitted action was evaluated against —
+    /// the `t_due` of stage-9 decision 9-6.
+    ///
+    /// Under either rule this is the same value the action was emitted with: the
+    /// per-track anchor is immutable once armed, and the absolute variant depends
+    /// only on the object's own `t_gen`. Every admitted object therefore has a
+    /// deadline, so unlike the common-timeline scheduler this never returns
+    /// `None` for a real object — only an invalid track can.
+    pub fn action_due_us(&self, action: &PlayoutAction) -> Option<u64> {
+        self.release_us(&action.object().header)
+    }
+
     /// The whole ablation difference, in one place: a per-object deadline that
     /// consults only this object's own track.
     pub fn release_us(&self, header: &Header) -> Option<u64> {
@@ -578,6 +592,7 @@ impl PerTrackReleaseScheduler {
             let epoch = TrackEpoch {
                 track_id: track,
                 pts_us: object.header.pts_us,
+                event_id: object.header.event_id,
                 monotonic_us: now_us,
                 offset_us: now_us.saturating_sub(object.header.pts_us),
             };
@@ -1146,6 +1161,89 @@ mod tests {
         assert_eq!(haptic_epoch.pts_us, 100_000);
         assert_ne!(haptic_epoch.offset_us, epoch.offset_us);
         assert_eq!(scheduler.next_wakeup_us(), Some(2_055_000));
+    }
+
+    /// Stage-9 decision 9-6, s3np side: `t_due` must be reconstructible from the
+    /// per-track `timeline_epoch` row under the epoch rule, and from the row's
+    /// own `t_gen` under the absolute variant.
+    #[test]
+    fn t_due_of_every_action_matches_its_track_epoch_or_its_t_gen() {
+        let d_play = config().d_play_us;
+
+        // --- per-track epoch rule ---
+        let mut scheduler = PerTrackReleaseScheduler::new(config()).unwrap();
+        // PC anchor: pts 100_000 observed at 1_020_000.
+        assert!(scheduler
+            .push(object(TRACK_PC, PC_TIER_NORMAL, 3, 100_000, 4, 1_000_000), 1_020_000)
+            .is_empty());
+        let epochs = scheduler.take_new_epochs();
+        assert_eq!(epochs.len(), 1);
+        let pc_epoch = epochs[0];
+        assert_eq!(pc_epoch.track_id, TRACK_PC);
+        assert_eq!(pc_epoch.pts_us, 100_000);
+        assert_eq!(pc_epoch.event_id, 4, "the anchor event id is reported");
+        let pc_due = |pts: u64| pc_epoch.monotonic_us + d_play + (pts - pc_epoch.pts_us);
+        let released = scheduler.advance(pc_due(100_000));
+        assert_eq!(released.len(), 1);
+        assert_eq!(
+            scheduler.action_due_us(&released[0]),
+            Some(pc_due(100_000))
+        );
+
+        // The haptic track has its OWN anchor, so its rows must be checked
+        // against its own epoch row — using the PC one would be wrong by the
+        // difference between the two arrival times.
+        assert!(scheduler
+            .push(object(TRACK_HAPTIC, HAPTIC_TIER_FULL, 9, 100_000, 4, 1_000_000), 1_060_000)
+            .is_empty());
+        let haptic_epoch = scheduler.take_new_epochs()[0];
+        assert_eq!(haptic_epoch.track_id, TRACK_HAPTIC);
+        let haptic_due =
+            |pts: u64| haptic_epoch.monotonic_us + d_play + (pts - haptic_epoch.pts_us);
+        assert_ne!(haptic_due(100_000), pc_due(100_000));
+        let released = scheduler.advance(haptic_due(100_000));
+        assert_eq!(released.len(), 1);
+        assert_eq!(
+            scheduler.action_due_us(&released[0]),
+            Some(haptic_due(100_000))
+        );
+
+        // A bound drop carries the same deadline it was evaluated against.
+        let mut bounded = PerTrackReleaseScheduler::new(ReleaseConfig {
+            max_objects_per_track: 1,
+            ..config()
+        })
+        .unwrap();
+        bounded.push(object(TRACK_PC, PC_TIER_NORMAL, 0, 0, 1, 2_000_000), 2_000_000);
+        let dropped = bounded.push(
+            object(TRACK_PC, PC_TIER_NORMAL, 1, 33_333, 2, 2_033_333),
+            2_033_333,
+        );
+        let drops: Vec<&PlayoutAction> = dropped
+            .iter()
+            .filter(|action| matches!(action, PlayoutAction::Drop { .. }))
+            .collect();
+        assert_eq!(drops.len(), 1);
+        let epoch = bounded.track_epoch(TRACK_PC).unwrap();
+        let pts = drops[0].object().header.pts_us;
+        assert_eq!(
+            bounded.action_due_us(drops[0]),
+            Some(epoch.monotonic_us + d_play + (pts - epoch.pts_us))
+        );
+
+        // --- absolute variant: no epoch row exists, t_due is t_gen + D_play ---
+        let mut absolute = PerTrackReleaseScheduler::new(absolute_config()).unwrap();
+        assert!(absolute
+            .push(object(TRACK_PC, PC_TIER_NORMAL, 3, 100_000, 4, 7_000_000), 7_030_000)
+            .is_empty());
+        assert!(absolute.take_new_epochs().is_empty(), "no timeline is armed");
+        assert!(absolute.track_epoch(TRACK_PC).is_none());
+        let released = absolute.advance(7_000_000 + d_play);
+        assert_eq!(released.len(), 1);
+        assert_eq!(
+            absolute.action_due_us(&released[0]),
+            Some(7_000_000 + d_play)
+        );
     }
 
     #[test]

@@ -163,6 +163,26 @@ struct Epoch {
     monotonic_us: u64,
 }
 
+/// The common timeline, reported once each time it is armed.
+///
+/// Stage-9 decision 9-6 defines L1-R success as "released on time", i.e.
+/// `t_release - t_due <= late tolerance`. The analyzer must read `t_due` from the
+/// row rather than reconstruct it from metadata, and it must be able to check
+/// that reconstruction independently — hence this row: for the common-timeline
+/// arms every `t_due` equals `t_epoch + (pts - anchor_pts_us) + D_play`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommonEpoch {
+    /// `pts_us` of the exact anchor PAIR that armed the timeline.
+    pub anchor_pts_us: u64,
+    /// `event_id` of that anchor pair.
+    pub anchor_event_id: u32,
+    /// Receiver-monotonic observation time at which it was armed.
+    pub monotonic_us: u64,
+    /// 0 for the first arming; 1 after the single permitted startup re-arm
+    /// (설계 v5 개정: exactly one re-arm, then permanent failure).
+    pub rearm_index: u8,
+}
+
 /// Deterministic S1 state machine.  Callers provide receiver-monotonic `now_us`
 /// values, which makes unit tests independent of wall time.
 pub struct PlayoutScheduler {
@@ -173,6 +193,7 @@ pub struct PlayoutScheduler {
     startup_started_us: Option<u64>,
     startup_rearms_used: u8,
     epoch: Option<Epoch>,
+    new_epochs: Vec<CommonEpoch>,
     startup_failed: bool,
 }
 
@@ -187,6 +208,7 @@ impl PlayoutScheduler {
             startup_started_us: None,
             startup_rearms_used: 0,
             epoch: None,
+            new_epochs: Vec::new(),
             startup_failed: false,
         })
     }
@@ -220,6 +242,38 @@ impl PlayoutScheduler {
 
     pub fn deadline_us(&self, pts_us: u64) -> Option<u64> {
         self.epoch.map(|_| self.due_us(pts_us))
+    }
+
+    /// Drain the timelines armed since the last call, for the caller to log.
+    pub fn take_new_epochs(&mut self) -> Vec<CommonEpoch> {
+        std::mem::take(&mut self.new_epochs)
+    }
+
+    /// The scheduled release instant an emitted action was evaluated against —
+    /// the `t_due` of stage-9 decision 9-6.
+    ///
+    /// This is the SAME `due_us` the scheduler used when it emitted the action
+    /// (the epoch is immutable once armed, and a re-arm can only happen while no
+    /// epoch exists), so labelling a row through this method cannot disagree with
+    /// the release/drop decision that produced it.
+    ///
+    /// `None` means the object never had a deadline: a drop emitted while no
+    /// epoch existed (startup timeout, shutdown before epoch, or a buffer bound
+    /// hit in the same `push` that later armed the timeline). Deriving it from
+    /// the *current* epoch instead of from `had_epoch` would retroactively invent
+    /// a deadline for exactly those objects.
+    pub fn action_due_us(&self, action: &PlayoutAction) -> Option<u64> {
+        match action {
+            PlayoutAction::Release(object) => self.deadline_us(object.header.pts_us),
+            PlayoutAction::Drop {
+                object,
+                had_epoch: true,
+                ..
+            } => self.deadline_us(object.header.pts_us),
+            PlayoutAction::Drop {
+                had_epoch: false, ..
+            } => None,
+        }
     }
 
     /// Insert one received object and return any immediately determined
@@ -455,10 +509,16 @@ impl PlayoutScheduler {
             .map(|item| (item.header.pts_us, item.header.event_id))
             .filter(|key| pc_pairs.contains(key))
             .min();
-        if let Some((pts_us, _)) = first_pair {
+        if let Some((pts_us, event_id)) = first_pair {
             self.epoch = Some(Epoch {
                 pts_us,
                 monotonic_us: now_us,
+            });
+            self.new_epochs.push(CommonEpoch {
+                anchor_pts_us: pts_us,
+                anchor_event_id: event_id,
+                monotonic_us: now_us,
+                rearm_index: self.startup_rearms_used,
             });
         }
     }
@@ -619,6 +679,77 @@ mod tests {
             .iter()
             .filter(|a| matches!(a, PlayoutAction::Release(_)))
             .count()
+    }
+
+    /// Stage-9 decision 9-6: every emitted row's `t_due` must be reconstructible
+    /// from the `timeline_epoch` row as `t_epoch + (pts - anchor_pts) + D_play`,
+    /// and an object that never had a deadline must report none.
+    #[test]
+    fn t_due_of_every_action_matches_the_reported_epoch() {
+        let mut scheduler = PlayoutScheduler::new(config()).unwrap();
+        assert!(scheduler.take_new_epochs().is_empty());
+
+        // No epoch yet: a startup-timeout drop has no deadline at all.
+        let lone = object(TRACK_PC, 0, 0, 1, 1_000);
+        assert!(scheduler.push(lone, 1_000).is_empty());
+        let timed_out = scheduler.advance(1_000 + config().startup_timeout_us);
+        assert_eq!(timed_out.len(), 1);
+        assert!(timed_out[0].is_pre_epoch_drop());
+        assert_eq!(scheduler.action_due_us(&timed_out[0]), None);
+        assert!(scheduler.take_new_epochs().is_empty(), "no timeline was armed");
+
+        // The exact anchor pair arms the timeline; the re-arm index records that
+        // this happened in the second window.
+        let pc = object(TRACK_PC, 3, 100_000, 4, 500_000);
+        let haptic = object(TRACK_HAPTIC, 9, 100_000, 4, 500_100);
+        assert!(scheduler.push(pc, 500_000).is_empty());
+        assert!(scheduler.push(haptic, 500_100).is_empty());
+        let epochs = scheduler.take_new_epochs();
+        assert_eq!(epochs.len(), 1);
+        let epoch = epochs[0];
+        assert_eq!(epoch.anchor_pts_us, 100_000);
+        assert_eq!(epoch.anchor_event_id, 4);
+        assert_eq!(epoch.monotonic_us, 500_100);
+        assert_eq!(epoch.rearm_index, 1, "the first window timed out");
+        assert!(scheduler.take_new_epochs().is_empty(), "reported once only");
+
+        let d_play = config().d_play_us;
+        let expected = |pts: u64| {
+            epoch.monotonic_us + d_play + (pts - epoch.anchor_pts_us)
+        };
+        // Both anchor objects are due at the epoch instant + D_play, on both
+        // tracks, and nothing is due before that.
+        assert!(scheduler.advance(expected(100_000) - 1).is_empty());
+        let released = scheduler.advance(expected(100_000));
+        assert_eq!(released.len(), 2);
+        for action in &released {
+            assert!(matches!(action, PlayoutAction::Release(_)));
+            assert_eq!(
+                scheduler.action_due_us(action),
+                Some(expected(action.object().header.pts_us))
+            );
+        }
+        // A later frame follows the same arithmetic.
+        let later = object(TRACK_PC, 4, 133_333, 5, 520_000);
+        assert!(scheduler.push(later, expected(100_000)).is_empty());
+        let released = scheduler.advance(expected(133_333));
+        assert_eq!(released.len(), 1);
+        assert_eq!(
+            scheduler.action_due_us(&released[0]),
+            Some(expected(133_333))
+        );
+        assert_eq!(
+            expected(133_333) - expected(100_000),
+            33_333,
+            "the timeline advances with source PTS, not with arrival"
+        );
+        // A bound drop after the epoch exists DOES carry the deadline it was
+        // evaluated against.
+        let mut bounded = PlayoutScheduler::new(config()).unwrap();
+        bounded.push(object(TRACK_PC, 0, 0, 1, 10), 10);
+        let armed = bounded.push(object(TRACK_HAPTIC, 0, 0, 1, 20), 20);
+        assert_eq!(bounded.take_new_epochs().len(), 1);
+        assert!(armed.iter().all(|a| bounded.action_due_us(a).is_some()));
     }
 
     #[test]

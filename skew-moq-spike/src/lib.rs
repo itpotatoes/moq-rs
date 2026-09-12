@@ -873,6 +873,28 @@ fn esc(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// `t_due` field of a release/drop row: the SCHEDULED release instant, on the
+/// receiver monotonic clock.
+///
+/// Stage-9 decision 9-6 defines the L1-R success condition as "released on
+/// time": `lateness = t_release - t_due <= late tolerance`, not dropped. The
+/// analyzer must read this from the row instead of reconstructing it from
+/// metadata, because the epoch that anchors it is a measured receiver event, not
+/// a configured value.
+///
+/// `null` means the object never had a deadline — a drop emitted while no
+/// timeline existed (startup timeout, shutdown before epoch, or a buffer bound
+/// hit in the same ingress batch that later armed the timeline), or an ingress
+/// queue overflow that the scheduler never saw. Those objects are terminal
+/// without a scheduling decision, and inventing a deadline for them would make
+/// the lateness distribution include values that were never evaluated.
+pub(crate) fn t_due_field(t_due: Option<u64>) -> String {
+    match t_due {
+        Some(value) => format!(",\"t_due\":{value}"),
+        None => ",\"t_due\":null".to_string(),
+    }
+}
+
 impl JsonlLogger {
     /// Open and write the meta line. `c_mbps` is None for the unconstrained run.
     pub fn new(
@@ -1184,6 +1206,9 @@ impl JsonlLogger {
     }
 
     /// Phase-4 L1-R application-release record. This is not L2 `t_play`.
+    ///
+    /// `t_due` is appended after every pre-existing field, so a consumer written
+    /// against the earlier shape reads the same values at the same keys.
     #[allow(clippy::too_many_arguments)]
     pub fn try_log_release(
         &mut self,
@@ -1193,48 +1218,51 @@ impl JsonlLogger {
         pts_us: u64,
         event_id: u32,
         t_release: u64,
+        t_due: Option<u64>,
     ) -> std::io::Result<()> {
         writeln!(
             self.w,
-            "{{\"role\":\"release\",\"track\":\"{track}\",\"tier\":{tier},\"seq\":{seq},\"pts_us\":{pts_us},\"event_id\":{event_id},\"t_release\":{t_release}}}"
+            "{{\"role\":\"release\",\"track\":\"{track}\",\"tier\":{tier},\"seq\":{seq},\"pts_us\":{pts_us},\"event_id\":{event_id},\"t_release\":{t_release}{}}}",
+            t_due_field(t_due)
         )?;
         self.w.flush()
     }
 
-    /// One `s3np` track's own timeline anchor, recorded when it forms.
+    /// One armed playout timeline (stage-9 decision 9-6 evidence).
     ///
-    /// This cannot go on `role:"meta"`: metadata is written before the
-    /// subscription exists, while the anchor is by definition the first object
-    /// actually observed on that track. It is therefore its own append-only
-    /// row, additive to every existing schema and written only by `--arm s3np`
-    /// under the per-track release rule. `t_epoch` is the scheduler observation
-    /// time — the same notion of "now" the S1 scheduler uses when it forms the
-    /// common epoch from the first exact pair — and `epoch_offset_us` is the
-    /// constant `t_epoch - pts_us` added to every `pts` on this track.
-    pub fn try_log_s3np_track_epoch(
+    /// `scope` is `"common"` for the S1/M1/S2/S3/S3R common timeline formed from
+    /// the first exact PC/haptic anchor pair, or `"pc"`/`"haptic"` for the s3np
+    /// per-track timelines. It lets the analyzer verify the `t_due` of every row
+    /// independently: `t_due == t_epoch + (pts_us - anchor_pts_us) + d_play_us`.
+    ///
+    /// The s3np ABSOLUTE variant arms no timeline and therefore emits no such
+    /// row; its `t_due` is `t_gen + D_play`, which is self-contained in the row.
+    pub fn try_log_timeline_epoch(
         &mut self,
-        track: &str,
-        pts_us: u64,
+        scope: &str,
         t_epoch: u64,
-        epoch_offset_us: u64,
+        anchor_pts_us: u64,
+        anchor_event_id: u32,
         d_play_us: u64,
-        release_rule: &str,
+        rearm_index: u8,
     ) -> std::io::Result<()> {
-        if !matches!(track, "pc" | "haptic") {
+        if !matches!(scope, "common" | "pc" | "haptic") {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "s3np track epoch must name pc or haptic",
+                "timeline epoch scope must be common, pc or haptic",
             ));
         }
         writeln!(
             self.w,
-            "{{\"role\":\"info\",\"event\":\"s3np_track_epoch\",\"track\":\"{track}\",\"pts_us\":{pts_us},\"t_epoch\":{t_epoch},\"epoch_offset_us\":{epoch_offset_us},\"d_play_us\":{d_play_us},\"s3np_release_rule\":\"{}\"}}",
-            esc(release_rule)
+            "{{\"role\":\"info\",\"event\":\"timeline_epoch\",\"scope\":\"{scope}\",\"t_epoch\":{t_epoch},\"anchor_pts_us\":{anchor_pts_us},\"anchor_event_id\":{anchor_event_id},\"d_play_us\":{d_play_us},\"rearm_index\":{rearm_index}}}"
         )?;
         self.w.flush()
     }
 
     /// Phase-4 L1-R terminal drop record with the same exact identity as rx.
+    ///
+    /// `t_due` is appended last and is `null` when the object never had a
+    /// deadline (see [`t_due_field`]).
     #[allow(clippy::too_many_arguments)]
     pub fn try_log_drop(
         &mut self,
@@ -1245,11 +1273,13 @@ impl JsonlLogger {
         event_id: u32,
         t_drop: u64,
         drop_reason: &str,
+        t_due: Option<u64>,
     ) -> std::io::Result<()> {
         writeln!(
             self.w,
-            "{{\"role\":\"drop\",\"track\":\"{track}\",\"tier\":{tier},\"seq\":{seq},\"pts_us\":{pts_us},\"event_id\":{event_id},\"t_drop\":{t_drop},\"drop_reason\":\"{}\"}}",
-            esc(drop_reason)
+            "{{\"role\":\"drop\",\"track\":\"{track}\",\"tier\":{tier},\"seq\":{seq},\"pts_us\":{pts_us},\"event_id\":{event_id},\"t_drop\":{t_drop},\"drop_reason\":\"{}\"{}}}",
+            esc(drop_reason),
+            t_due_field(t_due)
         )?;
         self.w.flush()
     }
@@ -1509,9 +1539,11 @@ mod phase4_jsonl_tests {
                 None,
             )
             .unwrap();
-            log.try_log_release("pc", 2, 7, 123_000, 8, 456_000)
+            log.try_log_release("pc", 2, 7, 123_000, 8, 456_000, Some(455_000))
                 .unwrap();
-            log.try_log_drop("haptic", 0, 9, 223_000, 0, 556_000, "late")
+            log.try_log_drop("haptic", 0, 9, 223_000, 0, 556_000, "late", None)
+                .unwrap();
+            log.try_log_timeline_epoch("common", 100_000, 123_000, 8, 50_000, 0)
                 .unwrap();
         }
         let lines: Vec<String> = std::fs::read_to_string(&path)
@@ -1519,13 +1551,20 @@ mod phase4_jsonl_tests {
             .lines()
             .map(str::to_owned)
             .collect();
+        // Stage-9 decision 9-6: `t_due` is APPENDED, so every pre-existing field
+        // keeps its name, order and position, and a drop with no evaluated
+        // deadline says so explicitly instead of inventing one.
         assert_eq!(
             lines[1],
-            "{\"role\":\"release\",\"track\":\"pc\",\"tier\":2,\"seq\":7,\"pts_us\":123000,\"event_id\":8,\"t_release\":456000}"
+            "{\"role\":\"release\",\"track\":\"pc\",\"tier\":2,\"seq\":7,\"pts_us\":123000,\"event_id\":8,\"t_release\":456000,\"t_due\":455000}"
         );
         assert_eq!(
             lines[2],
-            "{\"role\":\"drop\",\"track\":\"haptic\",\"tier\":0,\"seq\":9,\"pts_us\":223000,\"event_id\":0,\"t_drop\":556000,\"drop_reason\":\"late\"}"
+            "{\"role\":\"drop\",\"track\":\"haptic\",\"tier\":0,\"seq\":9,\"pts_us\":223000,\"event_id\":0,\"t_drop\":556000,\"drop_reason\":\"late\",\"t_due\":null}"
+        );
+        assert_eq!(
+            lines[3],
+            "{\"role\":\"info\",\"event\":\"timeline_epoch\",\"scope\":\"common\",\"t_epoch\":100000,\"anchor_pts_us\":123000,\"anchor_event_id\":8,\"d_play_us\":50000,\"rearm_index\":0}"
         );
         std::fs::remove_file(&path).unwrap();
     }

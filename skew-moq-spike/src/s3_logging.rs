@@ -215,13 +215,15 @@ impl JsonlLogger {
         pts_us: u64,
         event_id: u32,
         t_release: u64,
+        t_due: Option<u64>,
     ) -> Result<()> {
         validate_route(role, route)?;
         writeln!(
             self.w,
-            "{{\"role\":\"release\",\"track\":\"{}\",\"tier\":{tier},\"seq\":{seq},\"pts_us\":{pts_us},\"event_id\":{event_id},\"t_release\":{t_release},{}}}",
+            "{{\"role\":\"release\",\"track\":\"{}\",\"tier\":{tier},\"seq\":{seq},\"pts_us\":{pts_us},\"event_id\":{event_id},\"t_release\":{t_release},{}{}}}",
             role.as_str(),
             route_fields(route),
+            crate::t_due_field(t_due),
         )?;
         self.w.flush()
     }
@@ -237,14 +239,16 @@ impl JsonlLogger {
         event_id: u32,
         t_drop: u64,
         drop_reason: &str,
+        t_due: Option<u64>,
     ) -> Result<()> {
         validate_route(role, route)?;
         writeln!(
             self.w,
-            "{{\"role\":\"drop\",\"track\":\"{}\",\"tier\":{tier},\"seq\":{seq},\"pts_us\":{pts_us},\"event_id\":{event_id},\"t_drop\":{t_drop},\"drop_reason\":\"{}\",{}}}",
+            "{{\"role\":\"drop\",\"track\":\"{}\",\"tier\":{tier},\"seq\":{seq},\"pts_us\":{pts_us},\"event_id\":{event_id},\"t_drop\":{t_drop},\"drop_reason\":\"{}\",{}{}}}",
             role.as_str(),
             esc(drop_reason),
             route_fields(route),
+            crate::t_due_field(t_due),
         )?;
         self.w.flush()
     }
@@ -578,7 +582,7 @@ mod tests {
                 Some((14, 15, 16)),
             )
             .unwrap();
-            log.try_log_release_s3(TrackRole::Pc, pc, 4, 8, 9, 10, 17)
+            log.try_log_release_s3(TrackRole::Pc, pc, 4, 8, 9, 10, 17, Some(16))
                 .unwrap();
             log.try_log_accept_s3(TrackRole::Pc, pc, 14, 15, 16, 18, 43)
                 .unwrap();
@@ -596,7 +600,10 @@ mod tests {
         assert!(lines[2].contains(
             "\"role\":\"release\",\"track\":\"pc\",\"tier\":4,\"seq\":8,\"pts_us\":9,\"event_id\":10"
         ));
-        assert!(lines[2].ends_with("\"wire_track\":\"pc-d6\",\"route_generation\":7}"));
+        // The route identity keeps its place; stage-9 `t_due` is appended after
+        // it, so the release row ends with the scheduled instant.
+        assert!(lines[2].contains("\"wire_track\":\"pc-d6\",\"route_generation\":7"));
+        assert!(lines[2].ends_with("\"t_due\":16}"));
         assert!(lines[3].contains("\"role\":\"accept\",\"track\":\"pc\""));
         assert!(lines[3].ends_with("\"wire_track\":\"pc-d6\",\"route_generation\":7}"));
         std::fs::remove_file(path).unwrap();
