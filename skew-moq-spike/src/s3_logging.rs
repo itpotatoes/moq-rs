@@ -534,7 +534,7 @@ mod tests {
                 topology: Topology::Relay,
                 chunk_bytes: 178,
                 queue_policy: None,
-                s3np: None,
+                replay: None,
             }),
         )
         .unwrap()

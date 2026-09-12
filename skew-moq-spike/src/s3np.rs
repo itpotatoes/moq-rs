@@ -55,6 +55,28 @@ pub const PC_TIER_NORMAL: u16 = 2;
 pub const PC_TIER_RECOVERY: u16 = 3;
 pub const PC_TIER_CRITICAL: u16 = 4;
 
+/// Meta key under which the `s3np` receiver/sender records its release rule.
+/// Distinct from [`S3R_RELEASE_RULE_KEY`] so a single metadata row cannot be
+/// read as the other arm even if its value were somehow copied across.
+pub const S3NP_RELEASE_RULE_KEY: &str = "s3np_release_rule";
+
+/// Meta key of the `s3r` arm (plan 단계 9, user decision 9-7(b)).
+pub const S3R_RELEASE_RULE_KEY: &str = "s3r_release_rule";
+
+/// `s3r` = "S2 + replay of a registered tier trajectory, event pairs
+/// PRESERVED". Its receiver runs the UNCHANGED S1/S2 common-timeline scheduler
+/// ([`crate::playout::PlayoutScheduler`]), whose epoch is the first exact
+/// PC/haptic anchor pair, so there is exactly one recorded value.
+///
+/// The three replay-vs-adaptive comparisons this enables:
+/// * `S3 - S3R` — adaptation **plus** the cost of S3's multi-route subscription
+///   switching (barrier objects, retirement overlap), because `s3r` replays the
+///   trajectory on ONE static PC track and its receiver has no switch gate;
+/// * `S3R - S3NP` — the pair-preserving scheduler alone, given a byte-identical
+///   sender stream (the two arms share the sender replay path exactly);
+/// * `S3R - S2` — the tier trajectory alone, at fixed receiver mechanics.
+pub const S3R_RELEASE_RULE: &str = "common_timeline_first_exact_pair_epoch_plus_d_play";
+
 /// Which pairing-free release rule the receiver applies.
 ///
 /// There is deliberately **no default**. The two rules answer the same
@@ -1045,6 +1067,28 @@ mod tests {
             rule: ReleaseRule::AbsoluteTGen,
             ..config()
         }
+    }
+
+    #[test]
+    fn every_replay_arm_records_a_distinct_rule_under_a_distinct_key() {
+        // Three arms replay or adapt the same tier trajectory; none of their
+        // recorded release rules may collide, and the s3r key differs from the
+        // s3np key so even a copied value cannot produce a valid other-arm row.
+        assert_ne!(S3NP_RELEASE_RULE_KEY, S3R_RELEASE_RULE_KEY);
+        let values = [
+            ReleaseRule::PerTrackEpoch.as_str(),
+            ReleaseRule::AbsoluteTGen.as_str(),
+            S3R_RELEASE_RULE,
+        ];
+        for (index, left) in values.iter().enumerate() {
+            for right in &values[index + 1..] {
+                assert_ne!(left, right, "release rule names must be unique");
+            }
+        }
+        assert_eq!(
+            S3R_RELEASE_RULE,
+            "common_timeline_first_exact_pair_epoch_plus_d_play"
+        );
     }
 
     #[test]

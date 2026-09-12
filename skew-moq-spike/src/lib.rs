@@ -759,21 +759,23 @@ pub struct V5Meta {
     /// older fixtures); the static sender/receiver always record it so a
     /// consumer can rely on the key in both modes.
     pub queue_policy: Option<&'static str>,
-    /// Plan 단계 9 event-pair NON-preserving control. `None` on every other
-    /// arm keeps the meta line byte-identical; `Some` is what lets accounting
-    /// prove that an `s3np` run is not an `s3` run and vice versa.
-    pub s3np: Option<S3npMeta>,
+    /// Plan 단계 9 tier-trajectory REPLAY arms (`s3np`, `s3r`). `None` on every
+    /// other arm keeps the meta line byte-identical; `Some` is what lets
+    /// accounting prove which replay arm ran and which registered S3 run it
+    /// replayed.
+    pub replay: Option<TierReplayMeta>,
 }
 
-/// `s3np` policy attestation carried on BOTH endpoints' `role:"meta"` row.
+/// Replay-arm attestation carried on BOTH endpoints' `role:"meta"` row.
 ///
 /// Two things must be provable from either log alone: **which arm ran**, and
 /// **which registered S3 run's trajectory was replayed**. The schedule digest
-/// plus the source run id and source-log digests tie an `s3np` run to the S3 run
-/// of its block; the release rule distinguishes the registered primary rule from
-/// its sensitivity variant.
+/// plus the source run id and source-log digests tie the run to the S3 run of
+/// its block; the release rule — recorded under an arm-specific KEY — separates
+/// `s3np` (pairing-free, two rule variants) from `s3r` (pair-preserving common
+/// timeline) and both from closed-loop `s3`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct S3npMeta {
+pub struct TierReplayMeta {
     /// SHA-256 of the replayed tier-schedule document, as raw bytes;
     /// hex-formatted once, at write time.
     pub tier_schedule_sha256: [u8; 32],
@@ -787,21 +789,28 @@ pub struct S3npMeta {
     pub tier_schedule_source_rx_sha256: String,
     /// Number of entries in that schedule, including the offset-0 initial state.
     pub tier_schedule_switches: usize,
-    /// The fixed playout offset. The receiver applies it; the sender repeats it
-    /// for frozen metadata agreement, exactly as S2 repeats
-    /// `pc_delivery_timeout_ms`, so accounting can attest both sides agree.
-    pub d_play_us: u64,
-    /// `s3np::ReleaseRule::as_str()`. Recorded on both endpoints: the receiver
-    /// applies it, the sender echoes it so a single-log audit cannot confuse the
-    /// primary rule with its sensitivity variant.
+    /// Meta key for `release_rule`: `s3np::S3NP_RELEASE_RULE_KEY` or
+    /// `s3np::S3R_RELEASE_RULE_KEY`. Arm-specific so a metadata row cannot be
+    /// read as the other replay arm.
+    pub release_rule_key: &'static str,
+    /// `s3np::ReleaseRule::as_str()` or `s3np::S3R_RELEASE_RULE`. Recorded on
+    /// both endpoints: the receiver applies it, the sender echoes it so a
+    /// single-log audit cannot confuse the arms or the s3np rule variants.
     pub release_rule: &'static str,
-    /// Receiver-only release parameters; `None` on the sender, which schedules
-    /// nothing.
-    pub release: Option<S3npReleaseMeta>,
+    /// The fixed playout offset, emitted here only when no S1 common-timeline
+    /// block is present — i.e. always on the sender, and on the `s3np` receiver.
+    /// The `s3r` receiver runs the S1 scheduler, whose own block already records
+    /// `d_play_us`, so emitting it here too would put a DUPLICATE key on the
+    /// meta line.
+    pub d_play_us: Option<u64>,
+    /// Release parameters of the pairing-free scheduler. `None` on the sender
+    /// (which schedules nothing) and on the `s3r` receiver (whose S1 block
+    /// records the same parameters under the same names).
+    pub release: Option<ReplayReleaseMeta>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct S3npReleaseMeta {
+pub struct ReplayReleaseMeta {
     /// `s3np::ReleaseRule::playout_clock()`.
     pub playout_clock: &'static str,
     pub late_tolerance_us: u64,
@@ -818,7 +827,7 @@ fn hex32(bytes: &[u8; 32]) -> String {
     out
 }
 
-fn s3np_meta_fields(meta: &S3npMeta) -> String {
+fn replay_meta_fields(meta: &TierReplayMeta) -> String {
     let release = match meta.release {
         Some(release) => format!(
             ",\"playout_clock\":\"{}\",\"late_tolerance_us\":{},\"late_policy\":\"{}\",\"buffer_max_objects_per_track\":{},\"buffer_max_span_us\":{}",
@@ -830,8 +839,13 @@ fn s3np_meta_fields(meta: &S3npMeta) -> String {
         ),
         None => String::new(),
     };
+    let d_play = match meta.d_play_us {
+        Some(value) => format!(",\"d_play_us\":{value}"),
+        None => String::new(),
+    };
     format!(
-        ",\"s3np_release_rule\":\"{}\",\"tier_schedule_sha256\":\"{}\",\"tier_schedule_generation\":\"{}\",\"tier_schedule_source_run_id\":\"{}\",\"tier_schedule_source_tx_sha256\":\"{}\",\"tier_schedule_source_rx_sha256\":\"{}\",\"tier_schedule_switches\":{},\"d_play_us\":{}{}",
+        ",\"{}\":\"{}\",\"tier_schedule_sha256\":\"{}\",\"tier_schedule_generation\":\"{}\",\"tier_schedule_source_run_id\":\"{}\",\"tier_schedule_source_tx_sha256\":\"{}\",\"tier_schedule_source_rx_sha256\":\"{}\",\"tier_schedule_switches\":{}{}{}",
+        esc(meta.release_rule_key),
         esc(meta.release_rule),
         hex32(&meta.tier_schedule_sha256),
         esc(&meta.tier_schedule_generation),
@@ -839,7 +853,7 @@ fn s3np_meta_fields(meta: &S3npMeta) -> String {
         esc(&meta.tier_schedule_source_tx_sha256),
         esc(&meta.tier_schedule_source_rx_sha256),
         meta.tier_schedule_switches,
-        meta.d_play_us,
+        d_play,
         release,
     )
 }
@@ -958,16 +972,21 @@ impl JsonlLogger {
                 Some(policy) => format!(",\"queue_policy\":\"{}\"", esc(policy)),
                 None => String::new(),
             };
-            // `s3np` is mutually exclusive with the S1 common-timeline block:
-            // its release rule has no startup/rearm window, so recording those
-            // keys would claim a parameter that was never applied.
-            if v5.s3np.is_some() && !playout.is_empty() {
-                anyhow::bail!(
-                    "s3np metadata cannot be combined with the S1 common-timeline playout block"
-                );
+            // `s3r` legitimately carries BOTH the replay provenance and the S1
+            // common-timeline block. What must never happen is emitting the same
+            // key twice on one line, so the replay block's copies of `d_play_us`
+            // and the release parameters are refused when the S1 block is
+            // present. `s3np`, which has no S1 block, carries them there.
+            if let Some(meta) = &v5.replay {
+                if !playout.is_empty() && (meta.d_play_us.is_some() || meta.release.is_some()) {
+                    anyhow::bail!(
+                        "replay metadata would duplicate d_play_us/release keys already \
+                         written by the S1 common-timeline playout block"
+                    );
+                }
             }
-            let s3np = match &v5.s3np {
-                Some(meta) => s3np_meta_fields(meta),
+            let replay = match &v5.replay {
+                Some(meta) => replay_meta_fields(meta),
                 None => String::new(),
             };
             writeln!(
@@ -977,7 +996,7 @@ impl JsonlLogger {
                 s_bytes, LOG_SCHEMA_VERSION_V5, fps, haptic_hz,
                 v5.payload_mode.as_str(), v5.representation.as_str(),
                 v5.topology.as_str(), v5.chunk_bytes, seed,
-                design, extra, tracks, term, phase4_transport, playout, queue_policy, s3np
+                design, extra, tracks, term, phase4_transport, playout, queue_policy, replay
             )?;
         } else {
             writeln!(
@@ -1571,6 +1590,196 @@ mod phase4_jsonl_tests {
         assert_eq!(line.matches("\"arm\":").count(), 1);
         std::fs::remove_file(&path).unwrap();
     }
+
+    fn replay_meta(
+        arm_key: &'static str,
+        rule: &'static str,
+        d_play_us: Option<u64>,
+        release: Option<ReplayReleaseMeta>,
+    ) -> TierReplayMeta {
+        TierReplayMeta {
+            tier_schedule_sha256: [0xabu8; 32],
+            tier_schedule_generation: crate::s3np::TIER_SCHEDULE_GENERATION.to_string(),
+            tier_schedule_source_run_id: "epp9_src_s3_rep1".to_string(),
+            tier_schedule_source_tx_sha256: "0a".repeat(32),
+            tier_schedule_source_rx_sha256: "1b".repeat(32),
+            tier_schedule_switches: 4,
+            release_rule_key: arm_key,
+            release_rule: rule,
+            d_play_us,
+            release,
+        }
+    }
+
+    fn transport(arm: &'static str) -> Phase4TransportMeta {
+        Phase4TransportMeta {
+            arm,
+            pc_subgroup_mapping: "frame-per-subgroup",
+            pc_publisher_priority: 1,
+            haptic_publisher_priority: 0,
+            publisher_priority_profile: "relative-haptic0-pc1",
+            data_priority_mapping: "moqt-v2",
+            pc_delivery_timeout_ms: Some(67),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_meta(
+        path: &Path,
+        side: &str,
+        playout: Option<playout::PlayoutConfig>,
+        transport: Phase4TransportMeta,
+        replay: TierReplayMeta,
+    ) -> anyhow::Result<String> {
+        JsonlLogger::new(
+            path, "run", "moq", side, None, 0.0, 0.0, 0.0, 10, 30, 90, 1, None, None,
+            Some("both"), Some(TERM_PROTOCOL_V), playout, Some(transport),
+            Some(V5Meta {
+                payload_mode: PayloadMode::Frame,
+                representation: Representation::Bin,
+                topology: Topology::Relay,
+                chunk_bytes: 178,
+                queue_policy: Some("separate"),
+                replay: Some(replay),
+            }),
+        )?;
+        Ok(std::fs::read_to_string(path)?)
+    }
+
+    /// Plan 단계 9 replay arms: one metadata row must name the arm, its release
+    /// rule (under an arm-specific key), and the S3 run whose trajectory it
+    /// replayed — and must never write a key twice.
+    #[test]
+    fn replay_arm_metadata_names_the_arm_rule_and_source_run() {
+        let common = playout::PlayoutConfig {
+            d_play_us: 50_000,
+            startup_timeout_us: 2_000_000,
+            startup_rearm_limit: 1,
+            late_tolerance_us: 5_000,
+            max_objects_per_track: 64,
+            max_span_us: 250_000,
+            late_policy: playout::LatePolicy::DropLate,
+        };
+        let provenance = [
+            "\"tier_schedule_sha256\":\"abababababababababababababababababababababababababababababababab\"",
+            "\"tier_schedule_generation\":\"event-pair-plan-20260905-v1\"",
+            "\"tier_schedule_source_run_id\":\"epp9_src_s3_rep1\"",
+            "\"tier_schedule_source_tx_sha256\":\"0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a\"",
+            "\"tier_schedule_source_rx_sha256\":\"1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b\"",
+            "\"tier_schedule_switches\":4",
+        ];
+
+        // s3r receiver: S1 common-timeline block PLUS provenance. Its release
+        // parameters live on the S1 block, so the replay block adds only the rule.
+        let out = path("meta-s3r-rx");
+        let line = write_meta(
+            &out,
+            "rx",
+            Some(common),
+            transport("s3r"),
+            replay_meta(crate::s3np::S3R_RELEASE_RULE_KEY, crate::s3np::S3R_RELEASE_RULE, None, None),
+        )
+        .unwrap();
+        for field in provenance.iter().copied().chain([
+            "\"arm\":\"s3r\"",
+            "\"s3r_release_rule\":\"common_timeline_first_exact_pair_epoch_plus_d_play\"",
+            "\"pc_delivery_timeout_ms\":67",
+            "\"playout_clock\":\"receiver_monotonic_us\"",
+            "\"startup_timeout_us\":2000000",
+            "\"d_play_us\":50000",
+        ]) {
+            assert!(line.contains(field), "missing {field}: {line}");
+        }
+        assert!(!line.contains("s3np_release_rule"), "s3r must not claim the s3np key");
+        // Exactly once each: a duplicate key would make the row ambiguous.
+        for key in ["\"d_play_us\":", "\"playout_clock\":", "\"late_tolerance_us\":", "\"arm\":"] {
+            assert_eq!(line.matches(key).count(), 1, "{key} must appear once: {line}");
+        }
+        std::fs::remove_file(&out).unwrap();
+
+        // s3np receiver: no S1 block, so the replay block carries D_play and the
+        // pairing-free release parameters.
+        let out = path("meta-s3np-rx");
+        let line = write_meta(
+            &out,
+            "rx",
+            None,
+            transport("s3np"),
+            replay_meta(
+                crate::s3np::S3NP_RELEASE_RULE_KEY,
+                crate::s3np::ReleaseRule::PerTrackEpoch.as_str(),
+                Some(50_000),
+                Some(ReplayReleaseMeta {
+                    playout_clock: crate::s3np::ReleaseRule::PerTrackEpoch.playout_clock(),
+                    late_tolerance_us: 5_000,
+                    late_policy: "drop-late",
+                    max_objects_per_track: 64,
+                    max_span_us: 250_000,
+                }),
+            ),
+        )
+        .unwrap();
+        for field in provenance.iter().copied().chain([
+            "\"arm\":\"s3np\"",
+            "\"s3np_release_rule\":\"per_track_first_object_epoch_plus_d_play\"",
+            "\"playout_clock\":\"receiver_monotonic_us\"",
+            "\"d_play_us\":50000",
+            "\"buffer_max_span_us\":250000",
+        ]) {
+            assert!(line.contains(field), "missing {field}: {line}");
+        }
+        assert!(!line.contains("s3r_release_rule"));
+        assert!(!line.contains("startup_timeout_us"), "s3np has no startup window");
+        for key in ["\"d_play_us\":", "\"playout_clock\":", "\"arm\":"] {
+            assert_eq!(line.matches(key).count(), 1, "{key} must appear once: {line}");
+        }
+        std::fs::remove_file(&out).unwrap();
+
+        // Sender side of either arm: provenance plus the echoed offset and rule,
+        // and no release parameters (it schedules nothing).
+        let out = path("meta-s3r-tx");
+        let line = write_meta(
+            &out,
+            "tx",
+            None,
+            transport("s3r"),
+            replay_meta(
+                crate::s3np::S3R_RELEASE_RULE_KEY,
+                crate::s3np::S3R_RELEASE_RULE,
+                Some(50_000),
+                None,
+            ),
+        )
+        .unwrap();
+        for field in provenance.iter().copied().chain([
+            "\"arm\":\"s3r\"",
+            "\"s3r_release_rule\":\"common_timeline_first_exact_pair_epoch_plus_d_play\"",
+            "\"d_play_us\":50000",
+        ]) {
+            assert!(line.contains(field), "missing {field}: {line}");
+        }
+        assert!(!line.contains("playout_clock"), "the sender schedules nothing");
+        std::fs::remove_file(&out).unwrap();
+
+        // A replay block that would duplicate the S1 block's keys is refused
+        // rather than written: an ambiguous meta row is worse than a failed run.
+        let out = path("meta-duplicate-keys");
+        let error = write_meta(
+            &out,
+            "rx",
+            Some(common),
+            transport("s3r"),
+            replay_meta(
+                crate::s3np::S3R_RELEASE_RULE_KEY,
+                crate::s3np::S3R_RELEASE_RULE,
+                Some(50_000),
+                None,
+            ),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("duplicate"), "{error}");
+        let _ = std::fs::remove_file(&out);
+    }
 }
 
 #[cfg(test)]
@@ -1727,7 +1936,7 @@ mod phase1_v5_tests {
                     topology: Topology::Direct,
                     chunk_bytes: 178,
                     queue_policy: None,
-                    s3np: None,
+                    replay: None,
                 }),
             )
             .unwrap();
@@ -1785,7 +1994,7 @@ mod phase1_v5_tests {
                     topology: Topology::Direct,
                     chunk_bytes: 178,
                     queue_policy: None,
-                    s3np: None,
+                    replay: None,
                 }),
             )
             .unwrap();
@@ -1834,7 +2043,7 @@ mod phase1_v5_tests {
                     topology: Topology::Direct,
                     chunk_bytes: 178,
                     queue_policy: None,
-                    s3np: None,
+                    replay: None,
                 }),
             )
             .unwrap();
@@ -1894,7 +2103,7 @@ mod phase1_v5_tests {
                     topology: Topology::Relay,
                     chunk_bytes: 178,
                     queue_policy: None,
-                    s3np: None,
+                    replay: None,
                 }),
             )
             .unwrap();

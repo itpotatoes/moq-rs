@@ -200,6 +200,14 @@ enum Arm {
     /// not run, and the receiver releases each track on its own timeline.
     #[value(name = "s3np")]
     S3np,
+    /// Plan 단계 9 / user decision 9-7(b): "S2 + replay of a registered tier
+    /// trajectory, event pairs PRESERVED". On the SENDER this is byte-identical
+    /// to `s3np` — same single-track replay of `--tier-schedule`, same wire
+    /// policy — and the only difference is the recorded arm name. The two arms
+    /// differ purely in receiver mechanics, which is what makes
+    /// `S3R - S3NP` a clean scheduler comparison at an identical sender stream.
+    #[value(name = "s3r")]
+    S3r,
 }
 
 impl Arm {
@@ -212,18 +220,19 @@ impl Arm {
             Self::S2Eq => "s2eq",
             Self::S3 => "s3",
             Self::S3np => "s3np",
+            Self::S3r => "s3r",
         }
     }
 
     fn pc_frame_subgroups(self) -> bool {
         matches!(
             self,
-            Self::M1 | Self::S2 | Self::S2Eq | Self::S3 | Self::S3np
+            Self::M1 | Self::S2 | Self::S2Eq | Self::S3 | Self::S3np | Self::S3r
         )
     }
 
     fn pc_priority(self) -> u8 {
-        if matches!(self, Self::S2 | Self::S3 | Self::S3np) {
+        if matches!(self, Self::S2 | Self::S3 | Self::S3np | Self::S3r) {
             1
         } else {
             128
@@ -231,11 +240,25 @@ impl Arm {
     }
 
     fn haptic_priority(self) -> u8 {
-        if matches!(self, Self::S2 | Self::S3 | Self::S3np) {
+        if matches!(self, Self::S2 | Self::S3 | Self::S3np | Self::S3r) {
             0
         } else {
             128
         }
+    }
+
+    /// Whether this arm generates from a recorded tier trajectory instead of
+    /// from a fixed tier (`s3np`) or the live S3 FSM (`s3`). Both replay arms go
+    /// through ONE code path — `TierReplay` — so their sender-side tier and
+    /// haptic-density decisions are identical by construction, not by
+    /// coincidence.
+    fn replays_tier_schedule(self) -> bool {
+        matches!(self, Self::S3np | Self::S3r)
+    }
+
+    /// Arms that need the three S3 PC tier directories.
+    fn needs_pc_tier_dirs(self) -> bool {
+        matches!(self, Self::S3 | Self::S3np | Self::S3r)
     }
 }
 
@@ -645,6 +668,28 @@ impl TierReplay {
             _ => &self.normal,
         }
     }
+
+    /// Replayed PC tier for the PC slot whose nominal PTS is `pts_us`.
+    ///
+    /// The lookup key is the NOMINAL slot offset, never wall time, so the
+    /// decision is deterministic and identical for every replay arm. Both
+    /// `s3np` and `s3r` call exactly this.
+    fn pc_tier_at(&self, pts_us: u64) -> u16 {
+        self.schedule.state_at(pts_us).pc_tier
+    }
+
+    /// Whether the replayed density skips this haptic tick.
+    ///
+    /// `Essential` keeps only the exact anchor tick `3i`, which is precisely the
+    /// tick set S3's `haptic-essential` route produces; `Full` keeps every tick.
+    /// Identity, PCM slice and header of a kept tick are unchanged, so the only
+    /// effect is the haptic data rate.
+    fn skips_haptic_tick(&self, tick: u64, haptic_rate_hz: u64, ratio: u64) -> bool {
+        let offset_us = timestamp_us(tick, haptic_rate_hz);
+        self.schedule.state_at(offset_us).haptic_density
+            == skew_moq::s3np::HapticDensity::Essential
+            && tick % ratio != 0
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -811,7 +856,7 @@ fn phase4_transport(args: &Args) -> Result<Option<Phase4TransportMeta>> {
             args.arm.as_str()
         );
     }
-    if matches!(args.arm, Arm::S2 | Arm::S2Eq | Arm::S3 | Arm::S3np)
+    if matches!(args.arm, Arm::S2 | Arm::S2Eq | Arm::S3 | Arm::S3np | Arm::S3r)
         && args.data_priority_mapping != DataPriorityMapping::MoqtV2
     {
         anyhow::bail!(
@@ -847,7 +892,7 @@ fn phase4_transport(args: &Args) -> Result<Option<Phase4TransportMeta>> {
                 pc_delivery_timeout_ms: None,
             }))
         }
-        Arm::S2 | Arm::S2Eq | Arm::S3 | Arm::S3np => {
+        Arm::S2 | Arm::S2Eq | Arm::S3 | Arm::S3np | Arm::S3r => {
             let timeout = args.pc_delivery_timeout_ms.with_context(|| {
                 format!(
                     "--arm {} requires --pc-delivery-timeout-ms",
@@ -857,9 +902,10 @@ fn phase4_transport(args: &Args) -> Result<Option<Phase4TransportMeta>> {
             if timeout == 0 {
                 anyhow::bail!("--pc-delivery-timeout-ms must be greater than zero");
             }
-            // s3np is the S3 control, so it inherits the same frozen timeout:
-            // a different value would make the comparison a timeout ablation.
-            if matches!(args.arm, Arm::S3 | Arm::S3np) && timeout != 67 {
+            // The replay arms are S3 controls, so they inherit the same frozen
+            // timeout: a different value would make the comparison a timeout
+            // ablation instead of an adaptation/pairing one.
+            if matches!(args.arm, Arm::S3 | Arm::S3np | Arm::S3r) && timeout != 67 {
                 anyhow::bail!(
                     "--arm {} inherits the frozen 67ms PC delivery timeout",
                     args.arm.as_str()
@@ -882,46 +928,77 @@ fn phase4_transport(args: &Args) -> Result<Option<Phase4TransportMeta>> {
     }
 }
 
+/// Meta key under which this arm's release rule is recorded. Arm-specific so a
+/// metadata row can never be read as the other replay arm.
+fn replay_release_rule_key(arm: Arm) -> &'static str {
+    match arm {
+        Arm::S3r => skew_moq::s3np::S3R_RELEASE_RULE_KEY,
+        _ => skew_moq::s3np::S3NP_RELEASE_RULE_KEY,
+    }
+}
+
+/// The release rule this run's RECEIVER applies, echoed in sender metadata for
+/// the same reason S2 echoes `--pc-delivery-timeout-ms`: a single-endpoint audit
+/// must not be able to confuse the arms, or the two `s3np` rule variants.
+fn replay_release_rule(arm: Arm, s3np_rule: Option<CliReleaseRule>) -> &'static str {
+    match arm {
+        Arm::S3r => skew_moq::s3np::S3R_RELEASE_RULE,
+        _ => skew_moq::s3np::ReleaseRule::from(
+            s3np_rule.expect("validated s3np release rule"),
+        )
+        .as_str(),
+    }
+}
+
 fn priority_profile(args: &Args) -> PublisherPriorityProfile {
     args.publisher_priority_profile
         .unwrap_or(PublisherPriorityProfile::Equal128)
 }
 
-/// S3 and its non-preserving control both need the three PC tier directories,
-/// tier 2 on the Normal header, and both tracks. Only S3 owns subscription
-/// producers, and only s3np owns the replay/metadata-echo options, so each
+/// S3 and both replay arms need the three PC tier directories, tier 2 on the
+/// Normal header, and both tracks. Only S3 owns subscription producers; only the
+/// replay arms own `--tier-schedule`/`--d-play-ms`; and only `s3np` owns
+/// `--s3np-release-rule`, because `s3r` has exactly one release rule. Every
 /// arm's exclusive flags stay refused everywhere else.
 fn validate_s3_args(args: &Args) -> Result<()> {
     let tier_dirs = args.s3_recovery_frames_dir.is_some() || args.s3_critical_frames_dir.is_some();
     let s3_only = args.s3_producer_shutdown_timeout_ms.is_some();
-    let s3np_only = args.tier_schedule.is_some()
-        || args.d_play_ms.is_some()
-        || args.s3np_release_rule.is_some();
-    if !matches!(args.arm, Arm::S3 | Arm::S3np) {
+    let replay_only = args.tier_schedule.is_some() || args.d_play_ms.is_some();
+    let s3np_only = args.s3np_release_rule.is_some();
+    if !args.arm.needs_pc_tier_dirs() {
         if tier_dirs {
-            anyhow::bail!("S3 PC tier frame directories require --arm s3 or --arm s3np");
+            anyhow::bail!(
+                "S3 PC tier frame directories require --arm s3, --arm s3np or --arm s3r"
+            );
         }
         if s3_only {
             anyhow::bail!("S3 lifecycle options require --arm s3");
         }
+        if replay_only {
+            anyhow::bail!("--tier-schedule and --d-play-ms require --arm s3np or --arm s3r");
+        }
         if s3np_only {
-            anyhow::bail!(
-                "--tier-schedule, --d-play-ms and --s3np-release-rule require --arm s3np"
-            );
+            anyhow::bail!("--s3np-release-rule requires --arm s3np");
         }
         return Ok(());
     }
     let arm = args.arm.as_str();
-    if args.arm == Arm::S3 && s3np_only {
+    if args.arm == Arm::S3 && (replay_only || s3np_only) {
         anyhow::bail!(
-            "--tier-schedule, --d-play-ms and --s3np-release-rule require --arm s3np; \
+            "--tier-schedule, --d-play-ms and --s3np-release-rule require a replay arm; \
              S3 runs its own FSM and must never replay a recorded schedule"
         );
     }
-    if args.arm == Arm::S3np && s3_only {
+    if args.arm.replays_tier_schedule() && s3_only {
         anyhow::bail!(
-            "--s3-producer-shutdown-timeout-ms requires --arm s3; s3np publishes the \
-             static two-track mapping and owns no subscription producers"
+            "--s3-producer-shutdown-timeout-ms requires --arm s3; the replay arms publish \
+             the static two-track mapping and own no subscription producers"
+        );
+    }
+    if args.arm == Arm::S3r && s3np_only {
+        anyhow::bail!(
+            "--s3np-release-rule requires --arm s3np; s3r has exactly one release rule \
+             (the unchanged S1/S2 common timeline), so there is nothing to select"
         );
     }
     if args.tracks != TrackSel::Both {
@@ -950,18 +1027,21 @@ fn validate_s3_args(args: &Args) -> Result<()> {
     }
     args.tier_schedule
         .as_ref()
-        .context("--arm s3np requires --tier-schedule")?;
-    let d_play_ms = args
-        .d_play_ms
-        .context("--arm s3np requires --d-play-ms (the receiver value, for metadata agreement)")?;
+        .with_context(|| format!("--arm {arm} requires --tier-schedule"))?;
+    let d_play_ms = args.d_play_ms.with_context(|| {
+        format!("--arm {arm} requires --d-play-ms (the receiver value, for metadata agreement)")
+    })?;
     if !matches!(d_play_ms, 50 | 100) {
         anyhow::bail!("--d-play-ms must be a governing-design candidate: 50 or 100");
     }
-    // Fail closed: there is no default release rule anywhere in this arm.
-    args.s3np_release_rule
-        .context("--arm s3np requires --s3np-release-rule {per_track_epoch|absolute_t_gen}")?;
+    // Fail closed: s3np has no default release rule. s3r has exactly one, which
+    // is why it must NOT accept the flag (refused above).
+    if args.arm == Arm::S3np {
+        args.s3np_release_rule
+            .context("--arm s3np requires --s3np-release-rule {per_track_epoch|absolute_t_gen}")?;
+    }
     if args.queue_policy != QueuePolicy::Separate {
-        anyhow::bail!("--arm s3np requires --queue-policy separate");
+        anyhow::bail!("--arm {arm} requires --queue-policy separate");
     }
     Ok(())
 }
@@ -1311,7 +1391,7 @@ async fn main() -> Result<()> {
     let pcm = Arc::new(pcm);
     // S3 and its s3np control read the same three tier directories. S3 hands
     // them to its subscription producers; s3np selects between them per slot.
-    let s3_frames = if matches!(args.arm, Arm::S3 | Arm::S3np) {
+    let s3_frames = if args.arm.needs_pc_tier_dirs() {
         Some((
             Arc::new(load_frames_checked(
                 args.s3_recovery_frames_dir
@@ -1329,7 +1409,9 @@ async fn main() -> Result<()> {
     } else {
         None
     };
-    let tier_replay: Option<Arc<TierReplay>> = if args.arm == Arm::S3np {
+    // ONE replay path for both replay arms: identical tier and haptic-density
+    // decisions for the same schedule, by construction.
+    let tier_replay: Option<Arc<TierReplay>> = if args.arm.replays_tier_schedule() {
         let path = args
             .tier_schedule
             .as_ref()
@@ -1423,7 +1505,7 @@ async fn main() -> Result<()> {
             topology: args.topology,
             chunk_bytes: args.chunk_bytes,
             queue_policy: Some(args.queue_policy.as_str()),
-            s3np: tier_replay.as_ref().map(|replay| S3npMeta {
+            replay: tier_replay.as_ref().map(|replay| TierReplayMeta {
                 tier_schedule_sha256: replay.sha256,
                 tier_schedule_generation: replay.schedule.generation().to_string(),
                 tier_schedule_source_run_id: replay.schedule.source_run_id().to_string(),
@@ -1436,14 +1518,15 @@ async fn main() -> Result<()> {
                     .source_rx_sha256()
                     .to_string(),
                 tier_schedule_switches: replay.schedule.switches().len(),
-                d_play_us: args
-                    .d_play_ms
-                    .expect("validated s3np d-play echo")
-                    .saturating_mul(1_000),
-                release_rule: skew_moq::s3np::ReleaseRule::from(
-                    args.s3np_release_rule.expect("validated s3np release rule"),
-                )
-                .as_str(),
+                // The sender never runs the S1 block, so it always carries the
+                // echoed offset here.
+                d_play_us: Some(
+                    args.d_play_ms
+                        .expect("validated replay d-play echo")
+                        .saturating_mul(1_000),
+                ),
+                release_rule_key: replay_release_rule_key(args.arm),
+                release_rule: replay_release_rule(args.arm, args.s3np_release_rule),
                 // The sender schedules no playout; only the receiver records
                 // the release parameters it actually applied.
                 release: None,
@@ -1904,7 +1987,7 @@ async fn main() -> Result<()> {
                     // S3 switch time. Every other arm keeps its fixed tier.
                     let (tier, frame_set): (u16, &Vec<Vec<u8>>) = match &replay {
                         Some(replay) => {
-                            let pc_tier = replay.schedule.state_at(pts).pc_tier;
+                            let pc_tier = replay.pc_tier_at(pts);
                             (pc_tier, replay.frames(pc_tier))
                         }
                         None => (tier, &frames),
@@ -2018,20 +2101,13 @@ async fn main() -> Result<()> {
                     if now_us() >= end_us {
                         break;
                     }
-                    // s3np Essential density: emit only the exact anchor tick
-                    // 3i, which is precisely the tick set S3's
-                    // `haptic-essential` route produces. Identity, PCM slice
-                    // and header are unchanged; only the non-anchor ticks are
-                    // not generated, so the haptic data rate matches S3's.
-                    if let Some(replay) = &replay {
-                        let density = replay
-                            .schedule
-                            .state_at(timestamp_us(k, haptic_rate_hz))
-                            .haptic_density;
-                        if density == skew_moq::s3np::HapticDensity::Essential && k % ratio != 0 {
-                            k += 1;
-                            continue;
-                        }
+                    // Replayed haptic density (see `TierReplay::skips_haptic_tick`).
+                    if replay
+                        .as_ref()
+                        .is_some_and(|replay| replay.skips_haptic_tick(k, haptic_rate_hz, ratio))
+                    {
+                        k += 1;
+                        continue;
                     }
                     let (pts, event_id) = if k % ratio == 0 {
                         let fi = k / ratio;
@@ -2381,7 +2457,8 @@ mod tests {
     use super::{
         b1_transport_meta, epoch_record, hold_static_track_state_through_drain, now_us,
         object_buffer, phase4_transport, registered_s_bytes, resolved_priorities,
-        shared_fifo_append, validate_s3_args, validate_stage5_policy, CliReleaseRule,
+        replay_release_rule, replay_release_rule_key, shared_fifo_append, timestamp_us,
+        validate_s3_args, validate_stage5_policy, CliReleaseRule, Phase4TransportMeta, TierReplay,
         wait_registered_direct_fin_handoff, Args, Arm, DataPriorityMapping, DirectFinHandoff,
         Duration, PayloadMode, PublisherPriorityProfile, QueuePolicy, Representation,
         SharedFifoWriter, Topology, TrackSel, Url, HDR,
@@ -2665,7 +2742,7 @@ mod tests {
         assert!(validate_s3_args(&s3)
             .unwrap_err()
             .to_string()
-            .contains("--arm s3np"));
+            .contains("require a replay arm"));
         s3.tier_schedule = None;
         s3.d_play_ms = Some(50);
         assert!(validate_s3_args(&s3).is_err());
@@ -2734,6 +2811,216 @@ mod tests {
         missing.tracks = TrackSel::Both;
         missing.queue_policy = QueuePolicy::SharedFifo;
         assert!(validate_s3_args(&missing).is_err());
+    }
+
+    fn replay_schedule() -> skew_moq::s3np::TierSchedule {
+        let document = format!(
+            "{{\"schema\":\"{}\",\"generation\":\"{}\",\"source_run_id\":\"src\",\
+             \"source_tx_sha256\":\"{}\",\"source_rx_sha256\":\"{}\",\
+             \"pc_rate_hz\":30,\"haptic_rate_hz\":90,\"duration_us\":60000000,\"switches\":[\
+             {{\"t_offset_us\":0,\"pc_tier\":2,\"haptic_density\":\"full\"}},\
+             {{\"t_offset_us\":1000000,\"pc_tier\":4,\"haptic_density\":\"essential\"}},\
+             {{\"t_offset_us\":2000000,\"pc_tier\":3,\"haptic_density\":\"full\"}}]}}",
+            skew_moq::s3np::TIER_SCHEDULE_SCHEMA,
+            skew_moq::s3np::TIER_SCHEDULE_GENERATION,
+            "0a".repeat(32),
+            "1b".repeat(32),
+        );
+        skew_moq::s3np::TierSchedule::parse(&document).expect("fixture schedule must parse")
+    }
+
+    fn replay(schedule: skew_moq::s3np::TierSchedule) -> TierReplay {
+        TierReplay {
+            schedule,
+            sha256: [7u8; 32],
+            // Distinct frame counts per tier so a wrong tier selection would
+            // also show up as a wrong frame set.
+            normal: Arc::new(vec![vec![0u8; 100], vec![0u8; 101]]),
+            recovery: Arc::new(vec![vec![0u8; 50], vec![0u8; 51], vec![0u8; 52]]),
+            critical: Arc::new(vec![vec![0u8; 10]]),
+        }
+    }
+
+    #[test]
+    fn both_replay_arms_share_one_sender_path_and_decide_identically() {
+        // The sender difference between s3np and s3r is the recorded arm name and
+        // nothing else: they must select the same tier, the same frame set and
+        // the same haptic tick set for the same schedule. That is guaranteed
+        // structurally — `TierReplay` takes no arm — and pinned here.
+        assert!(Arm::S3np.replays_tier_schedule());
+        assert!(Arm::S3r.replays_tier_schedule());
+        for other in [Arm::B1, Arm::S1, Arm::M1, Arm::S2, Arm::S2Eq, Arm::S3] {
+            assert!(
+                !other.replays_tier_schedule(),
+                "{} must not replay a schedule",
+                other.as_str()
+            );
+        }
+        assert!(Arm::S3.needs_pc_tier_dirs());
+        assert!(Arm::S3np.needs_pc_tier_dirs());
+        assert!(Arm::S3r.needs_pc_tier_dirs());
+        assert!(!Arm::S2.needs_pc_tier_dirs());
+
+        // Identical wire policy, so S3R - S3NP cannot be a transport difference.
+        assert_eq!(
+            Arm::S3r.pc_frame_subgroups(),
+            Arm::S3np.pc_frame_subgroups()
+        );
+        assert_eq!(
+            (Arm::S3r.pc_priority(), Arm::S3r.haptic_priority()),
+            (Arm::S3np.pc_priority(), Arm::S3np.haptic_priority())
+        );
+
+        let replay = replay(replay_schedule());
+        // 30 Hz PC slots across both switch boundaries (1.0 s and 2.0 s).
+        let decisions: Vec<(u16, usize)> = (0..90u64)
+            .map(|slot| {
+                let pts = timestamp_us(slot, 30);
+                let tier = replay.pc_tier_at(pts);
+                (tier, replay.frames(tier).len())
+            })
+            .collect();
+        assert_eq!(decisions[0], (2, 2));
+        assert_eq!(decisions[29], (2, 2), "slot 29 pts=966666 is still Normal");
+        assert_eq!(decisions[30], (4, 1), "slot 30 pts=1000000 is the boundary");
+        assert_eq!(decisions[59], (4, 1));
+        assert_eq!(decisions[60], (3, 3), "slot 60 pts=2000000 is the boundary");
+        assert_eq!(decisions[89], (3, 3));
+
+        // Haptic: every tick kept under Full, only anchor ticks under Essential.
+        let kept: Vec<u64> = (0..270u64)
+            .filter(|tick| !replay.skips_haptic_tick(*tick, 90, 3))
+            .collect();
+        assert_eq!(kept.len(), 90 + 30 + 90);
+        assert!((0..90).all(|tick| kept.contains(&tick)), "Full keeps all");
+        for tick in 90..180u64 {
+            assert_eq!(
+                kept.contains(&tick),
+                tick % 3 == 0,
+                "Essential keeps only the anchor tick {tick}"
+            );
+        }
+        assert!((180..270).all(|tick| kept.contains(&tick)), "Full keeps all");
+    }
+
+    #[test]
+    fn s3r_records_its_own_release_rule_under_its_own_key() {
+        // Distinct KEY and distinct VALUE, so no metadata row can be read as the
+        // other replay arm even if a value were copied.
+        assert_eq!(
+            replay_release_rule_key(Arm::S3r),
+            skew_moq::s3np::S3R_RELEASE_RULE_KEY
+        );
+        assert_eq!(
+            replay_release_rule_key(Arm::S3np),
+            skew_moq::s3np::S3NP_RELEASE_RULE_KEY
+        );
+        assert_ne!(
+            replay_release_rule_key(Arm::S3r),
+            replay_release_rule_key(Arm::S3np)
+        );
+        assert_eq!(
+            replay_release_rule(Arm::S3r, None),
+            "common_timeline_first_exact_pair_epoch_plus_d_play"
+        );
+        assert_eq!(
+            replay_release_rule(Arm::S3np, Some(CliReleaseRule::PerTrackEpoch)),
+            "per_track_first_object_epoch_plus_d_play"
+        );
+        assert_eq!(
+            replay_release_rule(Arm::S3np, Some(CliReleaseRule::AbsoluteTGen)),
+            "absolute_t_gen_plus_d_play"
+        );
+    }
+
+    #[test]
+    fn s3r_transport_meta_differs_from_s3np_only_in_the_arm_name() {
+        let mut np = arm_args(Arm::S3np);
+        np.pc_delivery_timeout_ms = Some(67);
+        np.s3_recovery_frames_dir = Some("datasets/d7".into());
+        np.s3_critical_frames_dir = Some("datasets/d6".into());
+        np.tier_schedule = Some(PathBuf::from("schedule.json"));
+        np.d_play_ms = Some(50);
+        np.s3np_release_rule = Some(CliReleaseRule::PerTrackEpoch);
+        assert!(validate_s3_args(&np).is_ok());
+        let np_meta = phase4_transport(&np).unwrap().unwrap();
+
+        let mut r = arm_args(Arm::S3r);
+        r.pc_delivery_timeout_ms = Some(67);
+        r.s3_recovery_frames_dir = Some("datasets/d7".into());
+        r.s3_critical_frames_dir = Some("datasets/d6".into());
+        r.tier_schedule = Some(PathBuf::from("schedule.json"));
+        r.d_play_ms = Some(50);
+        assert!(validate_s3_args(&r).is_ok());
+        let r_meta = phase4_transport(&r).unwrap().unwrap();
+
+        assert_eq!(r_meta.arm, "s3r");
+        assert_eq!(np_meta.arm, "s3np");
+        assert_eq!(
+            Phase4TransportMeta { arm: "s3np", ..r_meta },
+            np_meta,
+            "the two replay arms must differ in nothing but the arm name"
+        );
+
+        // v5 requires the MoQT priority mapping for every prioritised arm.
+        r.data_priority_mapping = DataPriorityMapping::LegacyV1;
+        assert!(phase4_transport(&r)
+            .unwrap_err()
+            .to_string()
+            .contains("moqt-v2"));
+        r.data_priority_mapping = DataPriorityMapping::MoqtV2;
+
+        // s3r must refuse the s3np-only rule selector: it has exactly one rule.
+        r.s3np_release_rule = Some(CliReleaseRule::AbsoluteTGen);
+        assert!(validate_s3_args(&r)
+            .unwrap_err()
+            .to_string()
+            .contains("requires --arm s3np"));
+        r.s3np_release_rule = None;
+
+        // Required replay inputs, individually.
+        r.tier_schedule = None;
+        assert!(validate_s3_args(&r)
+            .unwrap_err()
+            .to_string()
+            .contains("--tier-schedule"));
+        r.tier_schedule = Some(PathBuf::from("schedule.json"));
+        r.d_play_ms = None;
+        assert!(validate_s3_args(&r)
+            .unwrap_err()
+            .to_string()
+            .contains("--d-play-ms"));
+        r.d_play_ms = Some(75);
+        assert!(validate_s3_args(&r)
+            .unwrap_err()
+            .to_string()
+            .contains("50 or 100"));
+        r.d_play_ms = Some(50);
+        // The frozen 67 ms timeout is inherited, like S3 and s3np.
+        r.pc_delivery_timeout_ms = Some(100);
+        assert!(phase4_transport(&r)
+            .unwrap_err()
+            .to_string()
+            .contains("67ms"));
+        r.pc_delivery_timeout_ms = Some(67);
+        // No subscription producers: s3r publishes the static mapping.
+        r.s3_producer_shutdown_timeout_ms = Some(2_000);
+        assert!(validate_s3_args(&r)
+            .unwrap_err()
+            .to_string()
+            .contains("requires --arm s3"));
+        r.s3_producer_shutdown_timeout_ms = None;
+        r.tier = 3;
+        assert!(validate_s3_args(&r)
+            .unwrap_err()
+            .to_string()
+            .contains("header tier 2"));
+        r.tier = 2;
+        r.tracks = TrackSel::Pc;
+        assert!(validate_s3_args(&r)
+            .unwrap_err()
+            .to_string()
+            .contains("--tracks both"));
     }
 
     struct DropProbe(Arc<AtomicUsize>);

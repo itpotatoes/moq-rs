@@ -58,6 +58,19 @@ enum Arm {
     /// cross-track deadline coupling.
     #[value(name = "s3np")]
     S3np,
+    /// Plan 단계 9 / user decision 9-7(b): "S2 + replay of a registered tier
+    /// trajectory, event pairs PRESERVED". The receiver is the UNCHANGED S2
+    /// receiver — the S1 common-timeline scheduler whose epoch is the first
+    /// exact PC/haptic anchor pair, plus the PC DELIVERY_TIMEOUT — and the
+    /// sender replays the tier trajectory on the single static PC track.
+    ///
+    /// It differs from closed-loop `s3` in receiver mechanics as well as in
+    /// adaptation: there is NO controller, NO switch gate, and therefore no
+    /// barrier objects and no route retirement. `S3 - S3R` consequently measures
+    /// adaptation PLUS the cost of multi-route switching, while `S3R - S3NP`
+    /// isolates the pair-preserving scheduler at an identical sender stream.
+    #[value(name = "s3r")]
+    S3r,
 }
 
 impl Arm {
@@ -70,7 +83,14 @@ impl Arm {
             Self::S2Eq => "s2eq",
             Self::S3 => "s3",
             Self::S3np => "s3np",
+            Self::S3r => "s3r",
         }
+    }
+
+    /// Arms that generate from a recorded tier trajectory and therefore carry
+    /// the schedule provenance in metadata.
+    fn replays_tier_schedule(self) -> bool {
+        matches!(self, Self::S3np | Self::S3r)
     }
 }
 
@@ -368,7 +388,7 @@ fn playout_config(args: &Args) -> Result<Option<PlayoutConfig>> {
                 bail!("PC delivery timeout requires --arm s2");
             }
         }
-        Arm::S2 | Arm::S2Eq | Arm::S3 | Arm::S3np => {
+        Arm::S2 | Arm::S2Eq | Arm::S3 | Arm::S3np | Arm::S3r => {
             let timeout = args.pc_delivery_timeout_ms.with_context(|| {
                 format!(
                     "--arm {} requires --pc-delivery-timeout-ms",
@@ -378,7 +398,7 @@ fn playout_config(args: &Args) -> Result<Option<PlayoutConfig>> {
             if timeout == 0 {
                 bail!("--pc-delivery-timeout-ms must be greater than zero");
             }
-            if matches!(args.arm, Arm::S3 | Arm::S3np) && timeout != 67 {
+            if matches!(args.arm, Arm::S3 | Arm::S3np | Arm::S3r) && timeout != 67 {
                 bail!(
                     "--arm {} inherits the frozen 67ms PC delivery timeout",
                     args.arm.as_str()
@@ -390,8 +410,21 @@ fn playout_config(args: &Args) -> Result<Option<PlayoutConfig>> {
     // `PlayoutConfig`: that type carries the exact-pair startup window, which
     // is the one thing the non-preserving control is defined not to use.
     // `s3np_release_config` validates and returns its own parameters.
+    //
+    // s3r deliberately falls THROUGH to the unchanged S1/S2 configuration: its
+    // whole definition is "the S2 receiver, fed a replayed tier trajectory", so
+    // the exact-pair epoch, startup window, late policy and buffer bounds are
+    // the S2 ones, with no new parameter.
     if args.arm == Arm::S3np {
         return Ok(None);
+    }
+    if args.arm == Arm::S3r {
+        if args.tracks != RxTrackSel::Both {
+            bail!("--arm s3r preserves PC/haptic event pairs and requires --tracks both");
+        }
+        if args.queue_policy != QueuePolicy::Separate {
+            bail!("--arm s3r requires --queue-policy separate");
+        }
     }
 
     let arm = args.arm.as_str();
@@ -446,7 +479,13 @@ fn playout_config(args: &Args) -> Result<Option<PlayoutConfig>> {
 fn s3np_release_config(args: &Args) -> Result<Option<skew_moq::s3np::ReleaseConfig>> {
     if args.arm != Arm::S3np {
         if args.s3np_release_rule.is_some() {
-            bail!("--s3np-release-rule requires --arm s3np");
+            // s3r is the likely mistake: it also replays a schedule, but it has
+            // exactly ONE release rule (the unchanged S1/S2 common timeline), so
+            // there is nothing to select and a selection must not be recorded.
+            bail!(
+                "--s3np-release-rule requires --arm s3np; --arm s3r always uses the \
+                 unchanged S1/S2 common timeline"
+            );
         }
         return Ok(None);
     }
@@ -660,7 +699,7 @@ fn phase4_transport(args: &Args) -> Option<Phase4TransportMeta> {
             data_priority_mapping: args.data_priority_mapping.as_str(),
             pc_delivery_timeout_ms: None,
         }),
-        Arm::S2 | Arm::S2Eq | Arm::S3 | Arm::S3np => Some(Phase4TransportMeta {
+        Arm::S2 | Arm::S2Eq | Arm::S3 | Arm::S3np | Arm::S3r => Some(Phase4TransportMeta {
             arm: args.arm.as_str(),
             pc_subgroup_mapping: "frame-per-subgroup",
             pc_publisher_priority: if args.arm == Arm::S2Eq { 128 } else { 1 },
@@ -725,7 +764,7 @@ fn validate_phase4_v5_args(args: &Args) -> Result<()> {
             args.arm.as_str()
         );
     }
-    if matches!(args.arm, Arm::S2 | Arm::S2Eq | Arm::S3 | Arm::S3np)
+    if matches!(args.arm, Arm::S2 | Arm::S2Eq | Arm::S3 | Arm::S3np | Arm::S3r)
         && args.data_priority_mapping != DataPriorityMapping::MoqtV2
     {
         bail!(
@@ -2941,8 +2980,8 @@ async fn main() -> Result<()> {
     let s3np_config = s3np_release_config(&args)?;
     let s3_runtime = s3_runtime_config(&args)?;
     let phase4_transport = phase4_transport(&args);
-    let s3np_meta = match (&s3np_config, &args.tier_schedule) {
-        (Some(config), Some(path)) => {
+    let replay_meta = match (args.arm.replays_tier_schedule(), &args.tier_schedule) {
+        (true, Some(path)) => {
             let document = std::fs::read_to_string(path)
                 .with_context(|| format!("read tier schedule {}", path.display()))?;
             let schedule = skew_moq::s3np::TierSchedule::parse(&document)
@@ -2961,10 +3000,13 @@ async fn main() -> Result<()> {
                     args.haptic_rate_hz
                 );
             }
-            let duration_s = args.duration_s.context(
-                "--arm s3np requires --duration-s so the replayed window can be checked \
-                 against the schedule",
-            )?;
+            let duration_s = args.duration_s.with_context(|| {
+                format!(
+                    "--arm {} requires --duration-s so the replayed window can be checked \
+                     against the schedule",
+                    args.arm.as_str()
+                )
+            })?;
             let duration_us = duration_us_exact(duration_s)?;
             if schedule.duration_us() != duration_us {
                 bail!(
@@ -2978,27 +3020,48 @@ async fn main() -> Result<()> {
                 use sha2::{Digest, Sha256};
                 Sha256::digest(document.as_bytes()).into()
             };
-            Some(S3npMeta {
+            // s3np records its own release parameters here; s3r's are already on
+            // the S1 common-timeline block, and duplicating a JSON key would
+            // make the meta row ambiguous, so it records only the rule name.
+            let (release_rule_key, release_rule, d_play_us, release) = match &s3np_config {
+                Some(config) => (
+                    skew_moq::s3np::S3NP_RELEASE_RULE_KEY,
+                    config.rule.as_str(),
+                    Some(config.d_play_us),
+                    Some(ReplayReleaseMeta {
+                        playout_clock: config.rule.playout_clock(),
+                        late_tolerance_us: config.late_tolerance_us,
+                        late_policy: config.late_policy.as_str(),
+                        max_objects_per_track: config.max_objects_per_track,
+                        max_span_us: config.max_span_us,
+                    }),
+                ),
+                None => (
+                    skew_moq::s3np::S3R_RELEASE_RULE_KEY,
+                    skew_moq::s3np::S3R_RELEASE_RULE,
+                    None,
+                    None,
+                ),
+            };
+            Some(TierReplayMeta {
                 tier_schedule_sha256: sha256,
                 tier_schedule_generation: schedule.generation().to_string(),
                 tier_schedule_source_run_id: schedule.source_run_id().to_string(),
                 tier_schedule_source_tx_sha256: schedule.source_tx_sha256().to_string(),
                 tier_schedule_source_rx_sha256: schedule.source_rx_sha256().to_string(),
                 tier_schedule_switches: schedule.switches().len(),
-                d_play_us: config.d_play_us,
-                release_rule: config.rule.as_str(),
-                release: Some(S3npReleaseMeta {
-                    playout_clock: config.rule.playout_clock(),
-                    late_tolerance_us: config.late_tolerance_us,
-                    late_policy: config.late_policy.as_str(),
-                    max_objects_per_track: config.max_objects_per_track,
-                    max_span_us: config.max_span_us,
-                }),
+                release_rule_key,
+                release_rule,
+                d_play_us,
+                release,
             })
         }
-        (Some(_), None) => bail!("--arm s3np requires --tier-schedule"),
-        (None, Some(_)) => bail!("--tier-schedule requires --arm s3np"),
-        (None, None) => None,
+        (true, None) => bail!(
+            "--arm {} requires --tier-schedule",
+            args.arm.as_str()
+        ),
+        (false, Some(_)) => bail!("--tier-schedule requires --arm s3np or --arm s3r"),
+        (false, None) => None,
     };
 
     let logger = Arc::new(Mutex::new(JsonlLogger::new(
@@ -3034,7 +3097,7 @@ async fn main() -> Result<()> {
             topology: args.topology,
             chunk_bytes: args.chunk_bytes,
             queue_policy: Some(args.queue_policy.as_str()),
-            s3np: s3np_meta,
+            replay: replay_meta,
         }),
     )?));
 
@@ -3108,7 +3171,7 @@ async fn main() -> Result<()> {
             let mut params = KeyValuePairs::default();
             // s3np keeps S2's PC DELIVERY_TIMEOUT: the control differs from S3
             // by event-pair preservation, not by transport policy.
-            if name == "pc" && matches!(args.arm, Arm::S2 | Arm::S2Eq | Arm::S3np) {
+            if name == "pc" && matches!(args.arm, Arm::S2 | Arm::S2Eq | Arm::S3np | Arm::S3r) {
                 params.set_delivery_timeout(
                     args.pc_delivery_timeout_ms
                         .expect("S2/s3np timeout validated before connecting"),
@@ -3623,7 +3686,7 @@ async fn main() -> Result<()> {
             let verdict = classify_ending_with_timeout(
                 &reports,
                 session_run.is_finished(),
-                matches!(args.arm, Arm::S2 | Arm::S2Eq | Arm::S3np)
+                matches!(args.arm, Arm::S2 | Arm::S2Eq | Arm::S3np | Arm::S3r)
                     && args.pc_delivery_timeout_ms.is_some(),
             );
             reports_out = reports;
@@ -4828,6 +4891,88 @@ mod rx_ending_tests {
             .to_string()
             .contains("67ms"));
         np.pc_delivery_timeout_ms = Some(67);
+
+        // ---- s3r: S2 receiver + replayed tier trajectory, pairs PRESERVED --
+        //
+        // The point of s3r is that NOTHING about the receiver changes: it builds
+        // the unchanged S1/S2 common-timeline config (exact-pair epoch, startup
+        // window, S2 late policy and buffer bounds) and no pairing-free config.
+        let mut sr = np;
+        sr.arm = Arm::S3r;
+        sr.s3np_release_rule = None;
+        sr.startup_timeout_ms = Some(2_000);
+        sr.startup_rearm_limit = Some(1);
+        sr.pc_delivery_timeout_ms = Some(67);
+        sr.duration_s = Some(60.0);
+
+        assert!(validate_phase4_v5_args(&sr).is_ok());
+        let meta = phase4_transport(&sr).unwrap();
+        assert_eq!(meta.arm, "s3r");
+        assert_eq!(meta.pc_subgroup_mapping, "frame-per-subgroup");
+        assert_eq!((meta.pc_publisher_priority, meta.haptic_publisher_priority), (1, 0));
+        assert_eq!(meta.publisher_priority_profile, "relative-haptic0-pc1");
+        assert_eq!(meta.pc_delivery_timeout_ms, Some(67));
+
+        // The pairing scheduler, with S2's parameters and nothing new.
+        let common = playout_config(&sr).unwrap().expect("s3r uses the S1 scheduler");
+        assert_eq!(common.d_play_us, 50_000);
+        assert_eq!(common.startup_timeout_us, 2_000_000);
+        assert_eq!(common.startup_rearm_limit, 1);
+        assert_eq!(common.late_tolerance_us, 5_000);
+        assert_eq!(common.max_objects_per_track, 64);
+        assert_eq!(common.max_span_us, 250_000);
+        assert!(
+            s3np_release_config(&sr).unwrap().is_none(),
+            "s3r must not build the pairing-free release config"
+        );
+        // An S2 fixture with the same flags yields the SAME scheduler config:
+        // s3r changes the sender's stream, not the receiver's release policy.
+        let mut s2_like = sr;
+        s2_like.arm = Arm::S2;
+        assert_eq!(playout_config(&s2_like).unwrap().unwrap(), common);
+        s2_like.arm = Arm::S3r;
+        let mut sr = s2_like;
+
+        // s3r inherits the frozen timeout and still needs the pairing options.
+        sr.pc_delivery_timeout_ms = Some(100);
+        assert!(playout_config(&sr).unwrap_err().to_string().contains("67ms"));
+        sr.pc_delivery_timeout_ms = Some(67);
+        sr.startup_timeout_ms = None;
+        assert!(playout_config(&sr)
+            .unwrap_err()
+            .to_string()
+            .contains("--startup-timeout-ms"));
+        sr.startup_timeout_ms = Some(2_000);
+        sr.tracks = RxTrackSel::Pc;
+        assert!(playout_config(&sr)
+            .unwrap_err()
+            .to_string()
+            .contains("--tracks both"));
+        sr.tracks = RxTrackSel::Both;
+        sr.queue_policy = QueuePolicy::SharedFifo;
+        assert!(playout_config(&sr).is_err());
+        sr.queue_policy = QueuePolicy::Separate;
+        // The s3np rule selector is refused: s3r has exactly one release rule.
+        sr.s3np_release_rule = Some(CliReleaseRule::AbsoluteTGen);
+        assert!(s3np_release_config(&sr)
+            .unwrap_err()
+            .to_string()
+            .contains("requires --arm s3np"));
+        sr.s3np_release_rule = None;
+        // No S3 controller options either.
+        sr.s3_window_ms = Some(1_000);
+        assert!(s3_runtime_config(&sr).is_err());
+        sr.s3_window_ms = None;
+        assert!(s3_runtime_config(&sr).unwrap().is_none());
+        assert!(playout_config(&sr).is_ok());
+
+        let mut np = sr;
+        np.arm = Arm::S3np;
+        np.startup_timeout_ms = None;
+        np.startup_rearm_limit = None;
+        np.s3np_release_rule = Some(CliReleaseRule::PerTrackEpoch);
+        assert!(playout_config(&np).unwrap().is_none());
+        assert!(s3np_release_config(&np).unwrap().is_some());
 
         // And no other arm builds the s3np release config — nor may it claim
         // the release rule.
@@ -6327,7 +6472,7 @@ mod s3_retirement_tests {
                     topology: Topology::Relay,
                     chunk_bytes: 178,
                     queue_policy: None,
-                    s3np: None,
+                    replay: None,
                 }),
             )
             .unwrap(),
