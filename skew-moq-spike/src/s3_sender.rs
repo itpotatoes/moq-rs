@@ -687,6 +687,20 @@ pub async fn run_namespace(
                     ));
                     continue;
                 }
+                // Switch/end boundary: once both current routes completed the
+                // run, a late subscription is refused here without consuming a
+                // generation, a producer, or a log row (the registry would also
+                // refuse activation with `RunCompleted`).
+                let completed = registry
+                    .lock()
+                    .map_err(|_| anyhow!("S3 producer registry poisoned"))?
+                    .current_routes_completed();
+                if completed {
+                    let _ = subscribed.close(moq_transport::serve::ServeError::not_found_ctx(
+                        format!("S3 subscription '{name}' arrived after run completion"),
+                    ));
+                    continue;
+                }
                 let (role, route) = match allocator.allocate(&name) {
                     Ok(route) => route,
                     Err(error) => {

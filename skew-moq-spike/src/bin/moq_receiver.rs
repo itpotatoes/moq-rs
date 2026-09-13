@@ -2001,13 +2001,25 @@ async fn request_s3_switch(
     // `subscribe_open_with_params` only holds its bookkeeping mutexes
     // synchronously (its single await is the SUBSCRIBE_OK), so the two
     // requests are queued back-to-back and their round trips overlap.
+    //
+    // Both opens are bounded by the switch's effect timeout (request_at +
+    // effect_timeout_us, from the SwitchConfig the gate already holds). A role
+    // that has not answered by then is abandoned; whatever did succeed is torn
+    // down and the gate is poisoned exactly as a late SUBSCRIBE_OK would
+    // poison it, so a stalled SUBSCRIBE cannot hold the control loop for the
+    // transport's request timeout.
+    let effect_deadline_us = request
+        .request_at_us
+        .saturating_add(ingress.gate().config().effect_timeout_us);
+    let effect_remaining = Duration::from_micros(effect_deadline_us.saturating_sub(now_us()));
+    let timed_out = std::sync::atomic::AtomicBool::new(false);
     let mut haptic_subscriber = subscriber.clone();
     let pc_open = async {
         if !request.pc_changed {
             return None;
         }
         let route = request.target.for_role(TrackRole::Pc);
-        let result = open_s3_subscription(
+        let open = open_s3_subscription(
             subscriber,
             namespace,
             TrackRole::Pc,
@@ -2020,8 +2032,16 @@ async fn request_s3_switch(
             bad_headers.clone(),
             ingress_drops.clone(),
             log_failed.clone(),
-        )
-        .await;
+        );
+        let result = tokio::select! {
+            result = open => result,
+            _ = tokio::time::sleep(effect_remaining) => {
+                timed_out.store(true, Ordering::Relaxed);
+                Err(anyhow::anyhow!(
+                    "S3 switch pc SUBSCRIBE did not complete before the effect timeout"
+                ))
+            }
+        };
         Some((TrackRole::Pc, route, result))
     };
     let haptic_open = async {
@@ -2029,7 +2049,7 @@ async fn request_s3_switch(
             return None;
         }
         let route = request.target.for_role(TrackRole::Haptic);
-        let result = open_s3_subscription(
+        let open = open_s3_subscription(
             &mut haptic_subscriber,
             namespace,
             TrackRole::Haptic,
@@ -2042,59 +2062,69 @@ async fn request_s3_switch(
             bad_headers.clone(),
             ingress_drops.clone(),
             log_failed.clone(),
-        )
-        .await;
+        );
+        let result = tokio::select! {
+            result = open => result,
+            _ = tokio::time::sleep(effect_remaining) => {
+                timed_out.store(true, Ordering::Relaxed);
+                Err(anyhow::anyhow!(
+                    "S3 switch haptic SUBSCRIBE did not complete before the effect timeout"
+                ))
+            }
+        };
         Some((TrackRole::Haptic, route, result))
     };
     let (pc, haptic) = tokio::join!(pc_open, haptic_open);
     let ready = match settle_switch_subscribes(pc.into_iter().chain(haptic).collect()) {
         SwitchSubscribeOutcome::Ready(ready) => ready,
         SwitchSubscribeOutcome::Failed { error, cleanup } => {
-            for subscription in cleanup {
-                discard_s3_subscription(subscription).await;
-            }
-            return Err(error);
+            let teardown = SwitchTeardown {
+                subscriptions: cleanup,
+                live_keys: Vec::new(),
+            };
+            let error = if timed_out.load(Ordering::Relaxed) {
+                // Fail through the gate so it is poisoned like a late
+                // SUBSCRIBE_OK; the run then ends loudly either way.
+                let gate = ingress.check_timeout(now_us());
+                anyhow::anyhow!("{error}; gate: {gate:?}")
+            } else {
+                error
+            };
+            return fail_s3_switch(teardown, live, error).await;
         }
     };
 
     // Gate calls in ascending t_ok order: the gate refuses non-monotonic time,
-    // and each role keeps its own SUBSCRIBE_OK timestamp. On any failure every
-    // target subscription of this request is torn down, including one that was
-    // already inserted, so no drain task leaks and no switch is half-applied.
-    let mut applied: Vec<(TrackRole, u64)> = Vec::new();
-    let mut pending = ready.into_iter();
-    while let Some((role, route, subscription, t_ok, retries)) = pending.next() {
-        let failure = if let Err(error) = ingress.check_timeout(t_ok) {
-            Some(anyhow::anyhow!(
+    // and each role keeps its own SUBSCRIBE_OK timestamp. EVERY failure in this
+    // loop (gate timeout, duplicate, SUBSCRIBE_OK record, logger) tears down
+    // every target subscription of this request, including those already
+    // inserted into `live`, so no drain task leaks and no switch is
+    // half-applied.
+    let mut apply = SwitchApplyState::new(ready);
+    while let Some((role, route, subscription, t_ok, retries)) = apply.take_next() {
+        let key = (role, route.generation);
+        let checks: Result<()> = if let Err(error) = ingress.check_timeout(t_ok) {
+            Err(anyhow::anyhow!(
                 "S3 switch timed out while subscribing: {error:?}"
             ))
-        } else if live.contains_key(&(role, route.generation)) {
-            Some(anyhow::anyhow!(
+        } else if live.contains_key(&key) {
+            Err(anyhow::anyhow!(
                 "duplicate live S3 subscription {} generation {}",
                 route.name,
                 route.generation
             ))
         } else {
-            None
+            Ok(())
         };
-        if let Some(error) = failure {
-            discard_s3_subscription(subscription).await;
-            for (_, _, subscription, _, _) in pending {
-                discard_s3_subscription(subscription).await;
-            }
-            for key in applied {
-                if let Some(subscription) = live.remove(&key) {
-                    discard_s3_subscription(subscription).await;
-                }
-            }
-            return Err(error);
+        if let Err(error) = checks {
+            return fail_s3_switch(apply.fail(Some(subscription)), live, error).await;
         }
-        live.insert((role, route.generation), subscription);
-        applied.push((role, route.generation));
-        ingress
-            .subscribe_ok(role, t_ok)
-            .map_err(|error| anyhow::anyhow!("record S3 SUBSCRIBE_OK: {error:?}"))?;
-        {
+        live.insert(key, subscription);
+        apply.inserted(key);
+        let applied: Result<()> = (|| {
+            ingress
+                .subscribe_ok(role, t_ok)
+                .map_err(|error| anyhow::anyhow!("record S3 SUBSCRIBE_OK: {error:?}"))?;
             let mut logger = logger
                 .lock()
                 .map_err(|_| anyhow::anyhow!("RX logger poisoned"))?;
@@ -2105,9 +2135,82 @@ async fn request_s3_switch(
                 route.generation,
                 retries
             ))?;
+            Ok(())
+        })();
+        if let Err(error) = applied {
+            return fail_s3_switch(apply.fail(None), live, error).await;
         }
     }
     Ok(true)
+}
+
+/// Everything that must be torn down when a switch request fails part-way.
+struct SwitchTeardown<S> {
+    /// Target subscriptions that were opened but never inserted into `live`.
+    subscriptions: Vec<S>,
+    /// Keys inserted into `live` during this request; they are removed and
+    /// torn down too.
+    live_keys: Vec<(TrackRole, u64)>,
+}
+
+/// Bookkeeping for the apply loop of one switch request: which settled
+/// subscriptions are still pending and which were already inserted into
+/// `live`, so that a failure at any step yields the complete teardown set.
+struct SwitchApplyState<S> {
+    pending: std::collections::VecDeque<(TrackRole, Route, S, u64, u32)>,
+    inserted: Vec<(TrackRole, u64)>,
+}
+
+impl<S> SwitchApplyState<S> {
+    fn new(ready: Vec<(TrackRole, Route, S, u64, u32)>) -> Self {
+        Self {
+            pending: ready.into_iter().collect(),
+            inserted: Vec::new(),
+        }
+    }
+
+    fn take_next(&mut self) -> Option<(TrackRole, Route, S, u64, u32)> {
+        self.pending.pop_front()
+    }
+
+    fn inserted(&mut self, key: (TrackRole, u64)) {
+        self.inserted.push(key);
+    }
+
+    /// Fail at the current step. `current` is the subscription taken by
+    /// `take_next` that was NOT inserted into `live` (None once inserted).
+    fn fail(self, current: Option<S>) -> SwitchTeardown<S> {
+        let mut subscriptions = Vec::with_capacity(self.pending.len() + 1);
+        subscriptions.extend(current);
+        subscriptions.extend(
+            self.pending
+                .into_iter()
+                .map(|(_, _, subscription, _, _)| subscription),
+        );
+        SwitchTeardown {
+            subscriptions,
+            live_keys: self.inserted,
+        }
+    }
+}
+
+/// Tear down every subscription of a failed switch request, then return the
+/// error. Subscriptions already inserted into `live` are removed first so the
+/// shutdown path never sees a half-applied switch.
+async fn fail_s3_switch(
+    teardown: SwitchTeardown<S3LiveSubscription>,
+    live: &mut HashMap<(TrackRole, u64), S3LiveSubscription>,
+    error: anyhow::Error,
+) -> Result<bool> {
+    for subscription in teardown.subscriptions {
+        discard_s3_subscription(subscription).await;
+    }
+    for key in teardown.live_keys {
+        if let Some(subscription) = live.remove(&key) {
+            discard_s3_subscription(subscription).await;
+        }
+    }
+    Err(error)
 }
 
 /// One changed role's target subscription attempt: `(subscription, t_ok, retries)`.
@@ -6908,6 +7011,69 @@ mod s3_switch_subscribe_tests {
             }
             SwitchSubscribeOutcome::Ready(_) => panic!("must fail"),
         }
+    }
+
+    fn entry(role: TrackRole, route: Route, s: &'static str) -> (TrackRole, Route, &'static str, u64, u32) {
+        (role, route, s, 4_000, 0)
+    }
+
+    #[test]
+    fn apply_state_returns_the_full_teardown_set_at_every_step() {
+        // Failure before the first insertion: current + remaining pending.
+        let mut apply = SwitchApplyState::new(vec![
+            entry(TrackRole::Pc, pc_route(), "pc"),
+            entry(TrackRole::Haptic, haptic_route(), "haptic"),
+        ]);
+        let (_, _, first, _, _) = apply.take_next().unwrap();
+        let teardown = apply.fail(Some(first));
+        assert_eq!(teardown.subscriptions, vec!["pc", "haptic"]);
+        assert!(teardown.live_keys.is_empty());
+
+        // Failure after the first insertion (e.g. subscribe_ok / log write):
+        // the inserted key is removed and the second is torn down.
+        let mut apply = SwitchApplyState::new(vec![
+            entry(TrackRole::Pc, pc_route(), "pc"),
+            entry(TrackRole::Haptic, haptic_route(), "haptic"),
+        ]);
+        let (role, route, _, _, _) = apply.take_next().unwrap();
+        apply.inserted((role, route.generation));
+        let teardown = apply.fail(None);
+        assert_eq!(teardown.subscriptions, vec!["haptic"]);
+        assert_eq!(teardown.live_keys, vec![(TrackRole::Pc, 1)]);
+
+        // Failure at the second entry's checks: first inserted, second current.
+        let mut apply = SwitchApplyState::new(vec![
+            entry(TrackRole::Pc, pc_route(), "pc"),
+            entry(TrackRole::Haptic, haptic_route(), "haptic"),
+        ]);
+        let (role, route, _, _, _) = apply.take_next().unwrap();
+        apply.inserted((role, route.generation));
+        let (_, _, second, _, _) = apply.take_next().unwrap();
+        let teardown = apply.fail(Some(second));
+        assert_eq!(teardown.subscriptions, vec!["haptic"]);
+        assert_eq!(teardown.live_keys, vec![(TrackRole::Pc, 1)]);
+
+        // Failure after both inserted: nothing pending, both keys removed.
+        let mut apply = SwitchApplyState::new(vec![
+            entry(TrackRole::Pc, pc_route(), "pc"),
+            entry(TrackRole::Haptic, haptic_route(), "haptic"),
+        ]);
+        while let Some((role, route, _, _, _)) = apply.take_next() {
+            apply.inserted((role, route.generation));
+        }
+        let teardown = apply.fail(None);
+        assert!(teardown.subscriptions.is_empty());
+        assert_eq!(
+            teardown.live_keys,
+            vec![(TrackRole::Pc, 1), (TrackRole::Haptic, 1)]
+        );
+
+        // Single-role switch, failure before insertion.
+        let mut apply = SwitchApplyState::new(vec![entry(TrackRole::Haptic, haptic_route(), "haptic")]);
+        let (_, _, only, _, _) = apply.take_next().unwrap();
+        let teardown = apply.fail(Some(only));
+        assert_eq!(teardown.subscriptions, vec!["haptic"]);
+        assert!(teardown.live_keys.is_empty());
     }
 
     #[test]
