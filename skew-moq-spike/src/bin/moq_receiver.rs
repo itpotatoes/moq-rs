@@ -1994,19 +1994,23 @@ async fn request_s3_switch(
         .map_err(|_| anyhow::anyhow!("RX logger poisoned"))?
         .try_log_s3_switch_request(request)?;
 
-    for role in [TrackRole::Pc, TrackRole::Haptic] {
-        let changed = match role {
-            TrackRole::Pc => request.pc_changed,
-            TrackRole::Haptic => request.haptic_changed,
-        };
-        if !changed {
-            continue;
+    // Open the changed roles' target subscriptions CONCURRENTLY. Each SUBSCRIBE
+    // costs several RTT; opening them one after the other doubled the time to
+    // the haptic SUBSCRIBE_OK and pushed the switch past its effect timeout
+    // under RTT/jitter/loss shaping. `Subscriber` is `Clone` and
+    // `subscribe_open_with_params` only holds its bookkeeping mutexes
+    // synchronously (its single await is the SUBSCRIBE_OK), so the two
+    // requests are queued back-to-back and their round trips overlap.
+    let mut haptic_subscriber = subscriber.clone();
+    let pc_open = async {
+        if !request.pc_changed {
+            return None;
         }
-        let route = request.target.for_role(role);
-        let (subscription, t_ok, retries) = open_s3_subscription(
+        let route = request.target.for_role(TrackRole::Pc);
+        let result = open_s3_subscription(
             subscriber,
             namespace,
-            role,
+            TrackRole::Pc,
             route,
             false,
             config.switch_retry_limit,
@@ -2017,26 +2021,76 @@ async fn request_s3_switch(
             ingress_drops.clone(),
             log_failed.clone(),
         )
-        .await?;
-        if let Err(error) = ingress.check_timeout(t_ok) {
-            drop(subscription.handle);
-            subscription.drain.abort();
-            let _ = subscription.drain.await;
-            return Err(anyhow::anyhow!(
-                "S3 switch timed out while subscribing: {error:?}"
-            ));
+        .await;
+        Some((TrackRole::Pc, route, result))
+    };
+    let haptic_open = async {
+        if !request.haptic_changed {
+            return None;
         }
-        if live.contains_key(&(role, route.generation)) {
-            drop(subscription.handle);
-            subscription.drain.abort();
-            let _ = subscription.drain.await;
-            return Err(anyhow::anyhow!(
+        let route = request.target.for_role(TrackRole::Haptic);
+        let result = open_s3_subscription(
+            &mut haptic_subscriber,
+            namespace,
+            TrackRole::Haptic,
+            route,
+            false,
+            config.switch_retry_limit,
+            args,
+            logger.clone(),
+            events.clone(),
+            bad_headers.clone(),
+            ingress_drops.clone(),
+            log_failed.clone(),
+        )
+        .await;
+        Some((TrackRole::Haptic, route, result))
+    };
+    let (pc, haptic) = tokio::join!(pc_open, haptic_open);
+    let ready = match settle_switch_subscribes(pc.into_iter().chain(haptic).collect()) {
+        SwitchSubscribeOutcome::Ready(ready) => ready,
+        SwitchSubscribeOutcome::Failed { error, cleanup } => {
+            for subscription in cleanup {
+                discard_s3_subscription(subscription).await;
+            }
+            return Err(error);
+        }
+    };
+
+    // Gate calls in ascending t_ok order: the gate refuses non-monotonic time,
+    // and each role keeps its own SUBSCRIBE_OK timestamp. On any failure every
+    // target subscription of this request is torn down, including one that was
+    // already inserted, so no drain task leaks and no switch is half-applied.
+    let mut applied: Vec<(TrackRole, u64)> = Vec::new();
+    let mut pending = ready.into_iter();
+    while let Some((role, route, subscription, t_ok, retries)) = pending.next() {
+        let failure = if let Err(error) = ingress.check_timeout(t_ok) {
+            Some(anyhow::anyhow!(
+                "S3 switch timed out while subscribing: {error:?}"
+            ))
+        } else if live.contains_key(&(role, route.generation)) {
+            Some(anyhow::anyhow!(
                 "duplicate live S3 subscription {} generation {}",
                 route.name,
                 route.generation
-            ));
+            ))
+        } else {
+            None
+        };
+        if let Some(error) = failure {
+            discard_s3_subscription(subscription).await;
+            for (_, _, subscription, _, _) in pending {
+                discard_s3_subscription(subscription).await;
+            }
+            for key in applied {
+                if let Some(subscription) = live.remove(&key) {
+                    discard_s3_subscription(subscription).await;
+                }
+            }
+            return Err(error);
         }
         live.insert((role, route.generation), subscription);
+        applied.push((role, route.generation));
         ingress
             .subscribe_ok(role, t_ok)
             .map_err(|error| anyhow::anyhow!("record S3 SUBSCRIBE_OK: {error:?}"))?;
@@ -2054,6 +2108,57 @@ async fn request_s3_switch(
         }
     }
     Ok(true)
+}
+
+/// One changed role's target subscription attempt: `(subscription, t_ok, retries)`.
+type SwitchSubscribeResult<S> = (TrackRole, Route, Result<(S, u64, u32)>);
+
+/// Settled outcome of the concurrent target subscriptions of one switch request.
+enum SwitchSubscribeOutcome<S> {
+    /// Every changed role subscribed. Entries are in ascending `t_ok` order
+    /// (PC first on a tie) so the gate's monotonic-time contract holds
+    /// whichever role's SUBSCRIBE_OK arrived first.
+    Ready(Vec<(TrackRole, Route, S, u64, u32)>),
+    /// At least one role failed. `cleanup` holds every subscription that did
+    /// succeed and must be torn down; `error` is the first failure in
+    /// PC-then-haptic order.
+    Failed { error: anyhow::Error, cleanup: Vec<S> },
+}
+
+fn settle_switch_subscribes<S>(
+    results: Vec<SwitchSubscribeResult<S>>,
+) -> SwitchSubscribeOutcome<S> {
+    let mut ready = Vec::with_capacity(results.len());
+    let mut error = None;
+    for (role, route, result) in results {
+        match result {
+            Ok((subscription, t_ok, retries)) => ready.push((role, route, subscription, t_ok, retries)),
+            Err(failure) => {
+                if error.is_none() {
+                    error = Some(failure);
+                }
+            }
+        }
+    }
+    if let Some(error) = error {
+        return SwitchSubscribeOutcome::Failed {
+            error,
+            cleanup: ready
+                .into_iter()
+                .map(|(_, _, subscription, _, _)| subscription)
+                .collect(),
+        };
+    }
+    ready.sort_by_key(|(role, _, _, t_ok, _)| (*t_ok, *role as u8));
+    SwitchSubscribeOutcome::Ready(ready)
+}
+
+/// Tear down a target subscription that will not be applied: release the
+/// handle (UNSUBSCRIBE), abort its drain task, and join it.
+async fn discard_s3_subscription(subscription: S3LiveSubscription) {
+    drop(subscription.handle);
+    subscription.drain.abort();
+    let _ = subscription.drain.await;
 }
 
 fn min_wakeup(values: impl IntoIterator<Item = Option<u64>>) -> Option<u64> {
@@ -6706,5 +6811,116 @@ mod s3_retirement_tests {
             "at-barrier frame must be rx-accounted on the old route: {log}"
         );
         std::fs::remove_file(&out).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod s3_switch_subscribe_tests {
+    use super::*;
+
+    fn pc_route() -> Route {
+        Route {
+            name: skew_moq::s3_switch::PC_RECOVERY_TRACK,
+            generation: 1,
+        }
+    }
+
+    fn haptic_route() -> Route {
+        Route {
+            name: skew_moq::s3_switch::HAPTIC_ESSENTIAL_TRACK,
+            generation: 1,
+        }
+    }
+
+    fn ready(
+        outcome: SwitchSubscribeOutcome<&'static str>,
+    ) -> Vec<(TrackRole, Route, &'static str, u64, u32)> {
+        match outcome {
+            SwitchSubscribeOutcome::Ready(ready) => ready,
+            SwitchSubscribeOutcome::Failed { error, .. } => panic!("unexpected failure: {error}"),
+        }
+    }
+
+    #[test]
+    fn both_ok_are_ordered_by_t_ok_whichever_role_answered_first() {
+        // Haptic SUBSCRIBE_OK arrived first: it must be fed to the gate first.
+        let out = ready(settle_switch_subscribes(vec![
+            (TrackRole::Pc, pc_route(), Ok(("pc", 5_000, 0))),
+            (TrackRole::Haptic, haptic_route(), Ok(("haptic", 4_000, 1))),
+        ]));
+        assert_eq!(
+            out.iter().map(|(role, _, s, t, r)| (*role, *s, *t, *r)).collect::<Vec<_>>(),
+            vec![
+                (TrackRole::Haptic, "haptic", 4_000, 1),
+                (TrackRole::Pc, "pc", 5_000, 0)
+            ]
+        );
+        // PC first when it answered first.
+        let out = ready(settle_switch_subscribes(vec![
+            (TrackRole::Pc, pc_route(), Ok(("pc", 4_000, 0))),
+            (TrackRole::Haptic, haptic_route(), Ok(("haptic", 5_000, 0))),
+        ]));
+        assert_eq!(out[0].0, TrackRole::Pc);
+        assert_eq!(out[1].0, TrackRole::Haptic);
+        // Tie: PC first (deterministic), timestamps untouched.
+        let out = ready(settle_switch_subscribes(vec![
+            (TrackRole::Haptic, haptic_route(), Ok(("haptic", 4_000, 0))),
+            (TrackRole::Pc, pc_route(), Ok(("pc", 4_000, 0))),
+        ]));
+        assert_eq!(out[0].0, TrackRole::Pc);
+        assert_eq!(out[1].0, TrackRole::Haptic);
+        assert_eq!((out[0].3, out[1].3), (4_000, 4_000));
+    }
+
+    #[test]
+    fn single_changed_role_is_passed_through() {
+        let out = ready(settle_switch_subscribes(vec![(
+            TrackRole::Haptic,
+            haptic_route(),
+            Ok(("haptic", 4_000, 2)),
+        )]));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, TrackRole::Haptic);
+        assert_eq!(out[0].4, 2);
+        let out = ready(settle_switch_subscribes::<&'static str>(Vec::new()));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn one_failure_returns_the_other_subscription_for_cleanup() {
+        match settle_switch_subscribes(vec![
+            (TrackRole::Pc, pc_route(), Ok(("pc", 5_000, 0))),
+            (TrackRole::Haptic, haptic_route(), Err(anyhow::anyhow!("haptic failed"))),
+        ]) {
+            SwitchSubscribeOutcome::Failed { error, cleanup } => {
+                assert_eq!(error.to_string(), "haptic failed");
+                assert_eq!(cleanup, vec!["pc"]);
+            }
+            SwitchSubscribeOutcome::Ready(_) => panic!("must fail"),
+        }
+        match settle_switch_subscribes(vec![
+            (TrackRole::Pc, pc_route(), Err(anyhow::anyhow!("pc failed"))),
+            (TrackRole::Haptic, haptic_route(), Ok(("haptic", 4_000, 0))),
+        ]) {
+            SwitchSubscribeOutcome::Failed { error, cleanup } => {
+                assert_eq!(error.to_string(), "pc failed");
+                assert_eq!(cleanup, vec!["haptic"]);
+            }
+            SwitchSubscribeOutcome::Ready(_) => panic!("must fail"),
+        }
+    }
+
+    #[test]
+    fn both_failures_report_pc_first_and_nothing_to_clean() {
+        match settle_switch_subscribes::<&'static str>(vec![
+            (TrackRole::Pc, pc_route(), Err(anyhow::anyhow!("pc failed"))),
+            (TrackRole::Haptic, haptic_route(), Err(anyhow::anyhow!("haptic failed"))),
+        ]) {
+            SwitchSubscribeOutcome::Failed { error, cleanup } => {
+                assert_eq!(error.to_string(), "pc failed");
+                assert!(cleanup.is_empty());
+            }
+            SwitchSubscribeOutcome::Ready(_) => panic!("must fail"),
+        }
     }
 }
