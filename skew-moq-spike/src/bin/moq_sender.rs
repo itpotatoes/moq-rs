@@ -1068,39 +1068,31 @@ fn topology_phase_arm(topology: Topology) -> &'static str {
     }
 }
 
-/// S3 only: decide whether a session end observed by the send loop is the
-/// receiver's normal end-of-run close rather than a mid-run fault.
+/// Resolve once the latest-generation PC and haptic producers have both
+/// terminated with the normal `producer_finished` reason.
 ///
-/// The S3 producers stop one slot before `end_us` (they break as soon as the
-/// next slot's target is `>= end_us`) and FIN their tracks; the registry marks
-/// their leases inactive before the FIN is forwarded. The receiver then FINs
-/// its current routes and closes the session. Without shaping that close
-/// reaches the sender before the wall-clock `sleep_until(end_us)` in
-/// `run_sequence` completes, so the session arm of the `select!` wins.
-///
-/// A session end is normal only when the measurement gate has opened and
-/// either the schedule end has passed, or every producer lease has already
-/// stopped and the observation lies within the final PC slot before `end_us`.
-/// Anything earlier (no schedule, warmup, mid-run, or producers still active)
-/// stays a fail-loud error.
-fn s3_session_end_is_normal(
-    now_us: u64,
-    schedule: Option<SourceSchedule>,
-    measurement_open: bool,
-    active_producers: usize,
-    pc_rate_hz: u64,
-) -> bool {
-    let Some(schedule) = schedule else {
-        return false;
-    };
-    if !measurement_open {
-        return false;
+/// The registry bumps `terminal_rx` under its own lock on every terminal
+/// transition, and the check below holds that same lock after marking the
+/// current version seen, so a transition can never fall between the check and
+/// the `changed()` wait.
+async fn wait_s3_current_routes_finished(
+    registry: &Arc<Mutex<SubscriptionProducerRegistry>>,
+    terminal_rx: &mut tokio::sync::watch::Receiver<u64>,
+) -> Result<()> {
+    loop {
+        terminal_rx.borrow_and_update();
+        let finished = registry
+            .lock()
+            .map_err(|_| anyhow::anyhow!("S3 producer registry poisoned"))?
+            .current_routes_finished();
+        if finished {
+            return Ok(());
+        }
+        terminal_rx
+            .changed()
+            .await
+            .map_err(|_| anyhow::anyhow!("S3 producer terminal watch closed"))?;
     }
-    if now_us >= schedule.end_us {
-        return true;
-    }
-    let slot_us = timestamp_us(1, pc_rate_hz);
-    active_producers == 0 && now_us.saturating_add(slot_us) >= schedule.end_us
 }
 
 async fn sleep_monotonic_until(target_us: u64) {
@@ -1695,6 +1687,10 @@ async fn main() -> Result<()> {
                 run_s3_namespace(ns_publisher, namespace, context, ns_registry, ns_routes),
             ));
 
+            let mut terminal_rx = registry
+                .lock()
+                .map_err(|_| anyhow::anyhow!("S3 producer registry poisoned"))?
+                .terminal_watch();
             let run_sequence = async {
                 let (schedule, phase) = if let (Some(batch_id), Some(phase_path)) =
                     (args.batch_id.as_deref(), args.phase_control.as_ref())
@@ -1757,7 +1753,17 @@ async fn main() -> Result<()> {
                 measurement_tx
                     .send(true)
                     .map_err(|_| anyhow::anyhow!("S3 measurement gate consumers closed"))?;
-                sleep_monotonic_until(schedule.end_us).await;
+                // The run is complete as soon as both current-route producers
+                // have reached end_us (recorded in the registry strictly before
+                // their track-close/PUBLISH_DONE can be forwarded), or at the
+                // wall-clock end if a producer never reports. Waiting only on
+                // the wall clock let the receiver's post-FIN close race ahead
+                // of `end_us` under zero shaping and surface as a session error.
+                tokio::select! {
+                    biased;
+                    finished = wait_s3_current_routes_finished(&registry, &mut terminal_rx) => finished?,
+                    _ = sleep_monotonic_until(schedule.end_us) => {}
+                }
                 Ok::<(), anyhow::Error>(())
             };
             let step: Result<()> = {
@@ -1766,7 +1772,10 @@ async fn main() -> Result<()> {
                 let nt = p.ns_task.as_mut().expect("namespace handle present");
                 let mut session_done = None;
                 let mut ns_done = None;
+                // `biased`: a completed run sequence must win over a session
+                // or namespace end that becomes ready in the same poll.
                 let outcome = tokio::select! {
+                    biased;
                     result = run_sequence => result,
                     _ = wait_signal(&mut sig_rx) => {
                         ending = Ending::Signal;
@@ -1774,32 +1783,7 @@ async fn main() -> Result<()> {
                     }
                     r = sr => {
                         session_done = Some(JoinOutcome::from_join_result(&r));
-                        // A poisoned registry yields `None` and therefore the
-                        // error path; no `?` here so the handle bookkeeping
-                        // above is never bypassed.
-                        let active_producers = registry
-                            .lock()
-                            .ok()
-                            .map(|registry| registry.active_count());
-                        let normal_end = matches!(
-                            active_producers,
-                            Some(active) if s3_session_end_is_normal(
-                                now_us(),
-                                *schedule_tx.borrow(),
-                                *measurement_tx.borrow(),
-                                active,
-                                args.pc_rate_hz,
-                            )
-                        );
-                        if normal_end {
-                            println!(
-                                "[tx] S3 session ended after every producer finished (peer closed first): {:?}",
-                                r
-                            );
-                            Ok(())
-                        } else {
-                            Err(anyhow::anyhow!("session ended during S3 send: {:?}", r))
-                        }
+                        Err(anyhow::anyhow!("session ended during S3 send: {:?}", r))
                     }
                     r = nt => {
                         ns_done = Some(JoinOutcome::from_join_result(&r));
@@ -2517,12 +2501,11 @@ mod tests {
     use super::{
         b1_transport_meta, epoch_record, hold_static_track_state_through_drain, now_us,
         object_buffer, phase4_transport, registered_s_bytes, resolved_priorities,
-        replay_release_rule, replay_release_rule_key, s3_session_end_is_normal,
-        shared_fifo_append, timestamp_us, validate_s3_args, validate_stage5_policy,
-        wait_registered_direct_fin_handoff, Args, Arm, CliReleaseRule, DataPriorityMapping,
-        DirectFinHandoff, Duration, PayloadMode, Phase4TransportMeta, PublisherPriorityProfile,
-        QueuePolicy, Representation, SharedFifoWriter, SourceSchedule, TierReplay, Topology,
-        TrackSel, Url, HDR,
+        replay_release_rule, replay_release_rule_key, shared_fifo_append, timestamp_us,
+        validate_s3_args, validate_stage5_policy, CliReleaseRule, Phase4TransportMeta, TierReplay,
+        wait_registered_direct_fin_handoff, Args, Arm, DataPriorityMapping, DirectFinHandoff,
+        Duration, PayloadMode, PublisherPriorityProfile, QueuePolicy, Representation,
+        SharedFifoWriter, Topology, TrackSel, Url, HDR,
     };
     use std::path::PathBuf;
     use std::sync::Mutex;
@@ -3240,32 +3223,4 @@ mod tests {
         assert!(span > 1_000);
     }
 
-    #[test]
-    fn s3_session_end_is_normal_only_after_producers_finished_in_final_slot() {
-        let schedule = Some(SourceSchedule {
-            warmup_start_us: None,
-            measurement_start_us: 4_000_000,
-            end_us: 34_000_000,
-        });
-        // CRinf evidence: last haptic object at end - 11.1 ms, both producers
-        // stopped, receiver FINs and closes immediately.
-        assert!(s3_session_end_is_normal(33_989_000, schedule, true, 0, 30));
-        // Exactly one PC slot before the end.
-        assert!(s3_session_end_is_normal(33_966_667, schedule, true, 0, 30));
-        // After end_us the close is normal regardless of the producer count.
-        assert!(s3_session_end_is_normal(34_000_000, schedule, true, 2, 30));
-        assert!(s3_session_end_is_normal(34_000_001, schedule, true, 0, 30));
-
-        // Producers still active inside the final slot: a real fault.
-        assert!(!s3_session_end_is_normal(33_989_000, schedule, true, 2, 30));
-        assert!(!s3_session_end_is_normal(33_989_000, schedule, true, 1, 30));
-        // All producers stopped but earlier than the final slot: a real fault
-        // (e.g. the receiver unsubscribed everything mid-run and closed).
-        assert!(!s3_session_end_is_normal(33_966_666, schedule, true, 0, 30));
-        assert!(!s3_session_end_is_normal(20_000_000, schedule, true, 0, 30));
-        // Measurement gate not open, or no schedule yet: never normal.
-        assert!(!s3_session_end_is_normal(33_989_000, schedule, false, 0, 30));
-        assert!(!s3_session_end_is_normal(33_989_000, None, true, 0, 30));
-        assert!(!s3_session_end_is_normal(3_000_000, schedule, false, 0, 30));
-    }
 }

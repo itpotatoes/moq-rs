@@ -149,6 +149,33 @@ pub enum SubscriptionTaskEnd {
     ProducerFinished,
 }
 
+/// Terminal outcome of one producer, recorded by `serve_subscription_producer`
+/// from the same branch that decides the logged stop reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProducerTerminal {
+    /// The producer loop returned normally (it reached the run end). Recorded
+    /// synchronously before the forwarder is polled again, i.e. before the
+    /// track close / PUBLISH_DONE for this route can reach the peer.
+    Finished,
+    /// The remote unsubscribed (or the forwarder ended) first.
+    RemoteClosed,
+    /// The producer returned an error.
+    Error,
+}
+
+/// True only when the latest-generation producer of BOTH roles has terminated
+/// with the normal `Finished` reason. Retired generations do not count; a
+/// remote unsubscribe or an error on the latest generation is never "finished".
+pub fn current_routes_finished(
+    pc: Option<ProducerTerminal>,
+    haptic: Option<ProducerTerminal>,
+) -> bool {
+    matches!(
+        (pc, haptic),
+        (Some(ProducerTerminal::Finished), Some(ProducerTerminal::Finished))
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubscriptionTaskResult {
     pub end: SubscriptionTaskEnd,
@@ -238,6 +265,13 @@ pub struct SubscriptionProducerRegistry {
     state: Arc<Mutex<RegistryState>>,
     active: HashMap<ProducerKey, watch::Sender<bool>>,
     seen: HashSet<ProducerKey>,
+    /// Highest activated generation per role: the "current" route.
+    latest: HashMap<TrackRole, u64>,
+    terminal: HashMap<ProducerKey, ProducerTerminal>,
+    forward_closed: HashSet<ProducerKey>,
+    /// Bumped on every terminal transition so a waiter can re-check
+    /// `current_routes_finished` without polling.
+    terminal_tx: watch::Sender<u64>,
 }
 
 impl SubscriptionProducerRegistry {
@@ -246,7 +280,75 @@ impl SubscriptionProducerRegistry {
             state: Arc::new(Mutex::new(RegistryState::default())),
             active: HashMap::new(),
             seen: HashSet::new(),
+            latest: HashMap::new(),
+            terminal: HashMap::new(),
+            forward_closed: HashSet::new(),
+            terminal_tx: watch::channel(0).0,
         }
+    }
+
+    /// Record how the producer of `route` terminated. The lease must already
+    /// be inactive (cancelled) and each generation records exactly once.
+    pub fn record_terminal(
+        &mut self,
+        role: TrackRole,
+        route: Route,
+        terminal: ProducerTerminal,
+    ) -> Result<(), ProducerError> {
+        let key = ProducerKey {
+            role,
+            generation: route.generation,
+        };
+        if !self.seen.contains(&key) || self.active.contains_key(&key) {
+            return Err(ProducerError::UnknownOrInactiveRoute);
+        }
+        if self.terminal.contains_key(&key) {
+            return Err(ProducerError::DuplicateOrReusedGeneration);
+        }
+        self.terminal.insert(key, terminal);
+        self.terminal_tx.send_modify(|version| *version += 1);
+        Ok(())
+    }
+
+    /// Record that the forwarder of a `Finished` producer has closed (its
+    /// track close / PUBLISH_DONE has been handed to the session).
+    pub fn mark_forward_closed(&mut self, role: TrackRole, route: Route) -> Result<(), ProducerError> {
+        let key = ProducerKey {
+            role,
+            generation: route.generation,
+        };
+        if self.terminal.get(&key) != Some(&ProducerTerminal::Finished) {
+            return Err(ProducerError::UnknownOrInactiveRoute);
+        }
+        self.forward_closed.insert(key);
+        Ok(())
+    }
+
+    pub fn forward_closed(&self, role: TrackRole, route: Route) -> bool {
+        self.forward_closed.contains(&ProducerKey {
+            role,
+            generation: route.generation,
+        })
+    }
+
+    /// Terminal outcome of the latest activated generation for `role`, or
+    /// `None` when no producer was activated or it is still running.
+    pub fn latest_terminal(&self, role: TrackRole) -> Option<ProducerTerminal> {
+        let generation = *self.latest.get(&role)?;
+        self.terminal.get(&ProducerKey { role, generation }).copied()
+    }
+
+    pub fn current_routes_finished(&self) -> bool {
+        current_routes_finished(
+            self.latest_terminal(TrackRole::Pc),
+            self.latest_terminal(TrackRole::Haptic),
+        )
+    }
+
+    /// Receiver that changes on every terminal transition; pair it with
+    /// [`Self::current_routes_finished`].
+    pub fn terminal_watch(&self) -> watch::Receiver<u64> {
+        self.terminal_tx.subscribe()
     }
 
     pub fn activate(
@@ -283,6 +385,10 @@ impl SubscriptionProducerRegistry {
             .stats
             .insert(key, stats);
         self.active.insert(key, cancel);
+        self.latest
+            .entry(role)
+            .and_modify(|latest| *latest = (*latest).max(route.generation))
+            .or_insert(route.generation);
 
         Ok(ProducerLease {
             key,
@@ -425,6 +531,7 @@ where
         biased;
         serve_result = &mut serve => {
             cancel_shared(&registry, role, route)?;
+            record_terminal_shared(&registry, role, route, ProducerTerminal::RemoteClosed)?;
             normalize_serve_end(serve_result)?;
             Ok(SubscriptionTaskResult {
                 end: SubscriptionTaskEnd::RemoteClosed,
@@ -438,10 +545,17 @@ where
                 Ok(produced) => produced,
                 Err(error) => {
                     cancel_shared(&registry, role, route)?;
+                    record_terminal_shared(&registry, role, route, ProducerTerminal::Error)?;
                     return Err(error).context("subscription producer");
                 }
             };
             cancel_shared(&registry, role, route)?;
+            // Ordering: `serve` is pinned in this task and was polled (Pending)
+            // before `produce` in this same `biased` poll; it is not polled
+            // again until the timeout below. The producer's dropped writers
+            // therefore cannot be observed, and no track close / PUBLISH_DONE
+            // can be forwarded, before this record lands.
+            record_terminal_shared(&registry, role, route, ProducerTerminal::Finished)?;
             let serve_result = tokio::time::timeout(shutdown_timeout, &mut serve)
                 .await
                 .context("forwarder did not close after producer end")?;
@@ -456,6 +570,11 @@ where
                     recorded
                 ));
             }
+            registry
+                .lock()
+                .map_err(|_| anyhow!("producer registry poisoned"))?
+                .mark_forward_closed(role, route)
+                .map_err(|error| anyhow!("mark producer forwarder closed: {error:?}"))?;
             Ok(SubscriptionTaskResult {
                 end: SubscriptionTaskEnd::ProducerFinished,
                 role,
@@ -476,6 +595,19 @@ fn cancel_shared(
         .map_err(|_| anyhow!("producer registry poisoned"))?
         .cancel(role, route)
         .map_err(|error| anyhow!("cancel producer lease: {error:?}"))
+}
+
+fn record_terminal_shared(
+    registry: &Arc<Mutex<SubscriptionProducerRegistry>>,
+    role: TrackRole,
+    route: Route,
+    terminal: ProducerTerminal,
+) -> anyhow::Result<()> {
+    registry
+        .lock()
+        .map_err(|_| anyhow!("producer registry poisoned"))?
+        .record_terminal(role, route, terminal)
+        .map_err(|error| anyhow!("record producer terminal: {error:?}"))
 }
 
 fn route_objects(
@@ -685,5 +817,132 @@ mod tests {
         lease.cancelled().await;
         assert!(lease.is_cancelled());
         assert_eq!(lease.record_object(), Err(ProducerError::LeaseCancelled));
+    }
+
+    #[test]
+    fn current_routes_finished_requires_both_latest_generations_finished() {
+        use ProducerTerminal::*;
+        assert!(current_routes_finished(Some(Finished), Some(Finished)));
+        assert!(!current_routes_finished(None, None));
+        assert!(!current_routes_finished(Some(Finished), None));
+        assert!(!current_routes_finished(None, Some(Finished)));
+        assert!(!current_routes_finished(Some(RemoteClosed), Some(Finished)));
+        assert!(!current_routes_finished(Some(Finished), Some(RemoteClosed)));
+        assert!(!current_routes_finished(Some(Error), Some(Finished)));
+        assert!(!current_routes_finished(Some(Finished), Some(Error)));
+    }
+
+    #[test]
+    fn registry_tracks_latest_generation_terminal_and_notifies() {
+        let mut registry = SubscriptionProducerRegistry::new();
+        let mut watch = registry.terminal_watch();
+        assert!(!registry.current_routes_finished());
+        assert_eq!(registry.latest_terminal(TrackRole::Pc), None);
+
+        let pc0 = route(PC_NORMAL_TRACK, 0);
+        let hap0 = route(HAPTIC_FULL_TRACK, 0);
+        let _pc_lease = registry.activate(TrackRole::Pc, pc0).unwrap();
+        let _hap_lease = registry.activate(TrackRole::Haptic, hap0).unwrap();
+        // Still active: cannot record, nothing finished.
+        assert_eq!(
+            registry.record_terminal(TrackRole::Pc, pc0, ProducerTerminal::Finished),
+            Err(ProducerError::UnknownOrInactiveRoute)
+        );
+        assert!(!registry.current_routes_finished());
+
+        // One role finished, the other still active -> false.
+        registry.cancel(TrackRole::Pc, pc0).unwrap();
+        registry
+            .record_terminal(TrackRole::Pc, pc0, ProducerTerminal::Finished)
+            .unwrap();
+        assert!(watch.has_changed().unwrap());
+        watch.borrow_and_update();
+        assert_eq!(
+            registry.latest_terminal(TrackRole::Pc),
+            Some(ProducerTerminal::Finished)
+        );
+        assert!(!registry.current_routes_finished());
+
+        // A generation records exactly once.
+        assert_eq!(
+            registry.record_terminal(TrackRole::Pc, pc0, ProducerTerminal::Finished),
+            Err(ProducerError::DuplicateOrReusedGeneration)
+        );
+
+        // Both latest generations finished -> true, and the watch fired.
+        registry.cancel(TrackRole::Haptic, hap0).unwrap();
+        registry
+            .record_terminal(TrackRole::Haptic, hap0, ProducerTerminal::Finished)
+            .unwrap();
+        assert!(watch.has_changed().unwrap());
+        assert!(registry.current_routes_finished());
+
+        // forward_closed only after a Finished terminal.
+        assert!(!registry.forward_closed(TrackRole::Pc, pc0));
+        registry.mark_forward_closed(TrackRole::Pc, pc0).unwrap();
+        assert!(registry.forward_closed(TrackRole::Pc, pc0));
+    }
+
+    #[test]
+    fn retired_generation_does_not_count_and_latest_remote_close_or_error_is_not_finished() {
+        // Old generation cancelled by a switch (RemoteClosed), new generation
+        // finished -> true.
+        let mut registry = SubscriptionProducerRegistry::new();
+        let pc0 = route(PC_NORMAL_TRACK, 0);
+        let pc1 = route(PC_RECOVERY_TRACK, 1);
+        let hap0 = route(HAPTIC_FULL_TRACK, 0);
+        let _pc0_lease = registry.activate(TrackRole::Pc, pc0).unwrap();
+        let _hap0_lease = registry.activate(TrackRole::Haptic, hap0).unwrap();
+        let _pc1_lease = registry.activate(TrackRole::Pc, pc1).unwrap();
+        registry.cancel(TrackRole::Pc, pc0).unwrap();
+        registry
+            .record_terminal(TrackRole::Pc, pc0, ProducerTerminal::RemoteClosed)
+            .unwrap();
+        assert_eq!(registry.latest_terminal(TrackRole::Pc), None);
+        registry.cancel(TrackRole::Haptic, hap0).unwrap();
+        registry
+            .record_terminal(TrackRole::Haptic, hap0, ProducerTerminal::Finished)
+            .unwrap();
+        assert!(!registry.current_routes_finished());
+        registry.cancel(TrackRole::Pc, pc1).unwrap();
+        registry
+            .record_terminal(TrackRole::Pc, pc1, ProducerTerminal::Finished)
+            .unwrap();
+        assert!(registry.current_routes_finished());
+
+        // Latest generation remote-unsubscribed -> false even though the old
+        // generation finished.
+        let mut registry = SubscriptionProducerRegistry::new();
+        let _pc0_lease = registry.activate(TrackRole::Pc, pc0).unwrap();
+        let _hap0_lease = registry.activate(TrackRole::Haptic, hap0).unwrap();
+        let _pc1_lease = registry.activate(TrackRole::Pc, pc1).unwrap();
+        registry.cancel(TrackRole::Pc, pc0).unwrap();
+        registry
+            .record_terminal(TrackRole::Pc, pc0, ProducerTerminal::Finished)
+            .unwrap();
+        registry.cancel(TrackRole::Haptic, hap0).unwrap();
+        registry
+            .record_terminal(TrackRole::Haptic, hap0, ProducerTerminal::Finished)
+            .unwrap();
+        assert!(!registry.current_routes_finished());
+        registry.cancel(TrackRole::Pc, pc1).unwrap();
+        registry
+            .record_terminal(TrackRole::Pc, pc1, ProducerTerminal::RemoteClosed)
+            .unwrap();
+        assert!(!registry.current_routes_finished());
+
+        // Latest generation error -> false.
+        let mut registry = SubscriptionProducerRegistry::new();
+        let _pc0_lease = registry.activate(TrackRole::Pc, pc0).unwrap();
+        let _hap0_lease = registry.activate(TrackRole::Haptic, hap0).unwrap();
+        registry.cancel(TrackRole::Pc, pc0).unwrap();
+        registry
+            .record_terminal(TrackRole::Pc, pc0, ProducerTerminal::Error)
+            .unwrap();
+        registry.cancel(TrackRole::Haptic, hap0).unwrap();
+        registry
+            .record_terminal(TrackRole::Haptic, hap0, ProducerTerminal::Finished)
+            .unwrap();
+        assert!(!registry.current_routes_finished());
     }
 }
