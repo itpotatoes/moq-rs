@@ -73,10 +73,13 @@ fn initial_measurement_slot(
     observed_at_us: u64,
     rate_hz: u64,
 ) -> Result<u64, SlotError> {
-    if schedule.warmup_start_us.is_some() && route_generation == 0 {
-        // The registered initial Normal/full routes own the common t0 and must
-        // emit measurement identity zero even when the gate wakes a few us
-        // late. Switched routes and every legacy run retain catch-up semantics.
+    if route_generation == 0 {
+        // The initial Normal/full routes (generation 0) own the common t0 and
+        // must emit measurement identity zero even when the gate wakes a few
+        // us late. This holds for both the registered (warmup pass) schedule
+        // and the legacy `now + warmup` schedule, matching the static S1/S2
+        // path which always emits slot 0. Switched routes (generation >= 1)
+        // retain catch-up semantics.
         Ok(0)
     } else {
         schedule
@@ -786,7 +789,7 @@ mod tests {
     }
 
     #[test]
-    fn registered_initial_routes_start_at_zero_but_switches_and_legacy_catch_up() {
+    fn initial_routes_start_at_zero_but_switches_catch_up() {
         let registered = SourceSchedule {
             warmup_start_us: Some(1_000_000),
             measurement_start_us: 4_000_000,
@@ -812,7 +815,38 @@ mod tests {
         };
         assert_eq!(
             initial_measurement_slot(legacy, 0, 4_000_001, 30).unwrap(),
+            0
+        );
+        assert_eq!(
+            initial_measurement_slot(legacy, 1, 4_000_001, 30).unwrap(),
             1
+        );
+        assert_eq!(
+            initial_measurement_slot(legacy, 1, 4_000_001, 90).unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn legacy_generation_zero_observed_late_still_starts_at_zero() {
+        // The legacy schedule (no registered warmup pass) is the path the
+        // stage-9 harness uses (`--warmup 1`, no `--warmup-pass`). The producer
+        // wakes a few us after the measurement anchor; it must still emit
+        // measurement slot 0 on both tracks, like the static S1/S2 sender.
+        let legacy = SourceSchedule {
+            warmup_start_us: None,
+            measurement_start_us: 4_000_000,
+            end_us: 34_000_000,
+        };
+        for late_us in [1, 5, 50, 500] {
+            let observed = legacy.measurement_start_us + late_us;
+            assert_eq!(initial_measurement_slot(legacy, 0, observed, 30).unwrap(), 0);
+            assert_eq!(initial_measurement_slot(legacy, 0, observed, 90).unwrap(), 0);
+        }
+        // Exactly on the anchor is also slot 0.
+        assert_eq!(
+            initial_measurement_slot(legacy, 0, legacy.measurement_start_us, 30).unwrap(),
+            0
         );
     }
 
