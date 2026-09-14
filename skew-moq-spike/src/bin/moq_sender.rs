@@ -30,7 +30,7 @@ use moq_transport::{
 use tokio::signal::unix::{signal, SignalKind};
 use url::Url;
 
-use skew_moq::s3_producer::{CompletionState, SubscriptionProducerRegistry};
+use skew_moq::s3_producer::{s3_run_verdict, RunVerdict, SubscriptionProducerRegistry, TransportEnd};
 use skew_moq::s3_sender::{
     run_namespace as run_s3_namespace, AcceptRouteMap, SenderContext as S3SenderContext,
     SourceSchedule,
@@ -1096,43 +1096,12 @@ async fn wait_s3_current_routes_completed(
     }
 }
 
-/// Verdict for a session/namespace end observed by the S3 send loop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TransportEndVerdict {
-    /// Both current routes completed the run: the transport end is the
-    /// peer's normal post-FIN close.
-    Normal,
-    /// Both producer loops reached the run end but a forwarder outcome is not
-    /// recorded yet; wait (bounded) for the producer tasks to record it.
-    AwaitForwarders,
-    /// A role is running, remote-closed, errored, or its forwarder failed:
-    /// the transport end is a mid-run fault.
-    Error,
-}
-
-/// Pure decision for a transport end observed at a given completion state.
-fn session_end_after_completion(state: CompletionState) -> TransportEndVerdict {
-    match state {
-        CompletionState::Completed => TransportEndVerdict::Normal,
-        CompletionState::Pending => TransportEndVerdict::AwaitForwarders,
-        CompletionState::Incomplete => TransportEndVerdict::Error,
-    }
-}
-
-/// Re-check completion when the session or namespace task ends. Returns
-/// `true` when the run is complete (normal end), `false` otherwise.
-///
-/// `PUBLISH_DONE` is emitted by `Drop for Subscribed` inside
-/// `Subscribed::serve_accepted`, which runs before the producer task can
-/// record `forward_closed`; a zero-latency peer close can therefore observe
-/// `Pending` here. In that state both producer loops have already reached the
-/// run end, and their tasks will record `Closed` or `Failed` within the
-/// producer shutdown timeout regardless of the session state, so the wait is
-/// bounded by `settle_bound` and never widens the error window.
-async fn settle_s3_transport_end(
+/// Wait until every reserved/activated producer task has recorded a final
+/// outcome (bounded). After this the registry snapshot is authoritative.
+async fn wait_s3_tasks_settled(
     registry: &Arc<Mutex<SubscriptionProducerRegistry>>,
     settle_bound: Duration,
-) -> Result<bool> {
+) -> Result<()> {
     let mut terminal_rx = registry
         .lock()
         .map_err(|_| anyhow::anyhow!("S3 producer registry poisoned"))?
@@ -1140,25 +1109,55 @@ async fn settle_s3_transport_end(
     let deadline = tokio::time::Instant::now() + settle_bound;
     loop {
         terminal_rx.borrow_and_update();
-        let state = registry
+        let outstanding = registry
             .lock()
             .map_err(|_| anyhow::anyhow!("S3 producer registry poisoned"))?
-            .completion_state();
-        match session_end_after_completion(state) {
-            TransportEndVerdict::Normal => return Ok(true),
-            TransportEndVerdict::Error => return Ok(false),
-            TransportEndVerdict::AwaitForwarders => {}
+            .outstanding();
+        if outstanding == 0 {
+            return Ok(());
         }
         match tokio::time::timeout_at(deadline, terminal_rx.changed()).await {
             Ok(Ok(())) => {}
             Ok(Err(_)) => return Err(anyhow::anyhow!("S3 producer terminal watch closed")),
-            Err(_) => return Ok(false),
+            // The verdict reports the outstanding count as an error reason.
+            Err(_) => return Ok(()),
         }
     }
 }
 
+/// JSON-escape `value` for embedding inside a quoted JSON string (serde_json
+/// escaping, so newlines and control characters are valid JSON). The shutdown
+/// row itself is built from `serde_json::Value`s; this mirrors that escaping
+/// for the unit test.
+#[cfg(test)]
 fn json_text(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
+    let quoted = serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string());
+    quoted[1..quoted.len() - 1].to_string()
+}
+
+/// The S3 verdict fields of the shutdown row (additive; every value is
+/// serialized with serde_json).
+fn s3_shutdown_fields(verdict: Option<&RunVerdict>, transport_ends: &[TransportEnd]) -> String {
+    if verdict.is_none() && transport_ends.is_empty() {
+        return String::new();
+    }
+    let ends: Vec<serde_json::Value> = transport_ends
+        .iter()
+        .map(|end| {
+            serde_json::json!({
+                "kind": end.kind,
+                "text": end.text,
+                "at_us": end.at_us,
+                "before_production_end": end.before_production_end,
+            })
+        })
+        .collect();
+    format!(
+        ",\"s3_verdict\":{},\"s3_verdict_reasons\":{},\"s3_transport_ends\":{}",
+        serde_json::Value::from(verdict.map(RunVerdict::as_str).unwrap_or("not_computed")),
+        serde_json::Value::from(verdict.map(|v| v.reasons().to_vec()).unwrap_or_default()),
+        serde_json::Value::Array(ends)
+    )
 }
 
 async fn sleep_monotonic_until(target_us: u64) {
@@ -1693,9 +1692,10 @@ async fn main() -> Result<()> {
     let mut pc_stats = TrackRunStats::default();
     let mut hap_stats = TrackRunStats::default();
     let mut ending = Ending::Normal;
-    // S3 only: how the transport ended when the session/namespace task
-    // finished after both current routes had completed the run.
-    let mut s3_transport_end: Option<String> = None;
+    // S3 only: session/namespace task ends observed by the send loop, and the
+    // single run verdict computed once after the drain from the registry.
+    let mut s3_transport_ends: Vec<TransportEnd> = Vec::new();
+    let mut s3_verdict: Option<RunVerdict> = None;
 
     // Fallible section. It must not use `?` to leave `main` — errors are
     // captured so the finalizer still runs (A2-c R1, Codex finding 5).
@@ -1749,9 +1749,9 @@ async fn main() -> Result<()> {
                         .expect("validated S3 shutdown timeout"),
                 ),
             });
-            // Producer tasks record the forwarder outcome within their
-            // shutdown timeout; allow that plus a margin before a Pending
-            // completion is treated as a fault.
+            // Producer tasks record their final outcome within their
+            // shutdown timeout; allow that plus a margin before the verdict
+            // counts them as outstanding.
             let settle_bound = context
                 .shutdown_timeout
                 .saturating_add(Duration::from_secs(1));
@@ -1858,11 +1858,20 @@ async fn main() -> Result<()> {
                     }
                     r = sr => {
                         session_done = Some(JoinOutcome::from_join_result(&r));
-                        // Re-check completion at this moment: a session end
-                        // after both current routes completed the run is the
-                        // peer's normal close; anything else stays an error.
-                        if settle_s3_transport_end(&registry, settle_bound).await? {
-                            s3_transport_end = Some(format!("session_after_completion:{:?}", r));
+                        // Do not decide here: record the end and fall through
+                        // to the single end-of-run verdict. Only a session end
+                        // while production is still running is immediate.
+                        let production_ended = registry
+                            .lock()
+                            .map(|registry| registry.production_ended())
+                            .unwrap_or(false);
+                        s3_transport_ends.push(TransportEnd {
+                            kind: "session",
+                            text: format!("{r:?}"),
+                            at_us: now_us(),
+                            before_production_end: !production_ended,
+                        });
+                        if production_ended {
                             Ok(())
                         } else {
                             Err(anyhow::anyhow!("session ended during S3 send: {:?}", r))
@@ -1870,8 +1879,17 @@ async fn main() -> Result<()> {
                     }
                     r = nt => {
                         ns_done = Some(JoinOutcome::from_join_result(&r));
-                        if settle_s3_transport_end(&registry, settle_bound).await? {
-                            s3_transport_end = Some(format!("namespace_after_completion:{:?}", r));
+                        let production_ended = registry
+                            .lock()
+                            .map(|registry| registry.production_ended())
+                            .unwrap_or(false);
+                        s3_transport_ends.push(TransportEnd {
+                            kind: "namespace",
+                            text: format!("{r:?}"),
+                            at_us: now_us(),
+                            before_production_end: !production_ended,
+                        });
+                        if production_ended {
                             Ok(())
                         } else {
                             Err(anyhow::anyhow!("S3 namespace ended during send: {:?}", r))
@@ -1896,6 +1914,19 @@ async fn main() -> Result<()> {
                     _ = wait_signal(&mut sig_rx) => { ending = Ending::Signal; }
                 }
             }
+            // Single run verdict: after the drain, once every producer task
+            // has recorded its outcome (bounded), from the registry alone.
+            let verdict = if ending == Ending::Signal {
+                None
+            } else {
+                wait_s3_tasks_settled(&registry, settle_bound).await?;
+                let snapshot = registry
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("S3 producer registry poisoned"))?
+                    .snapshot();
+                Some(s3_run_verdict(&snapshot, &s3_transport_ends))
+            };
+            s3_verdict = verdict.clone();
             let stats = registry
                 .lock()
                 .map_err(|_| anyhow::anyhow!("S3 producer registry poisoned"))?
@@ -1919,7 +1950,13 @@ async fn main() -> Result<()> {
                 hap_stats.logical_generated,
                 stats.len()
             );
-            return Ok(());
+            return match verdict {
+                None | Some(RunVerdict::Normal) => Ok(()),
+                Some(RunVerdict::Error(reasons)) => Err(anyhow::anyhow!(
+                    "S3 run verdict error: {}",
+                    reasons.join("; ")
+                )),
+            };
         }
 
         let (mut tracks_w, _req, tracks_r) = Tracks::new(namespace.clone()).produce();
@@ -2526,17 +2563,14 @@ async fn main() -> Result<()> {
         {
             record_io_failed = true;
         }
-        let s3_transport_end_field = s3_transport_end
-            .as_deref()
-            .map(|text| format!(",\"s3_transport_end\":\"{}\"", json_text(text)))
-            .unwrap_or_default();
+        let s3_fields = s3_shutdown_fields(s3_verdict.as_ref(), &s3_transport_ends);
         if lg
             .try_log_info(&format!(
                 "\"event\":\"shutdown\",\"ending\":\"{}\",\"session_join\":\"{}\",\"ns_join\":\"{}\"{}",
                 ending.as_str(),
                 joins.session.as_str(),
                 joins.ns.as_str(),
-                s3_transport_end_field
+                s3_fields
             ))
             .is_err()
         {
@@ -2594,11 +2628,11 @@ mod tests {
     use super::{
         b1_transport_meta, epoch_record, hold_static_track_state_through_drain, now_us,
         object_buffer, phase4_transport, registered_s_bytes, resolved_priorities,
-        json_text, replay_release_rule, replay_release_rule_key, session_end_after_completion,
+        json_text, replay_release_rule, replay_release_rule_key, s3_shutdown_fields,
         shared_fifo_append, timestamp_us, validate_s3_args, validate_stage5_policy, Args, Arm,
-        CliReleaseRule, CompletionState, DataPriorityMapping, DirectFinHandoff, Duration,
-        PayloadMode, Phase4TransportMeta, PublisherPriorityProfile, QueuePolicy, Representation,
-        SharedFifoWriter, TierReplay, Topology, TrackSel, TransportEndVerdict, Url, HDR,
+        CliReleaseRule, DataPriorityMapping, DirectFinHandoff, Duration, PayloadMode,
+        Phase4TransportMeta, PublisherPriorityProfile, QueuePolicy, Representation, RunVerdict,
+        SharedFifoWriter, TierReplay, Topology, TrackSel, TransportEnd, Url, HDR,
         wait_registered_direct_fin_handoff,
     };
     use std::path::PathBuf;
@@ -3319,27 +3353,51 @@ mod tests {
 
 
     #[test]
-    fn transport_end_verdict_follows_the_completion_state() {
-        assert_eq!(
-            session_end_after_completion(CompletionState::Completed),
-            TransportEndVerdict::Normal
-        );
-        assert_eq!(
-            session_end_after_completion(CompletionState::Pending),
-            TransportEndVerdict::AwaitForwarders
-        );
-        assert_eq!(
-            session_end_after_completion(CompletionState::Incomplete),
-            TransportEndVerdict::Error
-        );
-    }
-
-    #[test]
-    fn shutdown_row_transport_end_text_is_json_safe() {
+    fn shutdown_row_text_is_json_escaped_with_serde_json() {
         assert_eq!(
             json_text("session_after_completion:Ok(Err(Decode(More(1))))"),
             "session_after_completion:Ok(Err(Decode(More(1))))"
         );
         assert_eq!(json_text("a\"b\\c"), "a\\\"b\\\\c");
+        // Embedded newline and a control character must not reach the row raw.
+        let escaped = json_text("line1\nline2\u{1}tab\t");
+        assert_eq!(escaped, "line1\\nline2\\u0001tab\\t");
+        assert!(!escaped.contains('\n'));
+        let parsed: String = serde_json::from_str(&format!("\"{escaped}\"")).unwrap();
+        assert_eq!(parsed, "line1\nline2\u{1}tab\t");
+    }
+
+    #[test]
+    fn shutdown_row_s3_fields_are_valid_json_and_omitted_for_non_s3() {
+        assert_eq!(s3_shutdown_fields(None, &[]), "");
+        let ends = vec![TransportEnd {
+            kind: "session",
+            text: "Ok(Err(Decode(More(1))))\nsecond line".to_string(),
+            at_us: 33_990_000,
+            before_production_end: false,
+        }];
+        let verdict = RunVerdict::Error(vec!["pc: forwarder failed (remote_cancel)".to_string()]);
+        let fields = s3_shutdown_fields(Some(&verdict), &ends);
+        let row: serde_json::Value =
+            serde_json::from_str(&format!("{{\"event\":\"shutdown\"{fields}}}")).unwrap();
+        assert_eq!(row["s3_verdict"], "error");
+        assert_eq!(row["s3_verdict_reasons"][0], "pc: forwarder failed (remote_cancel)");
+        assert_eq!(row["s3_transport_ends"][0]["kind"], "session");
+        assert_eq!(row["s3_transport_ends"][0]["at_us"], 33_990_000);
+        assert_eq!(row["s3_transport_ends"][0]["before_production_end"], false);
+        assert_eq!(
+            row["s3_transport_ends"][0]["text"],
+            "Ok(Err(Decode(More(1))))\nsecond line"
+        );
+        let fields = s3_shutdown_fields(Some(&RunVerdict::Normal), &[]);
+        let row: serde_json::Value =
+            serde_json::from_str(&format!("{{\"event\":\"shutdown\"{fields}}}")).unwrap();
+        assert_eq!(row["s3_verdict"], "normal");
+        assert_eq!(row["s3_verdict_reasons"].as_array().unwrap().len(), 0);
+        // Transport ends recorded on the immediate-error path (no verdict).
+        let fields = s3_shutdown_fields(None, &ends);
+        let row: serde_json::Value =
+            serde_json::from_str(&format!("{{\"event\":\"shutdown\"{fields}}}")).unwrap();
+        assert_eq!(row["s3_verdict"], "not_computed");
     }
 }

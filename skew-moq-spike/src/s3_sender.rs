@@ -18,7 +18,7 @@ use tokio::task::JoinSet;
 
 use crate::s3_producer::{
     serve_subscription_producer, ProducerLease, RunSlotClock, SlotError,
-    SubscriptionProducerRegistry,
+    SubscriptionProducerRegistry, ProducerTaskGuard,
 };
 use crate::s3_switch::{
     Route, TrackRole, HAPTIC_ESSENTIAL_TRACK, HAPTIC_FULL_TRACK, PC_HAPTIC_CRITICAL_TRACK,
@@ -687,28 +687,37 @@ pub async fn run_namespace(
                     ));
                     continue;
                 }
-                // Switch/end boundary: once both current routes completed the
-                // run, a late subscription is refused here without consuming a
-                // generation, a producer, or a log row (the registry would also
-                // refuse activation with `RunCompleted`).
-                let completed = registry
-                    .lock()
-                    .map_err(|_| anyhow!("S3 producer registry poisoned"))?
-                    .current_routes_completed();
-                if completed {
-                    let _ = subscribed.close(moq_transport::serve::ServeError::not_found_ctx(
-                        format!("S3 subscription '{name}' arrived after run completion"),
-                    ));
-                    continue;
-                }
-                let (role, route) = match allocator.allocate(&name) {
-                    Ok(route) => route,
-                    Err(error) => {
+                // Switch/end boundary, ONE registry critical section: the
+                // completion check, the generation allocation, and the
+                // reservation happen under the same lock, so a subscription
+                // can never consume a generation after completion, and a
+                // reserved generation counts toward "latest" until it is
+                // activated or released. A refused subscription gets
+                // not_found and no log row.
+                let (role, route) = {
+                    let mut reg = registry
+                        .lock()
+                        .map_err(|_| anyhow!("S3 producer registry poisoned"))?;
+                    if reg.current_routes_completed() {
+                        drop(reg);
                         let _ = subscribed.close(moq_transport::serve::ServeError::not_found_ctx(
-                            format!("invalid S3 subscription: {error}")
+                            format!("S3 subscription '{name}' arrived after run completion"),
                         ));
                         continue;
                     }
+                    let (role, route) = match allocator.allocate(&name) {
+                        Ok(route) => route,
+                        Err(error) => {
+                            drop(reg);
+                            let _ = subscribed.close(moq_transport::serve::ServeError::not_found_ctx(
+                                format!("invalid S3 subscription: {error}")
+                            ));
+                            continue;
+                        }
+                    };
+                    reg.reserve(role, route)
+                        .map_err(|error| anyhow!("reserve S3 producer generation: {error:?}"))?;
+                    (role, route)
                 };
 
                 accept_routes
@@ -718,13 +727,17 @@ pub async fn run_namespace(
                 let context = context.clone();
                 let registry = registry.clone();
                 tasks.spawn(async move {
+                    // Declared first so it drops last: any exit of this task
+                    // without a recorded outcome (including abort) is
+                    // recorded as a fault by the guard.
+                    let _guard = ProducerTaskGuard::new(registry.clone(), role, route);
                     let logger = context.logger.clone();
                     let producer_context = context.clone();
                     let result = serve_subscription_producer(
                         subscribed,
                         role,
                         route,
-                        registry,
+                        registry.clone(),
                         context.shutdown_timeout,
                         move |writer, lease| {
                             let context = producer_context.clone();
@@ -739,9 +752,25 @@ pub async fn run_namespace(
                             }
                         },
                     ).await?;
-                    logger.lock()
-                        .map_err(|_| anyhow!("TX logger poisoned"))?
-                        .try_log_s3_producer_stop(result, now_us())?;
+                    // `None`: refused after run completion, a normal outcome.
+                    let Some(result) = result else {
+                        return Ok(());
+                    };
+                    let logged = logger
+                        .lock()
+                        .map_err(|_| anyhow!("TX logger poisoned"))
+                        .and_then(|mut logger| {
+                            logger
+                                .try_log_s3_producer_stop(result, now_us())
+                                .map_err(anyhow::Error::from)
+                        });
+                    if let Err(error) = logged {
+                        // Record BEFORE propagating so the verdict sees it.
+                        if let Ok(mut reg) = registry.lock() {
+                            let _ = reg.record_fault(role, route, "log_write");
+                        }
+                        return Err(error);
+                    }
                     Ok::<(), anyhow::Error>(())
                 });
             }
