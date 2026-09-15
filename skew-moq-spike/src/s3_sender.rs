@@ -638,22 +638,24 @@ async fn produce_haptic(
     Ok(count)
 }
 
-/// How `run_namespace` ended, typed at the source.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How `run_namespace` ended normally: main signalled stop and every child
+/// task was joined (each recorded `Settled`) before returning. Every other end
+/// is an `Err` carrying the original error text; main classifies it by
+/// ORDERING (before/after the session end and our stop), never by that text.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NamespaceEnd {
-    /// Main signalled stop after production ended; every child task was
-    /// joined (each recorded `Settled`) before returning.
-    Drained,
-    /// The publish handle reported closed AFTER production had ended; every
-    /// child task was joined before returning. Whether the children were
-    /// clean is the registry's call, not this value's.
-    PeerClosed,
+    Drained {
+        /// If the subscription stream ended or errored while draining, its
+        /// text is preserved here for audit.
+        subscribe_end: Option<String>,
+    },
 }
 
 type ChildOutcome = (TrackRole, Route, anyhow::Result<()>);
 
-/// Classify one joined child: an `Err` with no fault yet recorded for its key
-/// becomes `task_error`; a join failure (panic/cancel) is a namespace fault.
+/// Record one joined child: an `Err` with no fault yet recorded for its key
+/// becomes `task_error`; a panicked join is a namespace fault; a cancelled
+/// join was already recorded as `aborted` by the child's guard.
 fn record_child_outcome(
     registry: &Arc<Mutex<SubscriptionProducerRegistry>>,
     joined: Result<ChildOutcome, tokio::task::JoinError>,
@@ -669,12 +671,34 @@ fn record_child_outcome(
             }
             tracing::warn!(track = role.as_str(), generation = route.generation, error = %format!("{error:#}"), "S3 subscription task error");
         }
-        Err(error) => {
-            registry.record_namespace_fault(if error.is_panic() {
-                "task_panic"
-            } else {
-                "task_join_error"
-            });
+        Err(error) if error.is_panic() => registry.record_namespace_fault("task_panic"),
+        Err(_) => {}
+    }
+    Ok(())
+}
+
+/// Common cleanup for every early exit of `run_namespace`: abort the remaining
+/// children and join them (bounded) so each guard has recorded its outcome
+/// before main snapshots the registry. A child that does not finish within
+/// the bound is recorded as a namespace fault.
+async fn abandon_children(
+    tasks: &mut JoinSet<ChildOutcome>,
+    registry: &Arc<Mutex<SubscriptionProducerRegistry>>,
+    bound: Duration,
+) -> anyhow::Result<()> {
+    tasks.abort_all();
+    let deadline = tokio::time::Instant::now() + bound;
+    while !tasks.is_empty() {
+        match tokio::time::timeout_at(deadline, tasks.join_next()).await {
+            Ok(Some(joined)) => record_child_outcome(registry, joined)?,
+            Ok(None) => break,
+            Err(_) => {
+                registry
+                    .lock()
+                    .map_err(|_| anyhow!("S3 producer registry poisoned"))?
+                    .record_namespace_fault("child_join_timeout");
+                break;
+            }
         }
     }
     Ok(())
@@ -683,10 +707,12 @@ fn record_child_outcome(
 /// Publish one S3 namespace and own every subscription producer.
 ///
 /// Switch/end boundary: while running, subscriptions are allocated and
-/// reserved in one registry critical section. Once main signals `stop`
-/// (production ended) or the publish handle closes after production ended,
-/// no new subscription is accepted (they are closed `not_found`) and every
-/// child task is joined so each has recorded `Settled` before this returns.
+/// reserved in one registry critical section. Once main signals `stop`, no
+/// new subscription is accepted (they are closed `not_found`) and every child
+/// task is joined so each has recorded `Settled` before this returns
+/// `Drained`. Any other end (publish handle closed, subscription stream
+/// error, child failure) aborts-and-joins the remaining children (bounded)
+/// and returns the original error; main classifies it by ordering.
 pub async fn run_namespace(
     mut publisher: Publisher,
     namespace: TrackNamespace,
@@ -703,21 +729,21 @@ pub async fn run_namespace(
 
     let mut allocator = RouteAllocator::default();
     let mut tasks: JoinSet<ChildOutcome> = JoinSet::new();
-    let end = loop {
+    let child_join_bound = context.shutdown_timeout.saturating_add(Duration::from_secs(1));
+    loop {
         tokio::select! {
             subscribed = publish.subscribed() => {
                 let subscribed = match subscribed {
                     Ok(Some(subscribed)) => subscribed,
-                    // Same closed state as `closed()`: classify by production
-                    // state, never by the error text.
-                    Ok(None) | Err(_) => {
-                        if production_ended(&registry)? {
-                            break NamespaceEnd::PeerClosed;
-                        }
-                        return Err(match subscribed {
-                            Err(error) => anyhow::Error::from(error).context("receive S3 subscription"),
-                            _ => anyhow!("S3 namespace closed while waiting for subscriptions"),
-                        });
+                    // Distinct exits, each with its own text; main decides by
+                    // ordering relative to the session end and our stop.
+                    Ok(None) => {
+                        abandon_children(&mut tasks, &registry, child_join_bound).await?;
+                        bail!("S3 namespace closed while waiting for subscriptions");
+                    }
+                    Err(error) => {
+                        abandon_children(&mut tasks, &registry, child_join_bound).await?;
+                        return Err(anyhow::Error::from(error).context("receive S3 subscription"));
                     }
                 };
                 let name = subscribed.info.track_name.to_string_lossy().into_owned();
@@ -853,30 +879,34 @@ pub async fn run_namespace(
                 let failed = !matches!(joined, Ok((_, _, Ok(()))));
                 record_child_outcome(&registry, joined)?;
                 if failed {
-                    // Fail loud mid-run, as before: the fault is recorded and
-                    // the remaining children are abandoned by JoinSet drop
-                    // (their guards record `aborted`).
+                    // Fail loud mid-run: the fault is recorded, the remaining
+                    // children are aborted AND joined so their guards have
+                    // run before main snapshots.
+                    abandon_children(&mut tasks, &registry, child_join_bound).await?;
                     bail!("S3 subscription task failed");
                 }
             }
             closed = publish.closed() => {
-                if production_ended(&registry)? {
-                    break NamespaceEnd::PeerClosed;
+                abandon_children(&mut tasks, &registry, child_join_bound).await?;
+                match closed {
+                    Ok(()) => bail!("S3 namespace ended unexpectedly"),
+                    Err(error) => return Err(anyhow::Error::from(error).context("S3 namespace closed")),
                 }
-                closed.context("S3 namespace closed")?;
-                bail!("S3 namespace ended unexpectedly");
             }
             changed = stop.changed() => {
                 if changed.is_err() || *stop.borrow() {
-                    break NamespaceEnd::Drained;
+                    break;
                 }
             }
         }
-    };
+    }
 
-    // Drain: accept no new subscription (not_found), join every child so each
-    // has run its last statement (`Settled`), record each result.
+    // Drain after our stop: accept no new subscription (not_found), join every
+    // child so each has run its last statement (`Settled`), record each
+    // result. A subscription-stream end/error while draining is expected once
+    // the peer has closed; its text is preserved for audit.
     let mut accepting = true;
+    let mut subscribe_end = None;
     while !tasks.is_empty() {
         tokio::select! {
             joined = tasks.join_next() => {
@@ -891,19 +921,19 @@ pub async fn run_namespace(
                             "S3 namespace is draining after run end",
                         ));
                     }
-                    Ok(None) | Err(_) => accepting = false,
+                    Ok(None) => {
+                        accepting = false;
+                        subscribe_end = Some("subscription stream ended".to_string());
+                    }
+                    Err(error) => {
+                        accepting = false;
+                        subscribe_end = Some(format!("subscription stream error: {error}"));
+                    }
                 }
             }
         }
     }
-    Ok(end)
-}
-
-fn production_ended(registry: &Arc<Mutex<SubscriptionProducerRegistry>>) -> anyhow::Result<bool> {
-    Ok(registry
-        .lock()
-        .map_err(|_| anyhow!("S3 producer registry poisoned"))?
-        .production_ended())
+    Ok(NamespaceEnd::Drained { subscribe_end })
 }
 
 #[cfg(test)]

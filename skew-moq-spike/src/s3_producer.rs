@@ -213,16 +213,20 @@ pub enum TaskState {
     Settled,
 }
 
-/// How a session or namespace task ended, classified AT THE SOURCE (variant
-/// allowlists / typed namespace end), never from error text.
+/// How a session or namespace task end is classified. The classification is
+/// by ORDERING only, never by the result text or error variant:
+/// - a session end observed after every current-route track FIN'd on the
+///   wire (`tracks_finished_on_wire`) is the peer's positive handoff
+///   acknowledgement (`PeerClose`), whatever the join result says — the same
+///   acceptance the static path applies in `DirectFinHandoff::PeerClosed`;
+/// - a namespace end after our stop signal is `LocalClose`; one that follows
+///   the session end is `PeerClose`;
+/// - everything observed earlier (session end during the send, namespace end
+///   while the session was alive) or a handoff timeout is a `Fault`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportEndKind {
-    /// The peer closed the connection/session in a way a normal remote close
-    /// produces after our tracks ended.
     PeerClose,
-    /// We ended it (drained namespace, aborted task, local close).
     LocalClose,
-    /// Anything else.
     Fault(String),
 }
 
@@ -236,14 +240,44 @@ impl TransportEndKind {
     }
 }
 
-/// A session or namespace task end observed by the send loop.
+/// A session or namespace task end observed by the send loop. `text` keeps
+/// the original join/error text for audit; it never influences the verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportEnd {
     pub source: &'static str,
     pub kind: TransportEndKind,
     pub text: String,
     pub at_us: u64,
-    pub before_production_end: bool,
+    /// Registry state at the moment the end fired: not every current-route
+    /// track had FIN'd on the wire yet (both latest producers `Finished` with
+    /// forwarder `Closed`).
+    pub before_tracks_fin: bool,
+}
+
+/// Ordering-only classification of a session end: before the tracks FIN'd on
+/// the wire it is a fault (the session ended during the send); after, it is
+/// the peer's post-FIN close, accepted whatever the result text is.
+pub fn classify_session_end_by_order(tracks_finished_on_wire: bool) -> TransportEndKind {
+    if tracks_finished_on_wire {
+        TransportEndKind::PeerClose
+    } else {
+        TransportEndKind::Fault("session ended during S3 send".to_string())
+    }
+}
+
+/// Ordering-only classification of a namespace end: after our stop signal
+/// (`Drained`) it is ours; after the session task ended it follows the peer
+/// close; while the session was still alive and before our stop it is a fault
+/// (covers REQUEST_ERROR -> `ServeError::Closed(code)` and any producer-side
+/// error), regardless of the error text.
+pub fn classify_namespace_end_by_order(after_stop: bool, session_finished: bool) -> TransportEndKind {
+    if after_stop {
+        TransportEndKind::LocalClose
+    } else if session_finished {
+        TransportEndKind::PeerClose
+    } else {
+        TransportEndKind::Fault("namespace ended while the session was alive".to_string())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -333,9 +367,9 @@ pub fn s3_run_verdict(snapshot: &RegistrySnapshot, transport_ends: &[TransportEn
                 end.source, end.at_us, end.text
             ));
         }
-        if end.before_production_end {
+        if end.before_tracks_fin {
             reasons.push(format!(
-                "{} ended ({}) before production end at {} us: {}",
+                "{} ended ({}) before every current-route track FIN'd at {} us: {}",
                 end.source,
                 end.kind.as_str(),
                 end.at_us,
@@ -778,6 +812,14 @@ impl SubscriptionProducerRegistry {
         }
         self.settled.insert(key);
         self.terminal_tx.send_modify(|version| *version += 1);
+    }
+
+    /// Every current-route track has FIN'd on the wire: both latest-generation
+    /// producers are `Finished` AND their forwarders closed cleanly. This is
+    /// the sender's drain edge for the ordering-based transport-end
+    /// classification (the analogue of the static path's writer release).
+    pub fn tracks_finished_on_wire(&self) -> bool {
+        self.current_routes_completed()
     }
 
     /// Both latest-generation producers have finished producing (their loops
@@ -1741,13 +1783,17 @@ mod tests {
         }
     }
 
-    fn session_end(before_production_end: bool) -> TransportEnd {
+    fn session_end(before_tracks_fin: bool) -> TransportEnd {
         TransportEnd {
             source: "session",
-            kind: TransportEndKind::PeerClose,
+            kind: if before_tracks_fin {
+                classify_session_end_by_order(false)
+            } else {
+                classify_session_end_by_order(true)
+            },
             text: "Ok(Err(Decode(More(1))))".to_string(),
             at_us: 33_990_000,
-            before_production_end,
+            before_tracks_fin,
         }
     }
 
@@ -1838,12 +1884,14 @@ mod tests {
         });
         assert!(matches!(s3_run_verdict(&snapshot, &[]), RunVerdict::Error(_)));
 
-        // 6. session end before production end -> error
+        // 6. session end before the tracks FIN'd on the wire -> error (both the
+        // Fault kind and the ordering flag report it)
         let RunVerdict::Error(reasons) = s3_run_verdict(&clean_snapshot(), &[session_end(true)]) else {
             panic!("early session end must be an error");
         };
-        assert_eq!(reasons.len(), 1);
-        assert!(reasons[0].starts_with("session ended (peer_close) before production end at 33990000 us"));
+        assert_eq!(reasons.len(), 2);
+        assert!(reasons[0].starts_with("session ended with a fault at 33990000 us: session ended during S3 send"));
+        assert!(reasons[1].starts_with("session ended (fault) before every current-route track FIN'd at 33990000 us"));
 
         // 8. Pending never resolved -> error
         let mut snapshot = clean_snapshot();
@@ -2135,7 +2183,7 @@ mod tests {
             kind,
             text: "x".to_string(),
             at_us: 33_990_000,
-            before_production_end: before,
+            before_tracks_fin: before,
         };
         // Session PeerClose after production -> normal.
         assert_eq!(
@@ -2172,5 +2220,87 @@ mod tests {
         let mut snapshot = clean_snapshot();
         snapshot.outstanding = 1;
         assert!(matches!(s3_run_verdict(&snapshot, &[]), RunVerdict::Error(_)));
+    }
+
+    #[test]
+    fn transport_ends_are_classified_by_ordering_not_text() {
+        // Session end: only the ordering matters; the text is audit only.
+        assert_eq!(classify_session_end_by_order(true), TransportEndKind::PeerClose);
+        assert!(matches!(classify_session_end_by_order(false), TransportEndKind::Fault(_)));
+        for text in [
+            "Ok(Err(Decode(More(1))))",
+            "Ok(Err(Internal))",
+            "Ok(Err(WebTransport(Session(ConnectionError(TimedOut)))))",
+            "Err(JoinError::Panic(..))",
+        ] {
+            // After both current-route tracks FIN'd on the wire -> Normal with ANY text.
+            let after = TransportEnd {
+                source: "session",
+                kind: classify_session_end_by_order(true),
+                text: text.to_string(),
+                at_us: 33_990_000,
+                before_tracks_fin: false,
+            };
+            assert_eq!(s3_run_verdict(&clean_snapshot(), &[after]), RunVerdict::Normal, "{text}");
+            // Before -> Error with ANY text.
+            let before = TransportEnd {
+                source: "session",
+                kind: classify_session_end_by_order(false),
+                text: text.to_string(),
+                at_us: 20_000_000,
+                before_tracks_fin: true,
+            };
+            assert!(matches!(s3_run_verdict(&clean_snapshot(), &[before]), RunVerdict::Error(_)), "{text}");
+        }
+        // Namespace end: after our stop -> ours; after the session end -> peer;
+        // while the session was alive and before our stop -> fault, whatever
+        // the error text (REQUEST_ERROR / Closed(code) / producer Err).
+        assert_eq!(classify_namespace_end_by_order(true, false), TransportEndKind::LocalClose);
+        assert_eq!(classify_namespace_end_by_order(true, true), TransportEndKind::LocalClose);
+        assert_eq!(classify_namespace_end_by_order(false, true), TransportEndKind::PeerClose);
+        assert!(matches!(classify_namespace_end_by_order(false, false), TransportEndKind::Fault(_)));
+        let ns_alive = TransportEnd {
+            source: "namespace",
+            kind: classify_namespace_end_by_order(false, false),
+            text: "Err(S3 namespace closed: closed code=4)".to_string(),
+            at_us: 33_995_000,
+            before_tracks_fin: false,
+        };
+        let RunVerdict::Error(reasons) = s3_run_verdict(&clean_snapshot(), &[ns_alive]) else {
+            panic!("namespace Err while the session was alive must be an error");
+        };
+        assert!(reasons[0].contains("namespace ended while the session was alive"));
+        let ns_after_session = TransportEnd {
+            source: "namespace",
+            kind: classify_namespace_end_by_order(false, true),
+            text: "Err(S3 namespace closed: closed code=4)".to_string(),
+            at_us: 33_995_000,
+            before_tracks_fin: false,
+        };
+        let session = TransportEnd {
+            source: "session",
+            kind: classify_session_end_by_order(true),
+            text: "Ok(Err(Internal))".to_string(),
+            at_us: 33_994_000,
+            before_tracks_fin: false,
+        };
+        assert_eq!(
+            s3_run_verdict(&clean_snapshot(), &[session, ns_after_session]),
+            RunVerdict::Normal
+        );
+        // Handoff timeout: the receiver never closed after our FINs -> error.
+        let timed_out = TransportEnd {
+            source: "session",
+            kind: TransportEndKind::Fault(
+                "direct receiver did not close after S3 track FIN handoff".to_string(),
+            ),
+            text: "TimedOut".to_string(),
+            at_us: 94_000_000,
+            before_tracks_fin: false,
+        };
+        let RunVerdict::Error(reasons) = s3_run_verdict(&clean_snapshot(), &[timed_out]) else {
+            panic!("handoff timeout must be an error");
+        };
+        assert!(reasons[0].contains("direct receiver did not close after S3 track FIN handoff"));
     }
 }
