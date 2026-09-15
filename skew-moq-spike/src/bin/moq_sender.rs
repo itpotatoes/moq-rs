@@ -30,7 +30,10 @@ use moq_transport::{
 use tokio::signal::unix::{signal, SignalKind};
 use url::Url;
 
-use skew_moq::s3_producer::{s3_run_verdict, RunVerdict, SubscriptionProducerRegistry, TransportEnd};
+use skew_moq::s3_producer::{
+    s3_run_verdict, RunVerdict, SubscriptionProducerRegistry, TransportEnd, TransportEndKind,
+};
+use skew_moq::s3_sender::NamespaceEnd;
 use skew_moq::s3_sender::{
     run_namespace as run_s3_namespace, AcceptRouteMap, SenderContext as S3SenderContext,
     SourceSchedule,
@@ -89,7 +92,7 @@ impl Ending {
 /// await a handle whose result was already observed.
 type SessionJoinHandle =
     tokio::task::JoinHandle<std::result::Result<(), moq_transport::session::SessionError>>;
-type NamespaceJoinHandle = tokio::task::JoinHandle<anyhow::Result<()>>;
+type NamespaceJoinHandle = tokio::task::JoinHandle<anyhow::Result<NamespaceEnd>>;
 
 struct Producers {
     session_run: Option<SessionJoinHandle>,
@@ -1096,32 +1099,76 @@ async fn wait_s3_current_routes_completed(
     }
 }
 
-/// Wait until every reserved/activated producer task has recorded a final
-/// outcome (bounded). After this the registry snapshot is authoritative.
-async fn wait_s3_tasks_settled(
-    registry: &Arc<Mutex<SubscriptionProducerRegistry>>,
-    settle_bound: Duration,
-) -> Result<()> {
-    let mut terminal_rx = registry
-        .lock()
-        .map_err(|_| anyhow::anyhow!("S3 producer registry poisoned"))?
-        .terminal_watch();
-    let deadline = tokio::time::Instant::now() + settle_bound;
-    loop {
-        terminal_rx.borrow_and_update();
-        let outstanding = registry
-            .lock()
-            .map_err(|_| anyhow::anyhow!("S3 producer registry poisoned"))?
-            .outstanding();
-        if outstanding == 0 {
-            return Ok(());
-        }
-        match tokio::time::timeout_at(deadline, terminal_rx.changed()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => return Err(anyhow::anyhow!("S3 producer terminal watch closed")),
-            // The verdict reports the outstanding count as an error reason.
-            Err(_) => return Ok(()),
-        }
+/// Classify the session task result AT THE SOURCE (variant allowlist).
+///
+/// `PeerClose` allowlist, from moq-transport / web-transport-quinn / quinn:
+/// - `Decode(DecodeError::More(_))`: the control-stream reader hit EOF while
+///   expecting more bytes, i.e. the peer finished the control stream
+///   (`Session::run_recv` -> `recver.decode()`); this is the CRinf evidence
+///   `Ok(Err(Decode(More(1))))`.
+/// - `WebTransport(Error::Session(SessionError::ConnectionError(
+///   ApplicationClosed(_) | ConnectionClosed(_))))`: the peer sent a QUIC
+///   CONNECTION_CLOSE frame (application or transport variant).
+/// - `WebTransport(Error::Session(SessionError::WebTransportError(
+///   WebTransportError::Closed(_, _))))`: the peer sent
+///   CLOSE_WEBTRANSPORT_SESSION.
+/// `LocalClose`: `Ok(Ok(()))` (our outgoing queue closed), `ConnectionError::
+/// LocallyClosed`, or a cancelled join (finalizer abort). Everything else,
+/// including `TimedOut`/`Reset`/`TransportError` and a panicked join, is a
+/// `Fault`.
+fn classify_session_end(
+    result: &std::result::Result<
+        std::result::Result<(), moq_transport::session::SessionError>,
+        tokio::task::JoinError,
+    >,
+) -> TransportEndKind {
+    use moq_transport::coding::DecodeError;
+    use moq_transport::session::SessionError as MoqSessionError;
+    use web_transport::quinn::quinn::ConnectionError;
+    use web_transport::quinn::{SessionError as WtSessionError, WebTransportError};
+    use web_transport::Error as WtError;
+    match result {
+        Ok(Ok(())) => TransportEndKind::LocalClose,
+        Ok(Err(MoqSessionError::Decode(DecodeError::More(_)))) => TransportEndKind::PeerClose,
+        Ok(Err(MoqSessionError::WebTransport(WtError::Session(WtSessionError::ConnectionError(
+            ConnectionError::ApplicationClosed(_) | ConnectionError::ConnectionClosed(_),
+        ))))) => TransportEndKind::PeerClose,
+        Ok(Err(MoqSessionError::WebTransport(WtError::Session(
+            WtSessionError::WebTransportError(WebTransportError::Closed(_, _)),
+        )))) => TransportEndKind::PeerClose,
+        Ok(Err(MoqSessionError::WebTransport(WtError::Session(WtSessionError::ConnectionError(
+            ConnectionError::LocallyClosed,
+        ))))) => TransportEndKind::LocalClose,
+        Ok(Err(other)) => TransportEndKind::Fault(format!("session: {other}")),
+        Err(join) if join.is_cancelled() => TransportEndKind::LocalClose,
+        Err(join) => TransportEndKind::Fault(format!("session task join: {join}")),
+    }
+}
+
+/// Classify the namespace task result AT THE SOURCE: `run_namespace` returns
+/// a typed end. `Drained` = we stopped it (LocalClose); `PeerClosed` = the
+/// publish handle closed after production ended and every child was joined
+/// (PeerClose; child faults are the registry's call). Any `Err` or a
+/// panicked join is a `Fault`; a cancelled join is a `LocalClose`.
+fn classify_namespace_end(
+    result: &std::result::Result<anyhow::Result<NamespaceEnd>, tokio::task::JoinError>,
+) -> TransportEndKind {
+    match result {
+        Ok(Ok(NamespaceEnd::Drained)) => TransportEndKind::LocalClose,
+        Ok(Ok(NamespaceEnd::PeerClosed)) => TransportEndKind::PeerClose,
+        Ok(Err(error)) => TransportEndKind::Fault(format!("namespace: {error:#}")),
+        Err(join) if join.is_cancelled() => TransportEndKind::LocalClose,
+        Err(join) => TransportEndKind::Fault(format!("namespace task join: {join}")),
+    }
+}
+
+/// Await an optional join handle; `None` never resolves.
+async fn join_opt<T>(
+    handle: Option<&mut tokio::task::JoinHandle<T>>,
+) -> std::result::Result<T, tokio::task::JoinError> {
+    match handle {
+        Some(handle) => handle.await,
+        None => std::future::pending().await,
     }
 }
 
@@ -1145,7 +1192,12 @@ fn s3_shutdown_fields(verdict: Option<&RunVerdict>, transport_ends: &[TransportE
         .iter()
         .map(|end| {
             serde_json::json!({
-                "kind": end.kind,
+                "source": end.source,
+                "kind": end.kind.as_str(),
+                "fault": match &end.kind {
+                    TransportEndKind::Fault(reason) => serde_json::Value::from(reason.as_str()),
+                    _ => serde_json::Value::Null,
+                },
                 "text": end.text,
                 "at_us": end.at_us,
                 "before_production_end": end.before_production_end,
@@ -1758,8 +1810,11 @@ async fn main() -> Result<()> {
             let ns_publisher = publisher.clone();
             let ns_registry = registry.clone();
             let ns_routes = s3_accept_routes.clone();
+            // Main tells the namespace task when production has ended so it
+            // stops accepting subscriptions and joins every child.
+            let (ns_stop_tx, ns_stop_rx) = tokio::sync::watch::channel(false);
             producers.as_mut().expect("registered above").ns_task = Some(tokio::spawn(
-                run_s3_namespace(ns_publisher, namespace, context, ns_registry, ns_routes),
+                run_s3_namespace(ns_publisher, namespace, context, ns_registry, ns_routes, ns_stop_rx),
             ));
 
             let mut terminal_rx = registry
@@ -1858,15 +1913,17 @@ async fn main() -> Result<()> {
                     }
                     r = sr => {
                         session_done = Some(JoinOutcome::from_join_result(&r));
-                        // Do not decide here: record the end and fall through
-                        // to the single end-of-run verdict. Only a session end
-                        // while production is still running is immediate.
+                        // Do not decide here: record the typed end and fall
+                        // through to the single end-of-run verdict. Only a
+                        // session end while production is still running is
+                        // immediate.
                         let production_ended = registry
                             .lock()
                             .map(|registry| registry.production_ended())
                             .unwrap_or(false);
                         s3_transport_ends.push(TransportEnd {
-                            kind: "session",
+                            source: "session",
+                            kind: classify_session_end(&r),
                             text: format!("{r:?}"),
                             at_us: now_us(),
                             before_production_end: !production_ended,
@@ -1884,7 +1941,8 @@ async fn main() -> Result<()> {
                             .map(|registry| registry.production_ended())
                             .unwrap_or(false);
                         s3_transport_ends.push(TransportEnd {
-                            kind: "namespace",
+                            source: "namespace",
+                            kind: classify_namespace_end(&r),
                             text: format!("{r:?}"),
                             at_us: now_us(),
                             before_production_end: !production_ended,
@@ -1908,18 +1966,74 @@ async fn main() -> Result<()> {
             };
             step?;
 
+            // Drain, observing the session/namespace tasks: each end that
+            // fires during the drain is recorded (typed) and the drain
+            // continues for its remaining time.
             if ending != Ending::Signal {
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs_f64(args.drain_timeout)) => {}
-                    _ = wait_signal(&mut sig_rx) => { ending = Ending::Signal; }
+                let p = producers.as_mut().expect("producers set above");
+                let drain = tokio::time::sleep(Duration::from_secs_f64(args.drain_timeout));
+                tokio::pin!(drain);
+                loop {
+                    tokio::select! {
+                        _ = &mut drain => break,
+                        _ = wait_signal(&mut sig_rx) => { ending = Ending::Signal; break; }
+                        r = join_opt(p.session_run.as_mut()), if p.session_run.is_some() => {
+                            p.session_run = None;
+                            p.session_seen = Some(JoinOutcome::from_join_result(&r));
+                            s3_transport_ends.push(TransportEnd {
+                                source: "session",
+                                kind: classify_session_end(&r),
+                                text: format!("{r:?}"),
+                                at_us: now_us(),
+                                before_production_end: false,
+                            });
+                        }
+                        r = join_opt(p.ns_task.as_mut()), if p.ns_task.is_some() => {
+                            p.ns_task = None;
+                            p.ns_seen = Some(JoinOutcome::from_join_result(&r));
+                            s3_transport_ends.push(TransportEnd {
+                                source: "namespace",
+                                kind: classify_namespace_end(&r),
+                                text: format!("{r:?}"),
+                                at_us: now_us(),
+                                before_production_end: false,
+                            });
+                        }
+                    }
                 }
             }
-            // Single run verdict: after the drain, once every producer task
-            // has recorded its outcome (bounded), from the registry alone.
+            // End of run: stop the namespace task (it refuses new
+            // subscriptions and joins every child so each has recorded
+            // `Settled`), await it bounded, THEN snapshot and compute the
+            // single run verdict from the registry.
             let verdict = if ending == Ending::Signal {
                 None
             } else {
-                wait_s3_tasks_settled(&registry, settle_bound).await?;
+                let _ = ns_stop_tx.send(true);
+                let p = producers.as_mut().expect("producers set above");
+                if let Some(nt) = p.ns_task.as_mut() {
+                    let joined = tokio::time::timeout(settle_bound, &mut *nt).await;
+                    let r = match joined {
+                        Ok(r) => r,
+                        Err(_) => {
+                            registry
+                                .lock()
+                                .map_err(|_| anyhow::anyhow!("S3 producer registry poisoned"))?
+                                .record_namespace_fault("namespace_join_timeout");
+                            nt.abort();
+                            nt.await
+                        }
+                    };
+                    p.ns_task = None;
+                    p.ns_seen = Some(JoinOutcome::from_join_result(&r));
+                    s3_transport_ends.push(TransportEnd {
+                        source: "namespace",
+                        kind: classify_namespace_end(&r),
+                        text: format!("{r:?}"),
+                        at_us: now_us(),
+                        before_production_end: false,
+                    });
+                }
                 let snapshot = registry
                     .lock()
                     .map_err(|_| anyhow::anyhow!("S3 producer registry poisoned"))?
@@ -1982,9 +2096,12 @@ async fn main() -> Result<()> {
         // Announce the namespace (serves subscribes on demand).
         let mut ns_pub = publisher.clone();
         producers.as_mut().expect("registered above").ns_task = Some(tokio::spawn(async move {
+            // Static arms: the publish future ending is a local end; the
+            // typed value only matters for the S3 verdict.
             ns_pub
                 .publish_namespace(tracks_r)
                 .await
+                .map(|()| NamespaceEnd::Drained)
                 .map_err(anyhow::Error::from)
         }));
         // publisher no longer needed after cloning for the namespace.
@@ -2628,11 +2745,12 @@ mod tests {
     use super::{
         b1_transport_meta, epoch_record, hold_static_track_state_through_drain, now_us,
         object_buffer, phase4_transport, registered_s_bytes, resolved_priorities,
-        json_text, replay_release_rule, replay_release_rule_key, s3_shutdown_fields,
-        shared_fifo_append, timestamp_us, validate_s3_args, validate_stage5_policy, Args, Arm,
-        CliReleaseRule, DataPriorityMapping, DirectFinHandoff, Duration, PayloadMode,
-        Phase4TransportMeta, PublisherPriorityProfile, QueuePolicy, Representation, RunVerdict,
-        SharedFifoWriter, TierReplay, Topology, TrackSel, TransportEnd, Url, HDR,
+        classify_namespace_end, classify_session_end, json_text, replay_release_rule,
+        replay_release_rule_key, s3_shutdown_fields, shared_fifo_append, timestamp_us,
+        validate_s3_args, validate_stage5_policy, Args, Arm, CliReleaseRule, DataPriorityMapping,
+        DirectFinHandoff, Duration, NamespaceEnd, PayloadMode, Phase4TransportMeta,
+        PublisherPriorityProfile, QueuePolicy, Representation, RunVerdict, SharedFifoWriter,
+        TierReplay, Topology, TrackSel, TransportEnd, TransportEndKind, Url, HDR,
         wait_registered_direct_fin_handoff,
     };
     use std::path::PathBuf;
@@ -3371,7 +3489,8 @@ mod tests {
     fn shutdown_row_s3_fields_are_valid_json_and_omitted_for_non_s3() {
         assert_eq!(s3_shutdown_fields(None, &[]), "");
         let ends = vec![TransportEnd {
-            kind: "session",
+            source: "session",
+            kind: TransportEndKind::PeerClose,
             text: "Ok(Err(Decode(More(1))))\nsecond line".to_string(),
             at_us: 33_990_000,
             before_production_end: false,
@@ -3382,7 +3501,9 @@ mod tests {
             serde_json::from_str(&format!("{{\"event\":\"shutdown\"{fields}}}")).unwrap();
         assert_eq!(row["s3_verdict"], "error");
         assert_eq!(row["s3_verdict_reasons"][0], "pc: forwarder failed (remote_cancel)");
-        assert_eq!(row["s3_transport_ends"][0]["kind"], "session");
+        assert_eq!(row["s3_transport_ends"][0]["source"], "session");
+        assert_eq!(row["s3_transport_ends"][0]["kind"], "peer_close");
+        assert!(row["s3_transport_ends"][0]["fault"].is_null());
         assert_eq!(row["s3_transport_ends"][0]["at_us"], 33_990_000);
         assert_eq!(row["s3_transport_ends"][0]["before_production_end"], false);
         assert_eq!(
@@ -3399,5 +3520,66 @@ mod tests {
         let row: serde_json::Value =
             serde_json::from_str(&format!("{{\"event\":\"shutdown\"{fields}}}")).unwrap();
         assert_eq!(row["s3_verdict"], "not_computed");
+    }
+
+    #[test]
+    fn session_end_classifier_allowlists_only_normal_remote_closes() {
+        use moq_transport::coding::DecodeError;
+        use moq_transport::session::SessionError as MoqSessionError;
+        use web_transport::quinn::quinn::ConnectionError;
+        use web_transport::quinn::{SessionError as WtSessionError, WebTransportError};
+        use web_transport::Error as WtError;
+        type R = std::result::Result<
+            std::result::Result<(), MoqSessionError>,
+            tokio::task::JoinError,
+        >;
+        // CRinf evidence: control stream finished by the peer.
+        let crinf: R = Ok(Err(MoqSessionError::Decode(DecodeError::More(1))));
+        assert_eq!(classify_session_end(&crinf), TransportEndKind::PeerClose);
+        // CLOSE_WEBTRANSPORT_SESSION from the peer.
+        let wt_closed: R = Ok(Err(MoqSessionError::WebTransport(WtError::Session(
+            WtSessionError::WebTransportError(WebTransportError::Closed(0, "bye".to_string())),
+        ))));
+        assert_eq!(classify_session_end(&wt_closed), TransportEndKind::PeerClose);
+        // Our own close.
+        let local: R = Ok(Err(MoqSessionError::WebTransport(WtError::Session(
+            WtSessionError::ConnectionError(ConnectionError::LocallyClosed),
+        ))));
+        assert_eq!(classify_session_end(&local), TransportEndKind::LocalClose);
+        let ok: R = Ok(Ok(()));
+        assert_eq!(classify_session_end(&ok), TransportEndKind::LocalClose);
+        // Non-allowlisted variants are faults.
+        for other in [
+            MoqSessionError::Internal,
+            MoqSessionError::Decode(DecodeError::InvalidMessage(7)),
+            MoqSessionError::WebTransport(WtError::Session(WtSessionError::ConnectionError(
+                ConnectionError::TimedOut,
+            ))),
+            MoqSessionError::WebTransport(WtError::Session(WtSessionError::ConnectionError(
+                ConnectionError::Reset,
+            ))),
+            MoqSessionError::ProtocolViolation("x".to_string()),
+        ] {
+            let text = other.to_string();
+            let r: R = Ok(Err(other));
+            match classify_session_end(&r) {
+                TransportEndKind::Fault(reason) => assert!(reason.contains(&text)),
+                kind => panic!("{text} must be a fault, got {kind:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn namespace_end_classifier_uses_the_typed_end() {
+        type R = std::result::Result<anyhow::Result<NamespaceEnd>, tokio::task::JoinError>;
+        let drained: R = Ok(Ok(NamespaceEnd::Drained));
+        assert_eq!(classify_namespace_end(&drained), TransportEndKind::LocalClose);
+        let peer: R = Ok(Ok(NamespaceEnd::PeerClosed));
+        assert_eq!(classify_namespace_end(&peer), TransportEndKind::PeerClose);
+        let failed: R = Ok(Err(anyhow::anyhow!("S3 subscription task failed")));
+        match classify_namespace_end(&failed) {
+            TransportEndKind::Fault(reason) => assert!(reason.contains("S3 subscription task failed")),
+            kind => panic!("namespace Err must be a fault, got {kind:?}"),
+        }
     }
 }

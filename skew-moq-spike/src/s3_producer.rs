@@ -195,14 +195,52 @@ pub struct RegistrySnapshot {
     pub pc: Option<RoleTerminal>,
     pub haptic: Option<RoleTerminal>,
     pub faults: Vec<RecordedFault>,
-    /// Reserved or activated producers without a final recorded outcome.
+    /// Faults that cannot be keyed to one producer (namespace-level).
+    pub namespace_faults: Vec<&'static str>,
+    /// Producer tasks (reserved or activated) that have not recorded
+    /// `Settled` as their last statement.
     pub outstanding: usize,
+}
+
+/// Lifecycle of one producer task as the registry sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskState {
+    Reserved,
+    Active,
+    Terminal(RoleTerminal),
+    /// Released reservation or fully finished task; nothing more will be
+    /// recorded for it.
+    Settled,
+}
+
+/// How a session or namespace task ended, classified AT THE SOURCE (variant
+/// allowlists / typed namespace end), never from error text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransportEndKind {
+    /// The peer closed the connection/session in a way a normal remote close
+    /// produces after our tracks ended.
+    PeerClose,
+    /// We ended it (drained namespace, aborted task, local close).
+    LocalClose,
+    /// Anything else.
+    Fault(String),
+}
+
+impl TransportEndKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TransportEndKind::PeerClose => "peer_close",
+            TransportEndKind::LocalClose => "local_close",
+            TransportEndKind::Fault(_) => "fault",
+        }
+    }
 }
 
 /// A session or namespace task end observed by the send loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportEnd {
-    pub kind: &'static str,
+    pub source: &'static str,
+    pub kind: TransportEndKind,
     pub text: String,
     pub at_us: u64,
     pub before_production_end: bool,
@@ -257,14 +295,16 @@ fn role_verdict_reason(role: TrackRole, terminal: Option<RoleTerminal>) -> Optio
     }
 }
 
-/// The single run verdict, computed once after the drain from the registry
-/// snapshot and the observed transport ends.
+/// The single run verdict, computed once after the drain and after every
+/// producer task has been joined, from the registry snapshot and the typed
+/// transport ends.
 ///
 /// Normal ONLY if: both latest-generation producers are `Finished` with
 /// forwarder `Closed`; no fault of any kind was recorded (including on
-/// retired generations; a retired generation's `RemoteClosed` from a normal
-/// switch cancel is not a fault); no producer task is outstanding; and no
-/// session/namespace end was observed before production ended.
+/// retired generations and namespace-level faults; a retired generation's
+/// `RemoteClosed` from a normal switch cancel is not a fault); every producer
+/// task is `Settled`; no transport end is a `Fault`; and no transport end of
+/// any kind was observed before production ended.
 pub fn s3_run_verdict(snapshot: &RegistrySnapshot, transport_ends: &[TransportEnd]) -> RunVerdict {
     let mut reasons = Vec::new();
     reasons.extend(role_verdict_reason(TrackRole::Pc, snapshot.pc));
@@ -277,17 +317,29 @@ pub fn s3_run_verdict(snapshot: &RegistrySnapshot, transport_ends: &[TransportEn
             fault.reason
         ));
     }
+    for fault in &snapshot.namespace_faults {
+        reasons.push(format!("namespace fault: {fault}"));
+    }
     if snapshot.outstanding > 0 {
         reasons.push(format!(
-            "{} producer task(s) without a recorded outcome",
+            "{} producer task(s) not settled",
             snapshot.outstanding
         ));
     }
     for end in transport_ends {
+        if let TransportEndKind::Fault(reason) = &end.kind {
+            reasons.push(format!(
+                "{} ended with a fault at {} us: {reason}: {}",
+                end.source, end.at_us, end.text
+            ));
+        }
         if end.before_production_end {
             reasons.push(format!(
-                "{} ended before production end at {} us: {}",
-                end.kind, end.at_us, end.text
+                "{} ended ({}) before production end at {} us: {}",
+                end.source,
+                end.kind.as_str(),
+                end.at_us,
+                end.text
             ));
         }
     }
@@ -298,14 +350,16 @@ pub fn s3_run_verdict(snapshot: &RegistrySnapshot, transport_ends: &[TransportEn
     }
 }
 
-/// Held by every producer task for its whole lifetime. If the task ends (or
-/// is aborted) without a final recorded outcome, the drop records
-/// `Error("aborted")` / `Failed("aborted")` / a released reservation with an
-/// `aborted` fault, so the registry never has a silent gap.
+/// Created synchronously right after `reserve` and moved into the producer
+/// task, so it exists even for a task that is never polled. `settle` is the
+/// task's LAST statement; if the guard is dropped in any earlier state the
+/// drop records an `aborted` fault (closing whatever outcome gap exists) and
+/// `Settled`, so the registry never has a silent gap.
 pub struct ProducerTaskGuard {
     registry: Arc<Mutex<SubscriptionProducerRegistry>>,
     role: TrackRole,
     route: Route,
+    settled: bool,
 }
 
 impl ProducerTaskGuard {
@@ -314,12 +368,24 @@ impl ProducerTaskGuard {
             registry,
             role,
             route,
+            settled: false,
+        }
+    }
+
+    /// Record `Settled` for this task. Must be the last statement of the task.
+    pub fn settle(mut self) {
+        self.settled = true;
+        if let Ok(mut registry) = self.registry.lock() {
+            let _ = registry.record_settled(self.role, self.route);
         }
     }
 }
 
 impl Drop for ProducerTaskGuard {
     fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
         if let Ok(mut registry) = self.registry.lock() {
             registry.record_abandoned(self.role, self.route);
         }
@@ -483,7 +549,11 @@ pub struct SubscriptionProducerRegistry {
     released: HashSet<ProducerKey>,
     terminal: HashMap<ProducerKey, ProducerTerminal>,
     forward: HashMap<ProducerKey, ForwardOutcome>,
+    /// Tasks whose last statement (`Settled`) has run, plus released
+    /// reservations that were settled by their task or guard.
+    settled: HashSet<ProducerKey>,
     faults: Vec<RecordedFault>,
+    namespace_faults: Vec<&'static str>,
     /// Bumped on every terminal transition so a waiter can re-check
     /// `current_routes_finished` without polling.
     terminal_tx: watch::Sender<u64>,
@@ -499,7 +569,9 @@ impl SubscriptionProducerRegistry {
             released: HashSet::new(),
             terminal: HashMap::new(),
             forward: HashMap::new(),
+            settled: HashSet::new(),
             faults: Vec::new(),
+            namespace_faults: Vec::new(),
             terminal_tx: watch::channel(0).0,
         }
     }
@@ -609,32 +681,103 @@ impl SubscriptionProducerRegistry {
         Ok(())
     }
 
-    /// Drop-guard entry: close every gap a task can leave when it ends
-    /// without recording a final outcome. No-op when the outcome is complete.
+    /// The task's last statement. After this nothing more is recorded for
+    /// the key and it no longer counts as outstanding.
+    pub fn record_settled(&mut self, role: TrackRole, route: Route) -> Result<(), ProducerError> {
+        let key = ProducerKey {
+            role,
+            generation: route.generation,
+        };
+        if !self.seen.contains(&key) {
+            return Err(ProducerError::UnknownOrInactiveRoute);
+        }
+        if !self.settled.insert(key) {
+            return Err(ProducerError::DuplicateOrReusedGeneration);
+        }
+        self.terminal_tx.send_modify(|version| *version += 1);
+        Ok(())
+    }
+
+    /// Whether any fault has been recorded for this producer.
+    pub fn has_fault(&self, role: TrackRole, route: Route) -> bool {
+        self.faults
+            .iter()
+            .any(|fault| fault.role == role && fault.generation == route.generation)
+    }
+
+    /// A fault that cannot be keyed to one producer (e.g. a child task whose
+    /// join failed, or the namespace task not finishing in time).
+    pub fn record_namespace_fault(&mut self, reason: &'static str) {
+        self.namespace_faults.push(reason);
+        self.terminal_tx.send_modify(|version| *version += 1);
+    }
+
+    pub fn task_state(&self, role: TrackRole, route: Route) -> Option<TaskState> {
+        let key = ProducerKey {
+            role,
+            generation: route.generation,
+        };
+        if !self.seen.contains(&key) {
+            return None;
+        }
+        if self.settled.contains(&key) {
+            return Some(TaskState::Settled);
+        }
+        if self.reserved.contains(&key) {
+            return Some(TaskState::Reserved);
+        }
+        if self.active.contains_key(&key) {
+            return Some(TaskState::Active);
+        }
+        match self.terminal.get(&key) {
+            Some(terminal) => Some(TaskState::Terminal(RoleTerminal {
+                terminal: *terminal,
+                forward: self.forward.get(&key).copied(),
+            })),
+            // Released reservation not yet settled, or cancelled lease whose
+            // terminal is recorded in the same synchronous stretch.
+            None => Some(TaskState::Reserved),
+        }
+    }
+
+    /// Drop-guard entry for a task dropped before `Settled`: close every
+    /// outcome gap, record an `aborted` fault (always: a task that did not
+    /// run its last statement is a defect even if its outcome was complete),
+    /// and settle the key.
     pub fn record_abandoned(&mut self, role: TrackRole, route: Route) {
         let key = ProducerKey {
             role,
             generation: route.generation,
         };
-        if self.released.contains(&key) || !self.seen.contains(&key) {
+        if !self.seen.contains(&key) || self.settled.contains(&key) {
             return;
         }
+        let faults_before = self.faults.len();
         if self.reserved.contains(&key) {
             let _ = self.release_reservation(role, route, Some("aborted"));
-            return;
-        }
-        if self.active.contains_key(&key) {
-            let _ = self.cancel(role, route);
-        }
-        match self.terminal.get(&key).copied() {
-            None => {
-                let _ = self.record_terminal(role, route, ProducerTerminal::Error("aborted"));
+        } else if !self.released.contains(&key) {
+            if self.active.contains_key(&key) {
+                let _ = self.cancel(role, route);
             }
-            Some(ProducerTerminal::Finished) if !self.forward.contains_key(&key) => {
-                let _ = self.mark_forward(role, route, ForwardOutcome::Failed("aborted"));
+            match self.terminal.get(&key).copied() {
+                None => {
+                    let _ = self.record_terminal(role, route, ProducerTerminal::Error("aborted"));
+                }
+                Some(ProducerTerminal::Finished) if !self.forward.contains_key(&key) => {
+                    let _ = self.mark_forward(role, route, ForwardOutcome::Failed("aborted"));
+                }
+                _ => {}
             }
-            _ => {}
         }
+        if self.faults.len() == faults_before {
+            self.faults.push(RecordedFault {
+                role,
+                generation: route.generation,
+                reason: "aborted",
+            });
+        }
+        self.settled.insert(key);
+        self.terminal_tx.send_modify(|version| *version += 1);
     }
 
     /// Both latest-generation producers have finished producing (their loops
@@ -651,16 +794,13 @@ impl SubscriptionProducerRegistry {
         })
     }
 
-    /// Reserved or activated producers without a final recorded outcome.
+    /// Producer tasks (reserved or activated) that have not recorded
+    /// `Settled`. A task stays outstanding between its forwarder `Closed` and
+    /// its last statement, so a late `log_write` fault is never missed.
     pub fn outstanding(&self) -> usize {
         self.seen
             .iter()
-            .filter(|key| !self.released.contains(key))
-            .filter(|key| match self.terminal.get(key) {
-                None => true,
-                Some(ProducerTerminal::Finished) => !self.forward.contains_key(key),
-                Some(_) => false,
-            })
+            .filter(|key| !self.settled.contains(key))
             .count()
     }
 
@@ -673,6 +813,7 @@ impl SubscriptionProducerRegistry {
             pc: self.latest_role_terminal(TrackRole::Pc),
             haptic: self.latest_role_terminal(TrackRole::Haptic),
             faults: self.faults.clone(),
+            namespace_faults: self.namespace_faults.clone(),
             outstanding: self.outstanding(),
         }
     }
@@ -1595,13 +1736,15 @@ mod tests {
             pc: complete_role(),
             haptic: complete_role(),
             faults: Vec::new(),
+            namespace_faults: Vec::new(),
             outstanding: 0,
         }
     }
 
     fn session_end(before_production_end: bool) -> TransportEnd {
         TransportEnd {
-            kind: "session",
+            source: "session",
+            kind: TransportEndKind::PeerClose,
             text: "Ok(Err(Decode(More(1))))".to_string(),
             at_us: 33_990_000,
             before_production_end,
@@ -1638,6 +1781,16 @@ mod tests {
             registry.mark_forward_closed(role, route).unwrap();
         }
         assert!(registry.production_ended());
+        // Settled is the task's last statement; until then the task is
+        // outstanding even though its outcome is complete.
+        assert_eq!(registry.outstanding(), 3);
+        for (role, route) in [
+            (TrackRole::Pc, pc0),
+            (TrackRole::Pc, pc1),
+            (TrackRole::Haptic, hap0),
+        ] {
+            registry.record_settled(role, route).unwrap();
+        }
         assert_eq!(registry.outstanding(), 0);
         assert_eq!(
             s3_run_verdict(&registry.snapshot(), &[session_end(false)]),
@@ -1690,7 +1843,7 @@ mod tests {
             panic!("early session end must be an error");
         };
         assert_eq!(reasons.len(), 1);
-        assert!(reasons[0].starts_with("session ended before production end at 33990000 us"));
+        assert!(reasons[0].starts_with("session ended (peer_close) before production end at 33990000 us"));
 
         // 8. Pending never resolved -> error
         let mut snapshot = clean_snapshot();
@@ -1703,13 +1856,14 @@ mod tests {
             panic!("pending forwarder must be an error");
         };
         assert!(reasons.iter().any(|r| r == "pc: forwarder outcome never recorded"));
-        assert!(reasons.iter().any(|r| r == "1 producer task(s) without a recorded outcome"));
+        assert!(reasons.iter().any(|r| r == "1 producer task(s) not settled"));
 
         // 9. no producers at all -> error; latest remote-closed / error -> error
         let empty = RegistrySnapshot {
             pc: None,
             haptic: None,
             faults: Vec::new(),
+            namespace_faults: Vec::new(),
             outstanding: 0,
         };
         assert!(matches!(s3_run_verdict(&empty, &[]), RunVerdict::Error(_)));
@@ -1763,12 +1917,21 @@ mod tests {
         assert!(!registry.production_ended());
         registry.mark_forward_closed(TrackRole::Haptic, hap0).unwrap();
         assert!(!registry.current_routes_completed());
-        assert_eq!(registry.outstanding(), 1);
+        assert_eq!(registry.outstanding(), 3);
         // Released without fault (post-completion refusal): latest falls back.
         registry
             .release_reservation(TrackRole::Pc, pc1, None)
             .unwrap();
         assert!(registry.current_routes_completed());
+        assert_eq!(registry.task_state(TrackRole::Pc, pc1), Some(TaskState::Reserved));
+        for (role, route) in [
+            (TrackRole::Pc, pc0),
+            (TrackRole::Pc, pc1),
+            (TrackRole::Haptic, hap0),
+        ] {
+            registry.record_settled(role, route).unwrap();
+        }
+        assert_eq!(registry.task_state(TrackRole::Pc, pc1), Some(TaskState::Settled));
         assert_eq!(registry.outstanding(), 0);
         assert!(registry.faults().is_empty());
         // Now completed: reservation refused.
@@ -1783,6 +1946,8 @@ mod tests {
         registry
             .release_reservation(TrackRole::Pc, pc0, Some("subscription_setup"))
             .unwrap();
+        assert_eq!(registry.outstanding(), 1);
+        registry.record_settled(TrackRole::Pc, pc0).unwrap();
         assert_eq!(registry.outstanding(), 0);
         assert_eq!(registry.faults().len(), 1);
         assert_eq!(
@@ -1797,9 +1962,11 @@ mod tests {
         // Reserved, never activated.
         let mut registry = SubscriptionProducerRegistry::new();
         registry.reserve(TrackRole::Pc, pc0).unwrap();
+        assert_eq!(registry.task_state(TrackRole::Pc, pc0), Some(TaskState::Reserved));
         registry.record_abandoned(TrackRole::Pc, pc0);
         assert_eq!(registry.faults()[0].reason, "aborted");
         assert_eq!(registry.outstanding(), 0);
+        assert_eq!(registry.task_state(TrackRole::Pc, pc0), Some(TaskState::Settled));
         assert_eq!(registry.latest_role_terminal(TrackRole::Pc), None);
         // Active lease, aborted mid-production.
         let mut registry = SubscriptionProducerRegistry::new();
@@ -1823,7 +1990,8 @@ mod tests {
             registry.latest_role_terminal(TrackRole::Pc).unwrap().forward,
             Some(ForwardOutcome::Failed("aborted"))
         );
-        // Complete outcome: no-op.
+        // Complete outcome but dropped before Settled: still an `aborted`
+        // fault (the last statement never ran), then settled.
         let mut registry = SubscriptionProducerRegistry::new();
         let _lease = registry.activate(TrackRole::Pc, pc0).unwrap();
         registry.cancel(TrackRole::Pc, pc0).unwrap();
@@ -1831,16 +1999,46 @@ mod tests {
             .record_terminal(TrackRole::Pc, pc0, ProducerTerminal::Finished)
             .unwrap();
         registry.mark_forward_closed(TrackRole::Pc, pc0).unwrap();
+        assert_eq!(registry.outstanding(), 1);
+        registry.record_abandoned(TrackRole::Pc, pc0);
+        assert_eq!(registry.faults().len(), 1);
+        assert_eq!(registry.faults()[0].reason, "aborted");
+        assert_eq!(registry.outstanding(), 0);
+        // Settled task: abandonment is a no-op.
+        let mut registry = SubscriptionProducerRegistry::new();
+        let _lease = registry.activate(TrackRole::Pc, pc0).unwrap();
+        registry.cancel(TrackRole::Pc, pc0).unwrap();
+        registry
+            .record_terminal(TrackRole::Pc, pc0, ProducerTerminal::Finished)
+            .unwrap();
+        registry.mark_forward_closed(TrackRole::Pc, pc0).unwrap();
+        registry.record_settled(TrackRole::Pc, pc0).unwrap();
         registry.record_abandoned(TrackRole::Pc, pc0);
         assert!(registry.faults().is_empty());
+        assert_eq!(
+            registry.record_settled(TrackRole::Pc, pc0),
+            Err(ProducerError::DuplicateOrReusedGeneration)
+        );
         // Unknown key: no-op.
         registry.record_abandoned(TrackRole::Haptic, route(HAPTIC_FULL_TRACK, 7));
         assert!(registry.faults().is_empty());
-        // Drop guard drives the same path.
+        // Drop guard drives the same path; a settled guard records nothing.
         let registry = Arc::new(Mutex::new(SubscriptionProducerRegistry::new()));
         registry.lock().unwrap().reserve(TrackRole::Pc, pc0).unwrap();
         drop(ProducerTaskGuard::new(registry.clone(), TrackRole::Pc, pc0));
         assert_eq!(registry.lock().unwrap().faults()[0].reason, "aborted");
+        assert_eq!(registry.lock().unwrap().outstanding(), 0);
+        let registry = Arc::new(Mutex::new(SubscriptionProducerRegistry::new()));
+        let hap0 = route(HAPTIC_FULL_TRACK, 0);
+        registry.lock().unwrap().reserve(TrackRole::Haptic, hap0).unwrap();
+        registry
+            .lock()
+            .unwrap()
+            .release_reservation(TrackRole::Haptic, hap0, None)
+            .unwrap();
+        ProducerTaskGuard::new(registry.clone(), TrackRole::Haptic, hap0).settle();
+        assert!(registry.lock().unwrap().faults().is_empty());
+        assert_eq!(registry.lock().unwrap().outstanding(), 0);
         // record_fault after a clean terminal (log_write).
         let mut registry = SubscriptionProducerRegistry::new();
         let _lease = registry.activate(TrackRole::Pc, pc0).unwrap();
@@ -1855,5 +2053,124 @@ mod tests {
             registry.record_fault(TrackRole::Haptic, route(HAPTIC_FULL_TRACK, 0), "log_write"),
             Err(ProducerError::UnknownOrInactiveRoute)
         );
+    }
+
+    #[test]
+    fn outstanding_stays_one_between_closed_and_settled_and_log_write_is_seen() {
+        let mut registry = SubscriptionProducerRegistry::new();
+        let pc0 = route(PC_NORMAL_TRACK, 0);
+        let hap0 = route(HAPTIC_FULL_TRACK, 0);
+        registry.reserve(TrackRole::Pc, pc0).unwrap();
+        registry.reserve(TrackRole::Haptic, hap0).unwrap();
+        let _pc = registry.activate(TrackRole::Pc, pc0).unwrap();
+        let _hap = registry.activate(TrackRole::Haptic, hap0).unwrap();
+        assert_eq!(registry.task_state(TrackRole::Pc, pc0), Some(TaskState::Active));
+        for (role, route) in [(TrackRole::Haptic, hap0), (TrackRole::Pc, pc0)] {
+            registry.cancel(role, route).unwrap();
+            registry
+                .record_terminal(role, route, ProducerTerminal::Finished)
+                .unwrap();
+            registry.mark_forward_closed(role, route).unwrap();
+        }
+        registry.record_settled(TrackRole::Haptic, hap0).unwrap();
+        // PC: Closed recorded, last statement not yet run.
+        assert!(registry.current_routes_completed());
+        assert_eq!(registry.outstanding(), 1);
+        assert_eq!(
+            registry.task_state(TrackRole::Pc, pc0),
+            Some(TaskState::Terminal(RoleTerminal {
+                terminal: ProducerTerminal::Finished,
+                forward: Some(ForwardOutcome::Closed),
+            }))
+        );
+        // A snapshot taken now is an error verdict (not settled), never normal.
+        assert!(matches!(
+            s3_run_verdict(&registry.snapshot(), &[]),
+            RunVerdict::Error(_)
+        ));
+        // The stop-log write fails after Closed -> log_write fault, then Settled.
+        assert!(!registry.has_fault(TrackRole::Pc, pc0));
+        registry.record_fault(TrackRole::Pc, pc0, "log_write").unwrap();
+        assert!(registry.has_fault(TrackRole::Pc, pc0));
+        registry.record_settled(TrackRole::Pc, pc0).unwrap();
+        assert_eq!(registry.outstanding(), 0);
+        let RunVerdict::Error(reasons) = s3_run_verdict(&registry.snapshot(), &[]) else {
+            panic!("log_write after Closed must be an error");
+        };
+        assert_eq!(reasons, vec!["fault pc generation 0: log_write".to_string()]);
+    }
+
+    #[test]
+    fn child_error_without_registry_fault_becomes_task_error() {
+        // Mirrors run_namespace's join handling: a child `Err` with no fault
+        // recorded for its key gets `task_error`; with one, nothing extra.
+        let mut registry = SubscriptionProducerRegistry::new();
+        let pc0 = route(PC_NORMAL_TRACK, 0);
+        registry.reserve(TrackRole::Pc, pc0).unwrap();
+        registry.release_reservation(TrackRole::Pc, pc0, None).unwrap();
+        registry.record_settled(TrackRole::Pc, pc0).unwrap();
+        if !registry.has_fault(TrackRole::Pc, pc0) {
+            registry.record_fault(TrackRole::Pc, pc0, "task_error").unwrap();
+        }
+        assert_eq!(registry.faults().len(), 1);
+        assert_eq!(registry.faults()[0].reason, "task_error");
+        if !registry.has_fault(TrackRole::Pc, pc0) {
+            registry.record_fault(TrackRole::Pc, pc0, "task_error").unwrap();
+        }
+        assert_eq!(registry.faults().len(), 1);
+        registry.record_namespace_fault("task_join_error");
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.namespace_faults, vec!["task_join_error"]);
+        let RunVerdict::Error(reasons) = s3_run_verdict(&snapshot, &[]) else {
+            panic!("task_error must be an error");
+        };
+        assert!(reasons.iter().any(|r| r == "fault pc generation 0: task_error"));
+        assert!(reasons.iter().any(|r| r == "namespace fault: task_join_error"));
+    }
+
+    #[test]
+    fn typed_transport_ends_drive_the_verdict() {
+        let end = |source: &'static str, kind: TransportEndKind, before: bool| TransportEnd {
+            source,
+            kind,
+            text: "x".to_string(),
+            at_us: 33_990_000,
+            before_production_end: before,
+        };
+        // Session PeerClose after production -> normal.
+        assert_eq!(
+            s3_run_verdict(&clean_snapshot(), &[end("session", TransportEndKind::PeerClose, false)]),
+            RunVerdict::Normal
+        );
+        // Namespace LocalClose (drained) after production -> normal.
+        assert_eq!(
+            s3_run_verdict(&clean_snapshot(), &[end("namespace", TransportEndKind::LocalClose, false)]),
+            RunVerdict::Normal
+        );
+        // Session Fault(other) after production -> error.
+        let RunVerdict::Error(reasons) = s3_run_verdict(
+            &clean_snapshot(),
+            &[end("session", TransportEndKind::Fault("Internal".to_string()), false)],
+        ) else {
+            panic!("session fault must be an error");
+        };
+        assert!(reasons[0].starts_with("session ended with a fault at 33990000 us: Internal"));
+        // Namespace Fault after production -> error.
+        assert!(matches!(
+            s3_run_verdict(
+                &clean_snapshot(),
+                &[end("namespace", TransportEndKind::Fault("task".to_string()), false)]
+            ),
+            RunVerdict::Error(_)
+        ));
+        // LocalClose before production end -> error.
+        assert!(matches!(
+            s3_run_verdict(&clean_snapshot(), &[end("namespace", TransportEndKind::LocalClose, true)]),
+            RunVerdict::Error(_)
+        ));
+        // Unsettled task at snapshot -> error even with clean roles.
+        let mut snapshot = clean_snapshot();
+        snapshot.outstanding = 1;
+        assert!(matches!(s3_run_verdict(&snapshot, &[]), RunVerdict::Error(_)));
     }
 }

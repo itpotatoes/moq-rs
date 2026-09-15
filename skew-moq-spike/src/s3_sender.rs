@@ -17,8 +17,8 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 
 use crate::s3_producer::{
-    serve_subscription_producer, ProducerLease, RunSlotClock, SlotError,
-    SubscriptionProducerRegistry, ProducerTaskGuard,
+    serve_subscription_producer, ProducerLease, ProducerTaskGuard, RunSlotClock, SlotError,
+    SubscriptionProducerRegistry,
 };
 use crate::s3_switch::{
     Route, TrackRole, HAPTIC_ESSENTIAL_TRACK, HAPTIC_FULL_TRACK, PC_HAPTIC_CRITICAL_TRACK,
@@ -638,15 +638,63 @@ async fn produce_haptic(
     Ok(count)
 }
 
-/// Publish one S3 namespace and own every subscription producer until the
-/// namespace task is aborted/joined by the sender finalizer.
+/// How `run_namespace` ended, typed at the source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NamespaceEnd {
+    /// Main signalled stop after production ended; every child task was
+    /// joined (each recorded `Settled`) before returning.
+    Drained,
+    /// The publish handle reported closed AFTER production had ended; every
+    /// child task was joined before returning. Whether the children were
+    /// clean is the registry's call, not this value's.
+    PeerClosed,
+}
+
+type ChildOutcome = (TrackRole, Route, anyhow::Result<()>);
+
+/// Classify one joined child: an `Err` with no fault yet recorded for its key
+/// becomes `task_error`; a join failure (panic/cancel) is a namespace fault.
+fn record_child_outcome(
+    registry: &Arc<Mutex<SubscriptionProducerRegistry>>,
+    joined: Result<ChildOutcome, tokio::task::JoinError>,
+) -> anyhow::Result<()> {
+    let mut registry = registry
+        .lock()
+        .map_err(|_| anyhow!("S3 producer registry poisoned"))?;
+    match joined {
+        Ok((_, _, Ok(()))) => {}
+        Ok((role, route, Err(error))) => {
+            if !registry.has_fault(role, route) {
+                let _ = registry.record_fault(role, route, "task_error");
+            }
+            tracing::warn!(track = role.as_str(), generation = route.generation, error = %format!("{error:#}"), "S3 subscription task error");
+        }
+        Err(error) => {
+            registry.record_namespace_fault(if error.is_panic() {
+                "task_panic"
+            } else {
+                "task_join_error"
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Publish one S3 namespace and own every subscription producer.
+///
+/// Switch/end boundary: while running, subscriptions are allocated and
+/// reserved in one registry critical section. Once main signals `stop`
+/// (production ended) or the publish handle closes after production ended,
+/// no new subscription is accepted (they are closed `not_found`) and every
+/// child task is joined so each has recorded `Settled` before this returns.
 pub async fn run_namespace(
     mut publisher: Publisher,
     namespace: TrackNamespace,
     context: Arc<SenderContext>,
     registry: Arc<Mutex<SubscriptionProducerRegistry>>,
     accept_routes: AcceptRouteMap,
-) -> anyhow::Result<()> {
+    mut stop: watch::Receiver<bool>,
+) -> anyhow::Result<NamespaceEnd> {
     context.validate()?;
     let publish = publisher
         .publish_namespace_open(namespace)
@@ -654,12 +702,23 @@ pub async fn run_namespace(
     publish.ok().await.context("S3 namespace rejected")?;
 
     let mut allocator = RouteAllocator::default();
-    let mut tasks = JoinSet::new();
-    loop {
+    let mut tasks: JoinSet<ChildOutcome> = JoinSet::new();
+    let end = loop {
         tokio::select! {
             subscribed = publish.subscribed() => {
-                let Some(subscribed) = subscribed.context("receive S3 subscription")? else {
-                    bail!("S3 namespace closed while waiting for subscriptions");
+                let subscribed = match subscribed {
+                    Ok(Some(subscribed)) => subscribed,
+                    // Same closed state as `closed()`: classify by production
+                    // state, never by the error text.
+                    Ok(None) | Err(_) => {
+                        if production_ended(&registry)? {
+                            break NamespaceEnd::PeerClosed;
+                        }
+                        return Err(match subscribed {
+                            Err(error) => anyhow::Error::from(error).context("receive S3 subscription"),
+                            _ => anyhow!("S3 namespace closed while waiting for subscriptions"),
+                        });
+                    }
                 };
                 let name = subscribed.info.track_name.to_string_lossy().into_owned();
                 let Some(role) = role_for_track(&name) else {
@@ -719,75 +778,132 @@ pub async fn run_namespace(
                         .map_err(|error| anyhow!("reserve S3 producer generation: {error:?}"))?;
                     (role, route)
                 };
+                // Created synchronously, before the spawn, and moved into the
+                // future: a task that is never polled still records its
+                // abandonment when the future is dropped. Between here and the
+                // spawn there is no fallible statement except the route-map
+                // insert below, which releases the reservation on failure.
+                let guard = ProducerTaskGuard::new(registry.clone(), role, route);
 
-                accept_routes
+                if let Err(error) = accept_routes
                     .lock()
-                    .map_err(|_| anyhow!("S3 accept route map poisoned"))?
-                    .insert(subscribed.info.id, AcceptRoute { role, route });
+                    .map_err(|_| anyhow!("S3 accept route map poisoned"))
+                    .map(|mut routes| {
+                        routes.insert(subscribed.info.id, AcceptRoute { role, route });
+                    })
+                {
+                    drop(guard); // records `aborted` fault and Settled
+                    return Err(error);
+                }
                 let context = context.clone();
                 let registry = registry.clone();
                 tasks.spawn(async move {
-                    // Declared first so it drops last: any exit of this task
-                    // without a recorded outcome (including abort) is
-                    // recorded as a fault by the guard.
-                    let _guard = ProducerTaskGuard::new(registry.clone(), role, route);
+                    let guard = guard;
                     let logger = context.logger.clone();
                     let producer_context = context.clone();
-                    let result = serve_subscription_producer(
-                        subscribed,
-                        role,
-                        route,
-                        registry.clone(),
-                        context.shutdown_timeout,
-                        move |writer, lease| {
-                            let context = producer_context.clone();
-                            async move {
-                                context.logger.lock()
-                                    .map_err(|_| anyhow!("TX logger poisoned"))?
-                                    .try_log_s3_producer_start(role, route, now_us())?;
-                                match role {
-                                    TrackRole::Pc => produce_pc(writer, lease, context).await,
-                                    TrackRole::Haptic => produce_haptic(writer, lease, context).await,
+                    let outcome: anyhow::Result<()> = async {
+                        let result = serve_subscription_producer(
+                            subscribed,
+                            role,
+                            route,
+                            registry.clone(),
+                            context.shutdown_timeout,
+                            move |writer, lease| {
+                                let context = producer_context.clone();
+                                async move {
+                                    context.logger.lock()
+                                        .map_err(|_| anyhow!("TX logger poisoned"))?
+                                        .try_log_s3_producer_start(role, route, now_us())?;
+                                    match role {
+                                        TrackRole::Pc => produce_pc(writer, lease, context).await,
+                                        TrackRole::Haptic => produce_haptic(writer, lease, context).await,
+                                    }
                                 }
+                            },
+                        ).await?;
+                        // `None`: refused after run completion, a normal outcome.
+                        let Some(result) = result else {
+                            return Ok(());
+                        };
+                        let logged = logger
+                            .lock()
+                            .map_err(|_| anyhow!("TX logger poisoned"))
+                            .and_then(|mut logger| {
+                                logger
+                                    .try_log_s3_producer_stop(result, now_us())
+                                    .map_err(anyhow::Error::from)
+                            });
+                        if let Err(error) = logged {
+                            // Record BEFORE Settled so the verdict sees it.
+                            if let Ok(mut reg) = registry.lock() {
+                                let _ = reg.record_fault(role, route, "log_write");
                             }
-                        },
-                    ).await?;
-                    // `None`: refused after run completion, a normal outcome.
-                    let Some(result) = result else {
-                        return Ok(());
-                    };
-                    let logged = logger
-                        .lock()
-                        .map_err(|_| anyhow!("TX logger poisoned"))
-                        .and_then(|mut logger| {
-                            logger
-                                .try_log_s3_producer_stop(result, now_us())
-                                .map_err(anyhow::Error::from)
-                        });
-                    if let Err(error) = logged {
-                        // Record BEFORE propagating so the verdict sees it.
-                        if let Ok(mut reg) = registry.lock() {
-                            let _ = reg.record_fault(role, route, "log_write");
+                            return Err(error);
                         }
-                        return Err(error);
+                        Ok(())
                     }
-                    Ok::<(), anyhow::Error>(())
+                    .await;
+                    // LAST statement of the task.
+                    guard.settle();
+                    (role, route, outcome)
                 });
             }
             joined = tasks.join_next(), if !tasks.is_empty() => {
-                match joined {
-                    Some(Ok(Ok(()))) => {}
-                    Some(Ok(Err(error))) => return Err(error).context("S3 subscription task"),
-                    Some(Err(error)) => return Err(error).context("join S3 subscription task"),
-                    None => {}
+                let Some(joined) = joined else { continue };
+                let failed = !matches!(joined, Ok((_, _, Ok(()))));
+                record_child_outcome(&registry, joined)?;
+                if failed {
+                    // Fail loud mid-run, as before: the fault is recorded and
+                    // the remaining children are abandoned by JoinSet drop
+                    // (their guards record `aborted`).
+                    bail!("S3 subscription task failed");
                 }
             }
             closed = publish.closed() => {
+                if production_ended(&registry)? {
+                    break NamespaceEnd::PeerClosed;
+                }
                 closed.context("S3 namespace closed")?;
                 bail!("S3 namespace ended unexpectedly");
             }
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    break NamespaceEnd::Drained;
+                }
+            }
+        }
+    };
+
+    // Drain: accept no new subscription (not_found), join every child so each
+    // has run its last statement (`Settled`), record each result.
+    let mut accepting = true;
+    while !tasks.is_empty() {
+        tokio::select! {
+            joined = tasks.join_next() => {
+                if let Some(joined) = joined {
+                    record_child_outcome(&registry, joined)?;
+                }
+            }
+            subscribed = publish.subscribed(), if accepting => {
+                match subscribed {
+                    Ok(Some(subscribed)) => {
+                        let _ = subscribed.close(moq_transport::serve::ServeError::not_found_ctx(
+                            "S3 namespace is draining after run end",
+                        ));
+                    }
+                    Ok(None) | Err(_) => accepting = false,
+                }
+            }
         }
     }
+    Ok(end)
+}
+
+fn production_ended(registry: &Arc<Mutex<SubscriptionProducerRegistry>>) -> anyhow::Result<bool> {
+    Ok(registry
+        .lock()
+        .map_err(|_| anyhow!("S3 producer registry poisoned"))?
+        .production_ended())
 }
 
 #[cfg(test)]
