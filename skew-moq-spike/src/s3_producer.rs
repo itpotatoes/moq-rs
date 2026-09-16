@@ -200,6 +200,9 @@ pub struct RegistrySnapshot {
     /// Producer tasks (reserved or activated) that have not recorded
     /// `Settled` as their last statement.
     pub outstanding: usize,
+    /// The namespace task could not join every child within its bound; the
+    /// registry must never be read as complete.
+    pub children_unsettled: bool,
 }
 
 /// Lifecycle of one producer task as the registry sees it.
@@ -213,16 +216,22 @@ pub enum TaskState {
     Settled,
 }
 
-/// How a session or namespace task end is classified. The classification is
-/// by ORDERING only, never by the result text or error variant:
-/// - a session end observed after every current-route track FIN'd on the
-///   wire (`tracks_finished_on_wire`) is the peer's positive handoff
-///   acknowledgement (`PeerClose`), whatever the join result says — the same
-///   acceptance the static path applies in `DirectFinHandoff::PeerClosed`;
-/// - a namespace end after our stop signal is `LocalClose`; one that follows
-///   the session end is `PeerClose`;
-/// - everything observed earlier (session end during the send, namespace end
-///   while the session was alive) or a handoff timeout is a `Fault`.
+/// How a session or namespace task end is classified. Never from the result
+/// text or error variant of the SESSION; only from (a) the namespace close
+/// REASON moq-transport hands us at the moment the future completes and (b)
+/// the SETTLED producer state:
+/// - a session end, or a namespace `StateDropped` (the session's state went
+///   away: `closed()` -> `Ok(())` / `subscribed()` -> `Ok(None)`), is
+///   `PeerClose` iff, once every producer task has settled, both latest roles
+///   are `Finished` + forwarder `Closed` and no fault exists — the peer's
+///   post-FIN close is the positive handoff (parity with the static path's
+///   `DirectFinHandoff::PeerClosed(result)`); otherwise `Fault`;
+/// - a namespace `Err` from `closed()`/`subscribed()` (REQUEST_ERROR ->
+///   `ServeError::Closed(code)`, PUBLISH_NAMESPACE_CANCEL -> `Cancel`, other
+///   namespace errors) or a child/task error is ALWAYS `Fault`, whatever the
+///   timing;
+/// - a namespace `Drained` (the namespace task itself exited via our stop
+///   watch) or a cancelled join is `LocalClose`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportEndKind {
     PeerClose,
@@ -248,35 +257,69 @@ pub struct TransportEnd {
     pub kind: TransportEndKind,
     pub text: String,
     pub at_us: u64,
-    /// Registry state at the moment the end fired: not every current-route
-    /// track had FIN'd on the wire yet (both latest producers `Finished` with
-    /// forwarder `Closed`).
+    /// Sampled from the SETTLED registry (after every producer task settled
+    /// or the settle bound expired), not at the instant the end fired: not
+    /// every current-route track had FIN'd on the wire.
     pub before_tracks_fin: bool,
 }
 
-/// Ordering-only classification of a session end: before the tracks FIN'd on
-/// the wire it is a fault (the session ended during the send); after, it is
-/// the peer's post-FIN close, accepted whatever the result text is.
-pub fn classify_session_end_by_order(tracks_finished_on_wire: bool) -> TransportEndKind {
-    if tracks_finished_on_wire {
+/// Settle-then-classify for a session end or a namespace `StateDropped`.
+///
+/// Causal argument: a producer records forwarder `Closed` only after its
+/// forwarder future returned; that future returned in the same poll in which
+/// `Drop for Subscribed` queued PUBLISH_DONE; PUBLISH_DONE precedes any peer
+/// close it causes. So if the peer close is observed while the registry does
+/// not yet say `Closed`, the producer task was merely preempted between the
+/// forwarder's return and its recording. Waiting for it to SETTLE yields the
+/// producer's own validation outcome (`Closed`, or `Failed`/fault), which is
+/// the evidence — not elapsed time.
+pub fn classify_end_by_settled_state(settled_complete: bool) -> TransportEndKind {
+    if settled_complete {
         TransportEndKind::PeerClose
     } else {
-        TransportEndKind::Fault("session ended during S3 send".to_string())
+        TransportEndKind::Fault(
+            "transport ended before every current-route track settled Finished+Closed without fault"
+                .to_string(),
+        )
     }
 }
 
-/// Ordering-only classification of a namespace end: after our stop signal
-/// (`Drained`) it is ours; after the session task ended it follows the peer
-/// close; while the session was still alive and before our stop it is a fault
-/// (covers REQUEST_ERROR -> `ServeError::Closed(code)` and any producer-side
-/// error), regardless of the error text.
-pub fn classify_namespace_end_by_order(after_stop: bool, session_finished: bool) -> TransportEndKind {
-    if after_stop {
-        TransportEndKind::LocalClose
-    } else if session_finished {
-        TransportEndKind::PeerClose
-    } else {
-        TransportEndKind::Fault("namespace ended while the session was alive".to_string())
+/// What the namespace task reported, taken at the moment its future
+/// completed (the close REASON), never re-derived from main's state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NamespaceEndObservation {
+    /// Exited via our stop watch and joined every child.
+    Drained,
+    /// `closed()` -> `Ok(())` or `subscribed()` -> `Ok(None)`: the session's
+    /// publish state was dropped (session termination).
+    StateDropped,
+    /// `closed()`/`subscribed()` -> `Err(ServeError)`: REQUEST_ERROR,
+    /// PUBLISH_NAMESPACE_CANCEL, or another namespace error from the peer.
+    PeerError,
+    /// A child/task error or any other `Err` from the namespace task.
+    TaskError,
+    JoinCancelled,
+    JoinPanic,
+}
+
+pub fn classify_namespace_end(
+    observation: NamespaceEndObservation,
+    settled_complete: bool,
+) -> TransportEndKind {
+    match observation {
+        NamespaceEndObservation::Drained | NamespaceEndObservation::JoinCancelled => {
+            TransportEndKind::LocalClose
+        }
+        NamespaceEndObservation::StateDropped => classify_end_by_settled_state(settled_complete),
+        NamespaceEndObservation::PeerError => TransportEndKind::Fault(
+            "namespace closed by the peer with an error (REQUEST_ERROR/CANCEL)".to_string(),
+        ),
+        NamespaceEndObservation::TaskError => {
+            TransportEndKind::Fault("namespace task error".to_string())
+        }
+        NamespaceEndObservation::JoinPanic => {
+            TransportEndKind::Fault("namespace task panicked".to_string())
+        }
     }
 }
 
@@ -359,6 +402,12 @@ pub fn s3_run_verdict(snapshot: &RegistrySnapshot, transport_ends: &[TransportEn
             "{} producer task(s) not settled",
             snapshot.outstanding
         ));
+    }
+    if snapshot.children_unsettled {
+        reasons.push(
+            "namespace could not join every child task within its bound; registry incomplete"
+                .to_string(),
+        );
     }
     for end in transport_ends {
         if let TransportEndKind::Fault(reason) = &end.kind {
@@ -588,6 +637,7 @@ pub struct SubscriptionProducerRegistry {
     settled: HashSet<ProducerKey>,
     faults: Vec<RecordedFault>,
     namespace_faults: Vec<&'static str>,
+    children_unsettled: bool,
     /// Bumped on every terminal transition so a waiter can re-check
     /// `current_routes_finished` without polling.
     terminal_tx: watch::Sender<u64>,
@@ -606,6 +656,7 @@ impl SubscriptionProducerRegistry {
             settled: HashSet::new(),
             faults: Vec::new(),
             namespace_faults: Vec::new(),
+            children_unsettled: false,
             terminal_tx: watch::channel(0).0,
         }
     }
@@ -822,6 +873,28 @@ impl SubscriptionProducerRegistry {
         self.current_routes_completed()
     }
 
+    /// The SETTLED state a session end / namespace `StateDropped` is judged
+    /// by: every task settled, both latest roles Finished+Closed, no fault of
+    /// any kind, and the namespace joined every child.
+    pub fn settled_complete(&self) -> bool {
+        self.outstanding() == 0
+            && self.tracks_finished_on_wire()
+            && self.faults.is_empty()
+            && self.namespace_faults.is_empty()
+            && !self.children_unsettled
+    }
+
+    /// The namespace task hit its child-join bound: the registry may be
+    /// missing outcomes and must never be read as complete.
+    pub fn mark_children_unsettled(&mut self) {
+        self.children_unsettled = true;
+        self.terminal_tx.send_modify(|version| *version += 1);
+    }
+
+    pub fn children_unsettled(&self) -> bool {
+        self.children_unsettled
+    }
+
     /// Both latest-generation producers have finished producing (their loops
     /// reached the run end), whatever their forwarders did afterwards.
     pub fn production_ended(&self) -> bool {
@@ -857,6 +930,7 @@ impl SubscriptionProducerRegistry {
             faults: self.faults.clone(),
             namespace_faults: self.namespace_faults.clone(),
             outstanding: self.outstanding(),
+            children_unsettled: self.children_unsettled,
         }
     }
 
@@ -1780,17 +1854,14 @@ mod tests {
             faults: Vec::new(),
             namespace_faults: Vec::new(),
             outstanding: 0,
+            children_unsettled: false,
         }
     }
 
     fn session_end(before_tracks_fin: bool) -> TransportEnd {
         TransportEnd {
             source: "session",
-            kind: if before_tracks_fin {
-                classify_session_end_by_order(false)
-            } else {
-                classify_session_end_by_order(true)
-            },
+            kind: classify_end_by_settled_state(!before_tracks_fin),
             text: "Ok(Err(Decode(More(1))))".to_string(),
             at_us: 33_990_000,
             before_tracks_fin,
@@ -1890,7 +1961,7 @@ mod tests {
             panic!("early session end must be an error");
         };
         assert_eq!(reasons.len(), 2);
-        assert!(reasons[0].starts_with("session ended with a fault at 33990000 us: session ended during S3 send"));
+        assert!(reasons[0].starts_with("session ended with a fault at 33990000 us: transport ended before every current-route track settled"));
         assert!(reasons[1].starts_with("session ended (fault) before every current-route track FIN'd at 33990000 us"));
 
         // 8. Pending never resolved -> error
@@ -1913,6 +1984,7 @@ mod tests {
             faults: Vec::new(),
             namespace_faults: Vec::new(),
             outstanding: 0,
+            children_unsettled: false,
         };
         assert!(matches!(s3_run_verdict(&empty, &[]), RunVerdict::Error(_)));
         let mut snapshot = clean_snapshot();
@@ -2223,71 +2295,65 @@ mod tests {
     }
 
     #[test]
-    fn transport_ends_are_classified_by_ordering_not_text() {
-        // Session end: only the ordering matters; the text is audit only.
-        assert_eq!(classify_session_end_by_order(true), TransportEndKind::PeerClose);
-        assert!(matches!(classify_session_end_by_order(false), TransportEndKind::Fault(_)));
+    fn transport_ends_are_classified_by_settled_state_not_text() {
+        // Session end: only the settled producer state matters; the text is
+        // audit only.
+        assert_eq!(classify_end_by_settled_state(true), TransportEndKind::PeerClose);
+        assert!(matches!(classify_end_by_settled_state(false), TransportEndKind::Fault(_)));
         for text in [
             "Ok(Err(Decode(More(1))))",
             "Ok(Err(Internal))",
             "Ok(Err(WebTransport(Session(ConnectionError(TimedOut)))))",
             "Err(JoinError::Panic(..))",
         ] {
-            // After both current-route tracks FIN'd on the wire -> Normal with ANY text.
             let after = TransportEnd {
                 source: "session",
-                kind: classify_session_end_by_order(true),
+                kind: classify_end_by_settled_state(true),
                 text: text.to_string(),
                 at_us: 33_990_000,
                 before_tracks_fin: false,
             };
             assert_eq!(s3_run_verdict(&clean_snapshot(), &[after]), RunVerdict::Normal, "{text}");
-            // Before -> Error with ANY text.
             let before = TransportEnd {
                 source: "session",
-                kind: classify_session_end_by_order(false),
+                kind: classify_end_by_settled_state(false),
                 text: text.to_string(),
                 at_us: 20_000_000,
                 before_tracks_fin: true,
             };
             assert!(matches!(s3_run_verdict(&clean_snapshot(), &[before]), RunVerdict::Error(_)), "{text}");
         }
-        // Namespace end: after our stop -> ours; after the session end -> peer;
-        // while the session was alive and before our stop -> fault, whatever
-        // the error text (REQUEST_ERROR / Closed(code) / producer Err).
-        assert_eq!(classify_namespace_end_by_order(true, false), TransportEndKind::LocalClose);
-        assert_eq!(classify_namespace_end_by_order(true, true), TransportEndKind::LocalClose);
-        assert_eq!(classify_namespace_end_by_order(false, true), TransportEndKind::PeerClose);
-        assert!(matches!(classify_namespace_end_by_order(false, false), TransportEndKind::Fault(_)));
-        let ns_alive = TransportEnd {
+        // Namespace ends by the observed close reason.
+        use NamespaceEndObservation::*;
+        assert_eq!(classify_namespace_end(Drained, false), TransportEndKind::LocalClose);
+        assert_eq!(classify_namespace_end(JoinCancelled, false), TransportEndKind::LocalClose);
+        assert_eq!(classify_namespace_end(StateDropped, true), TransportEndKind::PeerClose);
+        assert!(matches!(classify_namespace_end(StateDropped, false), TransportEndKind::Fault(_)));
+        // Err(Closed(code)) after everything complete -> still a fault.
+        assert!(matches!(classify_namespace_end(PeerError, true), TransportEndKind::Fault(_)));
+        assert!(matches!(classify_namespace_end(TaskError, true), TransportEndKind::Fault(_)));
+        assert!(matches!(classify_namespace_end(JoinPanic, true), TransportEndKind::Fault(_)));
+        let ns = |obs, complete: bool, at_us: u64| TransportEnd {
             source: "namespace",
-            kind: classify_namespace_end_by_order(false, false),
-            text: "Err(S3 namespace closed: closed code=4)".to_string(),
-            at_us: 33_995_000,
-            before_tracks_fin: false,
+            kind: classify_namespace_end(obs, complete),
+            text: "Err(S3 namespace peer error: closed code=4)".to_string(),
+            at_us,
+            before_tracks_fin: !complete,
         };
-        let RunVerdict::Error(reasons) = s3_run_verdict(&clean_snapshot(), &[ns_alive]) else {
-            panic!("namespace Err while the session was alive must be an error");
+        let RunVerdict::Error(reasons) = s3_run_verdict(&clean_snapshot(), &[ns(PeerError, true, 33_995_000)]) else {
+            panic!("namespace Err(Closed(code)) after completion must be an error");
         };
-        assert!(reasons[0].contains("namespace ended while the session was alive"));
-        let ns_after_session = TransportEnd {
-            source: "namespace",
-            kind: classify_namespace_end_by_order(false, true),
-            text: "Err(S3 namespace closed: closed code=4)".to_string(),
-            at_us: 33_995_000,
-            before_tracks_fin: false,
-        };
-        let session = TransportEnd {
-            source: "session",
-            kind: classify_session_end_by_order(true),
-            text: "Ok(Err(Internal))".to_string(),
-            at_us: 33_994_000,
-            before_tracks_fin: false,
-        };
+        assert!(reasons[0].contains("namespace closed by the peer with an error"));
+        // Ok(()) / Ok(None) after complete -> normal.
         assert_eq!(
-            s3_run_verdict(&clean_snapshot(), &[session, ns_after_session]),
+            s3_run_verdict(&clean_snapshot(), &[ns(StateDropped, true, 33_995_000)]),
             RunVerdict::Normal
         );
+        // Ok(None) before production complete -> error.
+        assert!(matches!(
+            s3_run_verdict(&clean_snapshot(), &[ns(StateDropped, false, 20_000_000)]),
+            RunVerdict::Error(_)
+        ));
         // Handoff timeout: the receiver never closed after our FINs -> error.
         let timed_out = TransportEnd {
             source: "session",
@@ -2302,5 +2368,107 @@ mod tests {
             panic!("handoff timeout must be an error");
         };
         assert!(reasons[0].contains("direct receiver did not close after S3 track FIN handoff"));
+        // children_unsettled is an explicit error reason.
+        let mut snapshot = clean_snapshot();
+        snapshot.children_unsettled = true;
+        let RunVerdict::Error(reasons) = s3_run_verdict(&snapshot, &[]) else {
+            panic!("unsettled children must be an error");
+        };
+        assert!(reasons[0].contains("could not join every child task"));
+    }
+
+    #[test]
+    fn session_end_observed_before_closed_is_recorded_then_settled_state_decides() {
+        // The exact P1-2 interleaving on the registry: both producers have
+        // finished; PC is Closed+Settled; the haptic forwarder returned (and
+        // queued PUBLISH_DONE) but its task has not yet recorded Closed when
+        // the peer close is observed.
+        let mut registry = SubscriptionProducerRegistry::new();
+        let pc0 = route(PC_NORMAL_TRACK, 0);
+        let hap0 = route(HAPTIC_FULL_TRACK, 0);
+        registry.reserve(TrackRole::Pc, pc0).unwrap();
+        registry.reserve(TrackRole::Haptic, hap0).unwrap();
+        let _pc = registry.activate(TrackRole::Pc, pc0).unwrap();
+        let _hap = registry.activate(TrackRole::Haptic, hap0).unwrap();
+        for (role, route) in [(TrackRole::Pc, pc0), (TrackRole::Haptic, hap0)] {
+            registry.cancel(role, route).unwrap();
+            registry
+                .record_terminal(role, route, ProducerTerminal::Finished)
+                .unwrap();
+        }
+        registry.mark_forward_closed(TrackRole::Pc, pc0).unwrap();
+        registry.record_settled(TrackRole::Pc, pc0).unwrap();
+        // Session end observed NOW: the instantaneous state is not complete,
+        // so nothing is decided yet.
+        assert!(!registry.tracks_finished_on_wire());
+        assert!(!registry.settled_complete());
+        assert_eq!(registry.outstanding(), 1);
+        // The haptic task resumes and records its own validation outcome.
+        registry.mark_forward_closed(TrackRole::Haptic, hap0).unwrap();
+        registry.record_settled(TrackRole::Haptic, hap0).unwrap();
+        assert!(registry.settled_complete());
+        let end = TransportEnd {
+            source: "session",
+            kind: classify_end_by_settled_state(registry.settled_complete()),
+            text: "Ok(Err(Decode(More(1))))".to_string(),
+            at_us: 33_990_000,
+            before_tracks_fin: !registry.tracks_finished_on_wire(),
+        };
+        assert_eq!(end.kind, TransportEndKind::PeerClose);
+        assert!(!end.before_tracks_fin);
+        assert_eq!(s3_run_verdict(&registry.snapshot(), &[end]), RunVerdict::Normal);
+
+        // Same interleaving, but the producer records Failed after the end.
+        let mut registry = SubscriptionProducerRegistry::new();
+        registry.reserve(TrackRole::Pc, pc0).unwrap();
+        registry.reserve(TrackRole::Haptic, hap0).unwrap();
+        let _pc = registry.activate(TrackRole::Pc, pc0).unwrap();
+        let _hap = registry.activate(TrackRole::Haptic, hap0).unwrap();
+        for (role, route) in [(TrackRole::Pc, pc0), (TrackRole::Haptic, hap0)] {
+            registry.cancel(role, route).unwrap();
+            registry
+                .record_terminal(role, route, ProducerTerminal::Finished)
+                .unwrap();
+        }
+        registry.mark_forward_closed(TrackRole::Pc, pc0).unwrap();
+        registry.record_settled(TrackRole::Pc, pc0).unwrap();
+        assert!(!registry.settled_complete());
+        registry
+            .mark_forward_failed(TrackRole::Haptic, hap0, "remote_cancel")
+            .unwrap();
+        registry.record_settled(TrackRole::Haptic, hap0).unwrap();
+        assert_eq!(registry.outstanding(), 0);
+        assert!(!registry.settled_complete());
+        let end = TransportEnd {
+            source: "session",
+            kind: classify_end_by_settled_state(registry.settled_complete()),
+            text: "Ok(Err(Decode(More(1))))".to_string(),
+            at_us: 33_990_000,
+            before_tracks_fin: !registry.tracks_finished_on_wire(),
+        };
+        assert!(matches!(end.kind, TransportEndKind::Fault(_)));
+        assert!(end.before_tracks_fin);
+        assert!(matches!(s3_run_verdict(&registry.snapshot(), &[end]), RunVerdict::Error(_)));
+
+        // Mid-run: the session dies while producing; the serve arm records
+        // RemoteClosed, the tasks settle, and the settled state says fault.
+        let mut registry = SubscriptionProducerRegistry::new();
+        registry.reserve(TrackRole::Pc, pc0).unwrap();
+        registry.reserve(TrackRole::Haptic, hap0).unwrap();
+        let _pc = registry.activate(TrackRole::Pc, pc0).unwrap();
+        let _hap = registry.activate(TrackRole::Haptic, hap0).unwrap();
+        for (role, route) in [(TrackRole::Pc, pc0), (TrackRole::Haptic, hap0)] {
+            registry.cancel(role, route).unwrap();
+            registry
+                .record_terminal(role, route, ProducerTerminal::RemoteClosed)
+                .unwrap();
+            registry.record_settled(role, route).unwrap();
+        }
+        assert_eq!(registry.outstanding(), 0);
+        assert!(!registry.settled_complete());
+        assert!(matches!(
+            classify_end_by_settled_state(registry.settled_complete()),
+            TransportEndKind::Fault(_)
+        ));
     }
 }
