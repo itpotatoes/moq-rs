@@ -94,6 +94,42 @@ pub(super) struct ObjectForwarder {
     mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
 }
 
+/// Store `err` as the forwarder's terminal state. Fails with the error that
+/// is already stored (a `Cancel` from UNSUBSCRIBE) or `Done` when the watch
+/// peer is gone.
+fn close_forwarder_state(
+    state: &State<ObjectForwarderState>,
+    err: ServeError,
+) -> Result<(), ServeError> {
+    let state = state.lock();
+    state.closed.clone()?;
+
+    let mut state = state.into_mut().ok_or(ServeError::Done)?;
+    state.closed = Err(err);
+
+    Ok(())
+}
+
+/// Cleanup after `serve` returned: store the error, but ALWAYS return the
+/// FIRST observed serve result. A racing UNSUBSCRIBE (stored `Cancel`) or a
+/// vanished watch peer (`Done`) must not replace the transport error that
+/// actually ended forwarding; the stored value is only logged.
+fn finish_serve(
+    state: &State<ObjectForwarderState>,
+    res: Result<(), SessionError>,
+) -> Result<(), SessionError> {
+    if let Err(err) = &res {
+        if let Err(stored) = close_forwarder_state(state, err.clone().into()) {
+            tracing::debug!(
+                first = ?err,
+                stored = ?stored,
+                "forwarder already closed; keeping the first serve error"
+            );
+        }
+    }
+    res
+}
+
 impl ObjectForwarder {
     pub(super) fn new(
         publisher: Publisher,
@@ -134,13 +170,7 @@ impl ObjectForwarder {
     }
 
     fn close(&self, err: ServeError) -> Result<(), ServeError> {
-        let state = self.state.lock();
-        state.closed.clone()?;
-
-        let mut state = state.into_mut().ok_or(ServeError::Done)?;
-        state.closed = Err(err);
-
-        Ok(())
+        close_forwarder_state(&self.state, err)
     }
 
     async fn closed(&self) -> Result<(), ServeError> {
@@ -253,11 +283,7 @@ impl Subscribed {
             self.serve_accepted_inner(track).await
         }
         .await;
-        if let Err(err) = &res {
-            self.close(err.clone().into())?;
-        }
-
-        res
+        finish_serve(&self.forwarder.state, res)
     }
 
     /// Send SUBSCRIBE_OK without starting object forwarding.
@@ -308,10 +334,7 @@ impl Subscribed {
     /// completed for this same track before calling this method.
     pub async fn serve_accepted(mut self, track: serve::TrackReader) -> Result<(), SessionError> {
         let res = self.serve_accepted_inner(track).await;
-        if let Err(err) = &res {
-            self.close(err.clone().into())?;
-        }
-        res
+        finish_serve(&self.forwarder.state, res)
     }
 
     async fn serve_accepted_inner(
@@ -473,12 +496,18 @@ impl ObjectForwarder {
                 result = tasks.next(), if !tasks.is_empty() => {
                     if let Some(result) = result {
                         // Done from inside a subgroup means its state vanished;
-                        // ordinary end-of-subgroup and DELIVERY_TIMEOUT return
-                        // Ok. Do not let track-level Done normalization hide it.
+                        // Cancel from inside a subgroup is an aborted object.
+                        // Ordinary end-of-subgroup and DELIVERY_TIMEOUT return
+                        // Ok. Neither may be confused with the track-level
+                        // Done/Cancel (watch gone / peer UNSUBSCRIBE) that the
+                        // caller normalizes.
                         result.map_err(|error| match error {
                             SessionError::Serve(ServeError::Done) =>
                                 SessionError::Serve(ServeError::internal_ctx(
                                     "subgroup state ended before forwarding completed")),
+                            SessionError::Serve(ServeError::Cancel) =>
+                                SessionError::Serve(ServeError::internal_ctx(
+                                    "subgroup object aborted")),
                             error => error,
                         })?;
                     }
@@ -1053,11 +1082,23 @@ mod tests {
             tokio::pin!(forward);
             // Poll the actual reader/writer path until blocked on payload.
             assert!(futures::poll!(&mut forward).is_pending());
+            let aborted_with_cancel = cause == ServeError::Cancel;
             object.abort(cause).unwrap();
             let result = tokio::time::timeout(std::time::Duration::from_secs(1), forward)
                 .await.expect("failure must not wait for the unfinished sibling");
             assert!(result.is_err(), "residual object error was swallowed");
             assert!(!matches!(result, Err(SessionError::Serve(ServeError::Done))));
+            // An aborted object must never look like a peer UNSUBSCRIBE.
+            assert!(!matches!(result, Err(SessionError::Serve(ServeError::Cancel))));
+            if aborted_with_cancel {
+                // `internal_ctx` keeps the context in the log only; the typed
+                // variant is what separates it from a track-level Cancel.
+                assert!(
+                    matches!(&result, Err(SessionError::Serve(
+                        ServeError::InternalWithId(_, _) | ServeError::Internal(_)))),
+                    "unexpected mapping for subgroup-internal Cancel: {result:?}"
+                );
+            }
             drop(pending_object);
         }
     }
@@ -1312,5 +1353,71 @@ mod tests {
         assert!(!Subscribed::is_expected_serve_shutdown(
             &SessionError::Internal
         ));
+    }
+    #[tokio::test]
+    async fn first_serve_error_is_preserved_over_a_racing_unsubscribe_cancel() {
+        use crate::coding::TrackNamespace;
+        use bytes::Bytes;
+        // Real reader/forwarder path: a payload error (object aborted with
+        // Size after producer FIN) ends forwarding first.
+        let (writer, reader) = serve::Track::new(
+            TrackNamespace::from_utf8_path("test"), "video").produce();
+        let mut groups = writer.subgroups().unwrap();
+        let mut group = groups.append(1).unwrap();
+        let mut object = group.create(5, None).unwrap();
+        object.write(Bytes::from_static(b"hi")).unwrap();
+        drop(group);
+        drop(groups);
+        let TrackReaderMode::Subgroups(subgroups) = reader.mode().await.unwrap() else {
+            panic!("subgroups expected");
+        };
+        let (send_state, recv_state) = State::<ObjectForwarderState>::default().split();
+        let mut recv = ObjectForwarderRecv { state: recv_state };
+        let forward = ObjectForwarder::forward_subgroups(
+            subgroups, std::future::pending(), |subgroup| {
+                let header = data::SubgroupHeader {
+                    header_type: data::StreamHeaderType::SubgroupIdExt,
+                    track_alias: 42, group_id: subgroup.group_id,
+                    subgroup_id: Some(subgroup.subgroup_id),
+                    publisher_priority: subgroup.priority,
+                };
+                let state = send_state.clone();
+                async move {
+                    ObjectForwarder::serve_subgroup_to_buffer(header, subgroup, state,
+                        DeliveryFilter { forward: true, start_location: None, end_group_id: None },
+                        None).await.map(|_| ())
+                }
+            });
+        tokio::pin!(forward);
+        assert!(futures::poll!(&mut forward).is_pending());
+        object.abort(ServeError::Size).unwrap();
+        let res = tokio::time::timeout(std::time::Duration::from_secs(1), forward)
+            .await.expect("payload error must end forwarding");
+        assert!(matches!(res, Err(SessionError::Serve(ServeError::Size))), "{res:?}");
+        // UNSUBSCRIBE lands before the cleanup close: the stored Cancel must
+        // not replace the payload error.
+        recv.recv_unsubscribe().unwrap();
+        let finished = finish_serve(&send_state, res);
+        assert!(matches!(finished, Err(SessionError::Serve(ServeError::Size))), "{finished:?}");
+        assert!(matches!(send_state.lock().closed, Err(ServeError::Cancel)));
+        assert!(send_state.lock().unsubscribed);
+    }
+
+    #[test]
+    fn finish_serve_stores_the_error_when_nothing_is_stored_and_keeps_it_when_the_watch_is_gone() {
+        // Nothing stored: the error is stored and returned.
+        let (send_state, recv_state) = State::<ObjectForwarderState>::default().split();
+        let res = finish_serve(&send_state, Err(SessionError::Serve(ServeError::Size)));
+        assert!(matches!(res, Err(SessionError::Serve(ServeError::Size))));
+        assert!(matches!(send_state.lock().closed, Err(ServeError::Size)));
+        // Success passes through untouched.
+        assert!(finish_serve(&send_state, Ok(())).is_ok());
+        drop(recv_state);
+        // Watch peer gone (`close` would fail with Done): the first error is
+        // still the one returned.
+        let (send_state, recv_state) = State::<ObjectForwarderState>::default().split();
+        drop(recv_state);
+        let res = finish_serve(&send_state, Err(SessionError::Internal));
+        assert!(matches!(res, Err(SessionError::Internal)), "{res:?}");
     }
 }

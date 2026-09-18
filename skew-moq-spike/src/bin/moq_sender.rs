@@ -1221,6 +1221,117 @@ async fn settle_and_record_namespace_end(
     Ok(accepted)
 }
 
+/// End-of-run namespace shutdown, shared by the normal end and the early
+/// error exit: tell the namespace task to stop (it refuses new subscriptions
+/// and joins every child), join it within `ns_join_bound`; on expiry record
+/// `namespace_join_timeout` + `children_unsettled` BEFORE aborting, then a
+/// bounded second join. A handle that still does not finish stays with the
+/// finalizer, which reports it as timed out. Adds no wait when the task has
+/// already been observed (`ns_task` is `None`).
+async fn stop_and_join_namespace(
+    ns_stop_tx: &tokio::sync::watch::Sender<bool>,
+    registry: &Arc<Mutex<SubscriptionProducerRegistry>>,
+    ns_join_bound: Duration,
+    settle_bound: Duration,
+    ends: &mut Vec<TransportEnd>,
+    ns_task: &mut Option<NamespaceJoinHandle>,
+    ns_seen: &mut Option<JoinOutcome>,
+) -> Result<()> {
+    let _ = ns_stop_tx.send(true);
+    let Some(nt) = ns_task.as_mut() else {
+        return Ok(());
+    };
+    let joined = match tokio::time::timeout(ns_join_bound, &mut *nt).await {
+        Ok(r) => Some(r),
+        Err(_) => {
+            {
+                let mut registry = registry
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("S3 producer registry poisoned"))?;
+                registry.record_namespace_fault("namespace_join_timeout");
+                registry.mark_children_unsettled();
+            }
+            nt.abort();
+            tokio::time::timeout(PRODUCER_JOIN_BUDGET, &mut *nt).await.ok()
+        }
+    };
+    if let Some(r) = joined {
+        *ns_task = None;
+        *ns_seen = Some(JoinOutcome::from_join_result(&r));
+        // Classified from what the namespace task observed (`Drained` only
+        // if it exited via the stop watch).
+        settle_and_record_namespace_end(registry, settle_bound, ends, &r).await?;
+    }
+    Ok(())
+}
+
+/// Relay topology has no FIN handoff wait (the relay does not close this
+/// session), but a session task that has ALREADY finished — e.g. panicked
+/// while the namespace join was in progress — must be classified before the
+/// verdict through the same settle-then-classify path. Never waits for a
+/// still-running task: that one is left to the finalizer, whose panic
+/// discovery is merged by `merge_finalizer_join_faults`.
+async fn collect_finished_session_end(
+    registry: &Arc<Mutex<SubscriptionProducerRegistry>>,
+    settle_bound: Duration,
+    ends: &mut Vec<TransportEnd>,
+    session_run: &mut Option<SessionJoinHandle>,
+    session_seen: &mut Option<JoinOutcome>,
+) -> Result<()> {
+    let Some(sr) = session_run.as_mut() else {
+        return Ok(());
+    };
+    if !sr.is_finished() {
+        return Ok(());
+    }
+    let result = (&mut *sr).await;
+    *session_seen = Some(JoinOutcome::from_join_result(&result));
+    *session_run = None;
+    settle_and_record_session_end(registry, settle_bound, ends, &result).await?;
+    Ok(())
+}
+
+/// A session/namespace panic discovered only by the finalizer (its handle
+/// was never observed by the send loop) happened after the S3 verdict was
+/// computed. Record it as a `Fault` transport end and merge the reason into
+/// the verdict (Normal -> Error) so the written row is never contradictory.
+/// A verdict that was never computed stays `None` (`not_computed`); the
+/// fault end is still recorded. Returns whether anything was merged.
+fn merge_finalizer_join_faults(
+    verdict: &mut Option<RunVerdict>,
+    ends: &mut Vec<TransportEnd>,
+    joins: &ProducerJoins,
+    session_unobserved: bool,
+    ns_unobserved: bool,
+    tracks_fin: bool,
+) -> bool {
+    let mut merged = false;
+    for (source, outcome, unobserved, reason) in [
+        ("session", joins.session, session_unobserved, "session_panic_after_verdict"),
+        ("namespace", joins.ns, ns_unobserved, "namespace_panic_after_verdict"),
+    ] {
+        if outcome != JoinOutcome::Panicked || !unobserved {
+            continue;
+        }
+        ends.push(TransportEnd {
+            source,
+            kind: TransportEndKind::Fault(reason.to_string()),
+            text: "JoinError(panicked)".to_string(),
+            at_us: now_us(),
+            observed_at_us: None,
+            before_tracks_fin: !tracks_fin,
+        });
+        let text = format!("{source} task panicked (discovered by the finalizer): {reason}");
+        match verdict {
+            Some(RunVerdict::Error(reasons)) => reasons.push(text),
+            Some(RunVerdict::Normal) => *verdict = Some(RunVerdict::Error(vec![text])),
+            None => {}
+        }
+        merged = true;
+    }
+    merged
+}
+
 /// Await an optional join handle; `None` never resolves.
 async fn join_opt<T>(
     handle: Option<&mut tokio::task::JoinHandle<T>>,
@@ -1808,10 +1919,13 @@ async fn main() -> Result<()> {
     // single run verdict computed once after the drain from the registry.
     let mut s3_transport_ends: Vec<TransportEnd> = Vec::new();
     let mut s3_verdict: Option<RunVerdict> = None;
+    // S3 only: the registry, kept so the finalizer can sample the FIN state
+    // when it merges a join fault it discovered after the verdict.
+    let mut s3_registry: Option<Arc<Mutex<SubscriptionProducerRegistry>>> = None;
 
     // Fallible section. It must not use `?` to leave `main` — errors are
     // captured so the finalizer still runs (A2-c R1, Codex finding 5).
-    let outcome: Result<()> = async {
+    let mut outcome: Result<()> = async {
         // ---- MoQ session ----
         let (sess, tp) = connect(&args.relay).await.context("connect relay")?;
         let config = SessionConfig {
@@ -1840,6 +1954,7 @@ async fn main() -> Result<()> {
             let (recovery_frames, critical_frames) =
                 s3_frames.as_ref().expect("validated S3 frames");
             let registry = Arc::new(Mutex::new(SubscriptionProducerRegistry::new()));
+            s3_registry = Some(registry.clone());
             // The initial subscriptions must exist before the runner can
             // observe readiness and publish phase-control. Producers therefore
             // wait on this one-shot schedule authority instead of inventing an
@@ -2003,7 +2118,28 @@ async fn main() -> Result<()> {
                 }
                 outcome
             };
-            step?;
+            if let Err(error) = step {
+                // Early error exit runs the SAME stop -> bounded join ->
+                // unsettled record -> abort -> bounded second join sequence
+                // as the normal end, so every child is joined (or recorded
+                // unsettled) before the finalizer. The first error is the one
+                // propagated; a cleanup failure is only reported.
+                let p = producers.as_mut().expect("producers set above");
+                if let Err(cleanup) = stop_and_join_namespace(
+                    &ns_stop_tx,
+                    &registry,
+                    ns_join_bound,
+                    settle_bound,
+                    &mut s3_transport_ends,
+                    &mut p.ns_task,
+                    &mut p.ns_seen,
+                )
+                .await
+                {
+                    eprintln!("[tx] S3 namespace shutdown after error: {cleanup:#}");
+                }
+                return Err(error);
+            }
 
             // Drain, observing the session/namespace tasks: each end that
             // fires during the drain is recorded (typed) and the drain
@@ -2043,37 +2179,34 @@ async fn main() -> Result<()> {
             let verdict = if ending == Ending::Signal {
                 None
             } else {
-                let _ = ns_stop_tx.send(true);
                 let p = producers.as_mut().expect("producers set above");
-                if let Some(nt) = p.ns_task.as_mut() {
-                    let joined = match tokio::time::timeout(ns_join_bound, &mut *nt).await {
-                        Ok(r) => Some(r),
-                        Err(_) => {
-                            {
-                                let mut registry = registry.lock()
-                                    .map_err(|_| anyhow::anyhow!("S3 producer registry poisoned"))?;
-                                registry.record_namespace_fault("namespace_join_timeout");
-                                registry.mark_children_unsettled();
-                            }
-                            nt.abort();
-                            // Bounded second join (PRODUCER_JOIN_BUDGET); a
-                            // handle that still does not finish stays with
-                            // the finalizer, which reports it as timed out.
-                            tokio::time::timeout(PRODUCER_JOIN_BUDGET, &mut *nt).await.ok()
-                        }
-                    };
-                    if let Some(r) = joined {
-                        p.ns_task = None;
-                        p.ns_seen = Some(JoinOutcome::from_join_result(&r));
-                        // Classified from what the namespace task observed
-                        // (`Drained` only if it exited via the stop watch).
-                        settle_and_record_namespace_end(&registry, settle_bound, &mut s3_transport_ends, &r).await?;
-                    }
-                }
+                stop_and_join_namespace(
+                    &ns_stop_tx,
+                    &registry,
+                    ns_join_bound,
+                    settle_bound,
+                    &mut s3_transport_ends,
+                    &mut p.ns_task,
+                    &mut p.ns_seen,
+                )
+                .await?;
                 // Handoff wait, both schedule modes (registered warmup pass and
                 // the legacy `--warmup` mode). Direct topology only, like the
                 // static path: a relay sender's peer is the relay, which owns
                 // the downstream FIN handoff and does not close this session.
+                // Relay: no wait, but a session task that ALREADY finished
+                // (e.g. panicked during the namespace join) is classified now
+                // so the verdict sees it.
+                if args.topology != Topology::Direct {
+                    collect_finished_session_end(
+                        &registry,
+                        settle_bound,
+                        &mut s3_transport_ends,
+                        &mut p.session_run,
+                        &mut p.session_seen,
+                    )
+                    .await?;
+                }
                 if args.topology == Topology::Direct {
                     if let Some(sr) = p.session_run.as_mut() {
                         match wait_registered_direct_fin_handoff(
@@ -2704,6 +2837,11 @@ async fn main() -> Result<()> {
     // 1. Producers first: abort, join, and RECORD the outcome. A detached
     //    handle after a join timeout would leave a task that can still invoke
     //    accept callbacks, so quiescence alone must never be treated as proof.
+    // Handles the send loop never observed: a panic found in one of them
+    // here happened after the S3 verdict was computed and must be merged in.
+    let (session_unobserved, ns_unobserved) = producers
+        .as_ref()
+        .map_or((false, false), |p| (p.session_run.is_some(), p.ns_task.is_some()));
     let joins = match producers {
         Some(p) => {
             let session = join_producer(p.session_run, p.session_seen, PRODUCER_JOIN_BUDGET).await;
@@ -2713,6 +2851,30 @@ async fn main() -> Result<()> {
         // Setup failed before anything was spawned: nothing can call back.
         None => ProducerJoins::none_started(),
     };
+    if args.arm == Arm::S3 {
+        let tracks_fin = s3_registry
+            .as_ref()
+            .and_then(|registry| registry.lock().ok().map(|r| r.tracks_finished_on_wire()))
+            .unwrap_or(false);
+        if merge_finalizer_join_faults(
+            &mut s3_verdict,
+            &mut s3_transport_ends,
+            &joins,
+            session_unobserved,
+            ns_unobserved,
+            tracks_fin,
+        ) && outcome.is_ok()
+        {
+            ending = Ending::Error;
+            outcome = Err(anyhow::anyhow!(
+                "S3 run verdict error: {}",
+                s3_verdict
+                    .as_ref()
+                    .map(|v| v.reasons().join("; "))
+                    .unwrap_or_else(|| "task panicked after the verdict".to_string())
+            ));
+        }
+    }
 
     // 2. Accept instrumentation. The join outcomes gate `accept_intact`.
     let snap = match &accept_trace {
@@ -3657,5 +3819,146 @@ mod tests {
         assert_eq!(observe_namespace_end(&cancel).0, O::PeerError);
         let task: R = wrap(Err(anyhow::anyhow!("S3 subscription task failed")));
         assert_eq!(observe_namespace_end(&task).0, O::TaskError);
+    }
+    #[tokio::test]
+    async fn relay_collects_a_session_panic_that_finished_during_the_namespace_join() {
+        use super::{collect_finished_session_end, JoinOutcome, SubscriptionProducerRegistry};
+        use skew_moq::s3_producer::{
+            s3_run_verdict, ForwardOutcome, ProducerTerminal, RegistrySnapshot, RoleTerminal,
+            RunVerdict,
+        };
+        let registry = Arc::new(Mutex::new(SubscriptionProducerRegistry::new()));
+        let mut ends = Vec::new();
+        let mut seen = None;
+        // Still running: nothing is collected and nothing waits (relay has
+        // no handoff wait; the finalizer owns the running task).
+        let mut running = Some(tokio::spawn(async {
+            std::future::pending::<()>().await;
+            Ok::<(), moq_transport::session::SessionError>(())
+        }));
+        collect_finished_session_end(&registry, Duration::ZERO, &mut ends, &mut running, &mut seen)
+            .await
+            .unwrap();
+        assert!(running.is_some() && seen.is_none() && ends.is_empty());
+        running.take().unwrap().abort();
+        // Panicked while main was joining the namespace: classified through
+        // the settle-then-classify path as a Fault before the verdict.
+        let mut panicked = Some(tokio::spawn(async {
+            if true {
+                panic!("injected relay session panic");
+            }
+            Ok::<(), moq_transport::session::SessionError>(())
+        }));
+        while !panicked.as_ref().unwrap().is_finished() {
+            tokio::task::yield_now().await;
+        }
+        collect_finished_session_end(&registry, Duration::ZERO, &mut ends, &mut panicked, &mut seen)
+            .await
+            .unwrap();
+        assert!(panicked.is_none(), "a finished handle must not reach the finalizer");
+        assert_eq!(seen, Some(JoinOutcome::Panicked));
+        assert_eq!(ends.len(), 1);
+        assert_eq!(ends[0].source, "session");
+        assert!(matches!(&ends[0].kind, TransportEndKind::Fault(reason) if reason == "task panicked"));
+        let complete = Some(RoleTerminal {
+            terminal: ProducerTerminal::Finished,
+            forward: Some(ForwardOutcome::Closed),
+        });
+        let snapshot = RegistrySnapshot {
+            pc: complete,
+            haptic: complete,
+            faults: Vec::new(),
+            namespace_faults: Vec::new(),
+            outstanding: 0,
+            children_unsettled: false,
+        };
+        assert_eq!(s3_run_verdict(&snapshot, &[]), RunVerdict::Normal);
+        assert!(matches!(s3_run_verdict(&snapshot, &ends), RunVerdict::Error(_)));
+    }
+
+    #[tokio::test]
+    async fn namespace_shutdown_records_unsettled_children_when_the_join_times_out() {
+        use super::{stop_and_join_namespace, JoinOutcome, NamespaceExit, SubscriptionProducerRegistry};
+        use skew_moq::s3_producer::{s3_run_verdict, RunVerdict};
+        let registry = Arc::new(Mutex::new(SubscriptionProducerRegistry::new()));
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        // A namespace task whose children never finish.
+        let mut ns_task = Some(tokio::spawn(std::future::pending::<NamespaceExit>()));
+        let mut ns_seen = None;
+        let mut ends = Vec::new();
+        stop_and_join_namespace(
+            &stop_tx, &registry, Duration::ZERO, Duration::ZERO, &mut ends, &mut ns_task, &mut ns_seen,
+        )
+        .await
+        .unwrap();
+        assert!(*stop_rx.borrow(), "stop must be signalled first");
+        assert!(ns_task.is_none(), "the aborted namespace task must be joined");
+        assert_eq!(ns_seen, Some(JoinOutcome::Cancelled));
+        let snapshot = registry.lock().unwrap().snapshot();
+        assert!(snapshot.children_unsettled);
+        assert!(snapshot.namespace_faults.iter().any(|r| r == "namespace_join_timeout"));
+        assert_eq!(ends.len(), 1);
+        assert_eq!(ends[0].source, "namespace");
+        assert!(matches!(ends[0].kind, TransportEndKind::LocalClose));
+        assert!(matches!(s3_run_verdict(&snapshot, &ends), RunVerdict::Error(_)));
+        // A handle the send loop already observed: no wait, nothing recorded.
+        let mut observed = None;
+        let mut observed_seen = Some(JoinOutcome::Completed);
+        stop_and_join_namespace(
+            &stop_tx, &registry, Duration::ZERO, Duration::ZERO, &mut ends, &mut observed,
+            &mut observed_seen,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ends.len(), 1);
+        assert_eq!(observed_seen, Some(JoinOutcome::Completed));
+    }
+
+    #[test]
+    fn finalizer_panic_discovery_is_merged_into_the_verdict() {
+        use super::{merge_finalizer_join_faults, JoinOutcome, ProducerJoins};
+        use skew_moq::s3_producer::RunVerdict;
+        let joins = ProducerJoins {
+            session: JoinOutcome::Panicked,
+            ns: JoinOutcome::Cancelled,
+        };
+        // Already observed by the send loop: not merged again.
+        let mut verdict = Some(RunVerdict::Normal);
+        let mut ends = Vec::new();
+        assert!(!merge_finalizer_join_faults(&mut verdict, &mut ends, &joins, false, false, true));
+        assert_eq!(verdict, Some(RunVerdict::Normal));
+        assert!(ends.is_empty());
+        // Discovered by the finalizer: Normal -> Error plus a Fault end.
+        assert!(merge_finalizer_join_faults(&mut verdict, &mut ends, &joins, true, true, true));
+        assert!(matches!(&verdict, Some(RunVerdict::Error(reasons))
+            if reasons.len() == 1 && reasons[0].contains("session_panic_after_verdict")));
+        assert_eq!(ends.len(), 1);
+        assert_eq!(ends[0].source, "session");
+        assert!(matches!(&ends[0].kind, TransportEndKind::Fault(reason)
+            if reason == "session_panic_after_verdict"));
+        assert!(!ends[0].before_tracks_fin);
+        // An Error verdict gains a reason.
+        assert!(merge_finalizer_join_faults(&mut verdict, &mut ends, &joins, true, false, true));
+        assert!(matches!(&verdict, Some(RunVerdict::Error(reasons)) if reasons.len() == 2));
+        // A verdict that was never computed stays not_computed; the end is
+        // still recorded, sampled against the FIN state.
+        let mut none = None;
+        let mut ends_none = Vec::new();
+        assert!(merge_finalizer_join_faults(&mut none, &mut ends_none, &joins, true, false, false));
+        assert!(none.is_none());
+        assert_eq!(ends_none.len(), 1);
+        assert!(ends_none[0].before_tracks_fin);
+        // Non-panic joins never merge.
+        let clean = ProducerJoins { session: JoinOutcome::Cancelled, ns: JoinOutcome::TimedOut };
+        let mut normal = Some(RunVerdict::Normal);
+        let mut ends_clean = Vec::new();
+        assert!(!merge_finalizer_join_faults(&mut normal, &mut ends_clean, &clean, true, true, true));
+        assert_eq!(normal, Some(RunVerdict::Normal));
+        // The shutdown row stays valid JSON with the merged fields.
+        let fields = s3_shutdown_fields(verdict.as_ref(), &ends);
+        let row: serde_json::Value =
+            serde_json::from_str(&format!("{{\"event\":\"shutdown\"{fields}}}")).unwrap();
+        assert_eq!(row["s3_verdict"], "error");
+        assert_eq!(row["s3_transport_ends"][0]["fault"], "session_panic_after_verdict");
     }
 }

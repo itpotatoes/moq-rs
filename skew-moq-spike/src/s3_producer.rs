@@ -1257,17 +1257,33 @@ where
         biased;
         serve_result = &mut serve => {
             cancel_shared(&registry, role, route)?;
-            record_terminal_shared(&registry, role, route, ProducerTerminal::RemoteClosed)?;
-            if let Err(error) = normalize_serve_end(serve_result) {
-                record_fault_shared(&registry, role, route, "serve_error")?;
-                return Err(error);
+            // Classify BEFORE recording the terminal: only a track-level peer
+            // cancel (UNSUBSCRIBE / switch), a vanished track, or a clean
+            // forwarder end is `RemoteClosed`. Every other error (including
+            // the typed subgroup-object-abort error moq-transport now
+            // surfaces instead of `Cancel`) records the `serve_error` fault
+            // through an `Error` terminal, so the verdict fails even when a
+            // later generation completes normally.
+            match classify_serve_first_end(serve_result) {
+                ServeFirstEnd::RemoteClosed => {
+                    record_terminal_shared(&registry, role, route, ProducerTerminal::RemoteClosed)?;
+                    Ok(Some(SubscriptionTaskResult {
+                        end: SubscriptionTaskEnd::RemoteClosed,
+                        role,
+                        route,
+                        objects: route_objects(&registry, role, route)?,
+                    }))
+                }
+                ServeFirstEnd::Fault(error) => {
+                    record_terminal_shared(
+                        &registry,
+                        role,
+                        route,
+                        ProducerTerminal::Error(SERVE_ERROR_FAULT),
+                    )?;
+                    Err(error)
+                }
             }
-            Ok(Some(SubscriptionTaskResult {
-                end: SubscriptionTaskEnd::RemoteClosed,
-                role,
-                route,
-                objects: route_objects(&registry, role, route)?,
-            }))
         }
         producer_result = &mut produce => {
             let produced = match producer_result {
@@ -1309,7 +1325,7 @@ where
                         ))
                     }
                     Err(error) => {
-                        return Err(("serve_error", anyhow::Error::from(error).context("serve subscription")))
+                        return Err((SERVE_ERROR_FAULT, anyhow::Error::from(error).context("serve subscription")))
                     }
                 }
                 let recorded = match route_objects(&registry, role, route) {
@@ -1390,19 +1406,6 @@ fn mark_forward_shared(
     .map_err(|error| anyhow!("record producer forwarder outcome: {error:?}"))
 }
 
-fn record_fault_shared(
-    registry: &Arc<Mutex<SubscriptionProducerRegistry>>,
-    role: TrackRole,
-    route: Route,
-    reason: &'static str,
-) -> anyhow::Result<()> {
-    registry
-        .lock()
-        .map_err(|_| anyhow!("producer registry poisoned"))?
-        .record_fault(role, route, reason)
-        .map_err(|error| anyhow!("record producer fault: {error:?}"))
-}
-
 /// Release a reservation if one exists; an unreserved (directly activated)
 /// route is not an error here.
 fn release_reservation_shared(
@@ -1443,12 +1446,32 @@ fn route_objects(
         })
 }
 
-fn normalize_serve_end(result: Result<(), SessionError>) -> anyhow::Result<()> {
+/// Fault reason recorded when the forwarder ended with a real error, in
+/// either select arm.
+const SERVE_ERROR_FAULT: &str = "serve_error";
+
+/// How the forwarder ended when it finished before the producer loop.
+#[derive(Debug)]
+enum ServeFirstEnd {
+    /// `Ok(())`, track-level `Done` (track vanished), or track-level `Cancel`
+    /// (peer UNSUBSCRIBE, e.g. a tier switch). Not a fault by itself.
+    RemoteClosed,
+    /// Any other error, e.g. `Internal("subgroup object aborted")` or a QUIC
+    /// write failure. Always a fault.
+    Fault(anyhow::Error),
+}
+
+/// Classify the serve-first end. `forward_subgroups` in moq-transport maps a
+/// subgroup-internal `Cancel`/`Done` to a typed internal error, so the two
+/// track-level variants matched here are exactly the peer-driven ends.
+fn classify_serve_first_end(result: Result<(), SessionError>) -> ServeFirstEnd {
     match result {
         Ok(())
         | Err(SessionError::Serve(ServeError::Cancel))
-        | Err(SessionError::Serve(ServeError::Done)) => Ok(()),
-        Err(error) => Err(error).context("serve subscription"),
+        | Err(SessionError::Serve(ServeError::Done)) => ServeFirstEnd::RemoteClosed,
+        Err(error) => ServeFirstEnd::Fault(
+            anyhow::Error::from(error).context("serve subscription"),
+        ),
     }
 }
 
@@ -2619,5 +2642,97 @@ mod tests {
             s3_run_verdict(&clean_snapshot(), &[end(kind, true)]),
             RunVerdict::Error(_)
         ));
+    }
+    /// Serve-first arm classification: a subgroup object abort observed while
+    /// producing (surfaced by moq-transport as a typed internal error, never
+    /// as `Cancel`) on the first generation is a fault; a later generation
+    /// completing normally does not clear it. A genuine track-level peer
+    /// cancel on a retired generation remains a non-fault `RemoteClosed`.
+    #[test]
+    fn production_time_object_abort_on_a_retired_generation_fails_the_verdict() {
+        fn complete(registry: &mut SubscriptionProducerRegistry, role: TrackRole, route: Route) {
+            registry.cancel(role, route).unwrap();
+            registry
+                .record_terminal(role, route, ProducerTerminal::Finished)
+                .unwrap();
+            registry.mark_forward_closed(role, route).unwrap();
+        }
+        // The serve-first classifier: only peer-driven ends are RemoteClosed.
+        for peer_end in [
+            Ok(()),
+            Err(SessionError::Serve(ServeError::Cancel)),
+            Err(SessionError::Serve(ServeError::Done)),
+        ] {
+            assert!(matches!(
+                classify_serve_first_end(peer_end),
+                ServeFirstEnd::RemoteClosed
+            ));
+        }
+        let abort = SessionError::Serve(ServeError::internal_ctx("subgroup object aborted"));
+        let ServeFirstEnd::Fault(error) = classify_serve_first_end(Err(abort)) else {
+            panic!("subgroup object abort must be a fault");
+        };
+        // `internal_ctx` puts the context in the log only; the chain keeps
+        // the typed internal error and the serve context.
+        let text = format!("{error:#}");
+        assert!(text.contains("serve subscription") && text.contains("Internal error"), "{text}");
+        assert!(matches!(
+            classify_serve_first_end(Err(SessionError::Internal)),
+            ServeFirstEnd::Fault(_)
+        ));
+
+        let pc0 = route(PC_NORMAL_TRACK, 0);
+        let pc1 = route(PC_RECOVERY_TRACK, 1);
+        let hap0 = route(HAPTIC_FULL_TRACK, 0);
+        // Generation 0 PC: forwarder ended first with the object-abort error.
+        let mut registry = SubscriptionProducerRegistry::new();
+        let _pc0 = registry.activate(TrackRole::Pc, pc0).unwrap();
+        let _hap0 = registry.activate(TrackRole::Haptic, hap0).unwrap();
+        registry.cancel(TrackRole::Pc, pc0).unwrap();
+        registry
+            .record_terminal(TrackRole::Pc, pc0, ProducerTerminal::Error(SERVE_ERROR_FAULT))
+            .unwrap();
+        registry.record_settled(TrackRole::Pc, pc0).unwrap();
+        // A later generation completes normally, as does haptic.
+        let _pc1 = registry.activate(TrackRole::Pc, pc1).unwrap();
+        complete(&mut registry, TrackRole::Pc, pc1);
+        complete(&mut registry, TrackRole::Haptic, hap0);
+        registry.record_settled(TrackRole::Pc, pc1).unwrap();
+        registry.record_settled(TrackRole::Haptic, hap0).unwrap();
+        assert!(registry.current_routes_completed());
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.outstanding, 0);
+        assert_eq!(
+            snapshot.faults,
+            vec![RecordedFault {
+                role: TrackRole::Pc,
+                generation: 0,
+                reason: SERVE_ERROR_FAULT,
+            }]
+        );
+        let verdict = s3_run_verdict(&snapshot, &[]);
+        assert!(
+            matches!(&verdict, RunVerdict::Error(reasons)
+                if reasons.iter().any(|r| r.contains("fault pc generation 0: serve_error"))),
+            "{verdict:?}"
+        );
+        assert!(!registry.settled_complete());
+
+        // Control: the same shape with a peer UNSUBSCRIBE on generation 0
+        // (RemoteClosed, no fault) stays normal.
+        let mut registry = SubscriptionProducerRegistry::new();
+        let _pc0 = registry.activate(TrackRole::Pc, pc0).unwrap();
+        let _hap0 = registry.activate(TrackRole::Haptic, hap0).unwrap();
+        registry.cancel(TrackRole::Pc, pc0).unwrap();
+        registry
+            .record_terminal(TrackRole::Pc, pc0, ProducerTerminal::RemoteClosed)
+            .unwrap();
+        registry.record_settled(TrackRole::Pc, pc0).unwrap();
+        let _pc1 = registry.activate(TrackRole::Pc, pc1).unwrap();
+        complete(&mut registry, TrackRole::Pc, pc1);
+        complete(&mut registry, TrackRole::Haptic, hap0);
+        registry.record_settled(TrackRole::Pc, pc1).unwrap();
+        registry.record_settled(TrackRole::Haptic, hap0).unwrap();
+        assert_eq!(s3_run_verdict(&registry.snapshot(), &[]), RunVerdict::Normal);
     }
 }
