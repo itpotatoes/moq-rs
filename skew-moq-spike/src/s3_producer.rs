@@ -1461,10 +1461,12 @@ enum ServeFirstEnd {
     Fault(anyhow::Error),
 }
 
-/// Classify the serve-first end. `forward_subgroups` in moq-transport maps a
-/// subgroup-internal `Cancel`/`Done` to a typed internal error, so the ends
-/// matched here (`Ok`, track-level `Cancel`, track-level `Done`) are the ones
-/// the S3 contract treats as remote-closed. This is a contract classification,
+/// Classify the serve-first end. moq-transport classifies a subgroup reader's
+/// own `Cancel`/`Done` at the read boundary (`subgroup_reader_error`) as a
+/// typed internal error, and a child can only return a track-level `Cancel`
+/// from a vanished forwarder state that has a stored terminal (peer
+/// UNSUBSCRIBE), so the ends matched here (`Ok`, track-level `Cancel`,
+/// track-level `Done`) are the ones the S3 contract treats as remote-closed. This is a contract classification,
 /// not proof that the peer caused the end: track-level `Done` can also come
 /// from a locally dropped writer (`TrackReader::mode()` returns `Done` once
 /// the track state is closed without a reader mode).
