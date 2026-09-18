@@ -94,6 +94,24 @@ pub(super) struct ObjectForwarder {
     mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
 }
 
+/// The forwarder's stored terminal, if any: `Cancel` after a peer
+/// UNSUBSCRIBE (`ObjectForwarderRecv::recv_unsubscribe`) or a local `close`,
+/// otherwise the error passed to `close`. `None` when nothing is stored, which
+/// says nothing about whether the watch peer is still alive. Reads with
+/// `lock()`, which keeps working after the peer dropped the state.
+fn stored_terminal(state: &State<ObjectForwarderState>) -> Option<ServeError> {
+    state.lock().closed.clone().err()
+}
+
+/// Error for a serve/subgroup path that found the forwarder state vanished
+/// (`lock_mut()`/`into_mut()` returned `None`). `recv_unsubscribe` stores
+/// `Cancel` and only then drops the recv half, so a child racing that drop
+/// must surface the peer's stored terminal (track-level `Cancel`) instead of
+/// a synthetic `Done`; a pure watch loss with nothing stored stays `Done`.
+fn terminal_or_done(state: &State<ObjectForwarderState>) -> ServeError {
+    stored_terminal(state).unwrap_or(ServeError::Done)
+}
+
 /// Store `err` as the forwarder's terminal state. Fails with the error that
 /// is already stored (a `Cancel` from UNSUBSCRIBE) or `Done` when the watch
 /// peer is gone.
@@ -452,7 +470,9 @@ impl ObjectForwarder {
         let state = self.state.clone();
         let mlog = self.mlog.clone();
         let track_alias = self.track_alias;
-        Self::forward_subgroups(subgroups, self.closed(), move |subgroup| {
+        let terminal_state = self.state.clone();
+        Self::forward_subgroups(subgroups, self.closed(), move || stored_terminal(&terminal_state),
+            move |subgroup| {
             let header = data::SubgroupHeader {
                 header_type: data::StreamHeaderType::SubgroupIdExt,
                 track_alias,
@@ -469,9 +489,15 @@ impl ObjectForwarder {
     /// failure cancels the other in-task futures before returning the error.
     /// Keep watching remote cancellation after the track producer has ended:
     /// outstanding subgroup writes can still fail during this drain.
+    ///
+    /// `stored_terminal` reads the forwarder's stored terminal (see
+    /// [`stored_terminal`]); it decides whether a child `Done`/`Cancel` is the
+    /// peer's track-level end seen from inside a child (the `closed` arm lost
+    /// the poll-order race) or a genuine subgroup-internal failure.
     async fn forward_subgroups<F, Fut>(
         mut subgroups: serve::SubgroupsReader,
         closed: impl std::future::Future<Output = Result<(), ServeError>>,
+        stored_terminal: impl Fn() -> Option<ServeError>,
         mut forward: F,
     ) -> Result<(), SessionError>
     where
@@ -501,13 +527,33 @@ impl ObjectForwarder {
                         // Ok. Neither may be confused with the track-level
                         // Done/Cancel (watch gone / peer UNSUBSCRIBE) that the
                         // caller normalizes.
+                        //
+                        // Exception: the biased `closed` arm was already polled
+                        // Pending in this iteration when another thread stored
+                        // the forwarder terminal (UNSUBSCRIBE) and dropped the
+                        // watch peer, and the child then observed the vanished
+                        // state. The stored terminal is exactly what `closed`
+                        // returns on the next poll, so surface it now instead
+                        // of a synthetic internal error. Nothing stored means
+                        // the child's Done/Cancel is its own (state truly
+                        // vanished / object aborted) and stays a fault.
                         result.map_err(|error| match error {
-                            SessionError::Serve(ServeError::Done) =>
-                                SessionError::Serve(ServeError::internal_ctx(
-                                    "subgroup state ended before forwarding completed")),
-                            SessionError::Serve(ServeError::Cancel) =>
-                                SessionError::Serve(ServeError::internal_ctx(
-                                    "subgroup object aborted")),
+                            SessionError::Serve(inner @ (ServeError::Done | ServeError::Cancel)) => {
+                                if let Some(stored) = stored_terminal() {
+                                    tracing::debug!(
+                                        child = ?inner,
+                                        stored = ?stored,
+                                        "subgroup ended after the forwarder terminal was stored; surfacing the stored terminal"
+                                    );
+                                    return SessionError::Serve(stored);
+                                }
+                                match inner {
+                                    ServeError::Done => SessionError::Serve(ServeError::internal_ctx(
+                                        "subgroup state ended before forwarding completed")),
+                                    _ => SessionError::Serve(ServeError::internal_ctx(
+                                        "subgroup object aborted")),
+                                }
+                            }
                             error => error,
                         })?;
                     }
@@ -565,7 +611,7 @@ impl ObjectForwarder {
 
         state
             .lock_mut()
-            .ok_or(ServeError::Done)?
+            .ok_or_else(|| terminal_or_done(&state))?
             .record_stream_opened();
 
         let mapping = publisher.data_priority_mapping();
@@ -815,7 +861,7 @@ impl ObjectForwarder {
 
             state
                 .lock_mut()
-                .ok_or(ServeError::Done)?
+                .ok_or_else(|| terminal_or_done(&state))?
                 .update_largest_location(
                     subgroup_reader.group_id,
                     subgroup_object_reader.object_id,
@@ -880,7 +926,7 @@ impl ObjectForwarder {
 
         state
             .lock_mut()
-            .ok_or(ServeError::Done)?
+            .ok_or_else(|| terminal_or_done(&state))?
             .record_stream_opened();
 
         let mut output = SubgroupOutput::Buffer(bytes::BytesMut::new());
@@ -977,7 +1023,7 @@ impl ObjectForwarder {
 
             self.state
                 .lock_mut()
-                .ok_or(ServeError::Done)?
+                .ok_or_else(|| terminal_or_done(&self.state))?
                 .update_largest_location(
                     encoded_datagram.group_id,
                     encoded_datagram.object_id.unwrap(),
@@ -1065,7 +1111,7 @@ mod tests {
             };
             let state = State::<ObjectForwarderState>::default();
             let forward = ObjectForwarder::forward_subgroups(
-                subgroups, std::future::ready(Ok(())), |subgroup| {
+                subgroups, std::future::ready(Ok(())), || None, |subgroup| {
                     let header = data::SubgroupHeader {
                         header_type: data::StreamHeaderType::SubgroupIdExt,
                         track_alias: 42, group_id: subgroup.group_id,
@@ -1124,7 +1170,7 @@ mod tests {
             };
             let state = State::<ObjectForwarderState>::default();
             let result = ObjectForwarder::forward_subgroups(subgroups,
-                std::future::pending(), |subgroup| {
+                std::future::pending(), || None, |subgroup| {
                     let header = data::SubgroupHeader {
                         header_type: data::StreamHeaderType::SubgroupIdExt,
                         track_alias: 42, group_id: subgroup.group_id,
@@ -1156,7 +1202,7 @@ mod tests {
         };
         let (tx, rx) = tokio::sync::oneshot::channel();
         let forward = ObjectForwarder::forward_subgroups(subgroups,
-            async { rx.await.unwrap() }, |_| std::future::pending());
+            async { rx.await.unwrap() }, || None, |_| std::future::pending());
         tokio::pin!(forward);
         assert!(futures::poll!(&mut forward).is_pending());
         tx.send(Err(ServeError::Cancel)).unwrap();
@@ -1374,7 +1420,7 @@ mod tests {
         let (send_state, recv_state) = State::<ObjectForwarderState>::default().split();
         let mut recv = ObjectForwarderRecv { state: recv_state };
         let forward = ObjectForwarder::forward_subgroups(
-            subgroups, std::future::pending(), |subgroup| {
+            subgroups, std::future::pending(), || None, |subgroup| {
                 let header = data::SubgroupHeader {
                     header_type: data::StreamHeaderType::SubgroupIdExt,
                     track_alias: 42, group_id: subgroup.group_id,
@@ -1419,5 +1465,151 @@ mod tests {
         drop(recv_state);
         let res = finish_serve(&send_state, Err(SessionError::Internal));
         assert!(matches!(res, Err(SessionError::Internal)), "{res:?}");
+    }
+
+    /// Helper for the race tests: one subgroup with a single complete object,
+    /// producer FIN, returned in subgroups mode.
+    async fn one_object_track() -> serve::SubgroupsReader {
+        use crate::coding::TrackNamespace;
+        let (writer, reader) = serve::Track::new(
+            TrackNamespace::from_utf8_path("test"), "video").produce();
+        let mut groups = writer.subgroups().unwrap();
+        let mut group = groups.append(1).unwrap();
+        group.write(bytes::Bytes::from_static(b"hello")).unwrap();
+        drop(group);
+        drop(groups);
+        match reader.mode().await.unwrap() {
+            TrackReaderMode::Subgroups(subgroups) => subgroups,
+            _ => panic!("subgroups expected"),
+        }
+    }
+
+    fn buffer_child(
+        state: &State<ObjectForwarderState>,
+    ) -> impl FnMut(serve::SubgroupReader) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SessionError>> + Send>> + '_ {
+        move |subgroup| {
+            let header = data::SubgroupHeader {
+                header_type: data::StreamHeaderType::SubgroupIdExt,
+                track_alias: 42, group_id: subgroup.group_id,
+                subgroup_id: Some(subgroup.subgroup_id),
+                publisher_priority: subgroup.priority,
+            };
+            let state = state.clone();
+            Box::pin(async move {
+                ObjectForwarder::serve_subgroup_to_buffer(header, subgroup, state,
+                    DeliveryFilter { forward: true, start_location: None, end_group_id: None },
+                    None).await.map(|_| ())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_then_dropped_recv_half_is_seen_by_a_child_as_track_level_cancel() {
+        // Stage-9 race: UNSUBSCRIBE handling stores Cancel + unsubscribed and
+        // drops the recv half BEFORE the child's record_stream_opened path
+        // runs (its lock_mut() returns None). The child must resolve to the
+        // peer's stored terminal, not to Done / the internal error.
+        let mut subgroups = one_object_track().await;
+        let subgroup = subgroups.next().await.unwrap().expect("subgroup");
+        let (send_state, recv_state) = State::<ObjectForwarderState>::default().split();
+        let mut recv = ObjectForwarderRecv { state: recv_state };
+        recv.recv_unsubscribe().unwrap();
+        drop(recv);
+        assert!(send_state.lock_mut().is_none(), "recv half drop must vanish the state");
+        assert!(send_state.lock().unsubscribed);
+        assert!(matches!(stored_terminal(&send_state), Some(ServeError::Cancel)));
+        assert!(matches!(terminal_or_done(&send_state), ServeError::Cancel));
+
+        let header = data::SubgroupHeader {
+            header_type: data::StreamHeaderType::SubgroupIdExt,
+            track_alias: 42, group_id: subgroup.group_id,
+            subgroup_id: Some(subgroup.subgroup_id), publisher_priority: subgroup.priority,
+        };
+        let res = ObjectForwarder::serve_subgroup_to_buffer(header, subgroup, send_state.clone(),
+            DeliveryFilter { forward: true, start_location: None, end_group_id: None }, None).await;
+        assert!(matches!(res, Err(SessionError::Serve(ServeError::Cancel))), "{res:?}");
+        assert_eq!(send_state.lock().stream_count, 0);
+
+        // Same race through the parent with the `closed` arm still Pending
+        // (it lost the poll order): the run must end RemoteClosed (Cancel).
+        let subgroups = one_object_track().await;
+        let terminal_state = send_state.clone();
+        let res = tokio::time::timeout(std::time::Duration::from_secs(1),
+            ObjectForwarder::forward_subgroups(subgroups, std::future::pending(),
+                move || stored_terminal(&terminal_state), buffer_child(&send_state)))
+            .await.expect("must not hang");
+        assert!(matches!(res, Err(SessionError::Serve(ServeError::Cancel))), "{res:?}");
+    }
+
+    #[tokio::test]
+    async fn pure_watch_loss_with_nothing_stored_stays_done_for_a_child() {
+        // Recv half dropped without UNSUBSCRIBE: nothing stored, Done as before.
+        let mut subgroups = one_object_track().await;
+        let subgroup = subgroups.next().await.unwrap().expect("subgroup");
+        let (send_state, recv_state) = State::<ObjectForwarderState>::default().split();
+        drop(recv_state);
+        assert!(stored_terminal(&send_state).is_none());
+        assert!(matches!(terminal_or_done(&send_state), ServeError::Done));
+        let header = data::SubgroupHeader {
+            header_type: data::StreamHeaderType::SubgroupIdExt,
+            track_alias: 42, group_id: subgroup.group_id,
+            subgroup_id: Some(subgroup.subgroup_id), publisher_priority: subgroup.priority,
+        };
+        let res = ObjectForwarder::serve_subgroup_to_buffer(header, subgroup, send_state,
+            DeliveryFilter { forward: true, start_location: None, end_group_id: None }, None).await;
+        assert!(matches!(res, Err(SessionError::Serve(ServeError::Done))), "{res:?}");
+    }
+
+    #[tokio::test]
+    async fn child_done_with_stored_unsubscribe_cancel_is_track_level_cancel() {
+        let subgroups = one_object_track().await;
+        let (send_state, recv_state) = State::<ObjectForwarderState>::default().split();
+        let mut recv = ObjectForwarderRecv { state: recv_state };
+        recv.recv_unsubscribe().unwrap();
+        assert!(send_state.lock().unsubscribed);
+        let res = ObjectForwarder::forward_subgroups(subgroups, std::future::pending(),
+            || stored_terminal(&send_state),
+            |_| std::future::ready(Err(SessionError::Serve(ServeError::Done)))).await;
+        assert!(matches!(res, Err(SessionError::Serve(ServeError::Cancel))), "{res:?}");
+        // Any other stored terminal is surfaced as-is.
+        let subgroups = one_object_track().await;
+        let res = ObjectForwarder::forward_subgroups(subgroups, std::future::pending(),
+            || Some(ServeError::Closed(0x12)),
+            |_| std::future::ready(Err(SessionError::Serve(ServeError::Cancel)))).await;
+        assert!(matches!(res, Err(SessionError::Serve(ServeError::Closed(0x12)))), "{res:?}");
+    }
+
+    #[tokio::test]
+    async fn child_done_with_nothing_stored_is_still_the_internal_error() {
+        let subgroups = one_object_track().await;
+        let res = ObjectForwarder::forward_subgroups(subgroups, std::future::pending(), || None,
+            |_| std::future::ready(Err(SessionError::Serve(ServeError::Done)))).await;
+        // `internal_ctx` keeps "subgroup state ended before forwarding
+        // completed" in the log only; the typed variant is the contract.
+        assert!(
+            matches!(&res, Err(SessionError::Serve(
+                ServeError::InternalWithId(_, _) | ServeError::Internal(_)))),
+            "unexpected mapping for child Done: {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn child_cancel_with_nothing_stored_is_still_the_object_abort_error() {
+        let subgroups = one_object_track().await;
+        let res = ObjectForwarder::forward_subgroups(subgroups, std::future::pending(), || None,
+            |_| std::future::ready(Err(SessionError::Serve(ServeError::Cancel)))).await;
+        // `internal_ctx` keeps "subgroup object aborted" in the log only; the
+        // typed variant is what separates it from a track-level Cancel.
+        assert!(
+            matches!(&res, Err(SessionError::Serve(
+                ServeError::InternalWithId(_, _) | ServeError::Internal(_)))),
+            "unexpected mapping for child Cancel: {res:?}"
+        );
+        // Other child errors pass through untouched even with a stored terminal.
+        let subgroups = one_object_track().await;
+        let res = ObjectForwarder::forward_subgroups(subgroups, std::future::pending(),
+            || Some(ServeError::Cancel),
+            |_| std::future::ready(Err(SessionError::Serve(ServeError::Size)))).await;
+        assert!(matches!(res, Err(SessionError::Serve(ServeError::Size))), "{res:?}");
     }
 }
