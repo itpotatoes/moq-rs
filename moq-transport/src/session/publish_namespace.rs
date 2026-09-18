@@ -47,6 +47,14 @@ impl Drop for PublishNamespaceState {
     }
 }
 
+/// One step of [`PublishNamespace::subscribed`]: a stored peer error wins over
+/// a queued subscriber; `Ok(true)` means a subscriber is queued, `Ok(false)`
+/// means wait (or end when the state is dropped).
+fn subscribed_step(closed: &Result<(), ServeError>, queued: usize) -> Result<bool, ServeError> {
+    closed.clone()?;
+    Ok(queued > 0)
+}
+
 /// Represents an outbound PUBLISH_NAMESPACE sent by a publisher.
 ///
 /// Dropped with PUBLISH_NAMESPACE_DONE unless already closed with an error.
@@ -109,17 +117,27 @@ impl PublishNamespace {
     }
 
     /// Wait until a subscriber arrives for this namespace.
+    ///
+    /// A stored peer error (REQUEST_ERROR -> `Closed(code)`,
+    /// PUBLISH_NAMESPACE_CANCEL -> `Cancel`) is surfaced FIRST, even when a
+    /// subscription is still queued: once the receiving side has recorded the
+    /// error and dropped its handle, the queued subscriber can no longer be
+    /// handed out (`into_mut` yields `None`) and the error would otherwise be
+    /// lost behind an `Ok(None)`.
     pub async fn subscribed(&self) -> Result<Option<Subscribed>, ServeError> {
+        Self::subscribed_state(&self.state).await
+    }
+
+    async fn subscribed_state(state: &State<PublishNamespaceState>) -> Result<Option<Subscribed>, ServeError> {
         loop {
             {
-                let state = self.state.lock();
-                if !state.subscribers.is_empty() {
+                let state = state.lock();
+                if subscribed_step(&state.closed, state.subscribers.len())? {
                     return Ok(state
                         .into_mut()
                         .and_then(|mut state| state.subscribers.pop_front()));
                 }
 
-                state.closed.clone()?;
                 match state.modified() {
                     Some(notified) => notified,
                     None => return Ok(None),
@@ -240,5 +258,63 @@ impl PublishNamespaceRecv {
             .track_statuses_requested
             .push_back(track_status_requested);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subscribed_surfaces_a_stored_peer_error_before_a_queued_subscription() {
+        // REQUEST_ERROR recorded (Closed(code)) while a subscription is still
+        // queued and the recv handle was dropped: the error must be observed,
+        // never an `Ok(None)`.
+        assert!(matches!(
+            subscribed_step(&Err(ServeError::Closed(4)), 1),
+            Err(ServeError::Closed(4))
+        ));
+        assert!(matches!(
+            subscribed_step(&Err(ServeError::Cancel), 1),
+            Err(ServeError::Cancel)
+        ));
+        assert!(matches!(
+            subscribed_step(&Err(ServeError::Closed(4)), 0),
+            Err(ServeError::Closed(4))
+        ));
+        // No error: a queued subscription is handed out, otherwise wait.
+        assert!(subscribed_step(&Ok(()), 1).unwrap());
+        assert!(!subscribed_step(&Ok(()), 0).unwrap());
+    }
+
+    #[tokio::test]
+    async fn subscribed_wait_observes_recv_error_after_recv_handle_is_dropped() {
+        for error in [ServeError::Closed(4), ServeError::Cancel] {
+            let (send, recv) = State::<PublishNamespaceState>::default().split();
+            let recv = PublishNamespaceRecv { state: recv, request_id: 7 };
+            let wait = PublishNamespace::subscribed_state(&send);
+            tokio::pin!(wait);
+            assert!(futures::poll!(&mut wait).is_pending());
+            // recv_error consumes the receiver, records the error and drops
+            // the peer handle. The actual async wait must return that error.
+            recv.recv_error(error.clone()).unwrap();
+            assert_eq!(wait.await.err(), Some(error));
+        }
+    }
+
+    #[test]
+    fn recv_error_is_stored_once_and_read_first() {
+        let (send, recv) = State::<PublishNamespaceState>::default().split();
+        let recv = PublishNamespaceRecv {
+            state: recv,
+            request_id: 7,
+        };
+        recv.recv_error(ServeError::Closed(4)).unwrap();
+        let state = send.lock();
+        assert!(matches!(state.closed, Err(ServeError::Closed(4))));
+        assert!(matches!(
+            subscribed_step(&state.closed, state.subscribers.len()),
+            Err(ServeError::Closed(4))
+        ));
     }
 }

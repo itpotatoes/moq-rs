@@ -421,54 +421,73 @@ impl Subscribed {
 impl ObjectForwarder {
     async fn serve_subgroups(
         &mut self,
-        mut subgroups: serve::SubgroupsReader,
+        subgroups: serve::SubgroupsReader,
         delivery_filter: DeliveryFilter,
         delivery_timeout: Option<std::time::Duration>,
     ) -> Result<(), SessionError> {
-        let mut tasks = FuturesUnordered::new();
-        let mut done: Option<Result<(), ServeError>> = None;
+        let publisher = self.publisher.clone();
+        let state = self.state.clone();
+        let mlog = self.mlog.clone();
+        let track_alias = self.track_alias;
+        Self::forward_subgroups(subgroups, self.closed(), move |subgroup| {
+            let header = data::SubgroupHeader {
+                header_type: data::StreamHeaderType::SubgroupIdExt,
+                track_alias,
+                group_id: subgroup.group_id,
+                subgroup_id: Some(subgroup.subgroup_id),
+                publisher_priority: subgroup.priority,
+            };
+            Self::serve_subgroup(header, subgroup, publisher.clone(), state.clone(),
+                mlog.clone(), delivery_filter, delivery_timeout)
+        }).await
+    }
 
+    /// Drive the real subgroup reader and all forwarders together. A child
+    /// failure cancels the other in-task futures before returning the error.
+    /// Keep watching remote cancellation after the track producer has ended:
+    /// outstanding subgroup writes can still fail during this drain.
+    async fn forward_subgroups<F, Fut>(
+        mut subgroups: serve::SubgroupsReader,
+        closed: impl std::future::Future<Output = Result<(), ServeError>>,
+        mut forward: F,
+    ) -> Result<(), SessionError>
+    where
+        F: FnMut(serve::SubgroupReader) -> Fut,
+        Fut: std::future::Future<Output = Result<(), SessionError>>,
+    {
+        let mut tasks: FuturesUnordered<Fut> = FuturesUnordered::new();
+        let mut done = false;
+        let mut close_seen = false;
+        tokio::pin!(closed);
         loop {
             tokio::select! {
-                res = subgroups.next(), if done.is_none() => match res {
-                    Ok(Some(subgroup)) => {
-                        let header = data::SubgroupHeader {
-                            header_type: data::StreamHeaderType::SubgroupIdExt,  // SubGroupId = Yes, Extensions = Yes, ContainsEndOfGroup = No
-                            track_alias: self.track_alias,
-                            group_id: subgroup.group_id,
-                            subgroup_id: Some(subgroup.subgroup_id),
-                            publisher_priority: subgroup.priority,
-                        };
-
-                        let publisher = self.publisher.clone();
-                        let state = self.state.clone();
-                        let info = subgroup.info.clone();
-                        let mlog = self.mlog.clone();
-
-                        tasks.push(async move {
-                            if let Err(err) = Self::serve_subgroup(
-                                header,
-                                subgroup,
-                                publisher,
-                                state,
-                                mlog,
-                                delivery_filter,
-                                delivery_timeout,
-                            ).await {
-                                if Subscribed::is_expected_serve_shutdown(&err) {
-                                    tracing::debug!(subgroup_info = ?info, error = %err, "stopped serving subgroup");
-                                } else {
-                                    tracing::warn!(subgroup_info = ?info, error = %err, "failed to serve subgroup");
-                                }
-                            }
-                        });
-                    },
-                    Ok(None) => done = Some(Ok(())),
-                    Err(err) => done = Some(Err(err)),
+                // A stored remote error wins over final success.
+                biased;
+                result = &mut closed, if !close_seen => {
+                    close_seen = true;
+                    result?;
+                    // A dropped watch peer is not proof that queued groups
+                    // were forwarded. Drain the reader and child futures;
+                    // their own outcomes decide completion.
+                }
+                result = tasks.next(), if !tasks.is_empty() => {
+                    if let Some(result) = result {
+                        // Done from inside a subgroup means its state vanished;
+                        // ordinary end-of-subgroup and DELIVERY_TIMEOUT return
+                        // Ok. Do not let track-level Done normalization hide it.
+                        result.map_err(|error| match error {
+                            SessionError::Serve(ServeError::Done) =>
+                                SessionError::Serve(ServeError::internal_ctx(
+                                    "subgroup state ended before forwarding completed")),
+                            error => error,
+                        })?;
+                    }
+                }
+                result = subgroups.next(), if !done => match result? {
+                    Some(subgroup) => tasks.push(forward(subgroup)),
+                    None => done = true,
                 },
-                res = self.closed(), if done.is_none() => done = Some(res),
-                _ = tasks.next(), if !tasks.is_empty() => {},
-                else => return Ok(done.unwrap()?),
+                _ = std::future::ready(()), if done && tasks.is_empty() => return Ok(()),
             }
         }
     }
@@ -994,6 +1013,113 @@ mod tests {
         let locked = recv.state.lock();
         assert!(locked.unsubscribed);
         assert!(matches!(locked.closed, Err(ServeError::Cancel)));
+    }
+
+    #[tokio::test]
+    async fn subgroup_failure_after_track_end_reaches_parent_and_cancels_siblings() {
+        use crate::coding::TrackNamespace;
+        use bytes::Bytes;
+        for cause in [ServeError::Cancel, ServeError::Size, ServeError::Done] {
+            let (writer, reader) = serve::Track::new(
+                TrackNamespace::from_utf8_path("test"), "video").produce();
+            let mut groups = writer.subgroups().unwrap();
+            let mut failed = groups.append(1).unwrap();
+            let mut object = failed.create(5, None).unwrap();
+            object.write(Bytes::from_static(b"hi")).unwrap();
+            let mut pending = groups.append(1).unwrap();
+            let pending_object = pending.create(5, None).unwrap();
+            drop(failed);
+            drop(pending);
+            drop(groups); // producer FIN before the residual object fails
+            let TrackReaderMode::Subgroups(subgroups) = reader.mode().await.unwrap() else {
+                panic!("subgroups expected");
+            };
+            let state = State::<ObjectForwarderState>::default();
+            let forward = ObjectForwarder::forward_subgroups(
+                subgroups, std::future::ready(Ok(())), |subgroup| {
+                    let header = data::SubgroupHeader {
+                        header_type: data::StreamHeaderType::SubgroupIdExt,
+                        track_alias: 42, group_id: subgroup.group_id,
+                        subgroup_id: Some(subgroup.subgroup_id),
+                        publisher_priority: subgroup.priority,
+                    };
+                    let state = state.clone();
+                    async move {
+                        ObjectForwarder::serve_subgroup_to_buffer(header, subgroup, state,
+                            DeliveryFilter { forward: true, start_location: None, end_group_id: None },
+                            None).await.map(|_| ())
+                    }
+                });
+            tokio::pin!(forward);
+            // Poll the actual reader/writer path until blocked on payload.
+            assert!(futures::poll!(&mut forward).is_pending());
+            object.abort(cause).unwrap();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(1), forward)
+                .await.expect("failure must not wait for the unfinished sibling");
+            assert!(result.is_err(), "residual object error was swallowed");
+            assert!(!matches!(result, Err(SessionError::Serve(ServeError::Done))));
+            drop(pending_object);
+        }
+    }
+
+    #[tokio::test]
+    async fn parent_forwarder_accepts_normal_end_and_delivery_timeout_drop() {
+        use crate::coding::TrackNamespace;
+        for timeout_drop in [false, true] {
+            let (writer, reader) = serve::Track::new(
+                TrackNamespace::from_utf8_path("test"), "video").produce();
+            let mut groups = writer.subgroups().unwrap();
+            let mut group = groups.append(1).unwrap();
+            let held_object = if timeout_drop {
+                Some(group.create(5, None).unwrap())
+            } else {
+                group.write(bytes::Bytes::from_static(b"hello")).unwrap();
+                None
+            };
+            drop(group);
+            drop(groups);
+            let TrackReaderMode::Subgroups(subgroups) = reader.mode().await.unwrap() else {
+                panic!("subgroups expected");
+            };
+            let state = State::<ObjectForwarderState>::default();
+            let result = ObjectForwarder::forward_subgroups(subgroups,
+                std::future::pending(), |subgroup| {
+                    let header = data::SubgroupHeader {
+                        header_type: data::StreamHeaderType::SubgroupIdExt,
+                        track_alias: 42, group_id: subgroup.group_id,
+                        subgroup_id: Some(subgroup.subgroup_id), publisher_priority: subgroup.priority,
+                    };
+                    let state = state.clone();
+                    async move {
+                        ObjectForwarder::serve_subgroup_to_buffer(header, subgroup, state,
+                            DeliveryFilter { forward: true, start_location: None, end_group_id: None },
+                            Some(std::time::Duration::from_millis(1))).await.map(|_| ())
+                    }
+                });
+            tokio::time::timeout(std::time::Duration::from_secs(1), result).await.unwrap().unwrap();
+            assert_eq!(state.lock().delivery_timeouts, u64::from(timeout_drop));
+            drop(held_object);
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_cancel_during_subgroup_drain_is_not_hidden_by_track_fin() {
+        use crate::coding::TrackNamespace;
+        let (writer, reader) = serve::Track::new(
+            TrackNamespace::from_utf8_path("test"), "video").produce();
+        let mut groups = writer.subgroups().unwrap();
+        let _group = groups.append(1).unwrap();
+        drop(groups);
+        let TrackReaderMode::Subgroups(subgroups) = reader.mode().await.unwrap() else {
+            panic!("subgroups expected");
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let forward = ObjectForwarder::forward_subgroups(subgroups,
+            async { rx.await.unwrap() }, |_| std::future::pending());
+        tokio::pin!(forward);
+        assert!(futures::poll!(&mut forward).is_pending());
+        tx.send(Err(ServeError::Cancel)).unwrap();
+        assert!(matches!(forward.await, Err(SessionError::Serve(ServeError::Cancel))));
     }
 
     #[tokio::test]

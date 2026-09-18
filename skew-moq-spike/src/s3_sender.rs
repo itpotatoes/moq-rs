@@ -638,21 +638,44 @@ async fn produce_haptic(
     Ok(count)
 }
 
+/// Bound for the abort-and-join fallback inside `drain_children`.
+pub const DRAIN_ABANDON_BOUND: Duration = Duration::from_secs(2);
+/// Margin main adds on top of the namespace task's own bounds.
+pub const NAMESPACE_JOIN_MARGIN: Duration = Duration::from_secs(1);
+
+/// The bound main must allow the namespace task after the stop signal so the
+/// task's own drain (`shutdown_timeout + 1 s`) and its abandon fallback
+/// (`DRAIN_ABANDON_BOUND`) can both complete and write `children_unsettled`
+/// before main gives up on it.
+pub fn namespace_join_bound(shutdown_timeout: Duration) -> Duration {
+    shutdown_timeout
+        .saturating_add(Duration::from_secs(1))
+        .saturating_add(DRAIN_ABANDON_BOUND)
+        .saturating_add(NAMESPACE_JOIN_MARGIN)
+}
+
+/// What `run_namespace` returns: the end it observed and WHEN it observed
+/// it (source time), independent of when main collects the join.
+#[derive(Debug)]
+pub struct NamespaceExit {
+    pub observed_at_us: u64,
+    pub end: anyhow::Result<NamespaceEnd>,
+}
+
 /// How `run_namespace` ended without an error, observed by the namespace
 /// task itself at the moment its future completed (the close REASON); main
 /// never re-derives it from its own state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NamespaceEnd {
-    /// Exited via our stop watch; every child task was joined.
+    /// Exited via our stop watch; child cleanup was attempted within its bound.
     Drained {
         /// If the subscription stream ended or errored while draining, its
         /// text is preserved here for audit.
         subscribe_end: Option<String>,
     },
-    /// The session's publish state was dropped (session termination):
-    /// `closed()` returned `Ok(())` or `subscribed()` returned `Ok(None)`.
-    /// Every child task was joined before returning. Whether this is the
-    /// peer's normal post-FIN close is decided by the SETTLED registry.
+    /// The namespace watch peer was dropped: `closed()` returned `Ok(())`
+    /// or `subscribed()` returned `Ok(None)`. Child cleanup is bounded; the
+    /// settled registry decides local completeness, not remote delivery.
     StateDropped {
         source: &'static str,
         subscribe_end: Option<String>,
@@ -704,9 +727,8 @@ async fn abandon_children(
     while !tasks.is_empty() {
         match tokio::time::timeout_at(deadline, tasks.join_next()).await {
             Ok(Some(joined)) => {
-                if record_child_outcome(registry, joined).is_err() {
-                    break;
-                }
+                // Keep joining even if recording fails (e.g. poisoned registry).
+                let _ = record_child_outcome(registry, joined);
             }
             Ok(None) => break,
             Err(_) => {
@@ -722,50 +744,84 @@ async fn abandon_children(
 
 /// Join every child without aborting (they finish on their own once the run
 /// ended or the session went away), refusing new subscriptions meanwhile.
-/// On bound expiry fall back to `abandon_children`.
+/// On bound expiry fall back to `abandon_children`. A peer error observed on
+/// the subscription stream while draining is recorded as a namespace fault
+/// (as soon as it is observed) so the verdict fails; its text is
+/// kept too. A registry failure while recording routes through
+/// `abandon_children` before returning.
 async fn drain_children(
     tasks: &mut JoinSet<ChildOutcome>,
     publish: &moq_transport::session::PublishNamespace,
     registry: &Arc<Mutex<SubscriptionProducerRegistry>>,
     bound: Duration,
 ) -> anyhow::Result<Option<String>> {
+    drain_children_with(tasks, || publish.subscribed(), registry, bound).await
+}
+
+// Injectable subscription source; production uses PublishNamespace::subscribed.
+async fn drain_children_with<F, Fut>(
+    tasks: &mut JoinSet<ChildOutcome>,
+    mut subscribed: F,
+    registry: &Arc<Mutex<SubscriptionProducerRegistry>>,
+    bound: Duration,
+) -> anyhow::Result<Option<String>>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Option<moq_transport::session::Subscribed>, moq_transport::serve::ServeError>>,
+{
     let deadline = tokio::time::Instant::now() + bound;
     let mut accepting = true;
-    let mut subscribe_end = None;
-    while !tasks.is_empty() {
-        tokio::select! {
-            joined = tasks.join_next() => {
-                if let Some(joined) = joined {
-                    record_child_outcome(registry, joined)?;
-                }
-            }
-            subscribed = publish.subscribed(), if accepting => {
-                match subscribed {
-                    Ok(Some(subscribed)) => {
-                        let _ = subscribed.close(moq_transport::serve::ServeError::not_found_ctx(
-                            "S3 namespace is draining after run end",
-                        ));
+    let mut subscribe_end: Option<String> = None;
+    let outcome = async {
+        loop {
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(deadline) => {
+                    if let Ok(mut registry) = registry.lock() {
+                        registry.record_namespace_fault("child_drain_timeout");
+                        registry.mark_children_unsettled();
                     }
-                    Ok(None) => {
-                        accepting = false;
-                        subscribe_end = Some("subscription stream ended".to_string());
-                    }
-                    Err(error) => {
-                        accepting = false;
-                        subscribe_end = Some(format!("subscription stream error: {error}"));
+                    abandon_children(tasks, registry, DRAIN_ABANDON_BOUND).await;
+                    break;
+                }
+                subscribed = subscribed(), if accepting => {
+                    match subscribed {
+                        Ok(Some(subscribed)) => {
+                            let _ = subscribed.close(moq_transport::serve::ServeError::not_found_ctx(
+                                "S3 namespace is draining after run end",
+                            ));
+                        }
+                        Ok(None) => {
+                            accepting = false;
+                            subscribe_end = Some("subscription stream ended".to_string());
+                        }
+                        Err(error) => {
+                            accepting = false;
+                            let text = format!("subscription stream error: {error}");
+                            registry.lock()
+                                .map_err(|_| anyhow!("S3 producer registry poisoned"))?
+                                .record_namespace_fault(format!("drain_subscribe_error: {text}"));
+                            subscribe_end = Some(text);
+                        }
                     }
                 }
-            }
-            _ = tokio::time::sleep_until(deadline) => {
-                abandon_children(tasks, registry, Duration::from_secs(2)).await;
-                if let Ok(mut registry) = registry.lock() {
-                    registry.mark_children_unsettled();
+                joined = tasks.join_next(), if !tasks.is_empty() => {
+                    if let Some(joined) = joined {
+                        if let Err(error) = record_child_outcome(registry, joined) {
+                            return Err(error);
+                        }
+                    }
                 }
-                break;
+                _ = std::future::ready(()), if tasks.is_empty() => break,
             }
         }
+        Ok(subscribe_end)
     }
-    Ok(subscribe_end)
+    .await;
+    if outcome.is_err() {
+        abandon_children(tasks, registry, DRAIN_ABANDON_BOUND).await;
+    }
+    outcome
 }
 
 /// Publish one S3 namespace and own every subscription producer.
@@ -774,19 +830,38 @@ async fn drain_children(
 /// reserved in one registry critical section. The loop exits are classified
 /// HERE, at the moment the future completes, from the close reason
 /// moq-transport gives: stop watch -> `Drained`; `closed()`/`subscribed()`
-/// `Ok(())`/`Ok(None)` -> `StateDropped` (publish state dropped by session
-/// termination); `Err(ServeError)` from them (REQUEST_ERROR ->
+/// `Ok(())`/`Ok(None)` -> `StateDropped` (the namespace watch peer is gone); `Err(ServeError)` from them (REQUEST_ERROR ->
 /// `Closed(code)`, PUBLISH_NAMESPACE_CANCEL -> `Cancel`, others) -> `Err`
 /// with the original text; child failure -> `Err`. Every exit joins the
 /// children first (`drain_children` for the non-error exits,
 /// `abandon_children` for every error exit, both bounded).
 pub async fn run_namespace(
+    publisher: Publisher,
+    namespace: TrackNamespace,
+    context: Arc<SenderContext>,
+    registry: Arc<Mutex<SubscriptionProducerRegistry>>,
+    accept_routes: AcceptRouteMap,
+    stop: watch::Receiver<bool>,
+) -> NamespaceExit {
+    let mut observed_at_us = None;
+    let end = run_namespace_inner(
+        publisher, namespace, context, registry, accept_routes, stop, &mut observed_at_us,
+    )
+    .await;
+    NamespaceExit {
+        observed_at_us: observed_at_us.unwrap_or_else(now_us),
+        end,
+    }
+}
+
+async fn run_namespace_inner(
     mut publisher: Publisher,
     namespace: TrackNamespace,
     context: Arc<SenderContext>,
     registry: Arc<Mutex<SubscriptionProducerRegistry>>,
     accept_routes: AcceptRouteMap,
     mut stop: watch::Receiver<bool>,
+    observed_at_us: &mut Option<u64>,
 ) -> anyhow::Result<NamespaceEnd> {
     context.validate()?;
     let publish = publisher
@@ -803,7 +878,7 @@ pub async fn run_namespace(
                 subscribed = publish.subscribed() => {
                     let subscribed = match subscribed {
                         Ok(Some(subscribed)) => subscribed,
-                        // Publish state dropped by session termination.
+                        // The peer side of the namespace watch was dropped.
                         Ok(None) => return Ok(LoopExit::StateDropped("subscribed")),
                         // Peer namespace error; ALWAYS a fault downstream.
                         Err(error) => {
@@ -875,7 +950,7 @@ pub async fn run_namespace(
                     // spawn there is no fallible statement except the route-map
                     // insert below, which releases the reservation on failure.
                     let guard = ProducerTaskGuard::new(registry.clone(), role, route);
-    
+
                     if let Err(error) = accept_routes
                         .lock()
                         .map_err(|_| anyhow!("S3 accept route map poisoned"))
@@ -970,6 +1045,9 @@ pub async fn run_namespace(
     }
     .await;
 
+    // Capture the source observation BEFORE child cleanup can delay return.
+    *observed_at_us = Some(now_us());
+
     // Every exit joins the children before returning, so main's snapshot
     // after joining this task sees every child settled (or the
     // `children_unsettled` flag).
@@ -995,6 +1073,33 @@ pub async fn run_namespace(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn drain_records_peer_error_even_when_last_child_is_already_done() {
+        let registry = Arc::new(Mutex::new(SubscriptionProducerRegistry::new()));
+        let mut tasks = JoinSet::new();
+        // No children remain: an already-ready namespace error must still be
+        // observed before returning Drained.
+        let text = drain_children_with(&mut tasks,
+            || std::future::ready(Err(moq_transport::serve::ServeError::Closed(4))),
+            &registry, Duration::from_secs(1)).await.unwrap();
+        assert!(text.unwrap().contains("subscription stream error"));
+        assert!(registry.lock().unwrap().snapshot().namespace_faults.iter()
+            .any(|s| s.contains("drain_subscribe_error")));
+    }
+
+    #[tokio::test]
+    async fn drain_timeout_joins_aborted_children_and_keeps_timeout_fault() {
+        let registry = Arc::new(Mutex::new(SubscriptionProducerRegistry::new()));
+        let mut tasks = JoinSet::new();
+        tasks.spawn(std::future::pending::<ChildOutcome>());
+        drain_children_with(&mut tasks, std::future::pending,
+            &registry, Duration::ZERO).await.unwrap();
+        assert!(tasks.is_empty(), "aborted children must be joined");
+        let snapshot = registry.lock().unwrap().snapshot();
+        assert!(snapshot.children_unsettled);
+        assert!(snapshot.namespace_faults.iter().any(|s| s == "child_drain_timeout"));
+    }
 
     #[test]
     fn route_allocator_requires_s2_identical_normal_start_and_never_reuses_generation() {

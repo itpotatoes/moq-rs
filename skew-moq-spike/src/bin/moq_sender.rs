@@ -31,11 +31,11 @@ use tokio::signal::unix::{signal, SignalKind};
 use url::Url;
 
 use skew_moq::s3_producer::{
-    classify_end_by_settled_state, classify_namespace_end, s3_run_verdict,
+    classify_end_after_settle, classify_namespace_end, s3_run_verdict,
     NamespaceEndObservation, RunVerdict, SubscriptionProducerRegistry, TransportEnd,
-    TransportEndKind,
+    TransportEndKind, SettleOutcome,
 };
-use skew_moq::s3_sender::NamespaceEnd;
+use skew_moq::s3_sender::{NamespaceEnd, NamespaceExit, namespace_join_bound};
 use skew_moq::s3_sender::{
     run_namespace as run_s3_namespace, AcceptRouteMap, SenderContext as S3SenderContext,
     SourceSchedule,
@@ -94,7 +94,7 @@ impl Ending {
 /// await a handle whose result was already observed.
 type SessionJoinHandle =
     tokio::task::JoinHandle<std::result::Result<(), moq_transport::session::SessionError>>;
-type NamespaceJoinHandle = tokio::task::JoinHandle<anyhow::Result<NamespaceEnd>>;
+type NamespaceJoinHandle = tokio::task::JoinHandle<NamespaceExit>;
 
 struct Producers {
     session_run: Option<SessionJoinHandle>,
@@ -1101,66 +1101,63 @@ async fn wait_s3_current_routes_completed(
     }
 }
 
-/// Wait (bounded) until every producer task has recorded `Settled`. The
-/// producers keep running whatever the session task did: their forwarder
-/// return, validation, stop-log write and `Settled` do not depend on it.
+/// Wait until all producer tasks have recorded `Settled`. A producer may
+/// remain blocked after transport termination, so expiry is a persistent fault.
 async fn wait_s3_tasks_settled(
     registry: &Arc<Mutex<SubscriptionProducerRegistry>>,
     settle_bound: Duration,
-) -> Result<()> {
-    let mut terminal_rx = registry
-        .lock()
-        .map_err(|_| anyhow::anyhow!("S3 producer registry poisoned"))?
-        .terminal_watch();
+) -> Result<SettleOutcome> {
+    let mut terminal_rx = registry.lock()
+        .map_err(|_| anyhow::anyhow!("S3 producer registry poisoned"))?.terminal_watch();
     let deadline = tokio::time::Instant::now() + settle_bound;
     loop {
         terminal_rx.borrow_and_update();
-        let outstanding = registry
-            .lock()
-            .map_err(|_| anyhow::anyhow!("S3 producer registry poisoned"))?
-            .outstanding();
-        if outstanding == 0 {
-            return Ok(());
+        {
+            let mut registry = registry.lock()
+                .map_err(|_| anyhow::anyhow!("S3 producer registry poisoned"))?;
+            if registry.outstanding() == 0 {
+                return Ok(SettleOutcome::Settled);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                registry.record_namespace_fault("settle_timeout");
+                return Ok(SettleOutcome::TimedOut);
+            }
         }
         match tokio::time::timeout_at(deadline, terminal_rx.changed()).await {
             Ok(Ok(())) => {}
             Ok(Err(_)) => return Err(anyhow::anyhow!("S3 producer terminal watch closed")),
-            // Still outstanding: the settled state below is "not complete".
-            Err(_) => return Ok(()),
+            Err(_) => {
+                registry.lock()
+                    .map_err(|_| anyhow::anyhow!("S3 producer registry poisoned"))?
+                    .record_namespace_fault("settle_timeout");
+                return Ok(SettleOutcome::TimedOut);
+            }
         }
     }
 }
 
-/// Settle-then-classify a session end (parity with the static path: after
-/// our tracks FIN'd, the peer close is the positive handoff and is accepted
-/// whatever the join result says — `DirectFinHandoff::PeerClosed(result)` ->
-/// `JoinOutcome::from_join_result`). The end is recorded with the time it
-/// fired; the KIND and `before_tracks_fin` are taken from the SETTLED registry
-/// after every producer task settled (bounded), never from the instantaneous
-/// state or from elapsed time. See `classify_end_by_settled_state` for the
-/// causal argument.
+/// Observe a session end, then resolve pending local producer bookkeeping.
+/// The legacy `peer_close` label reports local completion, not remote receipt
+/// or proof of the cause of the session end. Preserve the original result.
 async fn settle_and_record_session_end<T: std::fmt::Debug>(
     registry: &Arc<Mutex<SubscriptionProducerRegistry>>,
     settle_bound: Duration,
     ends: &mut Vec<TransportEnd>,
-    result: &T,
+    result: &std::result::Result<T, tokio::task::JoinError>,
 ) -> Result<bool> {
     let at_us = now_us();
-    wait_s3_tasks_settled(registry, settle_bound).await?;
+    let settle = wait_s3_tasks_settled(registry, settle_bound).await?;
     let (settled_complete, tracks_fin) = {
-        let registry = registry
-            .lock()
+        let registry = registry.lock()
             .map_err(|_| anyhow::anyhow!("S3 producer registry poisoned"))?;
         (registry.settled_complete(), registry.tracks_finished_on_wire())
     };
-    let kind = classify_end_by_settled_state(settled_complete);
+    let task_panicked = result.as_ref().err().is_some_and(|e| e.is_panic());
+    let kind = classify_end_after_settle(settle, settled_complete, task_panicked);
     let accepted = kind == TransportEndKind::PeerClose;
     ends.push(TransportEnd {
-        source: "session",
-        kind,
-        text: format!("{result:?}"),
-        at_us,
-        before_tracks_fin: !tracks_fin,
+        source: "session", kind, text: format!("{result:?}"), at_us,
+        observed_at_us: None, before_tracks_fin: !tracks_fin,
     });
     Ok(accepted)
 }
@@ -1168,16 +1165,16 @@ async fn settle_and_record_session_end<T: std::fmt::Debug>(
 /// Map the namespace task's join result to what the namespace task itself
 /// observed at the moment its future completed; never re-derived from main.
 fn observe_namespace_end(
-    result: &std::result::Result<anyhow::Result<NamespaceEnd>, tokio::task::JoinError>,
+    result: &std::result::Result<NamespaceExit, tokio::task::JoinError>,
 ) -> (NamespaceEndObservation, String) {
     match result {
-        Ok(Ok(end @ NamespaceEnd::Drained { .. })) => {
+        Ok(NamespaceExit { end: Ok(end @ NamespaceEnd::Drained { .. }), .. }) => {
             (NamespaceEndObservation::Drained, format!("{end:?}"))
         }
-        Ok(Ok(end @ NamespaceEnd::StateDropped { .. })) => {
+        Ok(NamespaceExit { end: Ok(end @ NamespaceEnd::StateDropped { .. }), .. }) => {
             (NamespaceEndObservation::StateDropped, format!("{end:?}"))
         }
-        Ok(Err(error)) => {
+        Ok(NamespaceExit { end: Err(error), .. }) => {
             let text = format!("Err({error:#})");
             if error.downcast_ref::<moq_transport::serve::ServeError>().is_some() {
                 (NamespaceEndObservation::PeerError, text)
@@ -1198,26 +1195,27 @@ async fn settle_and_record_namespace_end(
     registry: &Arc<Mutex<SubscriptionProducerRegistry>>,
     settle_bound: Duration,
     ends: &mut Vec<TransportEnd>,
-    result: &std::result::Result<anyhow::Result<NamespaceEnd>, tokio::task::JoinError>,
+    result: &std::result::Result<NamespaceExit, tokio::task::JoinError>,
 ) -> Result<bool> {
     let at_us = now_us();
     let (observation, text) = observe_namespace_end(result);
-    if observation == NamespaceEndObservation::StateDropped {
-        wait_s3_tasks_settled(registry, settle_bound).await?;
-    }
+    let settle = if observation == NamespaceEndObservation::StateDropped {
+        wait_s3_tasks_settled(registry, settle_bound).await?
+    } else { SettleOutcome::Settled };
     let (settled_complete, tracks_fin) = {
         let registry = registry
             .lock()
             .map_err(|_| anyhow::anyhow!("S3 producer registry poisoned"))?;
         (registry.settled_complete(), registry.tracks_finished_on_wire())
     };
-    let kind = classify_namespace_end(observation, settled_complete);
+    let kind = classify_namespace_end(observation, settle, settled_complete);
     let accepted = !matches!(kind, TransportEndKind::Fault(_));
     ends.push(TransportEnd {
         source: "namespace",
         kind,
         text,
         at_us,
+        observed_at_us: result.as_ref().ok().map(|exit| exit.observed_at_us),
         before_tracks_fin: !tracks_fin,
     });
     Ok(accepted)
@@ -1261,6 +1259,7 @@ fn s3_shutdown_fields(verdict: Option<&RunVerdict>, transport_ends: &[TransportE
                 },
                 "text": end.text,
                 "at_us": end.at_us,
+                "observed_at_us": end.observed_at_us,
                 "before_tracks_fin": end.before_tracks_fin,
             })
         })
@@ -1868,6 +1867,7 @@ async fn main() -> Result<()> {
             let settle_bound = context
                 .shutdown_timeout
                 .saturating_add(Duration::from_secs(1));
+            let ns_join_bound = namespace_join_bound(context.shutdown_timeout);
             let ns_publisher = publisher.clone();
             let ns_registry = registry.clone();
             let ns_routes = s3_accept_routes.clone();
@@ -1976,20 +1976,20 @@ async fn main() -> Result<()> {
                         session_done = Some(JoinOutcome::from_join_result(&r));
                         // Settle-then-classify: wait for the producer tasks to
                         // settle (bounded), then judge by their own outcome. A
-                        // mid-run session death settles as RemoteClosed ->
-                        // fault -> the immediate error it always was.
-                        if settle_and_record_session_end(&registry, settle_bound, &mut s3_transport_ends, &r).await? {
-                            Ok(())
-                        } else {
-                            Err(anyhow::anyhow!("session ended during S3 send: {:?}", r))
+                        // mid-run session death must establish completion
+                        // within the bound or fail (including settle timeout).
+                        match settle_and_record_session_end(&registry, settle_bound, &mut s3_transport_ends, &r).await {
+                            Ok(true) => Ok(()),
+                            Ok(false) => Err(anyhow::anyhow!("session ended during S3 send: {:?}", r)),
+                            Err(error) => Err(error),
                         }
                     }
                     r = nt => {
                         ns_done = Some(JoinOutcome::from_join_result(&r));
-                        if settle_and_record_namespace_end(&registry, settle_bound, &mut s3_transport_ends, &r).await? {
-                            Ok(())
-                        } else {
-                            Err(anyhow::anyhow!("S3 namespace ended during send: {:?}", r))
+                        match settle_and_record_namespace_end(&registry, settle_bound, &mut s3_transport_ends, &r).await {
+                            Ok(true) => Ok(()),
+                            Ok(false) => Err(anyhow::anyhow!("S3 namespace ended during send: {:?}", r)),
+                            Err(error) => Err(error),
                         }
                     }
                 };
@@ -2036,8 +2036,8 @@ async fn main() -> Result<()> {
             //  (b) if the session task is still running, wait for the PEER
             //      CLOSE exactly like the static direct path
             //      (`wait_registered_direct_fin_handoff`): after our tracks
-            //      FIN'd, the peer close is the positive handoff
-            //      acknowledgement, accepted whatever the join result is;
+            //      FIN'd, classify the observed end by local completion;
+            //      this does not prove remote receipt; panics are faults;
             //      a missing close is a fault, a signal is a signal;
             //  (c) THEN snapshot and compute the single run verdict.
             let verdict = if ending == Ending::Signal {
@@ -2046,13 +2046,15 @@ async fn main() -> Result<()> {
                 let _ = ns_stop_tx.send(true);
                 let p = producers.as_mut().expect("producers set above");
                 if let Some(nt) = p.ns_task.as_mut() {
-                    let joined = match tokio::time::timeout(settle_bound, &mut *nt).await {
+                    let joined = match tokio::time::timeout(ns_join_bound, &mut *nt).await {
                         Ok(r) => Some(r),
                         Err(_) => {
-                            registry
-                                .lock()
-                                .map_err(|_| anyhow::anyhow!("S3 producer registry poisoned"))?
-                                .record_namespace_fault("namespace_join_timeout");
+                            {
+                                let mut registry = registry.lock()
+                                    .map_err(|_| anyhow::anyhow!("S3 producer registry poisoned"))?;
+                                registry.record_namespace_fault("namespace_join_timeout");
+                                registry.mark_children_unsettled();
+                            }
                             nt.abort();
                             // Bounded second join (PRODUCER_JOIN_BUDGET); a
                             // handle that still does not finish stays with
@@ -2100,6 +2102,7 @@ async fn main() -> Result<()> {
                                     ),
                                     text: "TimedOut".to_string(),
                                     at_us: now_us(),
+                                    observed_at_us: None,
                                     before_tracks_fin: !tracks_fin,
                                 });
                             }
@@ -2174,11 +2177,12 @@ async fn main() -> Result<()> {
         producers.as_mut().expect("registered above").ns_task = Some(tokio::spawn(async move {
             // Static arms: the publish future ending is a local end; the
             // typed value only matters for the S3 verdict.
-            ns_pub
+            let end = ns_pub
                 .publish_namespace(tracks_r)
                 .await
                 .map(|()| NamespaceEnd::Drained { subscribe_end: None })
-                .map_err(anyhow::Error::from)
+                .map_err(anyhow::Error::from);
+            NamespaceExit { observed_at_us: now_us(), end }
         }));
         // publisher no longer needed after cloning for the namespace.
         let _ = &mut publisher;
@@ -3568,6 +3572,7 @@ mod tests {
             kind: TransportEndKind::PeerClose,
             text: "Ok(Err(Decode(More(1))))\nsecond line".to_string(),
             at_us: 33_990_000,
+            observed_at_us: Some(33_980_000),
             before_tracks_fin: false,
         }];
         let verdict = RunVerdict::Error(vec!["pc: forwarder failed (remote_cancel)".to_string()]);
@@ -3580,6 +3585,7 @@ mod tests {
         assert_eq!(row["s3_transport_ends"][0]["kind"], "peer_close");
         assert!(row["s3_transport_ends"][0]["fault"].is_null());
         assert_eq!(row["s3_transport_ends"][0]["at_us"], 33_990_000);
+        assert_eq!(row["s3_transport_ends"][0]["observed_at_us"], 33_980_000);
         assert_eq!(row["s3_transport_ends"][0]["before_tracks_fin"], false);
         assert_eq!(
             row["s3_transport_ends"][0]["text"],
@@ -3597,14 +3603,43 @@ mod tests {
         assert_eq!(row["s3_verdict"], "not_computed");
     }
 
+    #[tokio::test]
+    async fn settle_timeout_is_retained_after_late_child_completion() {
+        use super::{wait_s3_tasks_settled, SettleOutcome, SubscriptionProducerRegistry};
+        use skew_moq::s3_switch::{Route, TrackRole, PC_NORMAL_TRACK};
+        let registry = Arc::new(Mutex::new(SubscriptionProducerRegistry::new()));
+        let route = Route { name: PC_NORMAL_TRACK, generation: 0 };
+        registry.lock().unwrap().reserve(TrackRole::Pc, route).unwrap();
+        assert_eq!(wait_s3_tasks_settled(&registry, Duration::ZERO).await.unwrap(),
+            SettleOutcome::TimedOut);
+        registry.lock().unwrap().record_settled(TrackRole::Pc, route).unwrap();
+        assert_eq!(wait_s3_tasks_settled(&registry, Duration::ZERO).await.unwrap(),
+            SettleOutcome::Settled);
+        assert!(registry.lock().unwrap().snapshot().namespace_faults.iter()
+            .any(|reason| reason == "settle_timeout"));
+    }
+
+    #[tokio::test]
+    async fn actual_session_task_panic_is_recorded_as_fault() {
+        use super::{settle_and_record_session_end, SubscriptionProducerRegistry};
+        let registry = Arc::new(Mutex::new(SubscriptionProducerRegistry::new()));
+        let task = tokio::spawn(async { panic!("injected session task panic"); });
+        let result = task.await;
+        let mut ends = Vec::new();
+        assert!(!settle_and_record_session_end(&registry, Duration::ZERO,
+            &mut ends, &result).await.unwrap());
+        assert!(matches!(&ends[0].kind, TransportEndKind::Fault(reason) if reason == "task panicked"));
+    }
+
     #[test]
     fn namespace_end_observation_is_taken_from_the_task_result() {
-        use super::{observe_namespace_end, NamespaceEnd};
+        use super::{observe_namespace_end, NamespaceEnd, NamespaceExit};
         use skew_moq::s3_producer::NamespaceEndObservation as O;
-        type R = std::result::Result<anyhow::Result<NamespaceEnd>, tokio::task::JoinError>;
-        let drained: R = Ok(Ok(NamespaceEnd::Drained { subscribe_end: None }));
+        type R = std::result::Result<NamespaceExit, tokio::task::JoinError>;
+        let wrap = |end| Ok(NamespaceExit { observed_at_us: 123, end });
+        let drained: R = wrap(Ok(NamespaceEnd::Drained { subscribe_end: None }));
         assert_eq!(observe_namespace_end(&drained).0, O::Drained);
-        let dropped: R = Ok(Ok(NamespaceEnd::StateDropped {
+        let dropped: R = wrap(Ok(NamespaceEnd::StateDropped {
             source: "closed",
             subscribe_end: Some("subscription stream ended".to_string()),
         }));
@@ -3612,15 +3647,15 @@ mod tests {
         assert_eq!(obs, O::StateDropped);
         assert!(text.contains("closed"));
         // REQUEST_ERROR -> ServeError::Closed(code) surfaced through anyhow.
-        let peer: R = Ok(Err(anyhow::Error::from(moq_transport::serve::ServeError::Closed(4))
+        let peer: R = wrap(Err(anyhow::Error::from(moq_transport::serve::ServeError::Closed(4))
             .context("S3 namespace peer error (closed)")));
         let (obs, text) = observe_namespace_end(&peer);
         assert_eq!(obs, O::PeerError);
         assert!(text.contains("S3 namespace peer error (closed)"));
-        let cancel: R = Ok(Err(anyhow::Error::from(moq_transport::serve::ServeError::Cancel)
+        let cancel: R = wrap(Err(anyhow::Error::from(moq_transport::serve::ServeError::Cancel)
             .context("S3 namespace peer error (subscribed)")));
         assert_eq!(observe_namespace_end(&cancel).0, O::PeerError);
-        let task: R = Ok(Err(anyhow::anyhow!("S3 subscription task failed")));
+        let task: R = wrap(Err(anyhow::anyhow!("S3 subscription task failed")));
         assert_eq!(observe_namespace_end(&task).0, O::TaskError);
     }
 }
