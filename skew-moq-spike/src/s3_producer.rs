@@ -1462,8 +1462,12 @@ enum ServeFirstEnd {
 }
 
 /// Classify the serve-first end. `forward_subgroups` in moq-transport maps a
-/// subgroup-internal `Cancel`/`Done` to a typed internal error, so the two
-/// track-level variants matched here are exactly the peer-driven ends.
+/// subgroup-internal `Cancel`/`Done` to a typed internal error, so the ends
+/// matched here (`Ok`, track-level `Cancel`, track-level `Done`) are the ones
+/// the S3 contract treats as remote-closed. This is a contract classification,
+/// not proof that the peer caused the end: track-level `Done` can also come
+/// from a locally dropped writer (`TrackReader::mode()` returns `Done` once
+/// the track state is closed without a reader mode).
 fn classify_serve_first_end(result: Result<(), SessionError>) -> ServeFirstEnd {
     match result {
         Ok(())

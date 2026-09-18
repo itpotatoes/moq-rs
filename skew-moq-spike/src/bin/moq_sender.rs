@@ -1291,12 +1291,18 @@ async fn collect_finished_session_end(
     Ok(())
 }
 
-/// A session/namespace panic discovered only by the finalizer (its handle
-/// was never observed by the send loop) happened after the S3 verdict was
-/// computed. Record it as a `Fault` transport end and merge the reason into
-/// the verdict (Normal -> Error) so the written row is never contradictory.
-/// A verdict that was never computed stays `None` (`not_computed`); the
-/// fault end is still recorded. Returns whether anything was merged.
+/// A session/namespace join fault (`Panicked`, or `TimedOut` after the
+/// finalizer's bounded join) discovered only by the finalizer — its handle
+/// was never observed by the send loop — is discovered after the S3 verdict
+/// was computed; the fault itself may have occurred earlier. Record it as a
+/// `Fault` transport end and merge the reason into the verdict
+/// (Normal -> Error) so the written row is never contradictory
+/// (`ending="normal"` next to `session_join="timed_out"`). `before_tracks_fin`
+/// is sampled from the registry at finalizer time, not the source end time.
+/// `Cancelled`, `Completed`, `NotStarted`, and an already-observed handle
+/// never merge. A verdict that was never computed stays `None`
+/// (`not_computed`); the fault end is still recorded. Returns whether
+/// anything was merged.
 fn merge_finalizer_join_faults(
     verdict: &mut Option<RunVerdict>,
     ends: &mut Vec<TransportEnd>,
@@ -1306,22 +1312,41 @@ fn merge_finalizer_join_faults(
     tracks_fin: bool,
 ) -> bool {
     let mut merged = false;
-    for (source, outcome, unobserved, reason) in [
-        ("session", joins.session, session_unobserved, "session_panic_after_verdict"),
-        ("namespace", joins.ns, ns_unobserved, "namespace_panic_after_verdict"),
+    for (source, outcome, unobserved) in [
+        ("session", joins.session, session_unobserved),
+        ("namespace", joins.ns, ns_unobserved),
     ] {
-        if outcome != JoinOutcome::Panicked || !unobserved {
+        if !unobserved {
             continue;
         }
+        let (reason, what, join_text) = match (source, outcome) {
+            ("session", JoinOutcome::Panicked) => {
+                ("session_panic_after_verdict", "panicked", "JoinError(panicked)")
+            }
+            ("namespace", JoinOutcome::Panicked) => {
+                ("namespace_panic_after_verdict", "panicked", "JoinError(panicked)")
+            }
+            ("session", JoinOutcome::TimedOut) => (
+                "session_join_timeout_after_verdict",
+                "join timed out",
+                "JoinError(timed out: join budget expired, task may still be running)",
+            ),
+            ("namespace", JoinOutcome::TimedOut) => (
+                "namespace_join_timeout_after_verdict",
+                "join timed out",
+                "JoinError(timed out: join budget expired, task may still be running)",
+            ),
+            _ => continue,
+        };
         ends.push(TransportEnd {
             source,
             kind: TransportEndKind::Fault(reason.to_string()),
-            text: "JoinError(panicked)".to_string(),
+            text: join_text.to_string(),
             at_us: now_us(),
             observed_at_us: None,
             before_tracks_fin: !tracks_fin,
         });
-        let text = format!("{source} task panicked (discovered by the finalizer): {reason}");
+        let text = format!("{source} task {what} (discovered by the finalizer): {reason}");
         match verdict {
             Some(RunVerdict::Error(reasons)) => reasons.push(text),
             Some(RunVerdict::Normal) => *verdict = Some(RunVerdict::Error(vec![text])),
@@ -2837,8 +2862,10 @@ async fn main() -> Result<()> {
     // 1. Producers first: abort, join, and RECORD the outcome. A detached
     //    handle after a join timeout would leave a task that can still invoke
     //    accept callbacks, so quiescence alone must never be treated as proof.
-    // Handles the send loop never observed: a panic found in one of them
-    // here happened after the S3 verdict was computed and must be merged in.
+    // Handles the send loop never observed: a panic or join timeout found in
+    // one of them here is discovered after the S3 verdict was computed (the
+    // fault itself may have occurred earlier) and must be merged in;
+    // `before_tracks_fin` is sampled from the registry at finalizer time.
     let (session_unobserved, ns_unobserved) = producers
         .as_ref()
         .map_or((false, false), |p| (p.session_run.is_some(), p.ns_task.is_some()));
@@ -2871,7 +2898,9 @@ async fn main() -> Result<()> {
                 s3_verdict
                     .as_ref()
                     .map(|v| v.reasons().join("; "))
-                    .unwrap_or_else(|| "task panicked after the verdict".to_string())
+                    .unwrap_or_else(|| {
+                        "task fault discovered by the finalizer after the verdict".to_string()
+                    })
             ));
         }
     }
@@ -3948,17 +3977,73 @@ mod tests {
         assert!(none.is_none());
         assert_eq!(ends_none.len(), 1);
         assert!(ends_none[0].before_tracks_fin);
-        // Non-panic joins never merge.
-        let clean = ProducerJoins { session: JoinOutcome::Cancelled, ns: JoinOutcome::TimedOut };
+        // An unobserved join timeout is a fault too: the task may still be
+        // running, so Normal -> Error with the timeout reason.
+        let timed = ProducerJoins { session: JoinOutcome::Cancelled, ns: JoinOutcome::TimedOut };
+        let mut normal = Some(RunVerdict::Normal);
+        let mut ends_timed = Vec::new();
+        assert!(merge_finalizer_join_faults(&mut normal, &mut ends_timed, &timed, true, true, true));
+        assert!(matches!(&normal, Some(RunVerdict::Error(reasons))
+            if reasons.len() == 1 && reasons[0].contains("namespace_join_timeout_after_verdict")));
+        assert_eq!(ends_timed.len(), 1);
+        assert_eq!(ends_timed[0].source, "namespace");
+        assert!(matches!(&ends_timed[0].kind, TransportEndKind::Fault(reason)
+            if reason == "namespace_join_timeout_after_verdict"));
+        assert!(ends_timed[0].text.contains("timed out"));
+        // Cancelled/Completed/NotStarted joins never merge, and neither does
+        // a timed-out handle the send loop already observed.
+        let clean = ProducerJoins { session: JoinOutcome::Cancelled, ns: JoinOutcome::Completed };
         let mut normal = Some(RunVerdict::Normal);
         let mut ends_clean = Vec::new();
         assert!(!merge_finalizer_join_faults(&mut normal, &mut ends_clean, &clean, true, true, true));
         assert_eq!(normal, Some(RunVerdict::Normal));
+        assert!(ends_clean.is_empty());
+        let none_started = ProducerJoins::none_started();
+        assert!(!merge_finalizer_join_faults(&mut normal, &mut ends_clean, &none_started, true, true, true));
+        assert_eq!(normal, Some(RunVerdict::Normal));
+        assert!(ends_clean.is_empty());
+        assert!(!merge_finalizer_join_faults(&mut normal, &mut ends_clean, &timed, false, false, true));
+        assert_eq!(normal, Some(RunVerdict::Normal));
+        assert!(ends_clean.is_empty());
         // The shutdown row stays valid JSON with the merged fields.
         let fields = s3_shutdown_fields(verdict.as_ref(), &ends);
         let row: serde_json::Value =
             serde_json::from_str(&format!("{{\"event\":\"shutdown\"{fields}}}")).unwrap();
         assert_eq!(row["s3_verdict"], "error");
         assert_eq!(row["s3_transport_ends"][0]["fault"], "session_panic_after_verdict");
+    }
+
+    #[test]
+    fn finalizer_session_join_timeout_is_merged_into_the_verdict() {
+        use super::{merge_finalizer_join_faults, JoinOutcome, ProducerJoins};
+        use skew_moq::s3_producer::RunVerdict;
+        // Relay run: namespace and children completed normally, the session
+        // task was still running at verdict time (verdict Normal), then the
+        // finalizer's abort + bounded join expired.
+        let joins = ProducerJoins {
+            session: JoinOutcome::TimedOut,
+            ns: JoinOutcome::Completed,
+        };
+        let mut verdict = Some(RunVerdict::Normal);
+        let mut ends = Vec::new();
+        assert!(merge_finalizer_join_faults(&mut verdict, &mut ends, &joins, true, false, true));
+        assert!(matches!(&verdict, Some(RunVerdict::Error(reasons))
+            if reasons.len() == 1 && reasons[0].contains("session_join_timeout_after_verdict")));
+        assert_eq!(ends.len(), 1);
+        assert_eq!(ends[0].source, "session");
+        assert!(matches!(&ends[0].kind, TransportEndKind::Fault(reason)
+            if reason == "session_join_timeout_after_verdict"));
+        assert_eq!(
+            ends[0].text,
+            "JoinError(timed out: join budget expired, task may still be running)"
+        );
+        assert!(ends[0].observed_at_us.is_none());
+        assert!(!ends[0].before_tracks_fin);
+        let fields = s3_shutdown_fields(verdict.as_ref(), &ends);
+        let row: serde_json::Value =
+            serde_json::from_str(&format!("{{\"event\":\"shutdown\"{fields}}}")).unwrap();
+        assert_eq!(row["s3_verdict"], "error");
+        assert_eq!(row["s3_transport_ends"][0]["source"], "session");
+        assert_eq!(row["s3_transport_ends"][0]["fault"], "session_join_timeout_after_verdict");
     }
 }
