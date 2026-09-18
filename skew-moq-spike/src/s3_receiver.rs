@@ -478,6 +478,19 @@ impl S3ReceiverIngress {
         self.gate.check_timeout(now_us)
     }
 
+    /// Abandon the pending switch whose target subscriptions the peer refused
+    /// after run completion (see `S3SwitchGate::abandon_pending`). Target
+    /// objects that were already buffered behind the exact-pair barrier can no
+    /// longer be applied and are returned as terminal `switch_barrier` drops,
+    /// exactly as `finish_pending` accounts them at shutdown.
+    pub fn abandon_pending(
+        &mut self,
+        now_us: u64,
+    ) -> Result<(SwitchRequest, Vec<IngressEvent>), SwitchError> {
+        let request = self.gate.abandon_pending(now_us)?;
+        Ok((request, self.finish_pending()))
+    }
+
     /// Terminally account target objects that never crossed the exact-pair
     /// barrier (shutdown, timeout, or subscription failure).
     pub fn finish_pending(&mut self) -> Vec<IngressEvent> {
@@ -1034,5 +1047,58 @@ mod tests {
         tracker.forget_evicted(&haptic).unwrap();
         assert!(tracker.advance(&scheduler, 50_002).unwrap().is_empty());
         assert_eq!(tracker.next_wakeup_us(&scheduler), None);
+    }
+
+    #[test]
+    fn abandon_pending_drops_barrier_objects_and_keeps_current_routes_releasable() {
+        let mut ingress = ingress(8);
+        let old = ingress.gate().active_routes();
+        let request = ingress
+            .request(transition(S3State::Normal, S3State::HapticCritical, 2), 2)
+            .unwrap();
+        // One role answered before the peer refused the other: its objects
+        // are barrier-only and must be terminally accounted on abandon.
+        ingress.subscribe_ok(TrackRole::Pc, 3).unwrap();
+        assert!(ingress
+            .push(object(TrackRole::Pc, request.target.pc, 200, 2), 5)
+            .unwrap()
+            .is_empty());
+        let (abandoned, drops) = ingress.abandon_pending(6).unwrap();
+        assert_eq!(abandoned, request);
+        assert_eq!(drops.len(), 1);
+        assert!(matches!(
+            &drops[0],
+            IngressEvent::Drop {
+                reason: DROP_SWITCH_BARRIER,
+                routed,
+            } if routed.route == request.target.pc && routed.object.header.pts_us == 200
+        ));
+        assert!(ingress.gate().pending_request().is_none());
+        assert!(!ingress.gate().is_failed());
+        assert_eq!(ingress.gate().active_routes(), old);
+        assert!(ingress.finish_pending().is_empty(), "nothing left behind the barrier");
+        // A late object of the abandoned target generation is stale, and the
+        // current routes stay release-eligible so the run can end on their FIN.
+        assert!(matches!(
+            ingress
+                .push(object(TrackRole::Haptic, request.target.haptic, 200, 2), 7)
+                .unwrap()
+                .as_slice(),
+            [IngressEvent::Drop {
+                reason: DROP_STALE_TIER,
+                ..
+            }]
+        ));
+        assert!(matches!(
+            ingress
+                .push(object(TrackRole::Pc, old.pc, 300, 3), 8)
+                .unwrap()
+                .as_slice(),
+            [IngressEvent::Scheduler(_)]
+        ));
+        assert_eq!(
+            ingress.abandon_pending(9).unwrap_err(),
+            SwitchError::NoSwitchPending
+        );
     }
 }

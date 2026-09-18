@@ -429,6 +429,61 @@ impl JsonlLogger {
         self.w.flush()
     }
 
+    /// Additive row: a controller transition decided at or after the registered
+    /// measurement window end is recorded but never requested on wire (the
+    /// sender refuses new subscriptions after run completion). The FSM trace
+    /// is preserved by the preceding `s3_controller`/`transition` row; this row
+    /// explains why no `s3_switch`/`request` follows it. `t_request` is the
+    /// instant the request would have been issued (`max(now, t_decision)`),
+    /// which is the value compared against `window_end_us`.
+    pub fn try_log_s3_switch_suppressed_after_end(
+        &mut self,
+        transition: S3Transition,
+        t_request: u64,
+        window_end_us: u64,
+    ) -> Result<()> {
+        if transition.at_us > t_request {
+            return Err(invalid("suppressed switch request occurs before its decision"));
+        }
+        if t_request < window_end_us {
+            return Err(invalid("suppressed switch request occurs before the window end"));
+        }
+        writeln!(
+            self.w,
+            "{{\"role\":\"s3_switch\",\"event\":\"suppressed_after_end\",\"t_decision\":{},\"t_request\":{t_request},\"window_end_us\":{window_end_us},\"from_state\":\"{}\",\"to_state\":\"{}\",\"cause\":\"{}\"}}",
+            transition.at_us,
+            transition.from.as_str(),
+            transition.to.as_str(),
+            transition.cause.as_str(),
+        )?;
+        self.w.flush()
+    }
+
+    /// Additive row: one changed role of a requested switch whose SUBSCRIBE the
+    /// sender refused with REQUEST_ERROR `DoesNotExist` after run completion,
+    /// observed at or after the registered window end. The switch is torn
+    /// down and abandoned without taking effect; the run is not failed by it.
+    pub fn try_log_s3_switch_refused_after_run_end(
+        &mut self,
+        role: TrackRole,
+        route: Route,
+        t_refused: u64,
+        window_end_us: u64,
+        error_code: u64,
+    ) -> Result<()> {
+        validate_route(role, route)?;
+        if t_refused < window_end_us {
+            return Err(invalid("refused switch observed before the window end"));
+        }
+        writeln!(
+            self.w,
+            "{{\"role\":\"s3_switch\",\"event\":\"refused_after_run_end\",\"t_refused\":{t_refused},\"window_end_us\":{window_end_us},\"track\":\"{}\",{},\"error_code\":{error_code}}}",
+            role.as_str(),
+            route_fields(route),
+        )?;
+        self.w.flush()
+    }
+
     pub fn try_log_s3_producer_start(
         &mut self,
         role: TrackRole,
@@ -482,7 +537,9 @@ fn validate_applied(applied: SwitchApplied) -> Result<()> {
 mod tests {
     use super::*;
     use crate::playout::{LatePolicy, PlayoutConfig};
-    use crate::s3_controller::{S3Config, S3Controller, S3Observation, TransitionCause};
+    use crate::s3_controller::{
+        S3Config, S3Controller, S3Observation, S3State, TransitionCause,
+    };
     use crate::s3_switch::{ObjectDisposition, S3SwitchGate, SwitchConfig};
     use crate::{
         now_us, PayloadMode, Phase4TransportMeta, Representation, Topology, V5Meta, TERM_PROTOCOL_V,
@@ -768,6 +825,109 @@ mod tests {
         assert!(text.contains(
             "\"event\":\"stop\",\"t_stop\":20,\"track\":\"haptic\",\"wire_track\":\"haptic-essential\",\"route_generation\":3,\"objects\":27,\"reason\":\"remote_closed\""
         ));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn window_end_rows_are_additive_valid_json_and_validated() {
+        let path = path("window-end");
+        {
+            let mut log = logger(&path);
+            let transition = S3Transition {
+                at_us: 30_024_000,
+                from: S3State::Normal,
+                to: S3State::HapticCritical,
+                cause: TransitionCause::DeadlineMissStreak,
+            };
+            // Decision after the window end (the observed defect shape).
+            log.try_log_s3_switch_suppressed_after_end(transition, 30_024_100, 30_000_000)
+                .unwrap();
+            // Request before the window end is not "after end": refused.
+            assert_eq!(
+                log.try_log_s3_switch_suppressed_after_end(transition, 29_999_999, 30_000_000)
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::InvalidInput
+            );
+            // Request before its own decision is malformed.
+            assert_eq!(
+                log.try_log_s3_switch_suppressed_after_end(transition, 30_023_999, 30_000_000)
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::InvalidInput
+            );
+            let route = Route {
+                name: PC_HAPTIC_CRITICAL_TRACK,
+                generation: 7,
+            };
+            log.try_log_s3_switch_refused_after_run_end(
+                TrackRole::Pc,
+                route,
+                30_050_000,
+                30_000_000,
+                0x10,
+            )
+            .unwrap();
+            assert_eq!(
+                log.try_log_s3_switch_refused_after_run_end(
+                    TrackRole::Pc,
+                    route,
+                    29_999_999,
+                    30_000_000,
+                    0x10,
+                )
+                .unwrap_err()
+                .kind(),
+                ErrorKind::InvalidInput
+            );
+            // Semantic/wire aliasing stays refused on the new row too.
+            assert_eq!(
+                log.try_log_s3_switch_refused_after_run_end(
+                    TrackRole::Haptic,
+                    route,
+                    30_050_000,
+                    30_000_000,
+                    0x10,
+                )
+                .unwrap_err()
+                .kind(),
+                ErrorKind::InvalidInput
+            );
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let rows: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("every row is valid JSON"))
+            .collect();
+        let suppressed = rows
+            .iter()
+            .find(|row| row["event"] == "suppressed_after_end")
+            .expect("suppressed row");
+        assert_eq!(suppressed["role"], "s3_switch");
+        assert_eq!(suppressed["t_decision"], 30_024_000_u64);
+        assert_eq!(suppressed["t_request"], 30_024_100_u64);
+        assert_eq!(suppressed["window_end_us"], 30_000_000_u64);
+        assert_eq!(suppressed["from_state"], "Normal");
+        assert_eq!(suppressed["to_state"], "Haptic-Critical");
+        assert_eq!(suppressed["cause"], "deadline_miss_streak");
+        let refused = rows
+            .iter()
+            .find(|row| row["event"] == "refused_after_run_end")
+            .expect("refused row");
+        assert_eq!(refused["role"], "s3_switch");
+        assert_eq!(refused["t_refused"], 30_050_000_u64);
+        assert_eq!(refused["window_end_us"], 30_000_000_u64);
+        assert_eq!(refused["track"], "pc");
+        assert_eq!(refused["wire_track"], "pc-d6");
+        assert_eq!(refused["route_generation"], 7);
+        assert_eq!(refused["error_code"], 16);
+        // Exactly the two accepted rows were written after the meta row.
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["role"] == "s3_switch")
+                .count(),
+            2
+        );
         std::fs::remove_file(path).unwrap();
     }
 }

@@ -338,6 +338,25 @@ impl S3SwitchGate {
         Ok(())
     }
 
+    /// Drop the pending request of a switch that never took effect because the
+    /// peer refused its target subscriptions after run completion (registered
+    /// sender rule: no new subscription once the current routes completed).
+    ///
+    /// The applied state and active routes are untouched — nothing changed on
+    /// wire — and the generations the request consumed stay consumed, so a
+    /// later request can never reuse them. The gate is NOT poisoned: the run
+    /// may still end by the current routes' FIN. A request that already
+    /// exceeded its effect timeout is refused here exactly as `check_timeout`
+    /// would refuse it (poisoning the gate), so this cannot be used to escape
+    /// a timed-out switch.
+    pub fn abandon_pending(&mut self, now_us: u64) -> Result<SwitchRequest, SwitchError> {
+        self.check_ready(now_us)?;
+        self.fail_if_timed_out(now_us)?;
+        let pending = self.pending.take().ok_or(SwitchError::NoSwitchPending)?;
+        self.last_now_us = Some(now_us);
+        Ok(pending.request)
+    }
+
     fn fail_if_timed_out(&mut self, now_us: u64) -> Result<(), SwitchError> {
         if self.pending.is_some_and(|pending| {
             now_us.saturating_sub(pending.request.request_at_us) > self.config.effect_timeout_us
@@ -592,5 +611,59 @@ mod tests {
             gate.request(transition(5, S3State::Normal, S3State::HapticCritical), 5,),
             Err(SwitchError::TransitionFromUnappliedState)
         );
+    }
+
+    #[test]
+    fn abandon_pending_drops_the_request_without_applying_or_poisoning() {
+        let mut gate = gate();
+        let request = gate
+            .request(transition(10, S3State::Normal, S3State::HapticCritical), 10)
+            .unwrap();
+        assert_eq!(gate.abandon_pending(5), Err(SwitchError::NonMonotonicTime));
+        let abandoned = gate.abandon_pending(20).unwrap();
+        assert_eq!(abandoned, request);
+        // Nothing took effect: state, routes and timeout health are unchanged.
+        assert!(gate.pending_request().is_none());
+        assert!(!gate.is_failed());
+        assert_eq!(gate.applied_state(), S3State::Normal);
+        assert_eq!(gate.active_routes().pc.name, "pc");
+        assert_eq!(gate.active_routes().pc.generation, 0);
+        assert_eq!(gate.active_routes().haptic.name, "haptic");
+        assert_eq!(gate.active_routes().haptic.generation, 0);
+        // The abandoned generations are consumed; objects of them are stale.
+        assert_eq!(
+            gate.classify_object(TrackRole::Pc, request.target.pc.generation),
+            ObjectDisposition::StaleDrop
+        );
+        assert_eq!(
+            gate.classify_object(TrackRole::Haptic, request.target.haptic.generation),
+            ObjectDisposition::StaleDrop
+        );
+        assert_eq!(gate.check_timeout(30), Ok(()));
+        assert_eq!(gate.abandon_pending(31), Err(SwitchError::NoSwitchPending));
+        // A later legal request from the still-applied Normal state gets
+        // fresh generations, never the abandoned ones.
+        let next = gate
+            .request(transition(40, S3State::Normal, S3State::HapticCritical), 40)
+            .unwrap();
+        assert_eq!(next.target.pc.generation, request.target.pc.generation + 1);
+        assert_eq!(
+            next.target.haptic.generation,
+            request.target.haptic.generation + 1
+        );
+    }
+
+    #[test]
+    fn abandon_pending_after_effect_timeout_poisons_like_check_timeout() {
+        let mut gate = gate();
+        gate.request(transition(10, S3State::Normal, S3State::HapticCritical), 10)
+            .unwrap();
+        assert_eq!(
+            gate.abandon_pending(10 + 1_000_000 + 1),
+            Err(SwitchError::SwitchTimedOut)
+        );
+        assert!(gate.is_failed());
+        assert!(gate.pending_request().is_some());
+        assert_eq!(gate.abandon_pending(10 + 1_000_000 + 2), Err(SwitchError::GateFailed));
     }
 }

@@ -1093,6 +1093,99 @@ fn is_retryable_subscribe_error(e: &moq_transport::serve::ServeError) -> bool {
     )
 }
 
+/// A SUBSCRIBE that gave up: the wire/local error is kept typed so the caller
+/// can classify it by `RequestErrorCode` instead of by its text. `Display` is
+/// byte-identical to the message the previous `bail!` produced, so the
+/// shutdown `detail` of every still-fatal failure is unchanged.
+#[derive(Debug)]
+struct S3SubscribeFailure {
+    role: TrackRole,
+    route: Route,
+    retries: u32,
+    error: moq_transport::serve::ServeError,
+}
+
+impl std::fmt::Display for S3SubscribeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "S3 subscribe {} generation {} failed after {} retries: {}",
+            self.route.name, self.route.generation, self.retries, self.error
+        )
+    }
+}
+
+impl std::error::Error for S3SubscribeFailure {}
+
+impl S3SubscribeFailure {
+    /// The peer answered REQUEST_ERROR `DoesNotExist` (0x10). After run
+    /// completion the S3 sender refuses every new subscription with exactly
+    /// this code (`s3_sender.rs`, registered 13th-review rule); the match is on
+    /// the typed code only, never on the reason text.
+    fn is_does_not_exist(&self) -> bool {
+        matches!(
+            self.error,
+            moq_transport::serve::ServeError::Closed(code)
+                if code == u64::from(moq_transport::message::RequestErrorCode::DoesNotExist)
+        )
+    }
+}
+
+/// Whether a controller transition may still be requested on wire.
+///
+/// `request_at_us` is the instant the request would be issued
+/// (`max(now, t_decision)`); `window_end_us` is the registered measurement
+/// window end (`t0 + duration`) if the receiver could derive it. Transitions
+/// at or after the window end are never requested: the sender has completed
+/// (or is completing) its current routes and refuses new subscriptions, and a
+/// switch that cannot take effect inside the window carries no measurement.
+/// Without a known window end the receiver behaves exactly as before.
+fn switch_allowed_at(request_at_us: u64, window_end_us: Option<u64>) -> bool {
+    window_end_us.map_or(true, |end| request_at_us < end)
+}
+
+/// Why the target subscriptions of a requested switch could not be opened.
+#[derive(Debug)]
+enum SwitchOpenFailure {
+    /// Every failed role was refused with `DoesNotExist` and the failure was
+    /// observed at or after the registered window end: the sender completed
+    /// the run before the SUBSCRIBE arrived. Carries the refused roles with
+    /// their wire error code for the additive `refused_after_run_end` rows.
+    RefusedAfterRunEnd(Vec<(TrackRole, Route, u64)>),
+    /// Anything else: fatal, exactly as before.
+    Fatal,
+}
+
+/// Classify the settled failures of one switch request. Refusal after run end
+/// requires ALL failures to be typed `DoesNotExist` subscribe failures (a
+/// timeout or any other code on either role stays fatal) and a known window
+/// end that `now_us` has reached.
+fn classify_switch_open_failure<'a>(
+    errors: impl IntoIterator<Item = &'a anyhow::Error>,
+    now_us: u64,
+    window_end_us: Option<u64>,
+) -> SwitchOpenFailure {
+    let Some(end) = window_end_us else {
+        return SwitchOpenFailure::Fatal;
+    };
+    if now_us < end {
+        return SwitchOpenFailure::Fatal;
+    }
+    let mut refused = Vec::new();
+    for error in errors {
+        match error.downcast_ref::<S3SubscribeFailure>() {
+            Some(failure) if failure.is_does_not_exist() => {
+                refused.push((failure.role, failure.route, failure.error.code()));
+            }
+            _ => return SwitchOpenFailure::Fatal,
+        }
+    }
+    if refused.is_empty() {
+        return SwitchOpenFailure::Fatal;
+    }
+    SwitchOpenFailure::RefusedAfterRunEnd(refused)
+}
+
 /// Outcome of establishing the subscription, for the shutdown record.
 #[derive(Debug, Clone, Copy, Default)]
 struct SubscribeStats {
@@ -1739,13 +1832,12 @@ async fn open_s3_subscription(
                 tokio::time::sleep(Duration::from_millis(args.subscribe_retry_ms)).await;
             }
             Err(error) => {
-                bail!(
-                    "S3 subscribe {} generation {} failed after {} retries: {}",
-                    route.name,
-                    route.generation,
+                return Err(anyhow::Error::new(S3SubscribeFailure {
+                    role,
+                    route,
                     retries,
-                    error
-                );
+                    error,
+                }));
             }
         }
     }
@@ -1975,9 +2067,11 @@ async fn request_s3_switch(
     bad_headers: Arc<AtomicU64>,
     ingress_drops: Arc<AtomicU64>,
     log_failed: Arc<AtomicU64>,
-) -> Result<bool> {
+    window_end_us: Option<u64>,
+    stats: &mut PlayoutStats,
+) -> Result<SwitchOutcome> {
     let Some(transition) = update.transition else {
-        return Ok(false);
+        return Ok(SwitchOutcome::NoTransition);
     };
     let request_at = now_us().max(transition.at_us);
     {
@@ -1985,6 +2079,11 @@ async fn request_s3_switch(
             .lock()
             .map_err(|_| anyhow::anyhow!("RX logger poisoned"))?;
         logger.try_log_s3_transition(transition, update.snapshot)?;
+        if !switch_allowed_at(request_at, window_end_us) {
+            let window_end_us = window_end_us.expect("a disallowed request has a window end");
+            logger.try_log_s3_switch_suppressed_after_end(transition, request_at, window_end_us)?;
+            return Ok(SwitchOutcome::SuppressedAfterEnd);
+        }
     }
     let request = ingress
         .request(transition, request_at)
@@ -2077,20 +2176,60 @@ async fn request_s3_switch(
     let (pc, haptic) = tokio::join!(pc_open, haptic_open);
     let ready = match settle_switch_subscribes(pc.into_iter().chain(haptic).collect()) {
         SwitchSubscribeOutcome::Ready(ready) => ready,
-        SwitchSubscribeOutcome::Failed { error, cleanup } => {
+        SwitchSubscribeOutcome::Failed {
+            error,
+            more_errors,
+            cleanup,
+        } => {
             let teardown = SwitchTeardown {
                 subscriptions: cleanup,
                 live_keys: Vec::new(),
             };
-            let error = if timed_out.load(Ordering::Relaxed) {
+            if timed_out.load(Ordering::Relaxed) {
                 // Fail through the gate so it is poisoned like a late
                 // SUBSCRIBE_OK; the run then ends loudly either way.
                 let gate = ingress.check_timeout(now_us());
-                anyhow::anyhow!("{error}; gate: {gate:?}")
-            } else {
-                error
+                let error = anyhow::anyhow!("{error}; gate: {gate:?}");
+                return fail_s3_switch(teardown, live, error).await;
+            }
+            let t_refused = now_us();
+            let refused = match classify_switch_open_failure(
+                std::iter::once(&error).chain(more_errors.iter()),
+                t_refused,
+                window_end_us,
+            ) {
+                SwitchOpenFailure::RefusedAfterRunEnd(refused) => refused,
+                SwitchOpenFailure::Fatal => {
+                    return fail_s3_switch(teardown, live, error).await;
+                }
             };
-            return fail_s3_switch(teardown, live, error).await;
+            // The sender completed the run before this SUBSCRIBE arrived
+            // (registered rule: no new subscription after completion). The
+            // switch never took effect: tear down whatever did open exactly
+            // as a fatal failure would, abandon the request in the gate so
+            // the current routes' FIN can still end the run normally, and
+            // account any target object that reached the barrier.
+            teardown_s3_switch(teardown, live).await;
+            let window_end_us = window_end_us.expect("a refusal after run end has a window end");
+            let (_, barrier_drops) = ingress
+                .abandon_pending(now_us())
+                .map_err(|error| anyhow::anyhow!("abandon refused S3 switch: {error:?}"))?;
+            {
+                let mut logger = logger
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("RX logger poisoned"))?;
+                for (role, route, code) in refused {
+                    logger.try_log_s3_switch_refused_after_run_end(
+                        role,
+                        route,
+                        t_refused,
+                        window_end_us,
+                        code,
+                    )?;
+                }
+                log_s3_barrier_drops(&mut logger, barrier_drops, stats)?;
+            }
+            return Ok(SwitchOutcome::RefusedAfterRunEnd);
         }
     };
 
@@ -2141,7 +2280,37 @@ async fn request_s3_switch(
             return fail_s3_switch(apply.fail(None), live, error).await;
         }
     }
-    Ok(true)
+    Ok(SwitchOutcome::Requested)
+}
+
+/// Terminally account target objects the ingress returned from behind the
+/// exact-pair barrier (`finish_pending`/`abandon_pending`): the same
+/// `role:"drop"` row and the same `dropped` count as every other terminal
+/// drop, so no object is unaccounted.
+fn log_s3_barrier_drops(
+    logger: &mut JsonlLogger,
+    events: Vec<IngressEvent>,
+    stats: &mut PlayoutStats,
+) -> Result<()> {
+    for event in events {
+        if let IngressEvent::Drop { routed, reason } = event {
+            let header = routed.object.header;
+            logger.try_log_drop_s3(
+                routed.role,
+                routed.route,
+                header.tier,
+                header.seq,
+                header.pts_us,
+                header.event_id,
+                now_us().max(routed.object.t_recv),
+                reason,
+                // Route/tier integrity, not a scheduling decision.
+                None,
+            )?;
+            stats.dropped += 1;
+        }
+    }
+    Ok(())
 }
 
 /// Everything that must be torn down when a switch request fails part-way.
@@ -2194,14 +2363,13 @@ impl<S> SwitchApplyState<S> {
     }
 }
 
-/// Tear down every subscription of a failed switch request, then return the
-/// error. Subscriptions already inserted into `live` are removed first so the
+/// Tear down every subscription of a switch request that will not be applied.
+/// Subscriptions already inserted into `live` are removed first so the
 /// shutdown path never sees a half-applied switch.
-async fn fail_s3_switch(
+async fn teardown_s3_switch(
     teardown: SwitchTeardown<S3LiveSubscription>,
     live: &mut HashMap<(TrackRole, u64), S3LiveSubscription>,
-    error: anyhow::Error,
-) -> Result<bool> {
+) {
     for subscription in teardown.subscriptions {
         discard_s3_subscription(subscription).await;
     }
@@ -2210,7 +2378,33 @@ async fn fail_s3_switch(
             discard_s3_subscription(subscription).await;
         }
     }
+}
+
+/// Tear down every subscription of a failed switch request, then return the
+/// error.
+async fn fail_s3_switch(
+    teardown: SwitchTeardown<S3LiveSubscription>,
+    live: &mut HashMap<(TrackRole, u64), S3LiveSubscription>,
+    error: anyhow::Error,
+) -> Result<SwitchOutcome> {
+    teardown_s3_switch(teardown, live).await;
     Err(error)
+}
+
+/// What `request_s3_switch` did with one controller update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwitchOutcome {
+    /// The update carried no transition.
+    NoTransition,
+    /// The switch was requested and is pending in the gate.
+    Requested,
+    /// The transition was decided at/after the registered window end: logged,
+    /// never requested (no gate request, no subscription).
+    SuppressedAfterEnd,
+    /// The request was issued but every changed role was refused with
+    /// `DoesNotExist` at/after the window end: torn down and abandoned in the
+    /// gate without failing the run.
+    RefusedAfterRunEnd,
 }
 
 /// One changed role's target subscription attempt: `(subscription, t_ok, retries)`.
@@ -2224,8 +2418,13 @@ enum SwitchSubscribeOutcome<S> {
     Ready(Vec<(TrackRole, Route, S, u64, u32)>),
     /// At least one role failed. `cleanup` holds every subscription that did
     /// succeed and must be torn down; `error` is the first failure in
-    /// PC-then-haptic order.
-    Failed { error: anyhow::Error, cleanup: Vec<S> },
+    /// PC-then-haptic order and `more_errors` the remaining ones in that
+    /// order, so a refusal classification can inspect every failed role.
+    Failed {
+        error: anyhow::Error,
+        more_errors: Vec<anyhow::Error>,
+        cleanup: Vec<S>,
+    },
 }
 
 fn settle_switch_subscribes<S>(
@@ -2233,12 +2432,15 @@ fn settle_switch_subscribes<S>(
 ) -> SwitchSubscribeOutcome<S> {
     let mut ready = Vec::with_capacity(results.len());
     let mut error = None;
+    let mut more_errors = Vec::new();
     for (role, route, result) in results {
         match result {
             Ok((subscription, t_ok, retries)) => ready.push((role, route, subscription, t_ok, retries)),
             Err(failure) => {
                 if error.is_none() {
                     error = Some(failure);
+                } else {
+                    more_errors.push(failure);
                 }
             }
         }
@@ -2246,6 +2448,7 @@ fn settle_switch_subscribes<S>(
     if let Some(error) = error {
         return SwitchSubscribeOutcome::Failed {
             error,
+            more_errors,
             cleanup: ready
                 .into_iter()
                 .map(|(_, _, subscription, _, _)| subscription)
@@ -2326,6 +2529,78 @@ fn release_retired_s3_subscription(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Registered window end from the first measurement object: t0 is recovered
+/// as `gen_ts_us - pts_us` (the sender stamps `t_gen` after waking at slot
+/// `t0 + pts_us`), so the result is never earlier than the true window end.
+/// `None` only on arithmetic overflow/underflow of a malformed header.
+fn derive_window_end_us(header: Header, duration_us: u64) -> Option<(u64, u64)> {
+    let t0_rx_us = header.gen_ts_us.checked_sub(header.pts_us)?;
+    let end_us = t0_rx_us.checked_add(duration_us)?;
+    Some((t0_rx_us, end_us))
+}
+
+/// Body of the additive `role:"info"` row that records the applied window end
+/// and its derivation (which object, `t0_rx_us = gen_ts_us - pts_us`).
+fn s3_window_end_row_body(
+    role: TrackRole,
+    route: Route,
+    header: Header,
+    t0_rx_us: u64,
+    duration_us: u64,
+    window_end_us: u64,
+) -> String {
+    format!(
+        "\"event\":\"s3_window_end\",\"window_end_us\":{window_end_us},\"t0_rx_us\":{t0_rx_us},\"duration_us\":{duration_us},\"t0_source\":\"first_object_gen_ts_minus_pts\",\"track\":\"{}\",{},\"seq\":{},\"pts_us\":{},\"gen_ts_us\":{}",
+        role.as_str(),
+        s3_route_fields(route),
+        header.seq,
+        header.pts_us,
+        header.gen_ts_us,
+    )
+}
+
+/// Body of the S3 shutdown row. The vocabulary up to `detail` is unchanged;
+/// the three S3 fields after it are additive (12th rework): how many
+/// controller transitions were never requested because they fell at or after
+/// the registered window end, how many requested switches the sender refused
+/// after run completion, and the window end applied (`null` if unknown).
+fn s3_shutdown_row_body(
+    failed: bool,
+    bad_headers: u64,
+    detail: &str,
+    switch_suppressed_after_end: u64,
+    switch_refused_after_run_end: u64,
+    window_end_us: Option<u64>,
+) -> String {
+    format!(
+        "\"event\":\"shutdown\",\"ending\":\"{}\",\"exit_code\":{},\"bad_headers\":{},\"subscribe_retries\":0,\"subscribe_wait_ms\":0,\"tracks\":[],\"detail\":\"{}\",\"s3_switch_suppressed_after_end\":{switch_suppressed_after_end},\"s3_switch_refused_after_run_end\":{switch_refused_after_run_end},\"s3_window_end_us\":{}",
+        if failed { "error" } else { "normal" },
+        if failed { 1 } else { 0 },
+        bad_headers,
+        json_escape(detail),
+        window_end_us
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".to_string()),
+    )
+}
+
+fn count_switch_outcome(outcome: SwitchOutcome, suppressed: &mut u64, refused: &mut u64) {
+    match outcome {
+        SwitchOutcome::SuppressedAfterEnd => *suppressed += 1,
+        SwitchOutcome::RefusedAfterRunEnd => *refused += 1,
+        SwitchOutcome::NoTransition | SwitchOutcome::Requested => {}
+    }
+}
+
+/// `wire_track`/`route_generation` fields in the S3 row vocabulary.
+fn s3_route_fields(route: Route) -> String {
+    format!(
+        "\"wire_track\":\"{}\",\"route_generation\":{}",
+        json_escape(route.name),
+        route.generation
+    )
+}
+
 async fn run_s3_receiver(
     args: &Args,
     playout: PlayoutConfig,
@@ -2502,6 +2777,28 @@ async fn run_s3_receiver(
     let mut controller_active_at_us: Option<u64> = None;
     let mut forced_misses_injected = false;
 
+    // Registered measurement window end, `t0 + duration`. The receiver has no
+    // wire copy of the sender's `measurement_start`; it recovers t0 from the
+    // first measurement object it observes as `gen_ts_us - pts_us`, because
+    // every S3 producer stamps `t_gen` after waking at slot `t0 + pts_us` on
+    // the host monotonic clock the two namespaces share. The estimate is
+    // therefore never earlier than t0 and late only by the sender's wake
+    // latency (sub-millisecond); it is fixed at first observation and logged
+    // so the window is reconstructible from the RX log alone. Without
+    // `--duration-s` the window is unknown and the controller is ungated.
+    let window_duration_us = args.duration_s.map(duration_us_exact).transpose()?;
+    let mut window_end_us: Option<u64> = None;
+    let mut switch_suppressed_after_end: u64 = 0;
+    let mut switch_refused_after_run_end: u64 = 0;
+    if window_duration_us.is_none() {
+        logger
+            .lock()
+            .map_err(|_| anyhow::anyhow!("RX logger poisoned"))?
+            .try_log_info(
+                "\"event\":\"s3_window_end\",\"window_end_us\":null,\"reason\":\"no_duration_s\"",
+            )?;
+    }
+
     while !normal_end && outcome_error.is_none() {
         let now = now_us();
         let pending_at_start = ingress.gate().pending_request().is_some();
@@ -2572,6 +2869,43 @@ async fn run_s3_receiver(
                         }
                         TrackRole::Haptic => {
                             recv_haptic.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    if window_end_us.is_none() {
+                        if let Some(duration_us) = window_duration_us {
+                            let header = routed.object.header;
+                            match derive_window_end_us(header, duration_us) {
+                                Some((t0_rx_us, end_us)) => {
+                                    window_end_us = Some(end_us);
+                                    if let Err(error) = logger
+                                        .lock()
+                                        .map_err(|_| anyhow::anyhow!("RX logger poisoned"))
+                                        .and_then(|mut logger| {
+                                            logger
+                                                .try_log_info(&s3_window_end_row_body(
+                                                    routed.role,
+                                                    routed.route,
+                                                    header,
+                                                    t0_rx_us,
+                                                    duration_us,
+                                                    end_us,
+                                                ))
+                                                .map_err(anyhow::Error::from)
+                                        })
+                                    {
+                                        outcome_error = Some(error);
+                                        continue;
+                                    }
+                                }
+                                None => {
+                                    outcome_error = Some(anyhow::anyhow!(
+                                        "S3 window end overflow: gen_ts_us={} pts_us={} duration_us={duration_us}",
+                                        header.gen_ts_us,
+                                        header.pts_us
+                                    ));
+                                    continue;
+                                }
+                            }
                         }
                     }
                     let ingress_events = match ingress.push(routed, now) {
@@ -2880,7 +3214,7 @@ async fn run_s3_receiver(
                     continue;
                 }
                 if let Some(update) = final_update {
-                    if let Err(error) = request_s3_switch(
+                    match request_s3_switch(
                         update,
                         &mut ingress,
                         &mut subscriber,
@@ -2893,11 +3227,22 @@ async fn run_s3_receiver(
                         bad_headers.clone(),
                         ingress_drops.clone(),
                         log_failed.clone(),
+                        window_end_us,
+                        &mut stats,
                     )
                     .await
                     {
-                        outcome_error = Some(error);
-                        continue;
+                        Ok(outcome) => {
+                            count_switch_outcome(
+                                outcome,
+                                &mut switch_suppressed_after_end,
+                                &mut switch_refused_after_run_end,
+                            );
+                        }
+                        Err(error) => {
+                            outcome_error = Some(error);
+                            continue;
+                        }
                     }
                 }
             }
@@ -2977,11 +3322,25 @@ async fn run_s3_receiver(
                     bad_headers.clone(),
                     ingress_drops.clone(),
                     log_failed.clone(),
+                    window_end_us,
+                    &mut stats,
                 )
                 .await
                 {
-                    Ok(true) => break,
-                    Ok(false) => {}
+                    Ok(outcome) => {
+                        count_switch_outcome(
+                            outcome,
+                            &mut switch_suppressed_after_end,
+                            &mut switch_refused_after_run_end,
+                        );
+                        // A pending request suppresses the rest of this
+                        // batch (as before). A suppressed or refused
+                        // transition leaves nothing pending, so the
+                        // controller keeps observing.
+                        if outcome == SwitchOutcome::Requested {
+                            break;
+                        }
+                    }
                     Err(error) => {
                         outcome_error = Some(error);
                         break;
@@ -2991,26 +3350,12 @@ async fn run_s3_receiver(
         }
     }
 
-    for event in ingress.finish_pending() {
-        if let IngressEvent::Drop { routed, reason } = event {
-            let header = routed.object.header;
-            logger
-                .lock()
-                .map_err(|_| anyhow::anyhow!("RX logger poisoned"))?
-                .try_log_drop_s3(
-                    routed.role,
-                    routed.route,
-                    header.tier,
-                    header.seq,
-                    header.pts_us,
-                    header.event_id,
-                    now_us().max(routed.object.t_recv),
-                    reason,
-                    // Route/tier integrity, not a scheduling decision.
-                    None,
-                )?;
-            stats.dropped += 1;
-        }
+    {
+        let barrier_drops = ingress.finish_pending();
+        let mut logger = logger
+            .lock()
+            .map_err(|_| anyhow::anyhow!("RX logger poisoned"))?;
+        log_s3_barrier_drops(&mut logger, barrier_drops, &mut stats)?;
     }
 
     // Stop every subscription before joining/aborting its drain, then stop the
@@ -3106,17 +3451,16 @@ async fn run_s3_receiver(
             stats.bridge_observer_dropped,
             stats.negative_lateness,
         ))?;
-        logger.try_log_info(&format!(
-            "\"event\":\"shutdown\",\"ending\":\"{}\",\"exit_code\":{},\"bad_headers\":{},\"subscribe_retries\":0,\"subscribe_wait_ms\":0,\"tracks\":[],\"detail\":\"{}\"",
-            if failed { "error" } else { "normal" },
-            if failed { 1 } else { 0 },
+        logger.try_log_info(&s3_shutdown_row_body(
+            failed,
             n_bad,
-            json_escape(
-                &outcome_error
-                    .as_ref()
-                    .map(|error| format!("{error:#}"))
-                    .unwrap_or_else(|| "rule=s3_current_routes_fin".to_string())
-            )
+            &outcome_error
+                .as_ref()
+                .map(|error| format!("{error:#}"))
+                .unwrap_or_else(|| "rule=s3_current_routes_fin".to_string()),
+            switch_suppressed_after_end,
+            switch_refused_after_run_end,
+            window_end_us,
         ))?;
         logger.try_flush()?;
     }
@@ -6995,8 +7339,13 @@ mod s3_switch_subscribe_tests {
             (TrackRole::Pc, pc_route(), Ok(("pc", 5_000, 0))),
             (TrackRole::Haptic, haptic_route(), Err(anyhow::anyhow!("haptic failed"))),
         ]) {
-            SwitchSubscribeOutcome::Failed { error, cleanup } => {
+            SwitchSubscribeOutcome::Failed {
+                error,
+                more_errors,
+                cleanup,
+            } => {
                 assert_eq!(error.to_string(), "haptic failed");
+                assert!(more_errors.is_empty());
                 assert_eq!(cleanup, vec!["pc"]);
             }
             SwitchSubscribeOutcome::Ready(_) => panic!("must fail"),
@@ -7005,8 +7354,13 @@ mod s3_switch_subscribe_tests {
             (TrackRole::Pc, pc_route(), Err(anyhow::anyhow!("pc failed"))),
             (TrackRole::Haptic, haptic_route(), Ok(("haptic", 4_000, 0))),
         ]) {
-            SwitchSubscribeOutcome::Failed { error, cleanup } => {
+            SwitchSubscribeOutcome::Failed {
+                error,
+                more_errors,
+                cleanup,
+            } => {
                 assert_eq!(error.to_string(), "pc failed");
+                assert!(more_errors.is_empty());
                 assert_eq!(cleanup, vec!["haptic"]);
             }
             SwitchSubscribeOutcome::Ready(_) => panic!("must fail"),
@@ -7082,11 +7436,272 @@ mod s3_switch_subscribe_tests {
             (TrackRole::Pc, pc_route(), Err(anyhow::anyhow!("pc failed"))),
             (TrackRole::Haptic, haptic_route(), Err(anyhow::anyhow!("haptic failed"))),
         ]) {
-            SwitchSubscribeOutcome::Failed { error, cleanup } => {
+            SwitchSubscribeOutcome::Failed {
+                error,
+                more_errors,
+                cleanup,
+            } => {
                 assert_eq!(error.to_string(), "pc failed");
+                // The second failure is kept, in PC-then-haptic order, so a
+                // refusal classification can inspect every failed role.
+                assert_eq!(more_errors.len(), 1);
+                assert_eq!(more_errors[0].to_string(), "haptic failed");
                 assert!(cleanup.is_empty());
             }
             SwitchSubscribeOutcome::Ready(_) => panic!("must fail"),
         }
+    }
+
+    // ---- 12th rework: registered window end gating of controller switches ----
+    //
+    // `request_s3_switch` needs a live `Subscriber`, so the two decisions it
+    // makes are factored into pure helpers and tested here (helper-only):
+    // `switch_allowed_at` (requirement A) and `classify_switch_open_failure`
+    // (requirement B). The teardown set on refusal is `SwitchTeardown` from
+    // `settle_switch_subscribes`, covered above, and is passed to the same
+    // `teardown_s3_switch` the fatal path uses.
+
+    use moq_transport::message::RequestErrorCode;
+    use moq_transport::serve::ServeError;
+
+    const WINDOW_END: u64 = 30_000_000;
+
+    fn subscribe_failure(role: TrackRole, route: Route, error: ServeError) -> anyhow::Error {
+        anyhow::Error::new(S3SubscribeFailure {
+            role,
+            route,
+            retries: 2,
+            error,
+        })
+    }
+
+    fn does_not_exist() -> ServeError {
+        ServeError::Closed(u64::from(RequestErrorCode::DoesNotExist))
+    }
+
+    #[test]
+    fn subscribe_failure_display_matches_the_previous_bail_text() {
+        // The shutdown `detail` of every still-fatal failure must not change.
+        let error = subscribe_failure(TrackRole::Pc, pc_route(), does_not_exist());
+        assert_eq!(
+            format!("{error:#}"),
+            "S3 subscribe pc-d7 generation 1 failed after 2 retries: closed, code=16"
+        );
+        assert_eq!(error.to_string(), format!("{error:#}"));
+        let failure = error.downcast_ref::<S3SubscribeFailure>().unwrap();
+        assert!(failure.is_does_not_exist());
+        assert!(!S3SubscribeFailure {
+            role: TrackRole::Pc,
+            route: pc_route(),
+            retries: 0,
+            error: ServeError::Closed(u64::from(RequestErrorCode::Timeout)),
+        }
+        .is_does_not_exist());
+        // Local not-found is not the wire refusal code.
+        assert!(!S3SubscribeFailure {
+            role: TrackRole::Pc,
+            route: pc_route(),
+            retries: 0,
+            error: ServeError::NotFound,
+        }
+        .is_does_not_exist());
+        assert_eq!(u64::from(RequestErrorCode::DoesNotExist), 0x10);
+    }
+
+    #[test]
+    fn switch_allowed_only_before_a_known_window_end() {
+        // (2) before the window end: requested as before.
+        assert!(switch_allowed_at(WINDOW_END - 1, Some(WINDOW_END)));
+        assert!(switch_allowed_at(0, Some(WINDOW_END)));
+        // (1) at or after the window end: never requested.
+        assert!(!switch_allowed_at(WINDOW_END, Some(WINDOW_END)));
+        assert!(!switch_allowed_at(WINDOW_END + 24_100, Some(WINDOW_END)));
+        // Unknown window end (no --duration-s): ungated, as before.
+        assert!(switch_allowed_at(WINDOW_END + 24_100, None));
+    }
+
+    #[test]
+    fn does_not_exist_at_or_after_window_end_is_a_refusal_with_every_role() {
+        // (3) both roles refused after the end: both rows, wire code 0x10.
+        let pc = subscribe_failure(TrackRole::Pc, pc_route(), does_not_exist());
+        let haptic = subscribe_failure(TrackRole::Haptic, haptic_route(), does_not_exist());
+        match classify_switch_open_failure([&pc, &haptic], WINDOW_END + 50_000, Some(WINDOW_END)) {
+            SwitchOpenFailure::RefusedAfterRunEnd(refused) => {
+                assert_eq!(
+                    refused,
+                    vec![
+                        (TrackRole::Pc, pc_route(), 0x10),
+                        (TrackRole::Haptic, haptic_route(), 0x10),
+                    ]
+                );
+            }
+            SwitchOpenFailure::Fatal => panic!("must be a refusal"),
+        }
+        // Exactly at the window end counts as after it (same rule as A).
+        assert!(matches!(
+            classify_switch_open_failure([&haptic], WINDOW_END, Some(WINDOW_END)),
+            SwitchOpenFailure::RefusedAfterRunEnd(refused)
+                if refused == vec![(TrackRole::Haptic, haptic_route(), 0x10)]
+        ));
+    }
+
+    #[test]
+    fn any_other_failure_shape_stays_fatal() {
+        let pc = subscribe_failure(TrackRole::Pc, pc_route(), does_not_exist());
+        // (4a) DoesNotExist observed before the window end: fatal as before.
+        assert!(matches!(
+            classify_switch_open_failure([&pc], WINDOW_END - 1, Some(WINDOW_END)),
+            SwitchOpenFailure::Fatal
+        ));
+        // (4b) a different request error code after the end: fatal.
+        let timeout = subscribe_failure(
+            TrackRole::Pc,
+            pc_route(),
+            ServeError::Closed(u64::from(RequestErrorCode::Timeout)),
+        );
+        assert!(matches!(
+            classify_switch_open_failure([&timeout], WINDOW_END + 1, Some(WINDOW_END)),
+            SwitchOpenFailure::Fatal
+        ));
+        // Local NotFound after retries exhausted is not the wire refusal.
+        let local = subscribe_failure(TrackRole::Pc, pc_route(), ServeError::NotFound);
+        assert!(matches!(
+            classify_switch_open_failure([&local], WINDOW_END + 1, Some(WINDOW_END)),
+            SwitchOpenFailure::Fatal
+        ));
+        // An untyped failure (e.g. the effect-timeout message) after the end.
+        let untyped = anyhow::anyhow!("S3 switch pc SUBSCRIBE did not complete before the effect timeout");
+        assert!(matches!(
+            classify_switch_open_failure([&untyped], WINDOW_END + 1, Some(WINDOW_END)),
+            SwitchOpenFailure::Fatal
+        ));
+        // Mixed: one refused, the other something else — no partial refusal.
+        assert!(matches!(
+            classify_switch_open_failure([&pc, &timeout], WINDOW_END + 1, Some(WINDOW_END)),
+            SwitchOpenFailure::Fatal
+        ));
+        assert!(matches!(
+            classify_switch_open_failure([&timeout, &pc], WINDOW_END + 1, Some(WINDOW_END)),
+            SwitchOpenFailure::Fatal
+        ));
+        // Unknown window end: never a refusal, whatever the code or time.
+        assert!(matches!(
+            classify_switch_open_failure([&pc], u64::MAX, None),
+            SwitchOpenFailure::Fatal
+        ));
+        // No failures at all cannot be classified as a refusal.
+        assert!(matches!(
+            classify_switch_open_failure(std::iter::empty(), WINDOW_END + 1, Some(WINDOW_END)),
+            SwitchOpenFailure::Fatal
+        ));
+    }
+
+    #[test]
+    fn window_end_is_t0_from_gen_ts_minus_pts_plus_duration() {
+        let header = |gen_ts_us: u64, pts_us: u64| Header {
+            version: VERSION,
+            track_id: TRACK_HAPTIC,
+            tier: 0,
+            seq: 0,
+            pts_us,
+            event_id: 1,
+            gen_ts_us,
+            payload_len: 0,
+        };
+        // First object is pts 0 at t0 (+ wake latency): t0 == gen_ts.
+        assert_eq!(
+            derive_window_end_us(header(4_000_123, 0), 30_000_000),
+            Some((4_000_123, 34_000_123))
+        );
+        // First observed object is a later slot (earlier ones lost): t0 is
+        // still recovered from the slot arithmetic, not from arrival.
+        assert_eq!(
+            derive_window_end_us(header(4_033_400, 33_333), 30_000_000),
+            Some((4_000_067, 34_000_067))
+        );
+        // Malformed relation or overflow yields no window instead of a wrong one.
+        assert_eq!(derive_window_end_us(header(10, 11), 30_000_000), None);
+        assert_eq!(derive_window_end_us(header(u64::MAX, 0), 1), None);
+    }
+
+    #[test]
+    fn window_end_and_shutdown_info_rows_are_valid_json_with_additive_fields() {
+        let header = Header {
+            version: VERSION,
+            track_id: TRACK_HAPTIC,
+            tier: 0,
+            seq: 0,
+            pts_us: 0,
+            event_id: 1,
+            gen_ts_us: 4_000_123,
+            payload_len: 0,
+        };
+        let haptic = Route {
+            name: skew_moq::s3_switch::HAPTIC_FULL_TRACK,
+            generation: 0,
+        };
+        let row = format!(
+            "{{\"role\":\"info\",{}}}",
+            s3_window_end_row_body(TrackRole::Haptic, haptic, header, 4_000_123, 30_000_000, 34_000_123)
+        );
+        let value: serde_json::Value = serde_json::from_str(&row).expect("valid JSON");
+        assert_eq!(value["event"], "s3_window_end");
+        assert_eq!(value["window_end_us"], 34_000_123_u64);
+        assert_eq!(value["t0_rx_us"], 4_000_123_u64);
+        assert_eq!(value["duration_us"], 30_000_000_u64);
+        assert_eq!(value["t0_source"], "first_object_gen_ts_minus_pts");
+        assert_eq!(value["track"], "haptic");
+        assert_eq!(value["wire_track"], "haptic");
+        assert_eq!(value["route_generation"], 0);
+        assert_eq!(value["gen_ts_us"], 4_000_123_u64);
+
+        // Shutdown row: the pre-existing vocabulary is untouched and the three
+        // S3 fields are appended after `detail`.
+        let normal = format!(
+            "{{\"role\":\"info\",{}}}",
+            s3_shutdown_row_body(false, 0, "rule=s3_current_routes_fin", 1, 1, Some(34_000_123))
+        );
+        assert!(normal.starts_with(
+            "{\"role\":\"info\",\"event\":\"shutdown\",\"ending\":\"normal\",\"exit_code\":0,\"bad_headers\":0,\"subscribe_retries\":0,\"subscribe_wait_ms\":0,\"tracks\":[],\"detail\":\"rule=s3_current_routes_fin\","
+        ));
+        let value: serde_json::Value = serde_json::from_str(&normal).expect("valid JSON");
+        assert_eq!(value["s3_switch_suppressed_after_end"], 1);
+        assert_eq!(value["s3_switch_refused_after_run_end"], 1);
+        assert_eq!(value["s3_window_end_us"], 34_000_123_u64);
+        let error = format!(
+            "{{\"role\":\"info\",{}}}",
+            s3_shutdown_row_body(
+                true,
+                0,
+                "S3 subscribe pc-d6 generation 7 failed after 2 retries: closed, code=16",
+                0,
+                0,
+                None
+            )
+        );
+        let value: serde_json::Value = serde_json::from_str(&error).expect("valid JSON");
+        assert_eq!(value["ending"], "error");
+        assert_eq!(value["exit_code"], 1);
+        assert_eq!(
+            value["detail"],
+            "S3 subscribe pc-d6 generation 7 failed after 2 retries: closed, code=16"
+        );
+        assert!(value["s3_window_end_us"].is_null());
+    }
+
+    #[test]
+    fn switch_outcomes_count_only_the_two_additive_shutdown_fields() {
+        let mut suppressed = 0;
+        let mut refused = 0;
+        for outcome in [
+            SwitchOutcome::NoTransition,
+            SwitchOutcome::Requested,
+            SwitchOutcome::SuppressedAfterEnd,
+            SwitchOutcome::RefusedAfterRunEnd,
+            SwitchOutcome::SuppressedAfterEnd,
+        ] {
+            count_switch_outcome(outcome, &mut suppressed, &mut refused);
+        }
+        assert_eq!((suppressed, refused), (2, 1));
     }
 }
