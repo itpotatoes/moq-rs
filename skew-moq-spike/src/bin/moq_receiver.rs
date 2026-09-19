@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -1649,6 +1649,34 @@ fn json_escape(s: &str) -> String {
     out
 }
 
+/// PROVENANCE of one track terminal (16th rework, P1-A).
+///
+/// A code-less `ServeError::Cancel` is produced BOTH by a peer/relay collapse
+/// and by this receiver's own release of the subscription (dropping the
+/// handle sends UNSUBSCRIBE, `session/subscribe.rs:278`), and
+/// `classify_track_end` cannot tell them apart. The 15th rework worked around
+/// that by faulting a torn-down target only when a close CODE happened to be
+/// present, which silently dropped every code-less REMOTE failure — including
+/// the `Failed`/`None` the drain raises for a malformed subgroup or a failed
+/// log write.
+///
+/// The tag is therefore decided by provenance, not by the shape of the error:
+/// the drain task itself records whether the receiver had already begun
+/// releasing this subscription at the instant it classified the terminal. The
+/// read happens in the same poll that observes the error and BEFORE the event
+/// is enqueued, so a terminal that was already queued when the release started
+/// is necessarily `Remote` — which is exactly the arrival order the relay-late
+/// refusal path produces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalSource {
+    /// The receiver had not begun releasing this subscription. The terminal is
+    /// the peer's (or a local protocol/log fault), never our own teardown.
+    Remote,
+    /// The receiver had already set `local_release` — dropped, or is about to
+    /// drop, the handle — so this terminal may be its own UNSUBSCRIBE.
+    LocalRelease,
+}
+
 #[derive(Debug)]
 enum S3WireEvent {
     Object(RoutedObject),
@@ -1665,6 +1693,11 @@ enum S3WireEvent {
         /// must never be parsed for it; this field is the only authority.
         /// `None` for every non-`Closed` ending.
         close_code: Option<u64>,
+        /// Whether this terminal can be the receiver's OWN teardown. See
+        /// [`TerminalSource`]. A `Closed(code)` is always the peer's whatever
+        /// this says; the tag is what makes a CODE-LESS remote failure
+        /// distinguishable from our own UNSUBSCRIBE.
+        source: TerminalSource,
     },
 }
 
@@ -1684,6 +1717,26 @@ fn track_end_close_code(e: &moq_transport::serve::ServeError) -> Option<u64> {
 struct S3LiveSubscription<H> {
     handle: H,
     drain: tokio::task::JoinHandle<()>,
+    /// Set by [`S3LiveSubscription::release_handle`] immediately BEFORE the
+    /// handle is dropped, and read by the drain task when it classifies its
+    /// terminal. This is the provenance channel of [`TerminalSource`]; it is
+    /// never cleared, because a released subscription is never reopened.
+    local_release: Arc<AtomicBool>,
+}
+
+impl<H> S3LiveSubscription<H> {
+    /// Release the wire handle (drop == UNSUBSCRIBE) through the ONE site that
+    /// also records the release for provenance, and hand back the drain task.
+    ///
+    /// Every receiver-initiated release goes through here. The store happens
+    /// before the drop, so any terminal the drop itself causes is classified
+    /// `LocalRelease`, while anything the drain had already classified keeps
+    /// the `Remote` tag it was built with.
+    fn release_handle(self) -> tokio::task::JoinHandle<()> {
+        self.local_release.store(true, Ordering::Release);
+        drop(self.handle);
+        self.drain
+    }
 }
 
 /// The single seam of the S3 receiver: opening one target subscription.
@@ -1758,6 +1811,7 @@ async fn drain_s3_track(
     bad_headers: Arc<AtomicU64>,
     ingress_drops: Arc<AtomicU64>,
     log_failed: Arc<AtomicU64>,
+    local_release: Arc<AtomicBool>,
 ) {
     let result = async {
         let mut subgroups = match received_track.mode().await? {
@@ -1864,17 +1918,30 @@ async fn drain_s3_track(
     }
     .await;
 
-    let (end, detail, close_code) = match result {
-        Ok(()) => (TrackEnd::Fin, String::new(), None),
+    let (end, detail, close_code, source) = match result {
+        // End-of-track is the publisher's, and it is never faulted anyway.
+        Ok(()) => (TrackEnd::Fin, String::new(), None, TerminalSource::Remote),
+        // The ONLY shape our own release can take. The flag is read here, in
+        // the same poll that observed the error and before the event is
+        // enqueued, so the answer describes the state at classification time.
         Err(DrainFail::Serve(error)) => (
             classify_track_end(&error),
             error.to_string(),
             track_end_close_code(&error),
+            if local_release.load(Ordering::Acquire) {
+                TerminalSource::LocalRelease
+            } else {
+                TerminalSource::Remote
+            },
         ),
+        // A malformed subgroup mode or a failed log write. Dropping the
+        // subscription handle cannot produce either, so this is remote (or a
+        // local defect) by construction and never our teardown.
         Err(DrainFail::NonSubgroup) => (
             TrackEnd::Failed,
             "invalid S3 subgroup/log state".to_string(),
             None,
+            TerminalSource::Remote,
         ),
     };
     let _ = events
@@ -1884,6 +1951,7 @@ async fn drain_s3_track(
             end,
             detail,
             close_code,
+            source,
         })
         .await;
 }
@@ -1923,6 +1991,7 @@ async fn open_s3_subscription<S: S3SubscribeSeam>(
         match subscriber.subscribe_open(writer, params).await {
             Ok(handle) => {
                 let t_ok = now_us();
+                let local_release = Arc::new(AtomicBool::new(false));
                 let drain = tokio::spawn(drain_s3_track(
                     role,
                     route,
@@ -1932,8 +2001,17 @@ async fn open_s3_subscription<S: S3SubscribeSeam>(
                     bad_headers,
                     ingress_drops,
                     log_failed,
+                    local_release.clone(),
                 ));
-                return Ok((S3LiveSubscription { handle, drain }, t_ok, retries));
+                return Ok((
+                    S3LiveSubscription {
+                        handle,
+                        drain,
+                        local_release,
+                    },
+                    t_ok,
+                    retries,
+                ));
             }
             Err(error) => {
                 // Per-role observation instant, taken where the error is seen
@@ -2187,6 +2265,7 @@ async fn request_s3_switch<S: S3SubscribeSeam>(
     log_failed: Arc<AtomicU64>,
     window_end_us: Option<u64>,
     stats: &mut PlayoutStats,
+    faults: &mut S3SwitchTargetFaults,
 ) -> Result<SwitchOutcome> {
     let Some(transition) = update.transition else {
         return Ok(SwitchOutcome::NoTransition);
@@ -2229,7 +2308,7 @@ async fn request_s3_switch<S: S3SubscribeSeam>(
         .request_at_us
         .saturating_add(ingress.gate().config().effect_timeout_us);
     let effect_remaining = Duration::from_micros(effect_deadline_us.saturating_sub(now_us()));
-    let timed_out = std::sync::atomic::AtomicBool::new(false);
+    let timed_out = AtomicBool::new(false);
     let mut haptic_subscriber = subscriber.clone();
     let pc_open = async {
         if !request.pc_changed {
@@ -2322,6 +2401,20 @@ async fn request_s3_switch<S: S3SubscribeSeam>(
                     return fail_s3_switch(teardown, live, error).await;
                 }
             };
+            // Which changed roles OPENED and were therefore torn down, as
+            // opposed to refused. A role whose `subscribe_open` failed has no
+            // drain task and can never produce an `S3WireEvent::Ended`.
+            let refused_roles: Vec<TrackRole> =
+                refused.iter().map(|(role, _, _, _)| *role).collect();
+            let torn_down: Vec<(TrackRole, Route)> = [TrackRole::Pc, TrackRole::Haptic]
+                .into_iter()
+                .filter(|role| match role {
+                    TrackRole::Pc => request.pc_changed,
+                    TrackRole::Haptic => request.haptic_changed,
+                })
+                .filter(|role| !refused_roles.contains(role))
+                .map(|role| (role, request.target.for_role(role)))
+                .collect();
             // The sender's run had already ended when this SUBSCRIBE arrived
             // — either its current routes finished producing or its namespace
             // was draining after the run end; both are signalled by the one
@@ -2332,6 +2425,9 @@ async fn request_s3_switch<S: S3SubscribeSeam>(
             // current routes' FIN can still end the run normally, and account
             // any target object that reached the barrier.
             teardown_s3_switch(teardown, live).await?;
+            // The real instant the teardown completed, so the additive row
+            // below is not back-dated to the request's settle instant.
+            let t_torn_down = now_us();
             let (_, barrier_drops) = ingress
                 .abandon_pending(now_us())
                 .map_err(|error| anyhow::anyhow!("abandon refused S3 switch: {error:?}"))?;
@@ -2348,6 +2444,21 @@ async fn request_s3_switch<S: S3SubscribeSeam>(
                         window_end_us,
                         code,
                     )?;
+                }
+                // 16th rework, P1-B. The relay path registers every torn-down
+                // target in the fault store's watch list; the DIRECT path did
+                // not, so a target whose open SUCCEEDED and whose drain had
+                // already queued a failure (`Closed(0x10)`, a peer `Cancel`,
+                // ...) matched nothing once the gate abandoned the request —
+                // not pending, not watched, not current — and was dropped.
+                // Same registration, same additive row, same `cause` label.
+                for (role, route) in torn_down {
+                    logger.try_log_info(&format!(
+                        "\"event\":\"s3_switch_target_torn_down\",\"track\":\"{}\",{},\"t_torn_down\":{t_torn_down},\"cause\":\"refused_after_run_end\"",
+                        role.as_str(),
+                        s3_route_fields(route),
+                    ))?;
+                    faults.watch_abandoned(role, route);
                 }
                 log_s3_barrier_drops(&mut logger, barrier_drops, stats)?;
             }
@@ -2536,6 +2647,46 @@ fn log_s3_exit_note(logger: &Arc<Mutex<JsonlLogger>>, body: &str) -> Result<()> 
         .map_err(anyhow::Error::from)
 }
 
+/// Fold ONE drain-join outcome into the shutdown accounting (16th rework,
+/// P1-C).
+///
+/// * `Joined` — our own abort, or a task that had already finished: normal.
+/// * `Panicked` — a run FAULT. The additive `s3_drain_join_panic` row is kept,
+///   and the cause is recorded through `keep_first_cause`, so a strictly
+///   earlier cause still wins and the panic is still in the log as its own
+///   row. It does NOT touch `drains_unjoined`, which counts only tasks that
+///   may still be running.
+/// * `Unjoined` — still running past the bound: counted, reported in the
+///   shutdown row, and fatal through the existing integrity check.
+fn note_s3_drain_join(
+    join: DrainJoin,
+    logger: &Arc<Mutex<JsonlLogger>>,
+    drains_unjoined: &mut u64,
+    outcome_error: &mut Option<anyhow::Error>,
+) {
+    match join {
+        DrainJoin::Joined => {}
+        DrainJoin::Panicked(detail) => {
+            // The panic happened BEFORE this row is written, so it is the
+            // earlier cause; a failing row write below can only be secondary.
+            keep_first_cause(
+                outcome_error,
+                anyhow::anyhow!("S3 drain task panicked: {detail}"),
+            );
+            if let Err(error) = log_s3_exit_note(
+                logger,
+                &format!(
+                    "\"event\":\"s3_drain_join_panic\",\"detail\":\"{}\"",
+                    json_escape(&detail)
+                ),
+            ) {
+                keep_first_cause(outcome_error, error);
+            }
+        }
+        DrainJoin::Unjoined => *drains_unjoined += 1,
+    }
+}
+
 /// Bound on joining ONE aborted drain task. An aborted `drain_s3_track` stops
 /// at its next await point, which it reaches immediately, so this bound is a
 /// liveness guard and never a normal outcome.
@@ -2557,17 +2708,27 @@ async fn teardown_s3_switch<H>(
     live: &mut HashMap<(TrackRole, u64), S3LiveSubscription<H>>,
 ) -> Result<()> {
     let mut unjoined = 0usize;
+    let mut panics: Vec<String> = Vec::new();
+    let mut note = |join: DrainJoin| match join {
+        DrainJoin::Joined => {}
+        DrainJoin::Panicked(detail) => panics.push(detail),
+        DrainJoin::Unjoined => unjoined += 1,
+    };
     for subscription in teardown.subscriptions {
-        if !discard_s3_subscription(subscription).await {
-            unjoined += 1;
-        }
+        note(discard_s3_subscription(subscription).await);
     }
     for key in teardown.live_keys {
         if let Some(subscription) = live.remove(&key) {
-            if !discard_s3_subscription(subscription).await {
-                unjoined += 1;
-            }
+            note(discard_s3_subscription(subscription).await);
         }
+    }
+    // A panicking drain is as fatal here as one that never stopped: it stopped
+    // mid-track, so nothing guarantees the route was fully accounted.
+    if !panics.is_empty() {
+        bail!(
+            "S3 switch teardown: drain task(s) panicked: {}",
+            panics.join("; ")
+        );
     }
     if unjoined > 0 {
         bail!(
@@ -2666,19 +2827,48 @@ fn settle_switch_subscribes<S>(
     SwitchSubscribeOutcome::Ready(ready)
 }
 
+/// Outcome of joining ONE aborted drain task (16th rework, P1-C).
+///
+/// The 15th rework collapsed this into a bool, which hid a PANICKING drain:
+/// `timeout(..).await` answers `Ok(Err(JoinError))` for a panic, so a panic
+/// counted as "joined within the bound" and changed nothing. A drain that
+/// panics between two objects leaves no unterminated object, drops its sender
+/// clone (so the queue still reports `Disconnected`) and, with the current
+/// routes FIN'd, trips no other integrity check — it must be reported.
+#[derive(Debug)]
+enum DrainJoin {
+    /// Stopped within the bound: cancelled by our abort, or already finished.
+    Joined,
+    /// Stopped within the bound, but the task had PANICKED.
+    Panicked(String),
+    /// Still running after `S3_DRAIN_JOIN_BOUND`.
+    Unjoined,
+}
+
+/// Join one aborted drain task, bounded, distinguishing a panic from our own
+/// cancellation.
+async fn join_s3_drain(drain: tokio::task::JoinHandle<()>) -> DrainJoin {
+    match tokio::time::timeout(S3_DRAIN_JOIN_BOUND, drain).await {
+        // Our own abort is the NORMAL outcome here and is not a fault.
+        Ok(Err(error)) if error.is_panic() => DrainJoin::Panicked(error.to_string()),
+        Ok(_) => DrainJoin::Joined,
+        Err(_) => DrainJoin::Unjoined,
+    }
+}
+
 /// Tear down a target subscription that will not be applied: release the
 /// handle (UNSUBSCRIBE), abort its drain task, and join it.
 ///
-/// Drop the wire handle (sends UNSUBSCRIBE), abort the drain task and wait
-/// for it to actually stop. Returns whether the join completed within
-/// `S3_DRAIN_JOIN_BOUND`; `false` means the task may still be running and the
-/// caller can no longer assume the route is silent.
-async fn discard_s3_subscription<H>(subscription: S3LiveSubscription<H>) -> bool {
-    drop(subscription.handle);
-    subscription.drain.abort();
-    tokio::time::timeout(S3_DRAIN_JOIN_BOUND, subscription.drain)
-        .await
-        .is_ok()
+/// The release goes through `S3LiveSubscription::release_handle`, so every
+/// terminal the drain classifies from this point on is tagged
+/// `TerminalSource::LocalRelease` and is never mistaken for a peer failure.
+/// The join result distinguishes a task that did not stop within
+/// `S3_DRAIN_JOIN_BOUND` (the route can no longer be assumed silent) from one
+/// that stopped by PANICKING (a defect that must fail the run).
+async fn discard_s3_subscription<H>(subscription: S3LiveSubscription<H>) -> DrainJoin {
+    let drain = subscription.release_handle();
+    drain.abort();
+    join_s3_drain(drain).await
 }
 
 fn min_wakeup(values: impl IntoIterator<Item = Option<u64>>) -> Option<u64> {
@@ -2727,8 +2917,7 @@ fn release_retired_s3_subscription<H>(
     logger: &Arc<Mutex<JsonlLogger>>,
     retired_drains: &mut Vec<tokio::task::JoinHandle<()>>,
 ) -> Result<()> {
-    drop(subscription.handle);
-    retired_drains.push(subscription.drain);
+    retired_drains.push(subscription.release_handle());
     logger
         .lock()
         .map_err(|_| anyhow::anyhow!("RX logger poisoned"))?
@@ -2979,17 +3168,49 @@ impl S3SwitchTargetFaults {
     }
 }
 
+/// Is this terminal of an UNAPPLIED switch target a run fault?
+///
+/// `pending` is what `unapplied_switch_target` answers: `true` while the gate
+/// still holds the request (the subscription is live), `false` once the
+/// relay-late refusal path abandoned it and only the watch list remembers the
+/// route.
+///
+/// The rule, stated once (16th rework, P1-A):
+///   * the sender's run-ended code is NEVER a fault, on either side;
+///   * a FIN is never a fault (it is the publisher's clean end of track);
+///   * while PENDING, any other terminal is the peer's, because the receiver
+///     has not released anything yet;
+///   * once WATCHED, the receiver has dropped the handle, so a terminal is a
+///     fault when it cannot be that release: either it carries a close CODE
+///     (our UNSUBSCRIBE never produces one) or the drain classified it before
+///     the release began (`TerminalSource::Remote`).
+///
+/// The 15th rework used `close_code.is_some()` alone for the watched case,
+/// which dropped every code-less remote failure — a peer `Cancel` and the
+/// `Failed`/`None` of a malformed subgroup or a failed log write.
+fn is_switch_target_fault(
+    pending: bool,
+    end: TrackEnd,
+    close_code: Option<u64>,
+    source: TerminalSource,
+) -> bool {
+    if close_code == Some(S3_RUN_ENDED_REQUEST_ERROR_CODE) || end == TrackEnd::Fin {
+        return false;
+    }
+    pending || close_code.is_some() || source == TerminalSource::Remote
+}
+
 /// Is this ended route a target of a switch that never applied?
 ///
 /// Two ways to be one, and they are treated differently on purpose:
 ///   * the gate still has the PENDING request and this is a changed role's
 ///     target — the subscription is still live, so any terminal on it comes
 ///     from the peer;
-///   * the request was already abandoned by the relay-late refusal path and
-///     the route is `watched` — here the receiver itself dropped the handle
-///     and aborted the drain, so a code-less `Cancelled` may be its OWN
-///     teardown. The caller therefore only faults a watched route on a peer
-///     error CODE (see `handle_s3_wire_event`).
+///   * the request was already abandoned by a refusal/teardown path (relay or
+///     direct) and the route is `watched` — here the receiver itself released
+///     the handle, so a code-less `Cancelled` may be its OWN teardown. The
+///     caller resolves that by PROVENANCE, not by the presence of a code; see
+///     `is_switch_target_fault`.
 fn unapplied_switch_target(
     ingress: &S3ReceiverIngress,
     faults: &S3SwitchTargetFaults,
@@ -3080,9 +3301,9 @@ fn refuse_pending_s3_switch<H>(
         let Some(subscription) = live.remove(&(role, target.generation)) else {
             continue;
         };
-        drop(subscription.handle);
-        subscription.drain.abort();
-        retired_drains.push(subscription.drain);
+        let drain = subscription.release_handle();
+        drain.abort();
+        retired_drains.push(drain);
         if role != observed_role {
             torn_down.push((role, target));
         }
@@ -3385,9 +3606,9 @@ fn handle_s3_wire_event<H>(
                                     break;
                                 }
                                 Err(RetireError::Duplicate(old)) => {
-                                    drop(old.handle);
-                                    old.drain.abort();
-                                    retired_drains.push(old.drain);
+                                    let drain = old.release_handle();
+                                    drain.abort();
+                                    retired_drains.push(drain);
                                     *outcome_error = Some(anyhow::anyhow!(
                                         "duplicate retiring S3 route {} generation {}",
                                         route.name,
@@ -3407,6 +3628,7 @@ fn handle_s3_wire_event<H>(
             end,
             detail,
             close_code,
+            source,
         } => {
             // A retiring route that ends (relay FIN/close) has nothing
             // left in flight: complete its deferred unsubscribe now.
@@ -3433,18 +3655,11 @@ fn handle_s3_wire_event<H>(
             // erased; `abandon_pending`, the sibling's refusal and
             // `recompute_s3_normal_end` cannot reach it.
             if let Some(pending) = unapplied_switch_target(ingress, faults, role, route) {
-                // While the request is still PENDING the subscription is
-                // live, so ANY non-FIN terminal is the peer's. Once the
-                // request was abandoned the receiver itself dropped the
-                // handle and aborted the drain, so a code-less `Cancelled`
-                // may be that teardown; only a peer error CODE is a fault
-                // there.
-                let general_terminal = close_code != Some(S3_RUN_ENDED_REQUEST_ERROR_CODE)
-                    && if pending {
-                        end != TrackEnd::Fin
-                    } else {
-                        close_code.is_some()
-                    };
+                // The whole rule lives in `is_switch_target_fault`; a watched
+                // (torn-down) target is separated from our own teardown by the
+                // terminal's PROVENANCE, not by whether a close code happens
+                // to be present.
+                let general_terminal = is_switch_target_fault(pending, end, close_code, source);
                 if general_terminal {
                     if let Err(error) = logger
                         .lock()
@@ -3452,13 +3667,14 @@ fn handle_s3_wire_event<H>(
                         .and_then(|mut logger| {
                             logger
                                 .try_log_info(&format!(
-                                    "\"event\":\"s3_switch_target_terminal_fault\",\"track\":\"{}\",{},\"t_ended\":{now},\"end\":\"{:?}\",\"error_code\":{},\"pending\":{pending}",
+                                    "\"event\":\"s3_switch_target_terminal_fault\",\"track\":\"{}\",{},\"t_ended\":{now},\"end\":\"{:?}\",\"error_code\":{},\"pending\":{pending},\"terminal_source\":\"{:?}\"",
                                     role.as_str(),
                                     s3_route_fields(route),
                                     end,
                                     close_code
                                         .map(|code| code.to_string())
                                         .unwrap_or_else(|| "null".to_string()),
+                                    source,
                                 ))
                                 .map_err(anyhow::Error::from)
                         })
@@ -4137,6 +4353,7 @@ where
                         log_failed.clone(),
                         window_end_us,
                         &mut stats,
+                        &mut switch_faults,
                     )
                     .await
                     {
@@ -4246,6 +4463,7 @@ where
                     log_failed.clone(),
                     window_end_us,
                     &mut stats,
+                    &mut switch_faults,
                 )
                 .await
                 {
@@ -4338,44 +4556,29 @@ where
     // because it could still write a row after the shutdown row — which is
     // precisely the invariant this section exists to guarantee.
     let mut drains_unjoined: u64 = 0;
+    // A join that COMPLETES can still carry a `JoinError`. Every task here was
+    // aborted first, so `is_cancelled()` is the NORMAL outcome and is not a
+    // fault; a PANIC is (16th rework, P1-C). The 15th rework recorded a panic
+    // additively and left the verdict alone, arguing that it "shows up in the
+    // object accounting". It does not: a drain that panics BETWEEN objects
+    // leaves no unterminated rx object, drops its sender clone so the queue
+    // still reports `Disconnected`, and with the current routes FIN'd every
+    // other `failed` condition can be false. The row stays additive; the cause
+    // is recorded through `keep_first_cause` so an EARLIER cause still wins.
     for (_role, _route, subscription) in retiring.drain_all() {
-        if !discard_s3_subscription(subscription).await {
-            drains_unjoined += 1;
-        }
+        let join = discard_s3_subscription(subscription).await;
+        note_s3_drain_join(join, &logger, &mut drains_unjoined, &mut outcome_error);
     }
     for (_, subscription) in live.drain() {
-        if !discard_s3_subscription(subscription).await {
-            drains_unjoined += 1;
-        }
+        let join = discard_s3_subscription(subscription).await;
+        note_s3_drain_join(join, &logger, &mut drains_unjoined, &mut outcome_error);
     }
     for drain in retired_drains.drain(..) {
         if !drain.is_finished() {
             drain.abort();
         }
-        // A join that COMPLETES can still carry a `JoinError`. Every task here
-        // was aborted first, so `is_cancelled()` is the NORMAL outcome and is
-        // not a fault; only a panic is, and it is recorded additively. It does
-        // not by itself change the verdict, because a panicking drain task
-        // shows up in the object accounting below (an unterminated rx object,
-        // a route residue, or a queue that never reports `Disconnected`) —
-        // that is what fails the run. `discard_s3_subscription` collapses the
-        // same distinction into "joined within the bound"; that is a stated
-        // limitation of this exit path, not an oversight.
-        match tokio::time::timeout(S3_DRAIN_JOIN_BOUND, drain).await {
-            Ok(Err(error)) if error.is_panic() => {
-                if let Err(error) = log_s3_exit_note(
-                    &logger,
-                    &format!(
-                        "\"event\":\"s3_drain_join_panic\",\"detail\":\"{}\"",
-                        json_escape(&error.to_string())
-                    ),
-                ) {
-                    keep_first_cause(&mut outcome_error, error);
-                }
-            }
-            Ok(_) => {}
-            Err(_) => drains_unjoined += 1,
-        }
+        let join = join_s3_drain(drain).await;
+        note_s3_drain_join(join, &logger, &mut drains_unjoined, &mut outcome_error);
     }
     // Only a handle the select never consumed may be polled here; re-polling
     // a completed one panics and would skip everything below, including the
@@ -8289,6 +8492,7 @@ mod s3_retirement_tests {
             bad_headers.clone(),
             ingress_drops.clone(),
             log_failed.clone(),
+            Arc::new(AtomicBool::new(false)),
         ));
 
         // The relay serves the in-flight at-barrier copy plus one
@@ -9049,6 +9253,288 @@ mod s3_switch_subscribe_tests {
             count_switch_outcome(outcome, &mut suppressed, &mut refused);
         }
         assert_eq!((suppressed, refused), (2, 1));
+    }
+}
+
+// ---- 16th rework: terminal PROVENANCE and the drain-join fault -------------
+//
+// Defect A of the 26th review: a watched (torn-down) switch target whose
+// failure carried no close code was ignored, because the 15th rework used the
+// PRESENCE of a code as its only way to tell a peer failure from the
+// receiver's own UNSUBSCRIBE. These cases pin the replacement — a provenance
+// tag the drain task itself records — at three levels: the rule as a pure
+// function, the drain task that produces the tag, and (in the control-loop
+// module below) the real loop.
+//
+// Defect C: a panicking drain join must fail the run.
+#[cfg(test)]
+mod s3_terminal_provenance_tests {
+    use super::*;
+    use crate::s3_retirement_tests::test_log_path;
+    use moq_transport::coding::TrackNamespace;
+    use moq_transport::serve::ServeError;
+
+    fn route() -> Route {
+        Route {
+            name: skew_moq::s3_switch::PC_HAPTIC_CRITICAL_TRACK,
+            generation: 2,
+        }
+    }
+
+    /// The whole watched/pending fault rule, as a truth table.
+    ///
+    /// The row that used to be WRONG is the last `Remote` pair: a torn-down
+    /// target that ends `Cancelled`/`Failed` with NO code. The 15th rework
+    /// answered `false` for both of them, which is how a real target failure
+    /// was normalised away; only the `LocalRelease` form may answer `false`.
+    #[test]
+    fn a_code_less_remote_terminal_faults_and_our_own_release_does_not() {
+        use TerminalSource::{LocalRelease, Remote};
+        let run_ended = Some(S3_RUN_ENDED_REQUEST_ERROR_CODE);
+        let does_not_exist = Some(u64::from(
+            moq_transport::message::RequestErrorCode::DoesNotExist,
+        ));
+
+        // The sender's run-ended code is never a fault, pending or watched,
+        // whatever the provenance says.
+        for pending in [true, false] {
+            for source in [Remote, LocalRelease] {
+                assert!(!is_switch_target_fault(
+                    pending,
+                    TrackEnd::Cancelled,
+                    run_ended,
+                    source
+                ));
+            }
+        }
+        // A FIN is never a fault either.
+        for pending in [true, false] {
+            for source in [Remote, LocalRelease] {
+                assert!(!is_switch_target_fault(pending, TrackEnd::Fin, None, source));
+            }
+        }
+        // PENDING: the subscription is still live, so every non-FIN terminal
+        // is the peer's — including a code-less one. Unchanged.
+        for source in [Remote, LocalRelease] {
+            assert!(is_switch_target_fault(
+                true,
+                TrackEnd::Cancelled,
+                None,
+                source
+            ));
+            assert!(is_switch_target_fault(true, TrackEnd::Failed, None, source));
+            assert!(is_switch_target_fault(
+                true,
+                TrackEnd::Cancelled,
+                does_not_exist,
+                source
+            ));
+        }
+        // WATCHED with a close CODE: our UNSUBSCRIBE never produces one, so it
+        // is a fault regardless of provenance. Unchanged, and NOT weakened.
+        for source in [Remote, LocalRelease] {
+            assert!(is_switch_target_fault(
+                false,
+                TrackEnd::Cancelled,
+                does_not_exist,
+                source
+            ));
+        }
+        // WATCHED, no code — THE DEFECT. `Remote` faults; only our own
+        // release is excused.
+        assert!(is_switch_target_fault(
+            false,
+            TrackEnd::Cancelled,
+            None,
+            Remote
+        ));
+        assert!(is_switch_target_fault(false, TrackEnd::Failed, None, Remote));
+        assert!(!is_switch_target_fault(
+            false,
+            TrackEnd::Cancelled,
+            None,
+            LocalRelease
+        ));
+        assert!(!is_switch_target_fault(
+            false,
+            TrackEnd::Failed,
+            None,
+            LocalRelease
+        ));
+    }
+
+    async fn drain_once(
+        local_release: Arc<AtomicBool>,
+        act: impl FnOnce(moq_transport::serve::TrackWriter),
+    ) -> S3WireEvent {
+        let out = test_log_path("s3-provenance");
+        let logger = Arc::new(Mutex::new(
+            JsonlLogger::new(
+                &out, "run", "moq", "rx", None, 0.0, 0.0, 0.0, 10, 30, 90, 1, None, None,
+                Some("both"), Some(TERM_PROTOCOL_V), None, None, None,
+            )
+            .unwrap(),
+        ));
+        let (event_tx, mut event_rx) = mpsc::channel::<S3WireEvent>(4);
+        let (writer, reader) =
+            Track::new(TrackNamespace::from_utf8_path("/provenance"), "pc").produce();
+        let drain = tokio::spawn(drain_s3_track(
+            TrackRole::Pc,
+            route(),
+            reader,
+            logger,
+            event_tx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            local_release,
+        ));
+        act(writer);
+        let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+            .await
+            .expect("the drain must terminate")
+            .expect("drain alive");
+        drain.await.unwrap();
+        std::fs::remove_file(&out).ok();
+        event
+    }
+
+    /// The REAL `drain_s3_track` produces the tag, and it reads the flag at
+    /// the instant it classifies the terminal.
+    #[tokio::test]
+    async fn the_drain_task_tags_a_code_less_cancel_by_the_release_flag() {
+        // Nobody released anything: a bare `Cancel` is the peer's.
+        let event = drain_once(Arc::new(AtomicBool::new(false)), |writer| {
+            writer.close(ServeError::Cancel).unwrap();
+        })
+        .await;
+        match event {
+            S3WireEvent::Ended {
+                end,
+                close_code,
+                source,
+                ..
+            } => {
+                assert_eq!(end, TrackEnd::Cancelled);
+                assert_eq!(close_code, None);
+                assert_eq!(source, TerminalSource::Remote);
+                // ... and that is exactly what the watched rule now faults.
+                assert!(is_switch_target_fault(false, end, close_code, source));
+            }
+            other => panic!("expected an end, got {other:?}"),
+        }
+
+        // The receiver had already begun releasing: the same wire terminal is
+        // OUR teardown and must not fault.
+        let event = drain_once(Arc::new(AtomicBool::new(true)), |writer| {
+            writer.close(ServeError::Cancel).unwrap();
+        })
+        .await;
+        match event {
+            S3WireEvent::Ended {
+                end,
+                close_code,
+                source,
+                ..
+            } => {
+                assert_eq!(end, TrackEnd::Cancelled);
+                assert_eq!(close_code, None);
+                assert_eq!(source, TerminalSource::LocalRelease);
+                assert!(!is_switch_target_fault(false, end, close_code, source));
+            }
+            other => panic!("expected an end, got {other:?}"),
+        }
+    }
+
+    /// The `Failed`/`None` variant the reviewer named: a NON-SUBGROUP track.
+    /// Dropping the handle cannot cause it, so it is `Remote` by construction
+    /// — even with the release flag already set — and it faults a watched
+    /// target.
+    #[tokio::test]
+    async fn a_non_subgroup_track_is_a_code_less_remote_failure() {
+        for released in [false, true] {
+            let event = drain_once(Arc::new(AtomicBool::new(released)), |writer| {
+                // Datagram mode, not subgroups: `DrainFail::NonSubgroup`.
+                let datagrams = writer.datagrams().expect("datagram mode");
+                drop(datagrams);
+            })
+            .await;
+            match event {
+                S3WireEvent::Ended {
+                    end,
+                    close_code,
+                    source,
+                    ..
+                } => {
+                    assert_eq!(end, TrackEnd::Failed);
+                    assert_eq!(close_code, None);
+                    assert_eq!(
+                        source,
+                        TerminalSource::Remote,
+                        "a malformed subgroup/log state is never our teardown"
+                    );
+                    assert!(is_switch_target_fault(false, end, close_code, source));
+                }
+                other => panic!("expected an end, got {other:?}"),
+            }
+        }
+    }
+
+    /// Defect C. The shutdown path joins every aborted drain through
+    /// `join_s3_drain` + `note_s3_drain_join`; these are exactly those two
+    /// calls. A panicking task fails the run (`outcome_error` set, additive
+    /// row written, `drains_unjoined` untouched); our own cancellation does
+    /// not.
+    ///
+    /// Helper-level on purpose: `drain_s3_track` has no reachable panic, so a
+    /// real-loop case cannot produce one without adding a production failure
+    /// injection point.
+    #[tokio::test]
+    async fn a_panicking_drain_join_fails_the_run_and_a_cancelled_one_does_not() {
+        let out = test_log_path("s3-drain-panic");
+        let logger = Arc::new(Mutex::new(
+            JsonlLogger::new(
+                &out, "run", "moq", "rx", None, 0.0, 0.0, 0.0, 10, 30, 90, 1, None, None,
+                Some("both"), Some(TERM_PROTOCOL_V), None, None, None,
+            )
+            .unwrap(),
+        ));
+        let mut drains_unjoined = 0u64;
+        let mut outcome_error: Option<anyhow::Error> = None;
+
+        // Our own abort of a healthy task: the NORMAL outcome.
+        let cancelled = tokio::spawn(async { std::future::pending::<()>().await });
+        cancelled.abort();
+        let join = join_s3_drain(cancelled).await;
+        assert!(matches!(join, DrainJoin::Joined), "{join:?}");
+        note_s3_drain_join(join, &logger, &mut drains_unjoined, &mut outcome_error);
+        assert!(outcome_error.is_none());
+        assert_eq!(drains_unjoined, 0);
+
+        // A drain that PANICKED between objects: no unterminated object, no
+        // route residue, the queue still closes — and yet the run must fail.
+        let panicking = tokio::spawn(async { panic!("scripted drain panic") });
+        let join = join_s3_drain(panicking).await;
+        assert!(matches!(join, DrainJoin::Panicked(_)), "{join:?}");
+        note_s3_drain_join(join, &logger, &mut drains_unjoined, &mut outcome_error);
+        let cause = format!(
+            "{:#}",
+            outcome_error.expect("a panicking drain join is a run fault")
+        );
+        assert!(cause.contains("S3 drain task panicked"), "{cause}");
+        assert_eq!(drains_unjoined, 0, "a panic is not an unjoined task");
+
+        // The additive row is KEPT, not replaced by the verdict.
+        drop(logger);
+        let text = std::fs::read_to_string(&out).expect("log written");
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.contains("\"event\":\"s3_drain_join_panic\""))
+                .count(),
+            1,
+            "{text}"
+        );
+        std::fs::remove_file(&out).ok();
     }
 }
 
@@ -9850,6 +10336,94 @@ mod s3_control_loop_tests {
         );
     }
 
+    /// (d2) 16th rework, P1-B — the DIRECT partial-success teardown.
+    ///
+    /// Same shape as (d): the PC target opens and drains, the haptic target is
+    /// refused with the run-ended code, so `request_s3_switch` tears the PC
+    /// target down and abandons the request WITHOUT failing the run. The
+    /// difference is that the PC target really failed first (`Closed(0x10)`),
+    /// and its `Ended` was already queued when the teardown ran.
+    ///
+    /// The 15th rework registered the torn-down target in the fault store's
+    /// watch list only on the RELAY path, so on this path the queued terminal
+    /// matched nothing — not pending (abandoned), not watched (never
+    /// registered), not current — and was dropped; the run ended `normal`.
+    /// The direct path now registers the same watch and writes the same
+    /// additive `s3_switch_target_torn_down` row as the relay path.
+    #[tokio::test]
+    async fn a_directly_torn_down_target_that_already_failed_fails_the_run() {
+        let mut script = initial_calls(Vec::new());
+        script.push(Call {
+            track: PC_CRITICAL,
+            before: vec![
+                Step::Fin(PC_NORMAL),
+                Step::Fin(HAPTIC_FULL),
+                Step::Yield(50),
+            ],
+            answer: Answer::Accept(vec![Step::Publish(
+                PC_CRITICAL,
+                vec![(4, 2, 33_333, 2), (4, 3, 66_666, 3)],
+            )]),
+        });
+        script.push(Call {
+            track: HAPTIC_ESSENTIAL,
+            before: vec![
+                // Let the pc-d6 drain read and enqueue the two objects ...
+                Step::Sleep(40),
+                Step::Yield(50),
+                // ... then the successfully opened target FAILS, and its
+                // terminal is enqueued BEFORE the sibling's refusal is even
+                // produced.
+                Step::CloseError(PC_CRITICAL, u64::from(RequestErrorCode::DoesNotExist)),
+                Step::Yield(50),
+            ],
+            answer: Answer::Refuse(run_ended()),
+        });
+        let outcome = run_case("s3-loop-d2", "30", "20", script).await;
+        let error = outcome
+            .result
+            .as_ref()
+            .expect_err("a failure of the successfully opened target must fail the run");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains(PC_CRITICAL) && text.contains("error_code=16"),
+            "the 0x10 terminal of the torn-down target must be the cause: {text}"
+        );
+        // The refusal of the OTHER role really happened and stays recorded.
+        let refused = outcome.find("s3_switch", "refused_after_run_end");
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0]["track"], "haptic");
+        // The direct path now records the torn-down target exactly as the
+        // relay path does — this row is what the watch registration rides on.
+        let torn = outcome.find("info", "s3_switch_target_torn_down");
+        assert_eq!(torn.len(), 1, "the opened-then-torn-down target is recorded");
+        assert_eq!(torn[0]["track"], "pc");
+        assert_eq!(torn[0]["wire_track"], PC_CRITICAL);
+        let fault = outcome.find("info", "s3_switch_target_terminal_fault");
+        assert_eq!(fault.len(), 1);
+        assert_eq!(fault[0]["track"], "pc");
+        assert_eq!(fault[0]["wire_track"], PC_CRITICAL);
+        assert_eq!(fault[0]["error_code"].as_u64().unwrap(), 16);
+        assert_eq!(fault[0]["pending"], false);
+        // Still no delivery loss: (d)'s invariant is unchanged by the verdict.
+        let target_rx: Vec<_> = outcome
+            .rows
+            .iter()
+            .filter(|row| row["role"] == "rx" && row["wire_track"] == PC_CRITICAL)
+            .collect();
+        assert_eq!(target_rx.len(), 2, "target objects must be rx-logged");
+        outcome.assert_every_rx_object_is_terminated();
+        let shutdown = outcome.shutdown();
+        assert_eq!(shutdown["ending"], "error");
+        assert_eq!(
+            shutdown["detail"].as_str().expect("detail is a string"),
+            text
+        );
+        assert_eq!(shutdown["s3_switch_refused_after_run_end"], 1);
+        assert_eq!(shutdown["s3_event_queue_closed"], true);
+        assert_eq!(shutdown["s3_drains_unjoined"], 0);
+    }
+
     /// (h) The sender's OTHER run-ended site: the SUBSCRIBE landed while the
     /// namespace was draining after the run end. Identical wire code, so the
     /// real loop must treat it exactly like (c) — non-fatal, rows written, run
@@ -10401,6 +10975,83 @@ mod s3_control_loop_tests {
         assert_eq!(
             shutdown["ending"], "error",
             "the FIN rule must not normalise a refused switch whose sibling failed"
+        );
+        assert_eq!(
+            shutdown["detail"].as_str().expect("detail is a string"),
+            text
+        );
+        assert_eq!(shutdown["s3_switch_refused_after_run_end"], 1);
+        assert_eq!(shutdown["s3_event_queue_closed"], true);
+        assert_eq!(shutdown["s3_drains_unjoined"], 0);
+        outcome.assert_every_rx_object_is_terminated();
+    }
+
+    /// (q) 16th rework, P1-A — the SAME arrival order as (n), but the straggling
+    /// terminal carries NO application code: a bare `ServeError::Cancel`, which
+    /// is what a relay or session collapse looks like on the wire.
+    ///
+    /// The 15th rework faulted a torn-down ("watched") target only when a close
+    /// CODE was present, because our own `discard_s3_subscription` surfaces as a
+    /// code-less `Cancel` too. That guard silently dropped every code-less
+    /// REMOTE failure and this run ended `normal`. The terminal is now separated
+    /// from our own teardown by PROVENANCE: the drain task records whether the
+    /// receiver had begun releasing the subscription at the instant it
+    /// classified the terminal, and here it had not.
+    #[tokio::test]
+    async fn a_code_less_target_terminal_after_the_siblings_refusal_still_fails_the_run() {
+        let mut script = initial_calls(Vec::new());
+        script.extend(accepted_switch_targets());
+        let outcome = run_case_delayed(
+            "s3-loop-q",
+            Some("30"),
+            "20",
+            script,
+            vec![(
+                TARGET_TERMINALS_AT_MS,
+                vec![
+                    Step::CloseError(PC_CRITICAL, S3_RUN_ENDED_REQUEST_ERROR_CODE),
+                    // No code at all — the case the 15th rework dropped.
+                    Step::Cancel(HAPTIC_ESSENTIAL),
+                    Step::Fin(PC_NORMAL),
+                    Step::Fin(HAPTIC_FULL),
+                    Step::Yield(50),
+                ],
+            )],
+        )
+        .await;
+        let error = outcome
+            .result
+            .as_ref()
+            .expect_err("a code-less remote terminal must still fail the run");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains(HAPTIC_ESSENTIAL) && text.contains("error_code=none"),
+            "the code-less terminal must be the recorded cause: {text}"
+        );
+        // The refusal itself really happened and stays recorded as an
+        // observation; only the VERDICT changes.
+        let refused = outcome.find("s3_switch", "refused_after_run_end");
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0]["track"], "pc");
+        let torn = outcome.find("info", "s3_switch_target_torn_down");
+        assert_eq!(torn.len(), 1);
+        assert_eq!(torn[0]["wire_track"], HAPTIC_ESSENTIAL);
+        let fault = outcome.find("info", "s3_switch_target_terminal_fault");
+        assert_eq!(fault.len(), 1, "the code-less terminal must be faulted");
+        assert_eq!(fault[0]["track"], "haptic");
+        assert!(
+            fault[0]["error_code"].is_null(),
+            "no close code: {}",
+            fault[0]
+        );
+        assert_eq!(fault[0]["pending"], false);
+        // The additive field that records WHY it was faulted despite having no
+        // code: the drain classified it before any release began.
+        assert_eq!(fault[0]["terminal_source"], "Remote");
+        let shutdown = outcome.shutdown();
+        assert_eq!(
+            shutdown["ending"], "error",
+            "the FIN rule must not normalise a code-less target failure"
         );
         assert_eq!(
             shutdown["detail"].as_str().expect("detail is a string"),
