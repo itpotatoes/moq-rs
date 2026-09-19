@@ -3038,10 +3038,37 @@ mod s3_run_ended_code_tests {
     use super::S3_RUN_ENDED_REQUEST_ERROR_CODE;
     use moq_transport::message::RequestErrorCode;
 
+    /// Map one registry variant to the code it must encode as.
+    ///
+    /// The `match` is EXHAUSTIVE over `RequestErrorCode`, and the enum is
+    /// neither `#[non_exhaustive]` nor otherwise open, so adding a variant
+    /// upstream makes this test module fail to COMPILE. That is the only
+    /// automatic part: the array in the test below is hand-written and a new
+    /// variant must be added to it BY HAND (the compile error points here).
+    /// Nothing in this file can discover a new variant on its own.
+    fn registry_code(code: RequestErrorCode) -> u64 {
+        match code {
+            RequestErrorCode::InternalError => 0x0,
+            RequestErrorCode::Unauthorized => 0x1,
+            RequestErrorCode::Timeout => 0x2,
+            RequestErrorCode::NotSupported => 0x3,
+            RequestErrorCode::MalformedAuthToken => 0x4,
+            RequestErrorCode::ExpiredAuthToken => 0x5,
+            RequestErrorCode::DoesNotExist => 0x10,
+            RequestErrorCode::InvalidRange => 0x11,
+            RequestErrorCode::MalformedTrack => 0x12,
+            RequestErrorCode::DuplicateSubscription => 0x19,
+            RequestErrorCode::Uninterested => 0x20,
+            RequestErrorCode::PrefixOverlap => 0x30,
+            RequestErrorCode::InvalidJoiningRequestId => 0x32,
+        }
+    }
+
     /// The run-ended signal only works if it can never collide with a code
-    /// moq-transport itself can produce. Every registry entry is listed by
-    /// hand so that adding one upstream fails here instead of silently
-    /// turning a real protocol error into "the run already ended".
+    /// moq-transport itself can produce. The registry entries are listed by
+    /// hand here; `registry_code` above is what stops that list from silently
+    /// falling behind, because a new upstream variant breaks its exhaustive
+    /// match at compile time and the list must then be extended by hand.
     #[test]
     fn run_ended_code_is_outside_the_request_error_registry() {
         let registry = [
@@ -3060,6 +3087,13 @@ mod s3_run_ended_code_tests {
             RequestErrorCode::InvalidJoiningRequestId,
         ];
         let codes: Vec<u64> = registry.into_iter().map(u64::from).collect();
+        // Every listed variant encodes as the code the exhaustive map says it
+        // does, so the array and the compile-time-checked map agree.
+        assert_eq!(
+            codes,
+            registry.into_iter().map(registry_code).collect::<Vec<u64>>(),
+            "a listed variant does not encode as its registry code"
+        );
         assert_eq!(
             codes,
             vec![0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x10, 0x11, 0x12, 0x19, 0x20, 0x30, 0x32],

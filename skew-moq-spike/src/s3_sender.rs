@@ -16,6 +16,7 @@ use moq_transport::session::Publisher;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
+use crate::s3_logging::S3RefusalCause;
 use crate::s3_producer::{
     serve_subscription_producer, ProducerLease, ProducerTaskGuard, RunSlotClock, SlotError,
     SubscriptionProducerRegistry,
@@ -202,6 +203,74 @@ fn role_for_track(name: &str) -> Option<TrackRole> {
         PC_NORMAL_TRACK | PC_RECOVERY_TRACK | PC_HAPTIC_CRITICAL_TRACK => Some(TrackRole::Pc),
         HAPTIC_FULL_TRACK | HAPTIC_ESSENTIAL_TRACK => Some(TrackRole::Haptic),
         _ => None,
+    }
+}
+
+/// The REQUEST-VALIDITY verdict of one arriving subscription, independent of
+/// whether the run is still producing.
+///
+/// It exists because the post-run drain window must apply the SAME checks the
+/// accept loop applies. Without it the drain window answered every arriving
+/// subscription with the run-ended code, so an unsupported track name or an
+/// invalid parameter set — fatal faults the receiver must never absorb —
+/// silently became the receiver's non-fatal path for as long as the drain
+/// window lasted.
+///
+/// Only the STATELESS checks live here: the track name and the
+/// DELIVERY_TIMEOUT parameter. `RouteAllocator::allocate`'s ordering rule
+/// ("the first PC subscription must be `pc-d6`") is deliberately NOT part of
+/// it — it is a property of the allocator's state machine, not of the
+/// request, and after the run has ended no generation may be allocated at
+/// all. A request that is valid here and would still have failed allocation
+/// is therefore refused with the run-ended code in the drain window; that is
+/// correct, because allocation is exactly what a finished run cannot do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestValidity {
+    /// A supported S3 track with an acceptable parameter set.
+    Valid(TrackRole),
+    /// The track name is not an S3 track: `not_found` (0x10).
+    UnsupportedTrack,
+    /// The DELIVERY_TIMEOUT parameter is not the registered one for this
+    /// role: internal error, carrying the accept loop's own message.
+    BadDeliveryTimeout(&'static str),
+}
+
+impl RequestValidity {
+    /// The close error for an invalid request — byte-identical to what the
+    /// accept loop has always sent, so both sites cannot drift apart.
+    fn refusal(self, name: &str) -> Option<moq_transport::serve::ServeError> {
+        match self {
+            RequestValidity::Valid(_) => None,
+            RequestValidity::UnsupportedTrack => {
+                Some(moq_transport::serve::ServeError::not_found_ctx(format!(
+                    "unsupported S3 subscription track '{name}'"
+                )))
+            }
+            RequestValidity::BadDeliveryTimeout(message) => {
+                Some(moq_transport::serve::ServeError::internal_ctx(message))
+            }
+        }
+    }
+}
+
+/// DELIVERY_TIMEOUT is hop-local. The receiver's registered 67 ms request is
+/// enforced by the relay on relay->receiver forwarding and need not be
+/// repeated on relay->publisher. If a direct peer does send it here, only the
+/// frozen value is accepted; haptic must not carry one at all.
+fn classify_subscription_request(name: &str, delivery_timeout_ms: Option<u64>) -> RequestValidity {
+    let Some(role) = role_for_track(name) else {
+        return RequestValidity::UnsupportedTrack;
+    };
+    match role {
+        TrackRole::Pc if delivery_timeout_ms.is_some() && delivery_timeout_ms != Some(67) => {
+            RequestValidity::BadDeliveryTimeout(
+                "S3 PC subscription carried a non-67ms DELIVERY_TIMEOUT",
+            )
+        }
+        TrackRole::Haptic if delivery_timeout_ms.is_some() => RequestValidity::BadDeliveryTimeout(
+            "S3 haptic subscription must not carry DELIVERY_TIMEOUT",
+        ),
+        _ => RequestValidity::Valid(role),
     }
 }
 
@@ -769,13 +838,49 @@ pub fn run_ended_refusal(context: &str) -> moq_transport::serve::ServeError {
     moq_transport::serve::ServeError::Closed(crate::S3_RUN_ENDED_REQUEST_ERROR_CODE)
 }
 
+/// Write the TX row for ONE run-ended refusal, at the instant of the refusal.
+///
+/// Both refusal sites call this, so the two are indistinguishable in the log
+/// exactly as they are on the wire, except for `cause`.
+///
+/// A refusal that cannot be logged is never dropped silently: it is recorded
+/// as a namespace fault, which `s3_run_verdict` turns into a failed run. That
+/// is the convention this file already uses for a fault observed while
+/// draining (`drain_subscribe_error`); it does NOT abort the children,
+/// because they are completing normally and killing them would destroy
+/// evidence of the very run whose log just failed.
+fn log_run_ended_refusal(
+    logger: &Arc<Mutex<JsonlLogger>>,
+    registry: &Arc<Mutex<SubscriptionProducerRegistry>>,
+    t_refused: u64,
+    name: &str,
+    cause: S3RefusalCause,
+) {
+    let logged = logger
+        .lock()
+        .map_err(|_| anyhow!("TX logger poisoned"))
+        .and_then(|mut logger| {
+            logger
+                .try_log_s3_producer_refused(t_refused, name, cause)
+                .map_err(anyhow::Error::from)
+        });
+    if let Err(error) = logged {
+        let text = format!("refusal_log_write: {error}");
+        tracing::error!(error = %format!("{error:#}"), "S3 run-ended refusal could not be logged");
+        if let Ok(mut registry) = registry.lock() {
+            registry.record_namespace_fault(text);
+        }
+    }
+}
+
 async fn drain_children(
     tasks: &mut JoinSet<ChildOutcome>,
     publish: &moq_transport::session::PublishNamespace,
     registry: &Arc<Mutex<SubscriptionProducerRegistry>>,
+    logger: &Arc<Mutex<JsonlLogger>>,
     bound: Duration,
 ) -> anyhow::Result<Option<String>> {
-    drain_children_with(tasks, || publish.subscribed(), registry, bound).await
+    drain_children_with(tasks, || publish.subscribed(), registry, logger, bound).await
 }
 
 // Injectable subscription source; production uses PublishNamespace::subscribed.
@@ -783,6 +888,7 @@ async fn drain_children_with<F, Fut>(
     tasks: &mut JoinSet<ChildOutcome>,
     mut subscribed: F,
     registry: &Arc<Mutex<SubscriptionProducerRegistry>>,
+    logger: &Arc<Mutex<JsonlLogger>>,
     bound: Duration,
 ) -> anyhow::Result<Option<String>>
 where
@@ -818,9 +924,46 @@ where
                             // just before its window end and arrived inside
                             // this drain window must NOT abort the receiver's
                             // run.
+                            //
+                            // But only for a VALID S3 request. The request
+                            // checks of the accept loop are applied first and
+                            // unchanged: an unsupported track name still gets
+                            // `not_found` (0x10) and an invalid DELIVERY_TIMEOUT
+                            // still gets the internal error, both fatal for the
+                            // receiver. Otherwise every malformed request that
+                            // happened to land inside the drain window would be
+                            // absorbed by the receiver's non-fatal path.
+                            let name = subscribed.info.track_name.to_string_lossy().into_owned();
+                            let validity = classify_subscription_request(
+                                &name,
+                                subscribed.info.delivery_timeout_ms,
+                            );
+                            if let Some(refusal) = validity.refusal(&name) {
+                                // No `refused` row: the row's `error_code` is
+                                // contractually the run-ended code, the accept
+                                // loop writes no row for the identical refusal
+                                // either, and this refusal is fatal for the
+                                // receiver, so it can never be silently
+                                // absorbed the way a run-ended refusal can.
+                                tracing::warn!(
+                                    track = %name,
+                                    code = refusal.code(),
+                                    "S3 subscription refused as invalid inside the post-run drain window"
+                                );
+                                let _ = subscribed.close(refusal);
+                                continue;
+                            }
+                            let t_refused = now_us();
                             let _ = subscribed.close(run_ended_refusal(
                                 "S3 namespace is draining after run end",
                             ));
+                            log_run_ended_refusal(
+                                logger,
+                                registry,
+                                t_refused,
+                                &name,
+                                S3RefusalCause::NamespaceDrain,
+                            );
                         }
                         Ok(None) => {
                             accepting = false;
@@ -918,29 +1061,17 @@ async fn run_namespace_inner(
                         }
                     };
                 let name = subscribed.info.track_name.to_string_lossy().into_owned();
-                    let Some(role) = role_for_track(&name) else {
-                        let _ = subscribed.close(moq_transport::serve::ServeError::not_found_ctx(
-                            format!("unsupported S3 subscription track '{name}'"),
-                        ));
-                        continue;
-                    };
-                    // DELIVERY_TIMEOUT is hop-local. The receiver's 67ms request
-                    // is enforced by the relay on relay→receiver forwarding and
-                    // need not be repeated on relay→publisher. If a direct peer
-                    // does send it here, only the frozen value is accepted.
-                    if role == TrackRole::Pc
-                        && subscribed.info.delivery_timeout_ms.is_some()
-                        && subscribed.info.delivery_timeout_ms != Some(67)
+                    // Request validity FIRST, through the same stateless check
+                    // the post-run drain window applies. Both refusals keep
+                    // the codes they have always had (0x10 / internal), which
+                    // stay fatal for the receiver.
+                    if let Some(refusal) = classify_subscription_request(
+                        &name,
+                        subscribed.info.delivery_timeout_ms,
+                    )
+                    .refusal(&name)
                     {
-                        let _ = subscribed.close(moq_transport::serve::ServeError::internal_ctx(
-                            "S3 PC subscription carried a non-67ms DELIVERY_TIMEOUT",
-                        ));
-                        continue;
-                    }
-                    if role == TrackRole::Haptic && subscribed.info.delivery_timeout_ms.is_some() {
-                        let _ = subscribed.close(moq_transport::serve::ServeError::internal_ctx(
-                            "S3 haptic subscription must not carry DELIVERY_TIMEOUT",
-                        ));
+                        let _ = subscribed.close(refusal);
                         continue;
                     }
                     // Switch/end boundary, ONE registry critical section: the
@@ -948,12 +1079,14 @@ async fn run_namespace_inner(
                     // reservation happen under the same lock, so a subscription
                     // can never consume a generation after completion, and a
                     // reserved generation counts toward "latest" until it is
-                    // activated or released. A refused subscription gets no
-                    // log row; the wire code is
+                    // activated or released. The wire code is
                     // `S3_RUN_ENDED_REQUEST_ERROR_CODE` when the refusal is
                     // "this run has ended" and `not_found` (0x10) for every
-                    // other refusal in this block (unsupported track name,
-                    // invalid route allocation), which stay fatal.
+                    // other refusal in this block (invalid route allocation),
+                    // which stays fatal. A run-ended refusal ALSO writes its
+                    // own `s3_producer`/`refused` TX row (14th rework); the
+                    // fatal ones still write none, exactly like the
+                    // request-validity refusals above.
                     let (role, route) = {
                         let mut reg = registry
                             .lock()
@@ -970,9 +1103,24 @@ async fn run_namespace_inner(
                             // the sender finishes at its last slot and so can
                             // legitimately refuse BEFORE the receiver's window
                             // end.
+                            // The sender records its OWN refusal, stamped at
+                            // the instant it refuses, so the receiver's
+                            // non-fatal path is auditable against this row
+                            // instead of being inferred from the order of
+                            // `producer`/`stop` rows (which is not a sound
+                            // inference: the run sequence also ends on the
+                            // wall clock).
+                            let t_refused = now_us();
                             let _ = subscribed.close(run_ended_refusal(&format!(
                                 "S3 subscription '{name}' arrived after run completion"
                             )));
+                            log_run_ended_refusal(
+                                &context.logger,
+                                &registry,
+                                t_refused,
+                                &name,
+                                S3RefusalCause::RunCompleted,
+                            );
                             continue;
                         }
                         let (role, route) = match allocator.allocate(&name) {
@@ -1098,11 +1246,15 @@ async fn run_namespace_inner(
     // `children_unsettled` flag).
     match loop_exit {
         Ok(LoopExit::Drained) => {
-            let subscribe_end = drain_children(&mut tasks, &publish, &registry, child_join_bound).await?;
+            let subscribe_end =
+                drain_children(&mut tasks, &publish, &registry, &context.logger, child_join_bound)
+                    .await?;
             Ok(NamespaceEnd::Drained { subscribe_end })
         }
         Ok(LoopExit::StateDropped(source)) => {
-            let subscribe_end = drain_children(&mut tasks, &publish, &registry, child_join_bound).await?;
+            let subscribe_end =
+                drain_children(&mut tasks, &publish, &registry, &context.logger, child_join_bound)
+                    .await?;
             Ok(NamespaceEnd::StateDropped {
                 source,
                 subscribe_end,
@@ -1118,6 +1270,34 @@ async fn run_namespace_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tx_log_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "skew-s3-sender-{name}-{}-{}.jsonl",
+            std::process::id(),
+            now_us()
+        ))
+    }
+
+    /// Minimal TX logger, same constructor the production sender uses.
+    fn tx_logger(path: &std::path::Path) -> Arc<Mutex<JsonlLogger>> {
+        Arc::new(Mutex::new(
+            JsonlLogger::new(
+                path, "run", "moq", "tx", None, 0.0, 0.0, 0.0, 1, 30, 90, 1, None, None,
+                Some("both"), Some(crate::TERM_PROTOCOL_V), None, None, None,
+            )
+            .unwrap(),
+        ))
+    }
+
+    /// Rows written by a logger, minus the `meta` first line.
+    fn rows(path: &std::path::Path) -> Vec<serde_json::Value> {
+        let text = std::fs::read_to_string(path).expect("TX log written");
+        text.lines()
+            .map(|line| serde_json::from_str(line).unwrap_or_else(|e| panic!("bad row {line}: {e}")))
+            .filter(|row: &serde_json::Value| row["role"] != "meta")
+            .collect()
+    }
 
     /// Both sender sites that mean "this run has ended" must leave the SAME
     /// typed code on the wire, because the receiver classifies on the code
@@ -1156,15 +1336,207 @@ mod tests {
         ));
     }
 
+    /// The drain window applies the SAME request-validity rule as the accept
+    /// loop, because both call this one function. An unsupported name and an
+    /// invalid DELIVERY_TIMEOUT keep their own fatal codes; only a valid S3
+    /// track can reach the run-ended refusal.
+    #[test]
+    fn request_validity_is_one_rule_for_the_accept_loop_and_the_drain_window() {
+        assert_eq!(
+            classify_subscription_request(PC_NORMAL_TRACK, None),
+            RequestValidity::Valid(TrackRole::Pc)
+        );
+        assert_eq!(
+            classify_subscription_request(PC_NORMAL_TRACK, Some(67)),
+            RequestValidity::Valid(TrackRole::Pc)
+        );
+        assert_eq!(
+            classify_subscription_request(HAPTIC_FULL_TRACK, None),
+            RequestValidity::Valid(TrackRole::Haptic)
+        );
+        // Every S3 track name is valid as a REQUEST; the ordering rule that
+        // makes `pc-d7` illegal as a FIRST subscription belongs to the
+        // allocator's state, not to the request.
+        assert_eq!(
+            classify_subscription_request(PC_RECOVERY_TRACK, None),
+            RequestValidity::Valid(TrackRole::Pc)
+        );
+        assert_eq!(
+            classify_subscription_request(HAPTIC_ESSENTIAL_TRACK, None),
+            RequestValidity::Valid(TrackRole::Haptic)
+        );
+        assert_eq!(
+            classify_subscription_request("pc-d99", None),
+            RequestValidity::UnsupportedTrack
+        );
+        assert!(matches!(
+            classify_subscription_request(PC_NORMAL_TRACK, Some(100)),
+            RequestValidity::BadDeliveryTimeout(_)
+        ));
+        assert!(matches!(
+            classify_subscription_request(HAPTIC_FULL_TRACK, Some(67)),
+            RequestValidity::BadDeliveryTimeout(_)
+        ));
+    }
+
+    /// An invalid request keeps the accept loop's fatal answers — the
+    /// `NotFound` family for an unsupported name, the `Internal` family for a
+    /// bad parameter set — and NEVER the run-ended code, wherever it is
+    /// refused.
+    ///
+    /// The assertion is on the VARIANT, because that is what decides the wire
+    /// code: `Subscribed::close` runs the error through
+    /// `Subscribed::request_error_code`
+    /// (`moq-transport/src/session/subscribed.rs:470`), which maps
+    /// `NotFound`/`NotFoundWithId` to `DoesNotExist` (0x10) and
+    /// `Internal*` to `InternalError` (0x0), and passes only `Closed(code)`
+    /// through unchanged. `ServeError::code()` is a different, local mapping
+    /// (it answers 0x4 for `NotFound`) and is not what reaches the peer.
+    #[test]
+    fn an_invalid_request_never_gets_the_run_ended_code() {
+        use moq_transport::serve::ServeError;
+        let unsupported = classify_subscription_request("pc-d99", None)
+            .refusal("pc-d99")
+            .expect("an unsupported track is refused");
+        assert!(
+            matches!(
+                unsupported,
+                ServeError::NotFound | ServeError::NotFoundWithId(..)
+            ),
+            "unsupported track must stay in the NotFound family: {unsupported:?}"
+        );
+        assert!(
+            !matches!(unsupported, ServeError::Closed(_)),
+            "a validity refusal must never be a pass-through Closed(code)"
+        );
+        let bad_timeout = classify_subscription_request(PC_NORMAL_TRACK, Some(100))
+            .refusal(PC_NORMAL_TRACK)
+            .expect("a bad DELIVERY_TIMEOUT is refused");
+        assert!(
+            matches!(
+                bad_timeout,
+                ServeError::Internal(_) | ServeError::InternalWithId(..)
+            ),
+            "a bad parameter set must stay in the Internal family: {bad_timeout:?}"
+        );
+        assert!(!matches!(bad_timeout, ServeError::Closed(_)));
+        // The run-ended refusal, by contrast, IS a pass-through `Closed`
+        // carrying the registered code — the one answer the receiver treats
+        // as non-fatal.
+        assert_eq!(
+            run_ended_refusal("t"),
+            ServeError::Closed(crate::S3_RUN_ENDED_REQUEST_ERROR_CODE)
+        );
+        // A valid request has no validity refusal at all: only then may the
+        // run-ended code be used.
+        assert!(classify_subscription_request(PC_NORMAL_TRACK, None)
+            .refusal(PC_NORMAL_TRACK)
+            .is_none());
+    }
+
+    /// The additive TX row both refusal sites write. The root validator is
+    /// written against this exact shape, so it is asserted field by field.
+    #[test]
+    fn a_run_ended_refusal_writes_its_own_tx_row() {
+        let path = tx_log_path("refused-row");
+        let logger = tx_logger(&path);
+        let registry = Arc::new(Mutex::new(SubscriptionProducerRegistry::new()));
+        log_run_ended_refusal(&logger, &registry, 1234, "pc-d6", S3RefusalCause::RunCompleted);
+        log_run_ended_refusal(
+            &logger,
+            &registry,
+            5678,
+            "pc-d99",
+            S3RefusalCause::NamespaceDrain,
+        );
+        let rows = rows(&path);
+        if std::env::var_os("SKEW_TEST_DUMP").is_some() {
+            eprintln!("{}", std::fs::read_to_string(&path).unwrap());
+        }
+        std::fs::remove_file(&path).ok();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0]["role"], "s3_producer");
+        assert_eq!(rows[0]["event"], "refused");
+        assert_eq!(rows[0]["t_refused"], 1234);
+        // The RAW requested name, not a normalized role.
+        assert_eq!(rows[0]["track"], "pc-d6");
+        assert_eq!(rows[0]["cause"], "run_completed");
+        assert_eq!(rows[0]["error_code"], 21315);
+        assert_eq!(
+            rows[0]["error_code"].as_u64().unwrap(),
+            crate::S3_RUN_ENDED_REQUEST_ERROR_CODE
+        );
+        assert_eq!(rows[1]["cause"], "namespace_drain");
+        assert_eq!(rows[1]["t_refused"], 5678);
+        assert_eq!(rows[1]["track"], "pc-d99");
+        assert_eq!(rows[1]["error_code"], 21315);
+        // Logging a refusal is not itself a fault.
+        assert!(registry
+            .lock()
+            .unwrap()
+            .snapshot()
+            .namespace_faults
+            .is_empty());
+    }
+
+    /// A peer-supplied name is escaped and bounded, so one absurd request can
+    /// neither corrupt the JSONL nor write an unbounded row.
+    #[test]
+    fn a_hostile_track_name_still_produces_one_parseable_row() {
+        let path = tx_log_path("refused-hostile");
+        let logger = tx_logger(&path);
+        let registry = Arc::new(Mutex::new(SubscriptionProducerRegistry::new()));
+        let hostile = format!("pc\"-\\-\n-\u{7f}-{}", "x".repeat(1024));
+        log_run_ended_refusal(
+            &logger,
+            &registry,
+            7,
+            &hostile,
+            S3RefusalCause::NamespaceDrain,
+        );
+        let rows = rows(&path);
+        std::fs::remove_file(&path).ok();
+        assert_eq!(rows.len(), 1, "one row, still parseable: {rows:?}");
+        let track = rows[0]["track"].as_str().expect("a string track");
+        assert!(track.starts_with("pc\"-\\-\n-\u{7f}-x"), "{track}");
+        assert_eq!(track.chars().count(), 256, "bounded at 256 characters");
+        assert_eq!(rows[0]["cause"], "namespace_drain");
+    }
+
+    /// A refusal whose row cannot be written is never dropped silently: it
+    /// becomes a namespace fault, and `s3_run_verdict` fails on that.
+    #[test]
+    fn a_refusal_that_cannot_be_logged_becomes_a_namespace_fault() {
+        let path = tx_log_path("refused-poisoned");
+        let logger = tx_logger(&path);
+        let registry = Arc::new(Mutex::new(SubscriptionProducerRegistry::new()));
+        // Poison the logger mutex the same way a panicking writer would.
+        let poisoner = Arc::clone(&logger);
+        std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison the TX logger");
+        })
+        .join()
+        .expect_err("the poisoning thread panics");
+        log_run_ended_refusal(&logger, &registry, 9, "pc-d6", S3RefusalCause::RunCompleted);
+        std::fs::remove_file(&path).ok();
+        let faults = registry.lock().unwrap().snapshot().namespace_faults;
+        assert_eq!(faults.len(), 1, "{faults:?}");
+        assert!(faults[0].starts_with("refusal_log_write:"), "{faults:?}");
+    }
+
     #[tokio::test]
     async fn drain_records_peer_error_even_when_last_child_is_already_done() {
         let registry = Arc::new(Mutex::new(SubscriptionProducerRegistry::new()));
         let mut tasks = JoinSet::new();
         // No children remain: an already-ready namespace error must still be
         // observed before returning Drained.
+        let path = tx_log_path("drain-peer-error");
+        let logger = tx_logger(&path);
         let text = drain_children_with(&mut tasks,
             || std::future::ready(Err(moq_transport::serve::ServeError::Closed(4))),
-            &registry, Duration::from_secs(1)).await.unwrap();
+            &registry, &logger, Duration::from_secs(1)).await.unwrap();
+        std::fs::remove_file(&path).ok();
         assert!(text.unwrap().contains("subscription stream error"));
         assert!(registry.lock().unwrap().snapshot().namespace_faults.iter()
             .any(|s| s.contains("drain_subscribe_error")));
@@ -1175,8 +1547,11 @@ mod tests {
         let registry = Arc::new(Mutex::new(SubscriptionProducerRegistry::new()));
         let mut tasks = JoinSet::new();
         tasks.spawn(std::future::pending::<ChildOutcome>());
+        let path = tx_log_path("drain-timeout");
+        let logger = tx_logger(&path);
         drain_children_with(&mut tasks, std::future::pending,
-            &registry, Duration::ZERO).await.unwrap();
+            &registry, &logger, Duration::ZERO).await.unwrap();
+        std::fs::remove_file(&path).ok();
         assert!(tasks.is_empty(), "aborted children must be joined");
         let snapshot = registry.lock().unwrap().snapshot();
         assert!(snapshot.children_unsettled);

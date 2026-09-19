@@ -53,6 +53,56 @@ fn route_fields(route: Route) -> String {
     )
 }
 
+/// JSON-escape a string that came off the wire.
+///
+/// `esc` only escapes `\` and `"`, which is enough for the crate's own
+/// `&'static str` track names but NOT for a peer-supplied one: a control
+/// character would produce a row no JSON parser accepts. Control characters
+/// are emitted as `\u00XX`, and the value is bounded so one absurd request
+/// cannot write an unbounded row. The bound is on CHARACTERS, applied on a
+/// char boundary, so the output is always valid UTF-8.
+fn esc_wire_name(name: &str) -> String {
+    const MAX_CHARS: usize = 256;
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars().take(MAX_CHARS) {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                out.push_str(&format!("\\u{:04x}", c as u32))
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Why the sender refused a subscription after its run had ended.
+///
+/// Both values mean "this run can no longer serve a new subscription" and
+/// both leave `S3_RUN_ENDED_REQUEST_ERROR_CODE` on the wire; they name the
+/// SITE so the receiver's non-fatal path can be audited against the sender's
+/// own record instead of being inferred from the order of other rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum S3RefusalCause {
+    /// The accept loop refused because `current_routes_completed()` was true.
+    RunCompleted,
+    /// The post-run drain window refused an otherwise valid S3 subscription.
+    NamespaceDrain,
+}
+
+impl S3RefusalCause {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            S3RefusalCause::RunCompleted => "run_completed",
+            S3RefusalCause::NamespaceDrain => "namespace_drain",
+        }
+    }
+}
+
 fn routes_fields(routes: Routes) -> String {
     format!(
         "\"pc_wire_track\":\"{}\",\"pc_route_generation\":{},\"haptic_wire_track\":\"{}\",\"haptic_route_generation\":{}",
@@ -540,6 +590,39 @@ impl JsonlLogger {
             route_fields(result.route),
             result.objects,
             producer_end(result.end),
+        )?;
+        self.w.flush()
+    }
+
+    /// Additive TX row: this run REFUSED a subscription because the run had
+    /// already ended, written by the sender at the instant it refuses.
+    ///
+    /// It exists so the receiver's non-fatal "refused after run end" path is
+    /// auditable against the sender's own record. It must not be inferred
+    /// from `s3_producer`/`stop` rows: the run sequence also ends on the wall
+    /// clock, so the namespace can be draining and refusing while forwarders
+    /// are still completing, and a `stop` row is stamped after the logger
+    /// lock is taken — the two orders are not comparable.
+    ///
+    /// `track` is the RAW requested track name as it arrived (not a
+    /// normalized role): an unsupported name can never be mapped to a role,
+    /// and the raw name is what makes such a request identifiable. It is
+    /// escaped and bounded by `esc_wire_name` because it is peer-supplied.
+    ///
+    /// `error_code` is read from the shared constant, so this row can never
+    /// claim a code the wire refusal did not carry.
+    pub fn try_log_s3_producer_refused(
+        &mut self,
+        t_refused: u64,
+        track: &str,
+        cause: S3RefusalCause,
+    ) -> Result<()> {
+        writeln!(
+            self.w,
+            "{{\"role\":\"s3_producer\",\"event\":\"refused\",\"t_refused\":{t_refused},\"track\":\"{}\",\"cause\":\"{}\",\"error_code\":{}}}",
+            esc_wire_name(track),
+            cause.as_str(),
+            crate::S3_RUN_ENDED_REQUEST_ERROR_CODE,
         )?;
         self.w.flush()
     }
