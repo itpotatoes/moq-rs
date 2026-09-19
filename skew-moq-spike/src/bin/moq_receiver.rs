@@ -1660,20 +1660,46 @@ fn json_escape(s: &str) -> String {
 /// the `Failed`/`None` the drain raises for a malformed subgroup or a failed
 /// log write.
 ///
-/// The tag is therefore decided by provenance, not by the shape of the error:
-/// the drain task itself records whether the receiver had already begun
-/// releasing this subscription at the instant it classified the terminal. The
-/// read happens in the same poll that observes the error and BEFORE the event
-/// is enqueued, so a terminal that was already queued when the release started
-/// is necessarily `Remote` — which is exactly the arrival order the relay-late
-/// refusal path produces.
+/// The tag is therefore decided by the SHAPE of the error first and by
+/// provenance only for the one shape that is genuinely ambiguous (17th
+/// rework, P1-A): the drain task records whether the receiver had already
+/// begun releasing this subscription at the instant it classified the
+/// terminal, and that record is applied ONLY to a bare `ServeError::Cancel`.
+/// The 16th rework applied it to every `Serve` error, so a `Size`, an
+/// `Internal` or a `Closed(code)` that the track had already produced became
+/// `LocalRelease` merely because a teardown had started somewhere.
+///
+/// What is now DETERMINISTIC:
+///   * every non-`Cancel` terminal, at any time, in either flag state, is
+///     `Remote` — a dropped handle cannot make a track report `Size`,
+///     `Internal`, `Mode` or `Closed(code)`;
+///   * a terminal that reached the event queue BEFORE the release started is
+///     `Remote`, because the flag is read in the same poll that observed the
+///     error and before the event is enqueued;
+///   * a `Cancel` observed while no release has begun is `Remote`.
+///
+/// What remains ATTRIBUTED TO US (the whole residual): a bare `Cancel`, with
+/// no application code, classified after the release of this very
+/// subscription began. It is attributed to the receiver on purpose. A
+/// peer-originated bare `Cancel` is not reachable over the wire in this
+/// system: every remote terminal arrives as PUBLISH_DONE or REQUEST_ERROR and
+/// is turned into `Done` or `Closed(code)`
+/// (`session/subscriber.rs:761-765`, `:835`), and the publisher's own `Cancel`
+/// is encoded as a numeric code before it is sent
+/// (`session/subscribed.rs:428-486`: `Drop for Subscribed` ->
+/// `publish_done_code` / `request_error_code`, where `Cancel` becomes
+/// `InternalError` or `Uninterested`). So the only producers of a bare `Cancel`
+/// at this receiver are local serve-layer teardowns — which is exactly what we
+/// attribute it to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TerminalSource {
-    /// The receiver had not begun releasing this subscription. The terminal is
-    /// the peer's (or a local protocol/log fault), never our own teardown.
+    /// The terminal is the peer's (or a local protocol/log fault), never our
+    /// own teardown: either no release had begun, or the error has a shape our
+    /// release cannot produce.
     Remote,
-    /// The receiver had already set `local_release` — dropped, or is about to
-    /// drop, the handle — so this terminal may be its own UNSUBSCRIBE.
+    /// A bare `Cancel` observed after `local_release` was set — dropped, or
+    /// about to drop, the handle — so this terminal may be its own
+    /// UNSUBSCRIBE.
     LocalRelease,
 }
 
@@ -1715,12 +1741,17 @@ fn track_end_close_code(e: &moq_transport::serve::ServeError) -> Option<u64> {
 /// sends UNSUBSCRIBE. The handle is only ever dropped, never called, which is
 /// why it can be a parameter without changing any production behaviour.
 struct S3LiveSubscription<H> {
-    handle: H,
-    drain: tokio::task::JoinHandle<()>,
-    /// Set by [`S3LiveSubscription::release_handle`] immediately BEFORE the
-    /// handle is dropped, and read by the drain task when it classifies its
-    /// terminal. This is the provenance channel of [`TerminalSource`]; it is
-    /// never cleared, because a released subscription is never reopened.
+    /// `Option` only so that [`S3LiveSubscription::release_handle`] can move
+    /// the handle out of a type that now has a `Drop` impl. It is `Some` for
+    /// the whole life of the value except inside `release_handle`.
+    handle: Option<H>,
+    /// `Option` for the same reason as `handle`.
+    drain: Option<tokio::task::JoinHandle<()>>,
+    /// Set by [`S3LiveSubscription::release_handle`] — and, as a backstop, by
+    /// the `Drop` impl below — immediately BEFORE the handle is dropped, and
+    /// read by the drain task when it classifies its terminal. This is the
+    /// provenance channel of [`TerminalSource`]; it is never cleared, because
+    /// a released subscription is never reopened.
     local_release: Arc<AtomicBool>,
 }
 
@@ -1732,10 +1763,34 @@ impl<H> S3LiveSubscription<H> {
     /// before the drop, so any terminal the drop itself causes is classified
     /// `LocalRelease`, while anything the drain had already classified keeps
     /// the `Remote` tag it was built with.
-    fn release_handle(self) -> tokio::task::JoinHandle<()> {
+    fn release_handle(mut self) -> tokio::task::JoinHandle<()> {
         self.local_release.store(true, Ordering::Release);
-        drop(self.handle);
+        drop(self.handle.take());
         self.drain
+            .take()
+            .expect("an S3 subscription is released exactly once")
+        // `self` drops here; the `Drop` impl re-stores the same flag (it is
+        // idempotent) and both fields are already `None`.
+    }
+}
+
+/// The provenance channel cannot be bypassed (17th rework, P1-A).
+///
+/// `release_handle` is the intended path, but nothing in the type system
+/// forced a future caller to use it: a plain `drop(subscription)` — or an
+/// early `?` return that lets a `HashMap` of live subscriptions fall out of
+/// scope, as the second initial subscribe failing does — would have dropped
+/// the wire handle, sent UNSUBSCRIBE and left the flag `false`, so the
+/// resulting bare `Cancel` would have been read as a REMOTE failure.
+///
+/// Setting the flag here makes "every drop of a live subscription is recorded
+/// as a local release" structural rather than a convention. The store runs in
+/// the `Drop` body, which Rust runs BEFORE the fields are dropped, so the
+/// ordering the drain relies on (flag set, then UNSUBSCRIBE) holds on this
+/// path too.
+impl<H> Drop for S3LiveSubscription<H> {
+    fn drop(&mut self) {
+        self.local_release.store(true, Ordering::Release);
     }
 }
 
@@ -1921,19 +1976,45 @@ async fn drain_s3_track(
     let (end, detail, close_code, source) = match result {
         // End-of-track is the publisher's, and it is never faulted anyway.
         Ok(()) => (TrackEnd::Fin, String::new(), None, TerminalSource::Remote),
-        // The ONLY shape our own release can take. The flag is read here, in
-        // the same poll that observed the error and before the event is
-        // enqueued, so the answer describes the state at classification time.
-        Err(DrainFail::Serve(error)) => (
-            classify_track_end(&error),
-            error.to_string(),
-            track_end_close_code(&error),
-            if local_release.load(Ordering::Acquire) {
+        // Provenance is decided by the SHAPE of the error first and by the
+        // flag only second (17th rework, P1-A).
+        //
+        // Our release drops the `Subscribe` handle, which drops the track
+        // WRITER (`session/subscribe.rs:277-283` -> `remove_subscribe`), and a
+        // dropped writer normally reaches this drain as end-of-track
+        // (`Ok(None)` from `SubgroupsReader::next`, i.e. FIN) rather than as
+        // an error at all. The one ERROR shape it can take is a bare
+        // `ServeError::Cancel`: the serve layer raises exactly that for "the
+        // peer half of this in-process state is gone" (`serve/track.rs:101`,
+        // `serve/subgroup.rs:133`). Every OTHER `Serve`
+        // error describes something the TRACK did — `Size`, `Internal`,
+        // `Mode`, `Closed(code)` — and dropping our handle cannot make a track
+        // produce any of them, so it is `Remote` whatever the flag says.
+        //
+        // That ordering is what the 16th rework got wrong: it applied the flag
+        // to every `Serve` error, so an error that was already decided before
+        // the release began (close first, release second) was still attributed
+        // to us. Only a bare `Cancel` is now ambiguous, and only after the
+        // release has started.
+        //
+        // The flag is still read in the same poll that observed the error and
+        // before the event is enqueued, so the answer describes the state at
+        // classification time.
+        Err(DrainFail::Serve(error)) => {
+            let source = if matches!(error, moq_transport::serve::ServeError::Cancel)
+                && local_release.load(Ordering::Acquire)
+            {
                 TerminalSource::LocalRelease
             } else {
                 TerminalSource::Remote
-            },
-        ),
+            };
+            (
+                classify_track_end(&error),
+                error.to_string(),
+                track_end_close_code(&error),
+                source,
+            )
+        }
         // A malformed subgroup mode or a failed log write. Dropping the
         // subscription handle cannot produce either, so this is remote (or a
         // local defect) by construction and never our teardown.
@@ -2005,8 +2086,8 @@ async fn open_s3_subscription<S: S3SubscribeSeam>(
                 ));
                 return Ok((
                     S3LiveSubscription {
-                        handle,
-                        drain,
+                        handle: Some(handle),
+                        drain: Some(drain),
                         local_release,
                     },
                     t_ok,
@@ -3181,13 +3262,25 @@ impl S3SwitchTargetFaults {
 ///   * while PENDING, any other terminal is the peer's, because the receiver
 ///     has not released anything yet;
 ///   * once WATCHED, the receiver has dropped the handle, so a terminal is a
-///     fault when it cannot be that release: either it carries a close CODE
-///     (our UNSUBSCRIBE never produces one) or the drain classified it before
-///     the release began (`TerminalSource::Remote`).
+///     fault when it cannot be that release: it carries a close CODE (our
+///     UNSUBSCRIBE never produces one), or it is a `Failed` shape (`Size`,
+///     `Internal`, `Mode`, a malformed subgroup — none of which a dropped
+///     handle can cause), or the drain classified it before the release began
+///     (`TerminalSource::Remote`).
 ///
-/// The 15th rework used `close_code.is_some()` alone for the watched case,
-/// which dropped every code-less remote failure — a peer `Cancel` and the
-/// `Failed`/`None` of a malformed subgroup or a failed log write.
+/// So exactly ONE combination is excused, and it is the residual documented on
+/// [`TerminalSource`]: a WATCHED target whose terminal is a BARE `Cancel`
+/// (`Cancelled` with no application code) that the drain classified after the
+/// release of that same subscription had begun.
+///
+/// History: the 15th rework used `close_code.is_some()` alone for the watched
+/// case, which dropped every code-less remote failure — a peer `Cancel` and
+/// the `Failed`/`None` of a malformed subgroup or a failed log write. The 16th
+/// rework added the provenance tag but let `LocalRelease` excuse a `Failed`
+/// terminal too; `end == TrackEnd::Failed` below closes that, so the rule
+/// holds even if a future tagging site were to mislabel a non-`Cancel` error
+/// (17th rework, P1-A). Both edits only ADD faults; no case that faulted
+/// before stops faulting.
 fn is_switch_target_fault(
     pending: bool,
     end: TrackEnd,
@@ -3197,7 +3290,10 @@ fn is_switch_target_fault(
     if close_code == Some(S3_RUN_ENDED_REQUEST_ERROR_CODE) || end == TrackEnd::Fin {
         return false;
     }
-    pending || close_code.is_some() || source == TerminalSource::Remote
+    pending
+        || close_code.is_some()
+        || source == TerminalSource::Remote
+        || end == TrackEnd::Failed
 }
 
 /// Is this ended route a target of a switch that never applied?
@@ -4587,24 +4683,52 @@ where
     // outcome.
     if !session_consumed {
         session_run.abort();
-        // The join RESULT is recorded, not discarded: a session task that has
-        // not stopped within the bound is the one case where something other
-        // than this function could still touch the transport after the
-        // shutdown row. It is additive and does NOT change the verdict — the
-        // session writes no JSONL row, so it cannot break the "exactly one
-        // terminal per rx object" invariant that `drains_unjoined` guards.
-        if tokio::time::timeout(S3_DRAIN_JOIN_BOUND, &mut session_run)
-            .await
-            .is_err()
-        {
-            if let Err(error) = log_s3_exit_note(
-                &logger,
-                &format!(
-                    "\"event\":\"s3_session_join_timeout\",\"bound_ms\":{}",
-                    S3_DRAIN_JOIN_BOUND.as_millis()
-                ),
-            ) {
-                keep_first_cause(&mut outcome_error, error);
+        // The INNER join result is inspected, not just the timeout (17th
+        // rework, P1-B). `timeout(..).await.is_err()` sees only "did not stop
+        // in time"; a session task that PANICKED returns `Ok(Err(JoinError))`
+        // and used to be indistinguishable from a clean stop, so the same
+        // panic was fatal when the main `select!` consumed it (the session arm
+        // above) and silent when shutdown consumed it. Three outcomes:
+        //
+        //   * `Ok(Err(e))` with `e.is_panic()` — a run FAULT. The panic
+        //     happened before this point, so it goes through `keep_first_cause`
+        //     and an earlier cause still wins; the additive note row records
+        //     it. This includes a guard that panics while the aborted task's
+        //     future is DROPPED, which tokio also reports as a panic.
+        //   * any other completion — our own abort (`is_cancelled`) or a task
+        //     that had already returned its own `Result`. Normal, unchanged:
+        //     ending the session at shutdown is what this code just asked for.
+        //   * the timeout — unchanged from the 16th rework: additive row, no
+        //     verdict change, because the session writes no JSONL row and so
+        //     cannot break the "exactly one terminal per rx object" invariant
+        //     that `drains_unjoined` guards.
+        match tokio::time::timeout(S3_DRAIN_JOIN_BOUND, &mut session_run).await {
+            Ok(Err(join_error)) if join_error.is_panic() => {
+                keep_first_cause(
+                    &mut outcome_error,
+                    anyhow::anyhow!("S3 session task panicked: {join_error}"),
+                );
+                if let Err(error) = log_s3_exit_note(
+                    &logger,
+                    &format!(
+                        "\"event\":\"s3_session_join_panic\",\"detail\":\"{}\"",
+                        json_escape(&join_error.to_string())
+                    ),
+                ) {
+                    keep_first_cause(&mut outcome_error, error);
+                }
+            }
+            Ok(_) => {}
+            Err(_elapsed) => {
+                if let Err(error) = log_s3_exit_note(
+                    &logger,
+                    &format!(
+                        "\"event\":\"s3_session_join_timeout\",\"bound_ms\":{}",
+                        S3_DRAIN_JOIN_BOUND.as_millis()
+                    ),
+                ) {
+                    keep_first_cause(&mut outcome_error, error);
+                }
             }
         }
     }
@@ -9340,8 +9464,7 @@ mod s3_terminal_provenance_tests {
                 source
             ));
         }
-        // WATCHED, no code — THE DEFECT. `Remote` faults; only our own
-        // release is excused.
+        // WATCHED, no code — THE 16TH-REWORK DEFECT. `Remote` faults.
         assert!(is_switch_target_fault(
             false,
             TrackEnd::Cancelled,
@@ -9349,18 +9472,44 @@ mod s3_terminal_provenance_tests {
             Remote
         ));
         assert!(is_switch_target_fault(false, TrackEnd::Failed, None, Remote));
+        // WATCHED, no code, tagged as our own release: a `Failed` shape is
+        // `Size`/`Internal`/`Mode`/a malformed subgroup, and dropping a handle
+        // cannot cause any of them, so it faults ANYWAY (17th rework, P1-A).
+        // This row used to answer `false`; STRENGTHENED, not weakened.
+        assert!(is_switch_target_fault(
+            false,
+            TrackEnd::Failed,
+            None,
+            LocalRelease
+        ));
+        // ... leaving EXACTLY ONE excused combination in the whole table: a
+        // watched target, a bare `Cancel`, tagged as our own release.
         assert!(!is_switch_target_fault(
             false,
             TrackEnd::Cancelled,
             None,
             LocalRelease
         ));
-        assert!(!is_switch_target_fault(
-            false,
-            TrackEnd::Failed,
-            None,
-            LocalRelease
-        ));
+
+        // Exhaustive restatement of "exactly one excused non-FIN, non-run-ended
+        // combination", so a future edit cannot excuse a second one unnoticed.
+        for pending in [true, false] {
+            for end in [TrackEnd::Cancelled, TrackEnd::Failed] {
+                for code in [None, does_not_exist] {
+                    for source in [Remote, LocalRelease] {
+                        let excused = !is_switch_target_fault(pending, end, code, source);
+                        let only_excused = !pending
+                            && end == TrackEnd::Cancelled
+                            && code.is_none()
+                            && source == LocalRelease;
+                        assert_eq!(
+                            excused, only_excused,
+                            "pending={pending} end={end:?} code={code:?} source={source:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     async fn drain_once(
@@ -9444,6 +9593,101 @@ mod s3_terminal_provenance_tests {
             }
             other => panic!("expected an end, got {other:?}"),
         }
+    }
+
+    /// 17TH-REWORK P1-A, the reviewer's ordering: the error EXISTS BEFORE the
+    /// release, and it is not a shape our release can take.
+    ///
+    /// `act` runs synchronously before the spawned drain is ever polled, so
+    /// the close is decided FIRST and `local_release` is set SECOND. The 16th
+    /// rework read only the flag at classification time, so every one of these
+    /// became `LocalRelease` and the watched rule excused it — a `Size` or an
+    /// `Internal` that dropping our handle cannot possibly cause.
+    #[tokio::test]
+    async fn an_error_that_precedes_the_release_is_remote_whatever_the_flag_says() {
+        let cases: Vec<(&str, ServeError, TrackEnd, Option<u64>)> = vec![
+            ("size", ServeError::Size, TrackEnd::Failed, None),
+            (
+                "internal",
+                ServeError::internal_ctx("scripted internal failure"),
+                TrackEnd::Failed,
+                None,
+            ),
+            (
+                "closed",
+                ServeError::Closed(u64::from(
+                    moq_transport::message::RequestErrorCode::DoesNotExist,
+                )),
+                TrackEnd::Cancelled,
+                Some(u64::from(
+                    moq_transport::message::RequestErrorCode::DoesNotExist,
+                )),
+            ),
+        ];
+        for (name, error, want_end, want_code) in cases {
+            let flag = Arc::new(AtomicBool::new(false));
+            let store = flag.clone();
+            let event = drain_once(flag.clone(), move |writer| {
+                // The reviewer's order: close first ...
+                writer.close(error).unwrap();
+                // ... release second.
+                store.store(true, Ordering::Release);
+            })
+            .await;
+            match event {
+                S3WireEvent::Ended {
+                    end,
+                    close_code,
+                    source,
+                    ..
+                } => {
+                    assert_eq!(end, want_end, "{name}");
+                    assert_eq!(close_code, want_code, "{name}");
+                    assert_eq!(
+                        source,
+                        TerminalSource::Remote,
+                        "{name}: a non-Cancel error is never our teardown"
+                    );
+                    assert!(
+                        is_switch_target_fault(false, end, close_code, source),
+                        "{name}: a torn-down target must still fault"
+                    );
+                }
+                other => panic!("expected an end, got {other:?}"),
+            }
+        }
+    }
+
+    /// The provenance channel cannot be bypassed: a plain `drop` of a live
+    /// subscription sets the same flag the release path sets, so a future
+    /// caller that forgets `release_handle` cannot turn its own UNSUBSCRIBE
+    /// into a `Remote` terminal (17th rework, P1-A item 4).
+    #[tokio::test]
+    async fn dropping_a_live_subscription_records_the_release() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let subscription = S3LiveSubscription {
+            handle: Some(()),
+            drain: Some(tokio::spawn(async {})),
+            local_release: flag.clone(),
+        };
+        assert!(!flag.load(Ordering::Acquire));
+        drop(subscription);
+        assert!(
+            flag.load(Ordering::Acquire),
+            "a bypassed release must still be recorded"
+        );
+
+        // And the normal path is unchanged: it also hands back a joinable
+        // drain task.
+        let flag = Arc::new(AtomicBool::new(false));
+        let subscription = S3LiveSubscription {
+            handle: Some(()),
+            drain: Some(tokio::spawn(async {})),
+            local_release: flag.clone(),
+        };
+        let drain = subscription.release_handle();
+        assert!(flag.load(Ordering::Acquire));
+        drain.await.unwrap();
     }
 
     /// The `Failed`/`None` variant the reviewer named: a NON-SUBGROUP track.
@@ -9946,6 +10190,22 @@ mod s3_control_loop_tests {
         /// PANICS after this many milliseconds, so the join handle yields
         /// `Err(JoinError)`.
         PanicAfterMs(u64),
+        /// Never ends on its own — like `Never` — but holds a guard that
+        /// PANICS when the task's future is dropped, i.e. when the shutdown
+        /// path aborts it. tokio catches that panic and reports it on the join
+        /// handle, so this is the one session ending that is only ever
+        /// observed by the SHUTDOWN join and never by the loop's `select!`
+        /// (17th rework, P1-B).
+        PanicOnAbort,
+    }
+
+    /// Panics when dropped. Used only by `SessionEnding::PanicOnAbort`.
+    struct PanicOnDropGuard;
+
+    impl Drop for PanicOnDropGuard {
+        fn drop(&mut self) {
+            panic!("scripted session guard panic on drop");
+        }
     }
 
     impl SessionEnding {
@@ -9953,6 +10213,10 @@ mod s3_control_loop_tests {
             tokio::spawn(async move {
                 match self {
                     SessionEnding::Never => std::future::pending().await,
+                    SessionEnding::PanicOnAbort => {
+                        let _guard = PanicOnDropGuard;
+                        std::future::pending().await
+                    }
                     SessionEnding::NormalAfterMs(ms) => {
                         tokio::time::sleep(Duration::from_millis(ms)).await;
                         Ok(())
@@ -10017,6 +10281,20 @@ mod s3_control_loop_tests {
         delayed: Vec<(u64, Vec<Step>)>,
     ) -> CaseOutcome {
         run_case_inner(name, duration_s, force_ms, script, delayed, SessionEnding::Never).await
+    }
+
+    /// `run_case_delayed` with a scripted session ending: the only way to end
+    /// a run by the normal FIN rule while the SESSION task misbehaves at
+    /// shutdown.
+    async fn run_case_delayed_with_session(
+        name: &str,
+        duration_s: Option<&str>,
+        force_ms: &str,
+        script: Vec<Call>,
+        delayed: Vec<(u64, Vec<Step>)>,
+        session: SessionEnding,
+    ) -> CaseOutcome {
+        run_case_inner(name, duration_s, force_ms, script, delayed, session).await
     }
 
     async fn run_case_inner(
@@ -11183,6 +11461,132 @@ mod s3_control_loop_tests {
         );
         assert!(outcome.find("s3_switch", "refused_after_run_end").is_empty());
         assert_eq!(outcome.shutdown()["ending"], "error");
+        outcome.assert_every_rx_object_is_terminated();
+    }
+
+    /// The early-return path the `Drop` impl had to keep working (17th
+    /// rework, P1-A item 4): the FIRST initial subscribe is already open when
+    /// the SECOND one fails, so the loop leaves `run_s3_control` through `?`
+    /// and the open subscription is dropped by going out of scope, never
+    /// through `release_handle`.
+    ///
+    /// With the `Drop` impl that drop now records the release on the same
+    /// flag, so the drain's terminal is still classified as OURS. The case
+    /// asserts the observable part: the run fails with the subscribe error and
+    /// nothing panics — in particular `release_handle`'s `expect` is
+    /// unreachable on this path, and the dropped `HashMap` neither hangs nor
+    /// double-releases.
+    #[tokio::test]
+    async fn a_failed_second_initial_subscribe_returns_without_releasing_the_first() {
+        let script = vec![
+            Call {
+                track: PC_NORMAL,
+                before: Vec::new(),
+                answer: Answer::Accept(Vec::new()),
+            },
+            Call {
+                track: HAPTIC_FULL,
+                before: Vec::new(),
+                // Not retryable, so the case does not sit through the retry
+                // schedule.
+                answer: Answer::Refuse(ServeError::Size),
+            },
+        ];
+        let outcome = run_case("s3-loop-r", "30", "5000", script).await;
+        let error = outcome
+            .result
+            .as_ref()
+            .expect_err("a failed initial subscribe fails the run");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("haptic") && text.contains("subscribe"),
+            "unexpected error: {text}"
+        );
+        assert_eq!(outcome.calls, vec![PC_NORMAL, HAPTIC_FULL]);
+        // The early return happens before the shutdown sequence, which is
+        // pre-existing behaviour and not what the `Drop` impl changes.
+        assert!(outcome.find("info", "shutdown").is_empty());
+    }
+
+    /// The script both 17th-rework P1-B cases share: no switch is ever
+    /// requested (the forcing delay is far beyond the run), and the two
+    /// initial routes FIN, so the run ends by the NORMAL FIN rule and the only
+    /// thing that can change the verdict is what the session task does at
+    /// shutdown.
+    async fn fin_ending_case(name: &str, session: SessionEnding) -> CaseOutcome {
+        run_case_delayed_with_session(
+            name,
+            Some("30"),
+            "5000",
+            initial_calls(vec![Step::Yield(50)]),
+            vec![(
+                300,
+                vec![
+                    Step::Fin(PC_NORMAL),
+                    Step::Fin(HAPTIC_FULL),
+                    Step::Yield(50),
+                ],
+            )],
+            session,
+        )
+        .await
+    }
+
+    /// (q) CONTROL for the case below: with a healthy session, this exact run
+    /// ends normally by the FIN rule. Without it, "the panic failed the run"
+    /// would not be distinguishable from "the run failed anyway".
+    #[tokio::test]
+    async fn the_fin_rule_case_ends_normally_with_a_healthy_session() {
+        let outcome = fin_ending_case("s3-loop-q0", SessionEnding::Never).await;
+        assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+        let shutdown = outcome.shutdown();
+        assert_eq!(shutdown["ending"], "normal");
+        assert_eq!(shutdown["detail"], "rule=s3_current_routes_fin");
+        assert!(outcome.find("info", "s3_session_join_panic").is_empty());
+        assert!(outcome.find("info", "s3_session_join_timeout").is_empty());
+        outcome.assert_every_rx_object_is_terminated();
+    }
+
+    /// (q) 17TH-REWORK P1-B. The SAME run, with a session task that panics
+    /// while the shutdown path aborts it (a guard that panics when the future
+    /// is dropped; tokio reports that on the join handle as a panic).
+    ///
+    /// The 16th rework joined with `timeout(..).await.is_err()`, which sees
+    /// only the timeout: `Ok(Err(JoinError::panic))` counted as a clean stop,
+    /// so the very same panic was FATAL when the main `select!` consumed it
+    /// and SILENT when shutdown did. The run must end in error, carrying the
+    /// panic as its cause, and still write the shutdown row and its additive
+    /// note.
+    #[tokio::test]
+    async fn a_session_task_that_panics_at_shutdown_fails_an_otherwise_normal_run() {
+        let outcome = fin_ending_case("s3-loop-q1", SessionEnding::PanicOnAbort).await;
+        let error = outcome
+            .result
+            .as_ref()
+            .expect_err("a session panic at shutdown must fail the run");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("S3 session task panicked"),
+            "unexpected error: {text}"
+        );
+        let notes = outcome.find("info", "s3_session_join_panic");
+        assert_eq!(notes.len(), 1, "one additive note row: {notes:?}");
+        assert!(
+            notes[0]["detail"].as_str().expect("detail").contains("panic"),
+            "the JoinError text must survive: {}",
+            notes[0]
+        );
+        // Not a timeout: the task DID stop within the bound.
+        assert!(outcome.find("info", "s3_session_join_timeout").is_empty());
+        let shutdown = outcome.shutdown();
+        assert_eq!(
+            shutdown["ending"], "error",
+            "the FIN rule must not normalise a session panic"
+        );
+        assert_eq!(shutdown["detail"].as_str().expect("detail"), text);
+        // Everything after the join still ran.
+        assert_eq!(shutdown["s3_event_queue_closed"], true);
+        assert_eq!(shutdown["s3_drains_unjoined"], 0);
         outcome.assert_every_rx_object_is_terminated();
     }
 }
