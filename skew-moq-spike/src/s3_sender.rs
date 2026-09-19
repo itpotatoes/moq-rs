@@ -218,7 +218,7 @@ fn role_for_track(name: &str) -> Option<TrackRole> {
 ///
 /// Only the STATELESS checks live here: the track name and the
 /// DELIVERY_TIMEOUT parameter. `RouteAllocator::allocate`'s ordering rule
-/// ("the first PC subscription must be `pc-d6`") is deliberately NOT part of
+/// ("the first PC subscription must be `PC_NORMAL_TRACK`, i.e. `pc`") is deliberately NOT part of
 /// it — it is a property of the allocator's state machine, not of the
 /// request, and after the run has ended no generation may be allocated at
 /// all. A request that is valid here and would still have failed allocation

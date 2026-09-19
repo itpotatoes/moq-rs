@@ -38,7 +38,7 @@ use skew_moq::s3_receiver::{
     validate_routed_object, IngressEvent, RetirementCause, RoutedObject, S3DeadlineTracker,
     S3ReceiverIngress, S3RetirementQueue, DROP_DUPLICATE_IDENTITY, DROP_STALE_TIER,
 };
-use skew_moq::s3_switch::{Route, S3SwitchGate, SwitchApplied, SwitchConfig, TrackRole};
+use skew_moq::s3_switch::{Route, S3SwitchGate, SwitchApplied, SwitchConfig, SwitchRequest, TrackRole};
 use skew_moq::*;
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -2506,10 +2506,34 @@ fn flush_s3_barrier_drops(
 /// only if there is none yet. Everything on the shutdown path uses this, so
 /// no failure after the loop can ever replace the recorded cause — and none
 /// of them can skip the rest of the shutdown sequence either.
+///
+/// SCOPE, stated exactly (15th rework). "First cause" is guaranteed for: the
+/// whole shutdown sequence; the control loop's session-end arm, max-duration
+/// check, retirement releases and switch-effect timeout, which can fire in the
+/// SAME iteration and where a later one is a consequence of the earlier; and
+/// the switch-target fault store. It is NOT guaranteed for the remaining
+/// in-iteration sites (`log_common_epochs`, `dispatch_s3_playout_actions`,
+/// the controller/tracker activation and the observation path) or for the
+/// assignments inside `handle_s3_wire_event`: those keep their original
+/// last-writer-wins behaviour, so a logging or accounting failure raised after
+/// a cause in the same iteration still replaces the reported `detail`. Every
+/// such case is itself a fatal fault, and the earlier cause is still in the
+/// log as its own row, but the shutdown `detail` is then the later one.
 fn keep_first_cause(outcome_error: &mut Option<anyhow::Error>, error: anyhow::Error) {
     if outcome_error.is_none() {
         *outcome_error = Some(error);
     }
+}
+
+/// One additive `info` row from the shutdown sequence. Returns the error
+/// instead of propagating it so the caller can fold it into `outcome_error`
+/// with `keep_first_cause` and still finish the shutdown sequence.
+fn log_s3_exit_note(logger: &Arc<Mutex<JsonlLogger>>, body: &str) -> Result<()> {
+    logger
+        .lock()
+        .map_err(|_| anyhow::anyhow!("RX logger poisoned"))?
+        .try_log_info(body)
+        .map_err(anyhow::Error::from)
 }
 
 /// Bound on joining ONE aborted drain task. An aborted `drain_s3_track` stops
@@ -2866,6 +2890,124 @@ fn is_pending_target_run_ended_refusal(
         && close_code == Some(S3_RUN_ENDED_REQUEST_ERROR_CODE)
 }
 
+/// Terminals observed on the target routes of a switch request that never
+/// applied.
+///
+/// Why this exists (15th rework, P1). The relay-late refusal path is
+/// non-fatal by design: the sender's run ended, nothing changed on wire, so
+/// the run may still end by its normal FIN rule. But a pending switch has TWO
+/// targets, and a target route is never a current route, so a GENERAL
+/// terminal on one of them (`Closed(0x10)`, `Failed`, ...) was observed by the
+/// event handler and then dropped — the current-route branch did not match it
+/// and nothing else looked at it. A run-ended refusal on the SIBLING role then
+/// abandoned the whole request and `recompute_s3_normal_end` let the run end
+/// normally, so a real transport failure was normalised away.
+///
+/// The direct path never had that hole: `classify_switch_open_failure`
+/// inspects EVERY failed role and is `Fatal` on any mix. This store is what
+/// makes the relay path obey the same rule — it is the only state that
+/// survives `abandon_pending`, the sibling's refusal and
+/// `recompute_s3_normal_end`.
+///
+/// ORDERING. The cause is persisted here the moment the handler sees it and
+/// is promoted into `outcome_error` at the first of: the sibling's refusal
+/// (`handle_s3_wire_event`) or the exit merge (`run_s3_control`). Promotion
+/// always goes through `keep_first_cause`, so a STRICTLY EARLIER cause still
+/// wins; in that case the terminal is still in the log as its own
+/// `s3_switch_target_terminal_fault` row. It is never erased, only ordered.
+///
+/// It is deliberately NOT written straight into `outcome_error` at
+/// observation: that would end the control loop at the first dead target and
+/// replace the registered 2 s switch effect timeout as the recorded cause of
+/// a switch that failed with its sibling still alive.
+#[derive(Default)]
+struct S3SwitchTargetFaults {
+    /// Target routes of a switch that the relay-late refusal path tore down.
+    /// Their drain tasks were aborted, but an `Ended` they had ALREADY
+    /// enqueued still arrives, and by then the gate has no pending request to
+    /// recognise them by.
+    watched: Vec<(TrackRole, Route)>,
+    /// Target routes on which a non-run-ended terminal was observed.
+    faulted: Vec<(TrackRole, Route)>,
+    /// The first such terminal, kept as the run's failure cause.
+    cause: Option<anyhow::Error>,
+}
+
+impl S3SwitchTargetFaults {
+    /// Remember a target route that was torn down with a pending request that
+    /// was abandoned, so a straggling terminal on it is still classified.
+    fn watch_abandoned(&mut self, role: TrackRole, route: Route) {
+        if !self.watched.contains(&(role, route)) {
+            self.watched.push((role, route));
+        }
+    }
+
+    fn is_watched(&self, role: TrackRole, route: Route) -> bool {
+        self.watched.contains(&(role, route))
+    }
+
+    fn forget(&mut self, role: TrackRole, route: Route) {
+        self.watched.retain(|entry| *entry != (role, route));
+    }
+
+    /// First-cause-wins inside the store as well: a second faulted target is
+    /// still recorded as faulted (so the refusal rule sees it), but the cause
+    /// text stays the first one.
+    fn record(&mut self, role: TrackRole, route: Route, error: anyhow::Error) {
+        if !self.faulted.contains(&(role, route)) {
+            self.faulted.push((role, route));
+        }
+        if self.cause.is_none() {
+            self.cause = Some(error);
+        }
+    }
+
+    /// Does THIS pending request have a faulted target? Routes carry their
+    /// generation, so this can never match a different switch's target.
+    fn request_has_fault(&self, request: SwitchRequest) -> bool {
+        [TrackRole::Pc, TrackRole::Haptic].into_iter().any(|role| {
+            let changed = match role {
+                TrackRole::Pc => request.pc_changed,
+                TrackRole::Haptic => request.haptic_changed,
+            };
+            changed && self.faulted.contains(&(role, request.target.for_role(role)))
+        })
+    }
+
+    fn take_cause(&mut self) -> Option<anyhow::Error> {
+        self.cause.take()
+    }
+}
+
+/// Is this ended route a target of a switch that never applied?
+///
+/// Two ways to be one, and they are treated differently on purpose:
+///   * the gate still has the PENDING request and this is a changed role's
+///     target — the subscription is still live, so any terminal on it comes
+///     from the peer;
+///   * the request was already abandoned by the relay-late refusal path and
+///     the route is `watched` — here the receiver itself dropped the handle
+///     and aborted the drain, so a code-less `Cancelled` may be its OWN
+///     teardown. The caller therefore only faults a watched route on a peer
+///     error CODE (see `handle_s3_wire_event`).
+fn unapplied_switch_target(
+    ingress: &S3ReceiverIngress,
+    faults: &S3SwitchTargetFaults,
+    role: TrackRole,
+    route: Route,
+) -> Option<bool> {
+    if let Some(request) = ingress.gate().pending_request() {
+        let changed = match role {
+            TrackRole::Pc => request.pc_changed,
+            TrackRole::Haptic => request.haptic_changed,
+        };
+        if changed && request.target.for_role(role) == route {
+            return Some(true);
+        }
+    }
+    faults.is_watched(role, route).then_some(false)
+}
+
 /// The run ends by its normal FIN rule as soon as both current routes have
 /// FINished and nothing is pending. Re-evaluated whenever a pending request
 /// is abandoned, because the FINs may have been observed WHILE it was
@@ -2897,6 +3039,16 @@ fn recompute_s3_normal_end(
 /// already uses — and joined (bounded) in the shutdown sequence BEFORE drain
 /// pass 2, which is what keeps "every rx object has exactly one terminal"
 /// true for anything those tasks wrote before stopping.
+///
+/// The torn-down sibling targets are handed to `faults.watch_abandoned` on
+/// the way out. The abort stops the drain task, but an `Ended` it had already
+/// enqueued still arrives after the gate has forgotten the request, and that
+/// terminal must still be classified (15th rework, P1).
+///
+/// PRECONDITION: the caller has already established that no target of this
+/// request faulted (`S3SwitchTargetFaults::request_has_fault`). A mixed
+/// request is fatal, exactly as `classify_switch_open_failure` makes it fatal
+/// on the direct path.
 #[allow(clippy::too_many_arguments)]
 fn refuse_pending_s3_switch<H>(
     observed_role: TrackRole,
@@ -2909,6 +3061,7 @@ fn refuse_pending_s3_switch<H>(
     logger: &Arc<Mutex<JsonlLogger>>,
     stats: &mut PlayoutStats,
     refused_after_run_end: &mut u64,
+    faults: &mut S3SwitchTargetFaults,
 ) -> Result<()> {
     let request = ingress
         .gate()
@@ -2970,6 +3123,7 @@ fn refuse_pending_s3_switch<H>(
                 role.as_str(),
                 s3_route_fields(route),
             ))?;
+            faults.watch_abandoned(role, route);
         }
         log_s3_barrier_drops(&mut logger, barrier_drops, stats)?;
     }
@@ -2988,7 +3142,9 @@ fn refuse_pending_s3_switch<H>(
 ///
 /// `outcome_error` is written exactly where the inline code wrote it,
 /// including its last-writer-wins behaviour, so an error path reports the same
-/// `detail` as before.
+/// `detail` as before. The switch-target fault sites added in the 15th rework
+/// are the exception and use `keep_first_cause`, because their whole purpose
+/// is that the cause they record survives what the sibling role does next.
 #[allow(clippy::too_many_arguments)]
 fn handle_s3_wire_event<H>(
     event: S3WireEvent,
@@ -3010,6 +3166,7 @@ fn handle_s3_wire_event<H>(
     logger: &Arc<Mutex<JsonlLogger>>,
     stats: &mut PlayoutStats,
     refused_after_run_end: &mut u64,
+    faults: &mut S3SwitchTargetFaults,
     outcome_error: &mut Option<anyhow::Error>,
 ) -> EventFlow {
     match event {
@@ -3269,11 +3426,105 @@ fn handle_s3_wire_event<H>(
                     *outcome_error = Some(error);
                 }
             }
+            // A target route of a switch that never applied, ending with
+            // anything OTHER than the sender's run-ended code, is a run
+            // failure that must survive whatever the sibling role does next
+            // (15th rework, P1). It is persisted in `faults` here and never
+            // erased; `abandon_pending`, the sibling's refusal and
+            // `recompute_s3_normal_end` cannot reach it.
+            if let Some(pending) = unapplied_switch_target(ingress, faults, role, route) {
+                // While the request is still PENDING the subscription is
+                // live, so ANY non-FIN terminal is the peer's. Once the
+                // request was abandoned the receiver itself dropped the
+                // handle and aborted the drain, so a code-less `Cancelled`
+                // may be that teardown; only a peer error CODE is a fault
+                // there.
+                let general_terminal = close_code != Some(S3_RUN_ENDED_REQUEST_ERROR_CODE)
+                    && if pending {
+                        end != TrackEnd::Fin
+                    } else {
+                        close_code.is_some()
+                    };
+                if general_terminal {
+                    if let Err(error) = logger
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("RX logger poisoned"))
+                        .and_then(|mut logger| {
+                            logger
+                                .try_log_info(&format!(
+                                    "\"event\":\"s3_switch_target_terminal_fault\",\"track\":\"{}\",{},\"t_ended\":{now},\"end\":\"{:?}\",\"error_code\":{},\"pending\":{pending}",
+                                    role.as_str(),
+                                    s3_route_fields(route),
+                                    end,
+                                    close_code
+                                        .map(|code| code.to_string())
+                                        .unwrap_or_else(|| "null".to_string()),
+                                ))
+                                .map_err(anyhow::Error::from)
+                        })
+                    {
+                        keep_first_cause(outcome_error, error);
+                    }
+                    faults.record(
+                        role,
+                        route,
+                        anyhow::anyhow!(
+                            "S3 switch target {} generation {} ended {:?} (error_code={}): {}",
+                            route.name,
+                            route.generation,
+                            end,
+                            close_code
+                                .map(|code| code.to_string())
+                                .unwrap_or_else(|| "none".to_string()),
+                            detail
+                        ),
+                    );
+                }
+                if !pending {
+                    faults.forget(role, route);
+                }
+            }
             // The relay form of a run-ended refusal: a target route of the
             // PENDING switch, accepted downstream before the upstream answer
             // was known, now ends with the sender's run-ended code. Same
             // meaning as a direct refusal, so the same non-fatal path.
             if is_pending_target_run_ended_refusal(ingress, role, route, end, close_code) {
+                // ... but ONLY when every observed terminal of this request's
+                // targets was the run-ended code. This is the same rule
+                // `classify_switch_open_failure` applies to every failed role
+                // on the direct path, so the two contracts now agree: a mix of
+                // a run-ended refusal and a general error is fatal on both.
+                let request = ingress
+                    .gate()
+                    .pending_request()
+                    .expect("a pending-target refusal has a pending request");
+                if faults.request_has_fault(request) {
+                    // The sibling's fault is promoted to the run's cause here,
+                    // so the refusal cannot bury it. If an EARLIER cause is
+                    // already recorded, first-cause-wins keeps that one and
+                    // the terminal stays in the log as its own
+                    // `s3_switch_target_terminal_fault` row.
+                    if let Some(cause) = faults.take_cause() {
+                        keep_first_cause(outcome_error, cause);
+                    }
+                    if let Err(error) = logger
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("RX logger poisoned"))
+                        .and_then(|mut logger| {
+                            logger
+                                .try_log_info(&format!(
+                                    "\"event\":\"s3_switch_refusal_not_taken\",\"track\":\"{}\",{},\"t_refused\":{now},\"error_code\":{},\"cause\":\"switch_target_terminal_fault\"",
+                                    role.as_str(),
+                                    s3_route_fields(route),
+                                    S3_RUN_ENDED_REQUEST_ERROR_CODE,
+                                ))
+                                .map_err(anyhow::Error::from)
+                        })
+                    {
+                        keep_first_cause(outcome_error, error);
+                    }
+                    return EventFlow::Continue;
+                }
                 match refuse_pending_s3_switch(
                     role,
                     route,
@@ -3285,6 +3536,7 @@ fn handle_s3_wire_event<H>(
                     logger,
                     stats,
                     refused_after_run_end,
+                    faults,
                 ) {
                     Ok(()) => {
                         recompute_s3_normal_end(ingress, current_finished, normal_end);
@@ -3372,6 +3624,7 @@ fn drain_s3_events_at_exit<H>(
     logger: &Arc<Mutex<JsonlLogger>>,
     stats: &mut PlayoutStats,
     refused_after_run_end: &mut u64,
+    faults: &mut S3SwitchTargetFaults,
     outcome_error: &mut Option<anyhow::Error>,
 ) -> ExitDrain {
     let mut drained = 0u64;
@@ -3407,6 +3660,7 @@ fn drain_s3_events_at_exit<H>(
             logger,
             stats,
             refused_after_run_end,
+            faults,
             &mut failure,
         );
         // Same terminal accounting as the shutdown flush that follows: no
@@ -3669,6 +3923,10 @@ where
     let mut window_end_us: Option<u64> = None;
     let mut switch_suppressed_after_end: u64 = 0;
     let mut switch_refused_after_run_end: u64 = 0;
+    // Terminals observed on switch targets that never applied. Persisted the
+    // moment they are seen and merged into `outcome_error` on the exit path
+    // below, so nothing on the non-fatal refusal path can erase them.
+    let mut switch_faults = S3SwitchTargetFaults::default();
     if window_duration_us.is_none() {
         logger
             .lock()
@@ -3710,14 +3968,26 @@ where
             event = event_rx.recv() => event,
             result = &mut session_run, if !session_consumed => {
                 session_consumed = true;
-                outcome_error = Some(anyhow::anyhow!("S3 session ended early: {result:?}"));
+                keep_first_cause(
+                    &mut outcome_error,
+                    anyhow::anyhow!("S3 session ended early: {result:?}"),
+                );
                 None
             }
             _ = tokio::time::sleep(wait) => None,
         };
         let now = now_us();
+        // First-cause-wins from here to the end of the iteration: the session
+        // arm above, the max-duration check and the retirement releases can
+        // all fire in the SAME iteration, and the cause that ended the run
+        // must not be replaced by a consequence of it. (The loop condition
+        // guarantees `outcome_error` was `None` at the top of the iteration,
+        // so this only orders causes WITHIN one iteration.)
         if now >= max_end_us {
-            outcome_error = Some(anyhow::anyhow!("S3 receiver max-duration reached"));
+            keep_first_cause(
+                &mut outcome_error,
+                anyhow::anyhow!("S3 receiver max-duration reached"),
+            );
             break;
         }
 
@@ -3732,7 +4002,7 @@ where
                 &logger,
                 &mut retired_drains,
             ) {
-                outcome_error = Some(error);
+                keep_first_cause(&mut outcome_error, error);
             }
         }
         if outcome_error.is_some() {
@@ -3761,6 +4031,7 @@ where
                 &logger,
                 &mut stats,
                 &mut switch_refused_after_run_end,
+                &mut switch_faults,
                 &mut outcome_error,
             ) {
                 EventFlow::Continue => {}
@@ -3802,7 +4073,16 @@ where
             controller_active_at_us = Some(now);
         }
         if let Err(error) = ingress.check_timeout(now) {
-            outcome_error = Some(anyhow::anyhow!("S3 switch timeout: {error:?}"));
+            // First-cause-wins: the effect timeout of the SAME pending switch
+            // can expire in the very iteration that recorded why its target
+            // died, and the timeout is then a consequence of that cause, not
+            // the cause. (With no earlier cause this is exactly as before —
+            // the registered timeout is what ends a switch that simply never
+            // took effect.)
+            keep_first_cause(
+                &mut outcome_error,
+                anyhow::anyhow!("S3 switch timeout: {error:?}"),
+            );
             continue;
         }
         if !forced_misses_injected
@@ -4033,6 +4313,7 @@ where
         &logger,
         &mut stats,
         &mut switch_refused_after_run_end,
+        &mut switch_faults,
         &mut outcome_error,
     );
     s3_events_drained_at_exit += pass_one.drained;
@@ -4071,8 +4352,29 @@ where
         if !drain.is_finished() {
             drain.abort();
         }
-        if tokio::time::timeout(S3_DRAIN_JOIN_BOUND, drain).await.is_err() {
-            drains_unjoined += 1;
+        // A join that COMPLETES can still carry a `JoinError`. Every task here
+        // was aborted first, so `is_cancelled()` is the NORMAL outcome and is
+        // not a fault; only a panic is, and it is recorded additively. It does
+        // not by itself change the verdict, because a panicking drain task
+        // shows up in the object accounting below (an unterminated rx object,
+        // a route residue, or a queue that never reports `Disconnected`) —
+        // that is what fails the run. `discard_s3_subscription` collapses the
+        // same distinction into "joined within the bound"; that is a stated
+        // limitation of this exit path, not an oversight.
+        match tokio::time::timeout(S3_DRAIN_JOIN_BOUND, drain).await {
+            Ok(Err(error)) if error.is_panic() => {
+                if let Err(error) = log_s3_exit_note(
+                    &logger,
+                    &format!(
+                        "\"event\":\"s3_drain_join_panic\",\"detail\":\"{}\"",
+                        json_escape(&error.to_string())
+                    ),
+                ) {
+                    keep_first_cause(&mut outcome_error, error);
+                }
+            }
+            Ok(_) => {}
+            Err(_) => drains_unjoined += 1,
         }
     }
     // Only a handle the select never consumed may be polled here; re-polling
@@ -4082,7 +4384,26 @@ where
     // outcome.
     if !session_consumed {
         session_run.abort();
-        let _ = tokio::time::timeout(S3_DRAIN_JOIN_BOUND, &mut session_run).await;
+        // The join RESULT is recorded, not discarded: a session task that has
+        // not stopped within the bound is the one case where something other
+        // than this function could still touch the transport after the
+        // shutdown row. It is additive and does NOT change the verdict — the
+        // session writes no JSONL row, so it cannot break the "exactly one
+        // terminal per rx object" invariant that `drains_unjoined` guards.
+        if tokio::time::timeout(S3_DRAIN_JOIN_BOUND, &mut session_run)
+            .await
+            .is_err()
+        {
+            if let Err(error) = log_s3_exit_note(
+                &logger,
+                &format!(
+                    "\"event\":\"s3_session_join_timeout\",\"bound_ms\":{}",
+                    S3_DRAIN_JOIN_BOUND.as_millis()
+                ),
+            ) {
+                keep_first_cause(&mut outcome_error, error);
+            }
+        }
     }
     // Every drain task has now been joined — or, for the `drains_unjoined`
     // ones that missed the bound, is still alive and still holds an
@@ -4116,6 +4437,7 @@ where
         &logger,
         &mut stats,
         &mut switch_refused_after_run_end,
+        &mut switch_faults,
         &mut outcome_error,
     );
     s3_events_drained_at_exit += pass_two.drained;
@@ -4128,6 +4450,15 @@ where
     // other case this returns nothing.
     if let Err(error) = flush_s3_barrier_drops(&mut ingress, &logger, &mut stats) {
         keep_first_cause(&mut outcome_error, error);
+    }
+    // Promote a switch-target terminal fault observed by EITHER drain pass or
+    // by the control loop. This is the merge point that makes the fault
+    // outlive `abandon_pending` and the FIN rule: `normal_end` may well be
+    // true here, but `failed` below is computed from `outcome_error`, so the
+    // run ends in error with the terminal's own cause unless a strictly
+    // earlier cause was already recorded.
+    if let Some(cause) = switch_faults.take_cause() {
+        keep_first_cause(&mut outcome_error, cause);
     }
     drop(bridge_tx);
     if let Some(mut child) = bridge_child {
@@ -8610,6 +8941,84 @@ mod s3_switch_subscribe_tests {
     /// The shutdown path records the FIRST cause and never replaces it, which
     /// is what lets every step after the loop fold its failure in instead of
     /// returning early and skipping drain pass 2 and the shutdown row.
+    /// The fault store is what makes the RELAY path obey
+    /// `classify_switch_open_failure`'s "every failed role" rule. Helper-level:
+    /// it pins the store's own contract (first cause, per-generation matching,
+    /// role symmetry) that the two control-loop cases then exercise on wire.
+    #[test]
+    fn a_faulted_target_is_matched_per_role_and_per_generation() {
+        use skew_moq::s3_controller::{S3State, TransitionCause};
+        use skew_moq::s3_switch::Routes;
+
+        let target = Routes {
+            pc: Route {
+                name: "pc-d6",
+                generation: 3,
+            },
+            haptic: Route {
+                name: "haptic-essential",
+                generation: 3,
+            },
+        };
+        let request = SwitchRequest {
+            decision_at_us: 0,
+            request_at_us: 0,
+            from: S3State::Normal,
+            to: S3State::HapticCritical,
+            cause: TransitionCause::DeadlineMissStreak,
+            target,
+            pc_changed: true,
+            haptic_changed: true,
+        };
+        let mut faults = S3SwitchTargetFaults::default();
+        assert!(!faults.request_has_fault(request));
+
+        // The HAPTIC role faults — the P1's own role assignment; the rule is
+        // symmetric, so the PC role behaves identically.
+        faults.record(
+            TrackRole::Haptic,
+            target.haptic,
+            anyhow::anyhow!("first cause"),
+        );
+        assert!(faults.request_has_fault(request));
+        // First-cause-wins inside the store as well.
+        faults.record(TrackRole::Pc, target.pc, anyhow::anyhow!("second cause"));
+        assert_eq!(
+            format!("{:#}", faults.take_cause().expect("a cause was recorded")),
+            "first cause"
+        );
+        assert!(faults.take_cause().is_none());
+        // Still faulted for the rule even after the cause was promoted.
+        assert!(faults.request_has_fault(request));
+
+        // A different generation of the SAME track name is a different route,
+        // so it can never be mistaken for this request's target.
+        let mut other = S3SwitchTargetFaults::default();
+        other.record(
+            TrackRole::Haptic,
+            Route {
+                name: "haptic-essential",
+                generation: 2,
+            },
+            anyhow::anyhow!("older generation"),
+        );
+        assert!(!other.request_has_fault(request));
+        // Neither is the same route under the other role.
+        let mut swapped = S3SwitchTargetFaults::default();
+        swapped.record(TrackRole::Pc, target.haptic, anyhow::anyhow!("wrong role"));
+        assert!(!swapped.request_has_fault(request));
+
+        // A torn-down target stays watched until its terminal arrives.
+        let mut watched = S3SwitchTargetFaults::default();
+        assert!(!watched.is_watched(TrackRole::Haptic, target.haptic));
+        watched.watch_abandoned(TrackRole::Haptic, target.haptic);
+        watched.watch_abandoned(TrackRole::Haptic, target.haptic);
+        assert!(watched.is_watched(TrackRole::Haptic, target.haptic));
+        assert!(!watched.is_watched(TrackRole::Pc, target.haptic));
+        watched.forget(TrackRole::Haptic, target.haptic);
+        assert!(!watched.is_watched(TrackRole::Haptic, target.haptic));
+    }
+
     #[test]
     fn the_first_cause_wins_on_the_shutdown_path() {
         let mut outcome_error: Option<anyhow::Error> = None;
@@ -8688,6 +9097,10 @@ mod s3_control_loop_tests {
         /// receiver's drain as `ServeError::Closed(code)` from
         /// `SubgroupsReader::next`.
         CloseError(&'static str, u64),
+        /// Close an already-open track with `ServeError::Cancel`: a terminal
+        /// with NO application code, which is what a generic teardown or a
+        /// session collapse looks like on the wire side.
+        Cancel(&'static str),
         /// Hand the runtime `n` scheduling turns so the spawned drain tasks
         /// actually read what was just published and enqueue it. This is what
         /// makes the queue ORDER deterministic.
@@ -8777,6 +9190,14 @@ mod s3_control_loop_tests {
                         .unwrap_or_else(|| panic!("close on unopened track {track}"))
                         .close(ServeError::Closed(*code))
                         .expect("close the track with an error");
+                }
+                Step::Cancel(track) => {
+                    state
+                        .open
+                        .remove(*track)
+                        .unwrap_or_else(|| panic!("cancel on unopened track {track}"))
+                        .close(ServeError::Cancel)
+                        .expect("cancel the track");
                 }
                 Step::Yield(_) | Step::Sleep(_) => {}
             }
@@ -9796,6 +10217,287 @@ mod s3_control_loop_tests {
         assert!(outcome
             .find("info", "s3_switch_refused_after_subscribe_ok")
             .is_empty());
+        let shutdown = outcome.shutdown();
+        assert_eq!(shutdown["ending"], "error");
+        assert_eq!(shutdown["s3_switch_refused_after_run_end"], 0);
+        assert_eq!(shutdown["s3_event_queue_closed"], true);
+        outcome.assert_every_rx_object_is_terminated();
+    }
+
+    /// Both target subscriptions of one switch accepted with NOTHING scripted
+    /// on them, so their terminals can be delivered later by the delayed task.
+    fn accepted_switch_targets() -> Vec<Call> {
+        vec![
+            Call {
+                track: PC_CRITICAL,
+                before: Vec::new(),
+                answer: Answer::Accept(Vec::new()),
+            },
+            Call {
+                track: HAPTIC_ESSENTIAL,
+                before: Vec::new(),
+                answer: Answer::Accept(Vec::new()),
+            },
+        ]
+    }
+
+    /// When the delayed task closes the two target tracks.
+    ///
+    /// Why a delayed step and not a scripted one: a step inside an `Answer`
+    /// runs while the control loop is blocked inside `request_s3_switch`, so
+    /// the SECOND target's drain task does not exist yet and can never enqueue
+    /// anything ahead of the loop's next poll. A delayed step runs on the
+    /// current-thread test runtime only while the loop is PARKED and both
+    /// drain tasks are alive, so closing the two tracks back-to-back (no
+    /// `Yield` between them) wakes both drains in script order, both `Ended`
+    /// events are enqueued before the loop is polled again, and the ARRIVAL
+    /// ORDER under test is exactly the script order.
+    ///
+    /// 500 ms is after the switch request (tens of ms: the epoch is armed by
+    /// the initial exact pair and the forced misses fire 20 ms after the
+    /// controller activates) and well inside the registered 2 s effect
+    /// timeout. A close that arrived before the request would panic on an
+    /// unopened track, never pass silently.
+    const TARGET_TERMINALS_AT_MS: u64 = 500;
+
+    /// (m) 15th rework, P1 — the P1 sequence in its own role assignment: the
+    /// HAPTIC target of a pending switch ends with a general error
+    /// (`Closed(0x10)`) and the PC target is then closed with the sender's
+    /// run-ended code. The run-ended close must NOT take the non-fatal path,
+    /// because not every observed terminal of this request's targets was the
+    /// run-ended code — the same rule `classify_switch_open_failure` applies
+    /// to every failed role on the direct path. The run fails and the 0x10 is
+    /// the recorded cause.
+    #[tokio::test]
+    async fn a_general_target_terminal_before_the_siblings_refusal_fails_the_run() {
+        let mut script = initial_calls(Vec::new());
+        script.extend(accepted_switch_targets());
+        let outcome = run_case_delayed(
+            "s3-loop-m",
+            Some("30"),
+            "20",
+            script,
+            vec![(
+                TARGET_TERMINALS_AT_MS,
+                vec![
+                    Step::CloseError(
+                        HAPTIC_ESSENTIAL,
+                        u64::from(RequestErrorCode::DoesNotExist),
+                    ),
+                    Step::CloseError(PC_CRITICAL, S3_RUN_ENDED_REQUEST_ERROR_CODE),
+                    Step::Fin(PC_NORMAL),
+                    Step::Fin(HAPTIC_FULL),
+                    Step::Yield(50),
+                ],
+            )],
+        )
+        .await;
+        assert_eq!(
+            outcome.calls,
+            vec![PC_NORMAL, HAPTIC_FULL, PC_CRITICAL, HAPTIC_ESSENTIAL],
+            "both targets must really have been subscribed"
+        );
+        assert_eq!(outcome.find("s3_switch", "subscribe_ok").len(), 2);
+        assert!(outcome.find("s3_switch", "apply").is_empty());
+        let error = outcome
+            .result
+            .as_ref()
+            .expect_err("a general terminal on a pending target must fail the run");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains(HAPTIC_ESSENTIAL) && text.contains("error_code=16"),
+            "the 0x10 terminal must be the recorded cause: {text}"
+        );
+        let fault = outcome.find("info", "s3_switch_target_terminal_fault");
+        assert_eq!(fault.len(), 1, "one faulted target");
+        assert_eq!(fault[0]["track"], "haptic");
+        assert_eq!(fault[0]["wire_track"], HAPTIC_ESSENTIAL);
+        assert_eq!(fault[0]["error_code"].as_u64().unwrap(), 16);
+        assert_eq!(fault[0]["pending"], true);
+        // The sibling's run-ended close was observed and REFUSED the non-fatal
+        // path, so no refusal row and no counter.
+        assert!(outcome.find("s3_switch", "refused_after_run_end").is_empty());
+        assert!(outcome
+            .find("info", "s3_switch_refused_after_subscribe_ok")
+            .is_empty());
+        let not_taken = outcome.find("info", "s3_switch_refusal_not_taken");
+        assert_eq!(not_taken.len(), 1);
+        assert_eq!(not_taken[0]["track"], "pc");
+        assert_eq!(not_taken[0]["wire_track"], PC_CRITICAL);
+        let shutdown = outcome.shutdown();
+        assert_eq!(shutdown["ending"], "error");
+        assert_eq!(
+            shutdown["detail"].as_str().expect("detail is a string"),
+            text,
+            "the shutdown row must carry the 0x10 cause, not the FIN rule"
+        );
+        assert_eq!(shutdown["s3_switch_refused_after_run_end"], 0);
+        assert_eq!(shutdown["s3_event_queue_closed"], true);
+        assert_eq!(shutdown["s3_drains_unjoined"], 0);
+        outcome.assert_every_rx_object_is_terminated();
+    }
+
+    /// (n) 15th rework, P1 — the REVERSE arrival order. The PC target's
+    /// run-ended close arrives first, so the non-fatal refusal legitimately
+    /// runs: it tears the haptic target down and abandons the request. The
+    /// haptic target's `Closed(0x10)`, already enqueued by then, arrives with
+    /// no pending request left to recognise it by. It must still fail the run
+    /// and must still name the 0x10.
+    ///
+    /// Implemented as "the refusal is recorded first": the refusal row and its
+    /// counter describe an observation that really happened (the sender did
+    /// refuse that role with that code) and the root verifier pairs every such
+    /// row with the sender's own refused row, so suppressing it afterwards
+    /// would falsify the log. The VERDICT is what the fault changes.
+    #[tokio::test]
+    async fn a_general_target_terminal_after_the_siblings_refusal_still_fails_the_run() {
+        let mut script = initial_calls(Vec::new());
+        script.extend(accepted_switch_targets());
+        let outcome = run_case_delayed(
+            "s3-loop-n",
+            Some("30"),
+            "20",
+            script,
+            vec![(
+                TARGET_TERMINALS_AT_MS,
+                vec![
+                    Step::CloseError(PC_CRITICAL, S3_RUN_ENDED_REQUEST_ERROR_CODE),
+                    Step::CloseError(
+                        HAPTIC_ESSENTIAL,
+                        u64::from(RequestErrorCode::DoesNotExist),
+                    ),
+                    Step::Fin(PC_NORMAL),
+                    Step::Fin(HAPTIC_FULL),
+                    Step::Yield(50),
+                ],
+            )],
+        )
+        .await;
+        let error = outcome
+            .result
+            .as_ref()
+            .expect_err("a general terminal after the refusal must still fail the run");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains(HAPTIC_ESSENTIAL) && text.contains("error_code=16"),
+            "the 0x10 terminal must be the recorded cause: {text}"
+        );
+        // The refusal itself really happened and is recorded as such.
+        let refused = outcome.find("s3_switch", "refused_after_run_end");
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0]["track"], "pc");
+        let torn = outcome.find("info", "s3_switch_target_torn_down");
+        assert_eq!(torn.len(), 1);
+        assert_eq!(torn[0]["wire_track"], HAPTIC_ESSENTIAL);
+        // ... and the straggling terminal of the torn-down target is still
+        // classified, with `pending` false because the gate had already
+        // forgotten the request.
+        let fault = outcome.find("info", "s3_switch_target_terminal_fault");
+        assert_eq!(fault.len(), 1);
+        assert_eq!(fault[0]["track"], "haptic");
+        assert_eq!(fault[0]["error_code"].as_u64().unwrap(), 16);
+        assert_eq!(fault[0]["pending"], false);
+        let shutdown = outcome.shutdown();
+        assert_eq!(
+            shutdown["ending"], "error",
+            "the FIN rule must not normalise a refused switch whose sibling failed"
+        );
+        assert_eq!(
+            shutdown["detail"].as_str().expect("detail is a string"),
+            text
+        );
+        assert_eq!(shutdown["s3_switch_refused_after_run_end"], 1);
+        assert_eq!(shutdown["s3_event_queue_closed"], true);
+        assert_eq!(shutdown["s3_drains_unjoined"], 0);
+        outcome.assert_every_rx_object_is_terminated();
+    }
+
+    /// (o) The non-fatal path is unchanged when EVERY observed terminal of the
+    /// request's targets is the run-ended code — including the second one,
+    /// which arrives after the request was abandoned and is therefore matched
+    /// by the watch list rather than by the gate. Case (j) covers the
+    /// one-terminal form; this is the two-terminal form.
+    #[tokio::test]
+    async fn both_target_terminals_with_the_run_ended_code_stay_non_fatal() {
+        let mut script = initial_calls(Vec::new());
+        script.extend(accepted_switch_targets());
+        let outcome = run_case_delayed(
+            "s3-loop-o",
+            Some("30"),
+            "20",
+            script,
+            vec![(
+                TARGET_TERMINALS_AT_MS,
+                vec![
+                    Step::CloseError(PC_CRITICAL, S3_RUN_ENDED_REQUEST_ERROR_CODE),
+                    Step::CloseError(HAPTIC_ESSENTIAL, S3_RUN_ENDED_REQUEST_ERROR_CODE),
+                    Step::Fin(PC_NORMAL),
+                    Step::Fin(HAPTIC_FULL),
+                    Step::Yield(50),
+                ],
+            )],
+        )
+        .await;
+        assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+        assert!(
+            outcome
+                .find("info", "s3_switch_target_terminal_fault")
+                .is_empty(),
+            "the run-ended code is never a fault"
+        );
+        assert_eq!(outcome.find("s3_switch", "refused_after_run_end").len(), 1);
+        let shutdown = outcome.shutdown();
+        assert_eq!(shutdown["ending"], "normal");
+        assert_eq!(shutdown["detail"], "rule=s3_current_routes_fin");
+        assert_eq!(shutdown["s3_switch_refused_after_run_end"], 1);
+        assert_eq!(shutdown["s3_event_queue_closed"], true);
+        outcome.assert_every_rx_object_is_terminated();
+    }
+
+    /// (p) A terminal with NO application code on a pending target — a generic
+    /// `Cancel`, i.e. a teardown or a session collapse rather than an answer
+    /// from the sender. It is faulted (the subscription was live, so the
+    /// terminal is the peer's) but, with no sibling refusal to bury it, the
+    /// run still dies exactly as before on the registered 2 s effect timeout,
+    /// and that remains the recorded first cause.
+    #[tokio::test]
+    async fn a_pending_target_cancelled_without_a_code_still_dies_on_the_effect_timeout() {
+        let mut script = initial_calls(Vec::new());
+        script.push(Call {
+            track: PC_CRITICAL,
+            before: Vec::new(),
+            answer: Answer::Accept(Vec::new()),
+        });
+        script.push(Call {
+            track: HAPTIC_ESSENTIAL,
+            before: Vec::new(),
+            answer: Answer::Accept(vec![
+                Step::Cancel(PC_CRITICAL),
+                Step::Fin(PC_NORMAL),
+                Step::Fin(HAPTIC_FULL),
+                Step::Yield(50),
+            ]),
+        });
+        let outcome = run_case("s3-loop-p", "30", "20", script).await;
+        let error = outcome
+            .result
+            .as_ref()
+            .expect_err("a code-less terminal on a pending target must stay fatal");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("S3 switch timeout"),
+            "the registered effect timeout must still be the cause: {text}"
+        );
+        let fault = outcome.find("info", "s3_switch_target_terminal_fault");
+        assert_eq!(fault.len(), 1, "the terminal is still recorded");
+        assert_eq!(fault[0]["track"], "pc");
+        assert_eq!(fault[0]["end"], "Cancelled");
+        assert!(
+            fault[0]["error_code"].is_null(),
+            "a `Cancel` carries no application code"
+        );
+        assert_eq!(fault[0]["pending"], true);
+        assert!(outcome.find("s3_switch", "refused_after_run_end").is_empty());
         let shutdown = outcome.shutdown();
         assert_eq!(shutdown["ending"], "error");
         assert_eq!(shutdown["s3_switch_refused_after_run_end"], 0);
