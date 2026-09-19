@@ -749,6 +749,26 @@ async fn abandon_children(
 /// (as soon as it is observed) so the verdict fails; its text is
 /// kept too. A registry failure while recording routes through
 /// `abandon_children` before returning.
+/// The ONE refusal every "this run has ended on the sender side" close uses.
+///
+/// Both call sites mean the same thing to the receiver — the run is over, so
+/// this subscription can never be served — and both must therefore leave the
+/// same typed code on the wire. Building it here instead of at each site is
+/// what makes that checkable: `run_ended_refusal_carries_the_registered_code`
+/// asserts the code once and both sites inherit it.
+///
+/// `ServeError::Closed` carries no reason string (the wire ReasonPhrase is
+/// moq-transport's own rendering of the code), so the diagnostic text is
+/// emitted locally here. The code, not the text, is the contract.
+pub fn run_ended_refusal(context: &str) -> moq_transport::serve::ServeError {
+    tracing::warn!(
+        context = %context,
+        code = crate::S3_RUN_ENDED_REQUEST_ERROR_CODE,
+        "S3 subscription refused: the run has already ended"
+    );
+    moq_transport::serve::ServeError::Closed(crate::S3_RUN_ENDED_REQUEST_ERROR_CODE)
+}
+
 async fn drain_children(
     tasks: &mut JoinSet<ChildOutcome>,
     publish: &moq_transport::session::PublishNamespace,
@@ -787,7 +807,18 @@ where
                 subscribed = subscribed(), if accepting => {
                     match subscribed {
                         Ok(Some(subscribed)) => {
-                            let _ = subscribed.close(moq_transport::serve::ServeError::not_found_ctx(
+                            // Reaching this drain already means the run ended:
+                            // it runs only for `LoopExit::Drained` (stop watch)
+                            // and `LoopExit::StateDropped` (namespace watch
+                            // peer gone). Every error exit goes to
+                            // `abandon_children`, which accepts nothing. So the
+                            // contract here is identical to the
+                            // `current_routes_completed` refusal, and a
+                            // SUBSCRIBE that legitimately left the receiver
+                            // just before its window end and arrived inside
+                            // this drain window must NOT abort the receiver's
+                            // run.
+                            let _ = subscribed.close(run_ended_refusal(
                                 "S3 namespace is draining after run end",
                             ));
                         }
@@ -917,17 +948,31 @@ async fn run_namespace_inner(
                     // reservation happen under the same lock, so a subscription
                     // can never consume a generation after completion, and a
                     // reserved generation counts toward "latest" until it is
-                    // activated or released. A refused subscription gets
-                    // not_found and no log row.
+                    // activated or released. A refused subscription gets no
+                    // log row; the wire code is
+                    // `S3_RUN_ENDED_REQUEST_ERROR_CODE` when the refusal is
+                    // "this run has ended" and `not_found` (0x10) for every
+                    // other refusal in this block (unsupported track name,
+                    // invalid route allocation), which stay fatal.
                     let (role, route) = {
                         let mut reg = registry
                             .lock()
                             .map_err(|_| anyhow!("S3 producer registry poisoned"))?;
                         if reg.current_routes_completed() {
                             drop(reg);
-                            let _ = subscribed.close(moq_transport::serve::ServeError::not_found_ctx(
-                                format!("S3 subscription '{name}' arrived after run completion"),
-                            ));
+                            // "The run has ended" is signalled by its OWN wire
+                            // code, not by `DoesNotExist`: 0x10 is also what an
+                            // unsupported track name, an invalid route
+                            // allocation and moq-transport's own "track not
+                            // found" produce, and those must stay fatal for the
+                            // receiver. The receiver's non-fatal path keys on
+                            // this code alone; it never keys on time, because
+                            // the sender finishes at its last slot and so can
+                            // legitimately refuse BEFORE the receiver's window
+                            // end.
+                            let _ = subscribed.close(run_ended_refusal(&format!(
+                                "S3 subscription '{name}' arrived after run completion"
+                            )));
                             continue;
                         }
                         let (role, route) = match allocator.allocate(&name) {
@@ -1073,6 +1118,43 @@ async fn run_namespace_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both sender sites that mean "this run has ended" must leave the SAME
+    /// typed code on the wire, because the receiver classifies on the code
+    /// alone. `drain_children_with`'s refusal arm needs a
+    /// `moq_transport::session::Subscribed`, which cannot be constructed
+    /// outside moq-transport, so the assertion is made on the single
+    /// constructor both arms call.
+    #[test]
+    fn run_ended_refusal_carries_the_registered_code() {
+        let refusal = run_ended_refusal("S3 namespace is draining after run end");
+        assert_eq!(
+            refusal,
+            moq_transport::serve::ServeError::Closed(crate::S3_RUN_ENDED_REQUEST_ERROR_CODE)
+        );
+        // What actually reaches REQUEST_ERROR.error_code
+        // (moq-transport subscribed.rs `request_error_code`).
+        assert_eq!(refusal.code(), crate::S3_RUN_ENDED_REQUEST_ERROR_CODE);
+        assert_eq!(refusal.code(), 0x5343);
+        // NOT DoesNotExist: the 0x10 refusals in this file are real faults.
+        assert_ne!(
+            refusal.code(),
+            u64::from(moq_transport::message::RequestErrorCode::DoesNotExist)
+        );
+        // The run-completion site builds the identical error.
+        assert_eq!(
+            run_ended_refusal("S3 subscription 'pc-d6' arrived after run completion"),
+            refusal,
+            "both run-ended sites must be indistinguishable on the wire"
+        );
+        // A wire refusal from either site stays non-retryable and typed the
+        // same way the receiver's `is_run_ended_refusal` expects.
+        assert!(matches!(
+            refusal,
+            moq_transport::serve::ServeError::Closed(code)
+                if code == crate::S3_RUN_ENDED_REQUEST_ERROR_CODE
+        ));
+    }
 
     #[tokio::test]
     async fn drain_records_peer_error_even_when_last_child_is_already_done() {

@@ -429,13 +429,18 @@ impl JsonlLogger {
         self.w.flush()
     }
 
-    /// Additive row: a controller transition decided at or after the registered
-    /// measurement window end is recorded but never requested on wire (the
-    /// sender refuses new subscriptions after run completion). The FSM trace
-    /// is preserved by the preceding `s3_controller`/`transition` row; this row
-    /// explains why no `s3_switch`/`request` follows it. `t_request` is the
-    /// instant the request would have been issued (`max(now, t_decision)`),
-    /// which is the value compared against `window_end_us`.
+    /// Additive row: a controller transition whose **request instant** falls at
+    /// or after the registered measurement window end is recorded but never
+    /// requested on wire (the sender refuses new subscriptions after run
+    /// completion). The FSM trace is preserved by the preceding
+    /// `s3_controller`/`transition` row; this row explains why no
+    /// `s3_switch`/`request` follows it.
+    ///
+    /// The compared value is `t_request = max(now, t_decision)`, NOT the
+    /// decision instant: a transition decided just before the window end but
+    /// whose request would be issued after it is suppressed as well. The row
+    /// carries both instants, so which of the two crossed the boundary is
+    /// always reconstructible from the log.
     pub fn try_log_s3_switch_suppressed_after_end(
         &mut self,
         transition: S3Transition,
@@ -460,24 +465,46 @@ impl JsonlLogger {
     }
 
     /// Additive row: one changed role of a requested switch whose SUBSCRIBE the
-    /// sender refused with REQUEST_ERROR `DoesNotExist` after run completion,
-    /// observed at or after the registered window end. The switch is torn
-    /// down and abandoned without taking effect; the run is not failed by it.
+    /// sender refused with the registered run-ended REQUEST_ERROR code.
+    /// The switch is torn down and abandoned without taking effect; the run is
+    /// not failed by it.
+    ///
+    /// One row per refused role. `t_refused` is **that role's own observation
+    /// instant**, captured inside `open_s3_subscription` at the moment the
+    /// error is seen and before any retry sleep, so two roles refused at
+    /// different times keep different `t_refused` values. `t_settled` is the
+    /// single post-`join!` instant at which the whole request was classified;
+    /// it is shared by the rows of one request and is never earlier than any
+    /// role's `t_refused`.
+    ///
+    /// `window_end_us` is reporting context only. It is `null` when the
+    /// receiver could not derive the window (no `--duration-s`, or no
+    /// measurement object observed yet), matching the `s3_window_end_us`
+    /// convention of the shutdown row. Classification NEVER depends on it: the
+    /// sender completes at its last slot, so a genuine run-ended refusal is
+    /// routinely observed before `t0 + duration`. The authority is the typed
+    /// wire code recorded in `error_code`.
     pub fn try_log_s3_switch_refused_after_run_end(
         &mut self,
         role: TrackRole,
         route: Route,
         t_refused: u64,
-        window_end_us: u64,
+        t_settled: u64,
+        window_end_us: Option<u64>,
         error_code: u64,
     ) -> Result<()> {
         validate_route(role, route)?;
-        if t_refused < window_end_us {
-            return Err(invalid("refused switch observed before the window end"));
+        if t_settled < t_refused {
+            return Err(invalid(
+                "refused switch settled before the refusal was observed",
+            ));
         }
         writeln!(
             self.w,
-            "{{\"role\":\"s3_switch\",\"event\":\"refused_after_run_end\",\"t_refused\":{t_refused},\"window_end_us\":{window_end_us},\"track\":\"{}\",{},\"error_code\":{error_code}}}",
+            "{{\"role\":\"s3_switch\",\"event\":\"refused_after_run_end\",\"t_refused\":{t_refused},\"window_end_us\":{},\"track\":\"{}\",{},\"error_code\":{error_code},\"t_settled\":{t_settled}}}",
+            window_end_us
+                .map(|end| end.to_string())
+                .unwrap_or_else(|| "null".to_string()),
             role.as_str(),
             route_fields(route),
         )?;
@@ -544,6 +571,13 @@ mod tests {
     use crate::{
         now_us, PayloadMode, Phase4TransportMeta, Representation, Topology, V5Meta, TERM_PROTOCOL_V,
     };
+
+    /// The one typed wire code the receiver accepts as "the sender's run has
+    /// already ended". Read from the shared constant so the row fixture cannot
+    /// drift away from the sender.
+    fn skew_run_ended_code() -> u64 {
+        crate::S3_RUN_ENDED_REQUEST_ERROR_CODE
+    }
 
     fn path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -864,17 +898,42 @@ mod tests {
                 TrackRole::Pc,
                 route,
                 30_050_000,
-                30_000_000,
-                0x10,
+                30_050_400,
+                Some(30_000_000),
+                skew_run_ended_code(),
             )
             .unwrap();
+            // 13th rework: the sender completes at its LAST SLOT, so a
+            // run-ended refusal observed before the window end is normal and
+            // must still be recordable. This used to be rejected.
+            log.try_log_s3_switch_refused_after_run_end(
+                TrackRole::Pc,
+                route,
+                29_999_999,
+                30_000_400,
+                Some(30_000_000),
+                skew_run_ended_code(),
+            )
+            .unwrap();
+            // Reporting context only: an underivable window end is `null`.
+            log.try_log_s3_switch_refused_after_run_end(
+                TrackRole::Pc,
+                route,
+                29_999_999,
+                30_000_400,
+                None,
+                skew_run_ended_code(),
+            )
+            .unwrap();
+            // A settle instant before the observation is malformed.
             assert_eq!(
                 log.try_log_s3_switch_refused_after_run_end(
                     TrackRole::Pc,
                     route,
-                    29_999_999,
-                    30_000_000,
-                    0x10,
+                    30_050_000,
+                    30_049_999,
+                    Some(30_000_000),
+                    skew_run_ended_code(),
                 )
                 .unwrap_err()
                 .kind(),
@@ -886,8 +945,9 @@ mod tests {
                     TrackRole::Haptic,
                     route,
                     30_050_000,
-                    30_000_000,
-                    0x10,
+                    30_050_400,
+                    Some(30_000_000),
+                    skew_run_ended_code(),
                 )
                 .unwrap_err()
                 .kind(),
@@ -916,17 +976,28 @@ mod tests {
             .expect("refused row");
         assert_eq!(refused["role"], "s3_switch");
         assert_eq!(refused["t_refused"], 30_050_000_u64);
+        assert_eq!(refused["t_settled"], 30_050_400_u64);
         assert_eq!(refused["window_end_us"], 30_000_000_u64);
         assert_eq!(refused["track"], "pc");
         assert_eq!(refused["wire_track"], "pc-d6");
         assert_eq!(refused["route_generation"], 7);
-        assert_eq!(refused["error_code"], 16);
-        // Exactly the two accepted rows were written after the meta row.
+        assert_eq!(refused["error_code"], skew_run_ended_code());
+        let refused_rows: Vec<&serde_json::Value> = rows
+            .iter()
+            .filter(|row| row["event"] == "refused_after_run_end")
+            .collect();
+        assert_eq!(refused_rows.len(), 3);
+        // Before the window end is accepted and keeps its own instants.
+        assert_eq!(refused_rows[1]["t_refused"], 29_999_999_u64);
+        assert_eq!(refused_rows[1]["window_end_us"], 30_000_000_u64);
+        // Underivable window end is `null`, never a fabricated number.
+        assert!(refused_rows[2]["window_end_us"].is_null());
+        // Exactly the four accepted rows were written after the meta row.
         assert_eq!(
             rows.iter()
                 .filter(|row| row["role"] == "s3_switch")
                 .count(),
-            2
+            4
         );
         std::fs::remove_file(path).unwrap();
     }

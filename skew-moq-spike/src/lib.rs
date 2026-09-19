@@ -44,6 +44,56 @@ pub const TERM_PROTOCOL_V: u32 = 1;
 pub const WARMUP_SEQ_FLAG: u32 = 1 << 31;
 pub const WARMUP_SEQ_MASK: u32 = WARMUP_SEQ_FLAG - 1;
 
+/// REQUEST_ERROR code the S3 sender uses for exactly one condition:
+/// **this run has ended on the sender side, so no new subscription can ever be
+/// served.**
+///
+/// Two sites produce it, and they are the same contract:
+///   * `s3_sender.rs` `run_namespace_inner` — the registry reports
+///     `current_routes_completed()`, i.e. the current routes finished
+///     producing;
+///   * `s3_sender.rs` `drain_children_with` — the namespace is draining after
+///     the run end. That drain is reached ONLY from `LoopExit::Drained` (the
+///     stop watch fired) and `LoopExit::StateDropped` (the namespace watch
+///     peer is gone); every error exit goes to `abandon_children`, which
+///     accepts no subscription at all. So reaching the drain already means the
+///     run is over.
+///
+/// It is NOT a claim that the run SUCCEEDED. The sender's own verdict and exit
+/// code decide that; this code says only that the subscription arrived too
+/// late to ever be served.
+///
+/// Why a dedicated code and not `DoesNotExist` (0x10): 0x10 is what the sender
+/// still answers for an unsupported S3 track name (`role_for_track` refusal),
+/// for an invalid route allocation, and what moq-transport's publisher raises
+/// for a plain "track not found". Those are real faults and must keep failing
+/// the run. Time cannot separate them either: the sender finishes at its last
+/// slot (measured: PC `producer_finished` ~31 ms and haptic ~8 ms *before* the
+/// receiver's window end), so a legitimate run-ended refusal is routinely
+/// observed before the receiver's `t0 + duration`. Only a typed signal is
+/// sound.
+///
+/// Wire round trip (both directions verified against the shared crate):
+///   * send — `moq-transport/src/session/subscribed.rs` `request_error_code`
+///     passes `ServeError::Closed(code)` through unchanged, so REQUEST_ERROR
+///     carries exactly this number;
+///   * receive — `moq-transport/src/session/subscriber.rs`
+///     `recv_request_error` turns any REQUEST_ERROR for an active SUBSCRIBE
+///     back into `ServeError::Closed(msg.error_code)`.
+///
+/// Value choice: 0x5343 is ASCII `"SC"` and is deliberately outside
+/// moq-transport's `RequestErrorCode` registry, which currently holds 0x0,
+/// 0x1, 0x2, 0x3, 0x4, 0x5, 0x10, 0x11, 0x12, 0x19, 0x20, 0x30 and 0x32
+/// (`moq-transport/src/message/request_error.rs`). It is therefore
+/// unambiguous: no other peer or code path in this workspace produces it.
+/// `run_ended_code_is_outside_the_request_error_registry` keeps that true.
+///
+/// The `ServeError::Closed` variant carries no reason string, so the wire
+/// ReasonPhrase becomes moq-transport's own `"closed, code=21315"`. The human
+/// text stays local (a `tracing::warn!` in `s3_sender::run_ended_refusal`) —
+/// the code, not the text, is the contract.
+pub const S3_RUN_ENDED_REQUEST_ERROR_CODE: u64 = 0x5343;
+
 pub fn warmup_seq(index: u64) -> anyhow::Result<u32> {
     let index = u32::try_from(index).context("warmup sequence exceeds u32")?;
     anyhow::ensure!(
@@ -2982,6 +3032,53 @@ fn write_batch<S: AcceptSink>(
 // These exist because the straggler and concurrent-shutdown branches were
 // previously reasoned-correct but never executed. Each test *forces* its branch
 // instead of hoping to observe it.
+
+#[cfg(test)]
+mod s3_run_ended_code_tests {
+    use super::S3_RUN_ENDED_REQUEST_ERROR_CODE;
+    use moq_transport::message::RequestErrorCode;
+
+    /// The run-ended signal only works if it can never collide with a code
+    /// moq-transport itself can produce. Every registry entry is listed by
+    /// hand so that adding one upstream fails here instead of silently
+    /// turning a real protocol error into "the run already ended".
+    #[test]
+    fn run_ended_code_is_outside_the_request_error_registry() {
+        let registry = [
+            RequestErrorCode::InternalError,
+            RequestErrorCode::Unauthorized,
+            RequestErrorCode::Timeout,
+            RequestErrorCode::NotSupported,
+            RequestErrorCode::MalformedAuthToken,
+            RequestErrorCode::ExpiredAuthToken,
+            RequestErrorCode::DoesNotExist,
+            RequestErrorCode::InvalidRange,
+            RequestErrorCode::MalformedTrack,
+            RequestErrorCode::DuplicateSubscription,
+            RequestErrorCode::Uninterested,
+            RequestErrorCode::PrefixOverlap,
+            RequestErrorCode::InvalidJoiningRequestId,
+        ];
+        let codes: Vec<u64> = registry.into_iter().map(u64::from).collect();
+        assert_eq!(
+            codes,
+            vec![0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x10, 0x11, 0x12, 0x19, 0x20, 0x30, 0x32],
+            "the registry changed; re-check the run-ended code for collisions"
+        );
+        assert!(
+            !codes.contains(&S3_RUN_ENDED_REQUEST_ERROR_CODE),
+            "run-ended code {S3_RUN_ENDED_REQUEST_ERROR_CODE:#x} collides with the registry"
+        );
+        // Pinned so the two sides of the wire cannot drift apart silently.
+        assert_eq!(S3_RUN_ENDED_REQUEST_ERROR_CODE, 0x5343);
+        // `ServeError::Closed` is the only variant that reaches the wire
+        // unchanged; anything else would be remapped to a registry code.
+        assert_eq!(
+            moq_transport::serve::ServeError::Closed(S3_RUN_ENDED_REQUEST_ERROR_CODE).code(),
+            S3_RUN_ENDED_REQUEST_ERROR_CODE
+        );
+    }
+}
 
 #[cfg(test)]
 mod accept_shutdown_tests {
