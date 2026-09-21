@@ -21,7 +21,8 @@ use moq_transport::{
     message::SubscriptionFilter,
     serve::{Track, TrackReader, TrackReaderMode, Tracks},
     session::{
-        DataPriorityMapping, PublishedNamespace, Session, SessionConfig, Subscribe, Subscriber,
+        DataPriorityMapping, PublishedNamespace, Session, SessionConfig, SessionError, Subscribe,
+        Subscriber,
     },
 };
 use std::process::Stdio;
@@ -1671,8 +1672,19 @@ fn json_escape(s: &str) -> String {
 ///
 /// What is now DETERMINISTIC:
 ///   * every non-`Cancel` terminal, at any time, in either flag state, is
-///     `Remote` — a dropped handle cannot make a track report `Size`,
-///     `Internal`, `Mode` or `Closed(code)`;
+///     `Remote`. That is the RULE, and it is deliberately unconditional; it is
+///     not a claim that our own release can never produce such a shape. The
+///     one known counter-path, raised by the 28th review and NOT reproduced:
+///     our UNSUBSCRIBE can cancel a subgroup future mid-send, and a partially
+///     sent stream dropped at FIN surfaces on the receive side as a short read
+///     whose writer stores `ServeError::Size` (`serve/subgroup.rs:643`, `Drop
+///     for SubgroupObjectWriter` with `remain != 0`). If that race is real, a
+///     `Size` caused by our own teardown is tagged `Remote` and faults the
+///     run. That is an ACCEPTED, unreproduced false-positive risk, taken on
+///     purpose: the alternative — excusing `Size` whenever a teardown is in
+///     flight — is the 16th-rework defect that silently dropped genuine remote
+///     failures. A false fault is loud and checkable; a dropped failure is
+///     neither;
 ///   * a terminal that reached the event queue BEFORE the release started is
 ///     `Remote`, because the flag is read in the same poll that observed the
 ///     error and before the event is enqueued;
@@ -1988,8 +2000,11 @@ async fn drain_s3_track(
         // peer half of this in-process state is gone" (`serve/track.rs:101`,
         // `serve/subgroup.rs:133`). Every OTHER `Serve`
         // error describes something the TRACK did — `Size`, `Internal`,
-        // `Mode`, `Closed(code)` — and dropping our handle cannot make a track
-        // produce any of them, so it is `Remote` whatever the flag says.
+        // `Mode`, `Closed(code)` — so it is `Remote` whatever the flag says.
+        // The rule is unconditional by design, not by proof of impossibility:
+        // see [`TerminalSource`] for the one unreproduced path by which our
+        // own UNSUBSCRIBE could still surface as `Size`, and why faulting on
+        // it is the accepted direction.
         //
         // That ordering is what the 16th rework got wrong: it applied the flag
         // to every `Serve` error, so an error that was already decided before
@@ -2773,6 +2788,157 @@ fn note_s3_drain_join(
 /// liveness guard and never a normal outcome.
 const S3_DRAIN_JOIN_BOUND: Duration = Duration::from_secs(1);
 
+/// How the SHUTDOWN join classifies the session task's OWN output (18th
+/// rework, P1).
+///
+/// The control loop's `select!` arm treats ANY session completion it observes
+/// as fatal. The shutdown join sees the same handle in the one case the select
+/// never got to: the session finished after the loop had already decided to
+/// end. Until this rework that case was `Ok(_) => {}` — a real
+/// `SessionError` (say the `ProtocolViolation` a second GOAWAY raises,
+/// `moq-transport` `session/mod.rs:979`) was discarded with no row and no
+/// verdict change, so the very same failure was fatal when the select consumed
+/// it and silent when shutdown did. Object accounting cannot substitute: a
+/// session that dies between objects leaves every `rx` row terminated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum S3SessionEnd {
+    /// Nothing to report. Either the task returned success, or it ended with a
+    /// GRACEFUL session close.
+    Normal,
+    /// The session really failed. A run FAULT, recorded through
+    /// `keep_first_cause` (so a strictly earlier cause still wins) plus an
+    /// additive `s3_session_error_at_shutdown` note row.
+    Fault(String),
+}
+
+/// The session task's output type as the shutdown join needs to see it.
+///
+/// `run_s3_control` is generic in that output so the LOOP is the code under
+/// test rather than a copy of it; this trait is what lets the shutdown join
+/// look INSIDE the result instead of discarding it, without giving up that
+/// parameterisation.
+trait S3SessionOutcome {
+    fn classify_session_end(&self) -> S3SessionEnd;
+}
+
+/// Production: `Session::run` returns `Result<(), SessionError>`.
+///
+/// NORMAL, exactly two shapes:
+///   * `Ok(())` — the session loop returned success;
+///   * `Err(e)` with `e.is_graceful_close()` — `moq-transport`
+///     `session/error.rs:126`. That covers a WebTransport
+///     `CLOSE_WEBTRANSPORT_SESSION` with code 0, a raw-QUIC
+///     `ApplicationClosed` with code 0 (including an HTTP/3-encoded 0), and
+///     `LocallyClosed`, reached through `Error::Session`, `Error::Read` or
+///     `Error::Write`. This is the shape a peer's clean end-of-run close takes,
+///     and the shutdown path must not turn it into a fault.
+///
+/// FAULT: every other `SessionError` — `ProtocolViolation`, `Decode`,
+/// `RoleViolation`, `Duplicate`, `Internal`, `WrongSize`, `Serve(..)`,
+/// `InvalidRequestId`, `TooManyRequests`, `InvalidPath`, `Encode`,
+/// `BoundsExceeded`, and any `WebTransport(..)` that is NOT a graceful close
+/// (a non-zero close code, a transport timeout, a reset).
+///
+/// A JoinError is NOT handled here: `is_panic()` keeps its own branch and
+/// `is_cancelled()` — our own `abort()` — stays normal, both unchanged.
+impl S3SessionOutcome for std::result::Result<(), SessionError> {
+    fn classify_session_end(&self) -> S3SessionEnd {
+        match self {
+            Ok(()) => S3SessionEnd::Normal,
+            Err(error) if error.is_graceful_close() => S3SessionEnd::Normal,
+            Err(error) => S3SessionEnd::Fault(error.to_string()),
+        }
+    }
+}
+
+/// Join the session task at shutdown and fold the outcome into the verdict.
+///
+/// Extracted from the shutdown sequence so the tests drive THIS code rather
+/// than a re-implementation of it. The caller has already checked that the
+/// loop's `select!` never consumed the handle; re-polling a consumed handle
+/// panics and would skip the rest of the shutdown sequence, including the
+/// shutdown row.
+///
+/// Four outcomes:
+///
+///   * `Ok(Err(e))` with `e.is_panic()` — a run FAULT (17th rework, P1-B).
+///     The panic happened before this point, so it goes through
+///     `keep_first_cause` and an earlier cause still wins; the additive
+///     `s3_session_join_panic` row records it. This includes a guard that
+///     panics while the aborted task's future is DROPPED, which tokio also
+///     reports as a panic.
+///   * `Ok(Ok(outcome))` — the task returned its OWN result. Classified by
+///     [`S3SessionOutcome`]: success and a graceful close are normal, any
+///     other `SessionError` is a run fault with an additive
+///     `s3_session_error_at_shutdown` row (18th rework, P1). `abort()` does
+///     NOT rewrite an already-completed task's output, so this arm really can
+///     carry a genuine session failure.
+///   * `Ok(Err(e))` otherwise — `is_cancelled()`, i.e. OUR OWN abort. Normal,
+///     unchanged: ending the session at shutdown is what this code just asked
+///     for.
+///   * the timeout — unchanged from the 16th rework: additive row, no verdict
+///     change, because the session writes no JSONL row and so cannot break the
+///     "exactly one terminal per rx object" invariant that `drains_unjoined`
+///     guards.
+async fn join_s3_session_at_shutdown<T>(
+    session_run: &mut tokio::task::JoinHandle<T>,
+    logger: &Arc<Mutex<JsonlLogger>>,
+    outcome_error: &mut Option<anyhow::Error>,
+) where
+    T: S3SessionOutcome,
+{
+    session_run.abort();
+    match tokio::time::timeout(S3_DRAIN_JOIN_BOUND, session_run).await {
+        Ok(Err(join_error)) if join_error.is_panic() => {
+            keep_first_cause(
+                outcome_error,
+                anyhow::anyhow!("S3 session task panicked: {join_error}"),
+            );
+            if let Err(error) = log_s3_exit_note(
+                logger,
+                &format!(
+                    "\"event\":\"s3_session_join_panic\",\"detail\":\"{}\"",
+                    json_escape(&join_error.to_string())
+                ),
+            ) {
+                keep_first_cause(outcome_error, error);
+            }
+        }
+        Ok(Ok(outcome)) => {
+            if let S3SessionEnd::Fault(detail) = outcome.classify_session_end() {
+                // The session failed BEFORE this row is written, so it is the
+                // earlier cause; a failing row write below can only be
+                // secondary.
+                keep_first_cause(
+                    outcome_error,
+                    anyhow::anyhow!("S3 session failed at shutdown: {detail}"),
+                );
+                if let Err(error) = log_s3_exit_note(
+                    logger,
+                    &format!(
+                        "\"event\":\"s3_session_error_at_shutdown\",\"detail\":\"{}\"",
+                        json_escape(&detail)
+                    ),
+                ) {
+                    keep_first_cause(outcome_error, error);
+                }
+            }
+        }
+        Ok(Err(_cancelled)) => {}
+        Err(_elapsed) => {
+            if let Err(error) = log_s3_exit_note(
+                logger,
+                &format!(
+                    "\"event\":\"s3_session_join_timeout\",\"bound_ms\":{}",
+                    S3_DRAIN_JOIN_BOUND.as_millis()
+                ),
+            ) {
+                keep_first_cause(outcome_error, error);
+            }
+        }
+    }
+}
+
 /// Tear down every subscription of a switch request that will not be applied.
 /// Subscriptions already inserted into `live` are removed first so the
 /// shutdown path never sees a half-applied switch.
@@ -3264,8 +3430,9 @@ impl S3SwitchTargetFaults {
 ///   * once WATCHED, the receiver has dropped the handle, so a terminal is a
 ///     fault when it cannot be that release: it carries a close CODE (our
 ///     UNSUBSCRIBE never produces one), or it is a `Failed` shape (`Size`,
-///     `Internal`, `Mode`, a malformed subgroup — none of which a dropped
-///     handle can cause), or the drain classified it before the release began
+///     `Internal`, `Mode`, a malformed subgroup — see [`TerminalSource`] for
+///     why this shape faults by rule rather than by an impossibility proof),
+///     or the drain classified it before the release began
 ///     (`TerminalSource::Remote`).
 ///
 /// So exactly ONE combination is excused, and it is the residual documented on
@@ -4062,7 +4229,11 @@ async fn run_s3_control<S, T>(
 ) -> Result<()>
 where
     S: S3SubscribeSeam,
-    T: std::fmt::Debug,
+    // `Debug` is what the loop's early-end arm reports verbatim;
+    // `S3SessionOutcome` is what the SHUTDOWN join classifies (18th rework,
+    // P1). Both are needed because the same handle can be consumed at either
+    // site.
+    T: std::fmt::Debug + S3SessionOutcome,
 {
     let mut controller = S3Controller::new(runtime.controller).map_err(anyhow::Error::msg)?;
     let gate = S3SwitchGate::new(runtime.switch)
@@ -4682,55 +4853,11 @@ where
     // at its next await point, so it is a liveness guard, never a normal
     // outcome.
     if !session_consumed {
-        session_run.abort();
-        // The INNER join result is inspected, not just the timeout (17th
-        // rework, P1-B). `timeout(..).await.is_err()` sees only "did not stop
-        // in time"; a session task that PANICKED returns `Ok(Err(JoinError))`
-        // and used to be indistinguishable from a clean stop, so the same
-        // panic was fatal when the main `select!` consumed it (the session arm
-        // above) and silent when shutdown consumed it. Three outcomes:
-        //
-        //   * `Ok(Err(e))` with `e.is_panic()` — a run FAULT. The panic
-        //     happened before this point, so it goes through `keep_first_cause`
-        //     and an earlier cause still wins; the additive note row records
-        //     it. This includes a guard that panics while the aborted task's
-        //     future is DROPPED, which tokio also reports as a panic.
-        //   * any other completion — our own abort (`is_cancelled`) or a task
-        //     that had already returned its own `Result`. Normal, unchanged:
-        //     ending the session at shutdown is what this code just asked for.
-        //   * the timeout — unchanged from the 16th rework: additive row, no
-        //     verdict change, because the session writes no JSONL row and so
-        //     cannot break the "exactly one terminal per rx object" invariant
-        //     that `drains_unjoined` guards.
-        match tokio::time::timeout(S3_DRAIN_JOIN_BOUND, &mut session_run).await {
-            Ok(Err(join_error)) if join_error.is_panic() => {
-                keep_first_cause(
-                    &mut outcome_error,
-                    anyhow::anyhow!("S3 session task panicked: {join_error}"),
-                );
-                if let Err(error) = log_s3_exit_note(
-                    &logger,
-                    &format!(
-                        "\"event\":\"s3_session_join_panic\",\"detail\":\"{}\"",
-                        json_escape(&join_error.to_string())
-                    ),
-                ) {
-                    keep_first_cause(&mut outcome_error, error);
-                }
-            }
-            Ok(_) => {}
-            Err(_elapsed) => {
-                if let Err(error) = log_s3_exit_note(
-                    &logger,
-                    &format!(
-                        "\"event\":\"s3_session_join_timeout\",\"bound_ms\":{}",
-                        S3_DRAIN_JOIN_BOUND.as_millis()
-                    ),
-                ) {
-                    keep_first_cause(&mut outcome_error, error);
-                }
-            }
-        }
+        // The whole join lives in `join_s3_session_at_shutdown` so the tests
+        // drive the real block instead of a copy of it (18th rework, P1); the
+        // classification of the session's own result, the panic branch and the
+        // timeout branch are documented there.
+        join_s3_session_at_shutdown(&mut session_run, &logger, &mut outcome_error).await;
     }
     // Every drain task has now been joined — or, for the `drains_unjoined`
     // ones that missed the bound, is still alive and still holds an
@@ -10175,9 +10302,11 @@ mod s3_control_loop_tests {
     /// How the session task ends, for the cases that exercise the
     /// `session_run` arm of the control loop's `select!`.
     ///
-    /// The production task is `session.run()`, whose output is a `Result`.
-    /// All variants share ONE output type so the loop's `T: Debug` parameter
-    /// is instantiated exactly once per case.
+    /// The production task is `session.run()`, whose output is
+    /// `Result<(), SessionError>`. All variants share that ONE output type, so
+    /// the loop's `T` parameter is instantiated exactly once per case AND with
+    /// the production type — which means the shutdown join runs the PRODUCTION
+    /// `S3SessionOutcome` impl, not a test stand-in (18th rework, P1).
     #[derive(Debug, Clone, Copy)]
     enum SessionEnding {
         /// Healthy: never ends on its own, aborted at shutdown (the default
@@ -10209,7 +10338,7 @@ mod s3_control_loop_tests {
     }
 
     impl SessionEnding {
-        fn spawn(self) -> tokio::task::JoinHandle<std::result::Result<(), String>> {
+        fn spawn(self) -> tokio::task::JoinHandle<std::result::Result<(), SessionError>> {
             tokio::spawn(async move {
                 match self {
                     SessionEnding::Never => std::future::pending().await,
@@ -10223,7 +10352,13 @@ mod s3_control_loop_tests {
                     }
                     SessionEnding::ErrorAfterMs(ms) => {
                         tokio::time::sleep(Duration::from_millis(ms)).await;
-                        Err("scripted session failure".to_string())
+                        // A REAL `SessionError`, so the loop's early-end
+                        // arm and the shutdown join both see the production
+                        // output type (18th rework, P1). The text the
+                        // pre-existing assertion below matches is unchanged.
+                        Err(SessionError::ProtocolViolation(
+                            "scripted session failure".to_string(),
+                        ))
                     }
                     SessionEnding::PanicAfterMs(ms) => {
                         tokio::time::sleep(Duration::from_millis(ms)).await;
@@ -11588,5 +11723,302 @@ mod s3_control_loop_tests {
         assert_eq!(shutdown["s3_event_queue_closed"], true);
         assert_eq!(shutdown["s3_drains_unjoined"], 0);
         outcome.assert_every_rx_object_is_terminated();
+    }
+
+    // ---- (r) 18TH-REWORK P1: the shutdown join must not discard an ABNORMAL
+    // session result. ------------------------------------------------------
+    //
+    // SCOPE OF THESE TESTS, stated plainly. They drive
+    // `join_s3_session_at_shutdown` — the REAL shutdown block, extracted so it
+    // is called, not copied — with the PRODUCTION output type
+    // `Result<(), SessionError>` and therefore the PRODUCTION
+    // `S3SessionOutcome` impl. They are helper-level and not full-loop,
+    // because the control loop's `select!` CONSUMES any session completion it
+    // can observe: a session that finishes while the loop runs always takes
+    // the "ended early" arm, so the only way to reach this join with a
+    // COMPLETED task is a completion that lands between the last select poll
+    // and the join — a window no deterministic script can hit without adding
+    // a new production seam. What the full loop still proves is the wiring:
+    // `..._ends_normally_with_a_healthy_session` (q0) shows a run that ends by
+    // the FIN rule calls this block and stays `normal`, and
+    // `a_session_task_that_panics_at_shutdown_...` (q1) shows a fault raised
+    // INSIDE this block flips that same run to `ending=error` with the fault
+    // as the shutdown `detail`. So "fault here" => "the FIN-rule run ends in
+    // error with that cause" is covered end to end.
+
+    /// A logger over a throwaway file, plus the rows it wrote.
+    fn shutdown_join_logger(name: &str) -> (Arc<Mutex<JsonlLogger>>, PathBuf) {
+        let out = test_log_path(name);
+        let logger = Arc::new(Mutex::new(
+            JsonlLogger::new(
+                &out,
+                "join-test",
+                "moq",
+                "rx",
+                None,
+                0.0,
+                0.0,
+                0.0,
+                1,
+                30,
+                90,
+                1,
+                None,
+                None,
+                Some("both"),
+                Some(TERM_PROTOCOL_V),
+                None,
+                None,
+                Some(V5Meta {
+                    payload_mode: PayloadMode::Frame,
+                    representation: Representation::Bin,
+                    topology: Topology::Relay,
+                    chunk_bytes: 178,
+                    queue_policy: None,
+                    replay: None,
+                }),
+            )
+            .unwrap(),
+        ));
+        (logger, out)
+    }
+
+    fn read_rows(out: &PathBuf) -> Vec<serde_json::Value> {
+        let text = std::fs::read_to_string(out).expect("log written");
+        std::fs::remove_file(out).ok();
+        text.lines()
+            .map(|line| {
+                serde_json::from_str(line).unwrap_or_else(|e| panic!("bad JSONL row {line}: {e}"))
+            })
+            .collect()
+    }
+
+    fn note_rows<'a>(rows: &'a [serde_json::Value], event: &str) -> Vec<&'a serde_json::Value> {
+        rows.iter()
+            .filter(|row| row["role"] == "info" && row["event"] == event)
+            .collect()
+    }
+
+    /// Run the REAL shutdown join over a session task that has ALREADY
+    /// completed with `ending`, exactly as the reviewer's recipe asks: let it
+    /// finish, confirm `is_finished()`, then run `abort -> timeout(join) ->
+    /// match`. `outcome_error` starts as `None`, which is the state a run that
+    /// ended by the normal FIN rule is in when it reaches this block.
+    async fn join_completed_session(
+        name: &str,
+        ending: std::result::Result<(), SessionError>,
+    ) -> (Option<String>, Vec<serde_json::Value>) {
+        let (logger, out) = shutdown_join_logger(name);
+        let mut session_run = tokio::spawn(async move { ending });
+        // Let the task RUN TO COMPLETION before the join. `abort()` does not
+        // rewrite a finished task's output, which is the whole point.
+        while !session_run.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let mut outcome_error: Option<anyhow::Error> = None;
+        join_s3_session_at_shutdown(&mut session_run, &logger, &mut outcome_error).await;
+        let rows = read_rows(&out);
+        (outcome_error.map(|error| format!("{error:#}")), rows)
+    }
+
+    /// A graceful close as the WebTransport capsule delivers it: code 0.
+    fn graceful_capsule_close() -> SessionError {
+        SessionError::WebTransport(web_transport::Error::Session(
+            web_transport::quinn::SessionError::WebTransportError(
+                web_transport::quinn::WebTransportError::Closed(0, "end of run".to_string()),
+            ),
+        ))
+    }
+
+    /// A graceful close as raw QUIC delivers it when WE closed.
+    fn graceful_local_close() -> SessionError {
+        SessionError::WebTransport(web_transport::Error::Session(
+            web_transport::quinn::SessionError::ConnectionError(
+                web_transport::quinn::quinn::ConnectionError::LocallyClosed,
+            ),
+        ))
+    }
+
+    /// (r) THE DEFECT. `Ok(_) => {}` swallowed `Ok(Ok(Err(session_error)))`.
+    /// The second-GOAWAY `ProtocolViolation` (`moq-transport`
+    /// `session/mod.rs:979`) is the concrete case: fatal when the loop's
+    /// `select!` consumed it, silent when shutdown did.
+    #[tokio::test]
+    async fn a_session_that_failed_before_the_shutdown_join_faults_the_run() {
+        let (error, rows) = join_completed_session(
+            "s3-join-r1",
+            Err(SessionError::ProtocolViolation(
+                "received multiple GOAWAY messages".to_string(),
+            )),
+        )
+        .await;
+        let error = error.expect("an abnormal session result must fault the run");
+        assert!(
+            error.contains("S3 session failed at shutdown"),
+            "unexpected cause: {error}"
+        );
+        assert!(
+            error.contains("received multiple GOAWAY messages"),
+            "the session's own error text must survive: {error}"
+        );
+        let notes = note_rows(&rows, "s3_session_error_at_shutdown");
+        assert_eq!(notes.len(), 1, "one additive note row: {notes:?}");
+        // The EXACT row, pinned so the root validator can register it.
+        assert_eq!(
+            *notes[0],
+            serde_json::json!({
+                "role": "info",
+                "event": "s3_session_error_at_shutdown",
+                "detail": "protocol violation: received multiple GOAWAY messages",
+            })
+        );
+        // The panic and timeout branches are untouched by this outcome.
+        assert!(note_rows(&rows, "s3_session_join_panic").is_empty());
+        assert!(note_rows(&rows, "s3_session_join_timeout").is_empty());
+    }
+
+    /// (r) THE PAIRED CONTROL. Same block, same already-finished task, a
+    /// GRACEFUL close instead — still normal, no row. Without this, "the
+    /// session error failed the run" would not be distinguishable from "any
+    /// completed session fails the run", which would break every clean
+    /// end-of-run close.
+    #[tokio::test]
+    async fn a_gracefully_closed_session_at_the_shutdown_join_stays_normal() {
+        for (name, ending) in [
+            ("s3-join-r2a", graceful_capsule_close()),
+            ("s3-join-r2b", graceful_local_close()),
+        ] {
+            assert!(
+                ending.is_graceful_close(),
+                "fixture must be graceful: {ending:?}"
+            );
+            let (error, rows) = join_completed_session(name, Err(ending)).await;
+            assert!(error.is_none(), "a graceful close must not fault: {error:?}");
+            assert!(note_rows(&rows, "s3_session_error_at_shutdown").is_empty());
+            assert!(note_rows(&rows, "s3_session_join_panic").is_empty());
+            assert!(note_rows(&rows, "s3_session_join_timeout").is_empty());
+        }
+    }
+
+    /// (r) A session task that simply returned success is normal, as before.
+    #[tokio::test]
+    async fn a_session_that_returned_ok_at_the_shutdown_join_stays_normal() {
+        let (error, rows) = join_completed_session("s3-join-r3", Ok(())).await;
+        assert!(error.is_none(), "Ok(()) must not fault: {error:?}");
+        assert!(note_rows(&rows, "s3_session_error_at_shutdown").is_empty());
+    }
+
+    /// (r) THE PRE-EXISTING NORMAL PATH, unchanged: a healthy session that is
+    /// still running is aborted here, and `is_cancelled()` is NOT a fault.
+    #[tokio::test]
+    async fn our_own_abort_of_a_live_session_stays_normal() {
+        let (logger, out) = shutdown_join_logger("s3-join-r4");
+        let mut session_run: tokio::task::JoinHandle<std::result::Result<(), SessionError>> =
+            tokio::spawn(async { std::future::pending().await });
+        let mut outcome_error: Option<anyhow::Error> = None;
+        join_s3_session_at_shutdown(&mut session_run, &logger, &mut outcome_error).await;
+        assert!(
+            outcome_error.is_none(),
+            "our own abort must stay normal: {outcome_error:?}"
+        );
+        let rows = read_rows(&out);
+        assert!(note_rows(&rows, "s3_session_error_at_shutdown").is_empty());
+        assert!(note_rows(&rows, "s3_session_join_panic").is_empty());
+        assert!(note_rows(&rows, "s3_session_join_timeout").is_empty());
+    }
+
+    /// (r) THE PANIC BRANCH, unchanged by the extraction: a task that has
+    /// already panicked still faults with the 17th-rework cause and row, and
+    /// NOT with the new one.
+    #[tokio::test]
+    async fn a_panicked_session_at_the_shutdown_join_keeps_the_17th_rework_branch() {
+        let (logger, out) = shutdown_join_logger("s3-join-r5");
+        let mut session_run: tokio::task::JoinHandle<std::result::Result<(), SessionError>> =
+            tokio::spawn(async { panic!("scripted session panic") });
+        while !session_run.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let mut outcome_error: Option<anyhow::Error> = None;
+        join_s3_session_at_shutdown(&mut session_run, &logger, &mut outcome_error).await;
+        let error = format!("{:#}", outcome_error.expect("a panic must fault the run"));
+        assert!(
+            error.contains("S3 session task panicked"),
+            "unexpected cause: {error}"
+        );
+        let rows = read_rows(&out);
+        assert_eq!(note_rows(&rows, "s3_session_join_panic").len(), 1);
+        assert!(note_rows(&rows, "s3_session_error_at_shutdown").is_empty());
+    }
+
+    /// (r) FIRST CAUSE WINS: a cause that existed before the join is not
+    /// replaced by the session fault, and the note row is still written.
+    #[tokio::test]
+    async fn an_earlier_cause_still_wins_over_the_session_fault() {
+        let (logger, out) = shutdown_join_logger("s3-join-r6");
+        let mut session_run = tokio::spawn(async {
+            std::result::Result::<(), SessionError>::Err(SessionError::ProtocolViolation(
+                "received multiple GOAWAY messages".to_string(),
+            ))
+        });
+        while !session_run.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let mut outcome_error: Option<anyhow::Error> = Some(anyhow::anyhow!("earlier cause"));
+        join_s3_session_at_shutdown(&mut session_run, &logger, &mut outcome_error).await;
+        assert_eq!(
+            format!("{:#}", outcome_error.expect("still an error")),
+            "earlier cause"
+        );
+        let rows = read_rows(&out);
+        assert_eq!(note_rows(&rows, "s3_session_error_at_shutdown").len(), 1);
+    }
+
+    /// (r) THE CLASSIFICATION TABLE on the production impl. Every non-graceful
+    /// `SessionError` faults; the graceful shapes and `Ok(())` do not.
+    #[test]
+    fn the_production_session_classification_is_exhaustive_about_graceful() {
+        use moq_transport::serve::ServeError;
+        assert_eq!(
+            std::result::Result::<(), SessionError>::Ok(()).classify_session_end(),
+            S3SessionEnd::Normal
+        );
+        for graceful in [graceful_capsule_close(), graceful_local_close()] {
+            assert_eq!(
+                std::result::Result::<(), SessionError>::Err(graceful).classify_session_end(),
+                S3SessionEnd::Normal
+            );
+        }
+        for fatal in [
+            SessionError::ProtocolViolation("x".to_string()),
+            SessionError::RoleViolation,
+            SessionError::Duplicate,
+            SessionError::Internal,
+            SessionError::WrongSize,
+            SessionError::InvalidRequestId,
+            SessionError::TooManyRequests,
+            SessionError::InvalidPath("x".to_string()),
+            SessionError::Serve(ServeError::Size),
+            // A WebTransport error that is NOT a graceful close: a non-zero
+            // application close code.
+            SessionError::WebTransport(web_transport::Error::Session(
+                web_transport::quinn::SessionError::WebTransportError(
+                    web_transport::quinn::WebTransportError::Closed(1, "boom".to_string()),
+                ),
+            )),
+            // ... and a transport-level death.
+            SessionError::WebTransport(web_transport::Error::Session(
+                web_transport::quinn::SessionError::ConnectionError(
+                    web_transport::quinn::quinn::ConnectionError::TimedOut,
+                ),
+            )),
+        ] {
+            let want = S3SessionEnd::Fault(fatal.to_string());
+            assert_eq!(
+                std::result::Result::<(), SessionError>::Err(fatal.clone())
+                    .classify_session_end(),
+                want,
+                "{fatal:?} must fault"
+            );
+        }
     }
 }
