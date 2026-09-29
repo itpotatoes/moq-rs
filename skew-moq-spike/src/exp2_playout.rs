@@ -2414,29 +2414,136 @@ pub(crate) mod tests {
         assert!(!s.is_empty());
     }
 
-    /// Truly alternating loss around the threshold: 60-event blocks with 3
-    /// then 5 PC-anchor losses.  Records the trajectory; asserts determinism
-    /// only (outcome is reported, parameters are not tuned).
+    /// Δ*(t): value after every update with `at <= t` (initial Δ_max).
+    fn delta_star_at(d: &[Exp2Decision], controller: usize, t: u64) -> u64 {
+        deltas(d)
+            .iter()
+            .filter(|u| u.controller == controller && u.at_us <= t)
+            .last()
+            .map_or(DMAX, |u| u.to_us)
+    }
+
+    /// Registration §2-1 criterion 1: while every consumed 60-completion
+    /// window keeps >= 4 misses, Δ* rises monotonically as
+    /// min(prev + s_up, Δ_max) (saturation allowed), never re-fires before 60
+    /// new completions, and never exceeds Δ_max.
     #[test]
-    fn exp2_stability_record_alternating_3_and_5_per_60_blocks() {
+    fn exp2_stability_criterion1_sustained_miss_monotone_rise() {
+        let l = ledger(1200);
+        // low delay until event 300 (Δ* decreases to D_min), then a sustained
+        // 5-per-60 PC-anchor loss to the end of the run
+        let trace = loss_trace(&l, |i| i >= 300 && i % 12 == 5);
+        for mode in [Exp2Mode::P0, Exp2Mode::P0Np] {
+            let r = run(mode, params(), &l, &trace);
+            let onset = T0 + l.pc_pts_us[300];
+            let us: Vec<DeltaUpdateRecord> = deltas(&r.decisions)
+                .into_iter()
+                .filter(|u| u.controller == 0 && u.at_us > onset)
+                .collect();
+            assert!(us.len() >= 10, "{mode:?}: steps keep firing");
+            let start = delta_star_at(&r.decisions, 0, onset);
+            assert_eq!(start, 100_000, "Δ* had decreased before the loss");
+            let mut prev = start;
+            for u in &us {
+                assert_eq!(u.cause, DeltaCause::MissStep, "{mode:?}: only miss steps while loss persists");
+                assert!(u.window_misses.unwrap() >= 4);
+                assert_eq!(u.from_us, prev, "monotone chain, no other change in between");
+                assert_eq!(u.to_us, (prev + 50_000).min(DMAX));
+                assert!(u.to_us <= DMAX);
+                prev = u.to_us;
+            }
+            assert_eq!(prev, DMAX, "saturation at Δ_max reached (allowed)");
+            let comps = pair_consumptions(&r.decisions);
+            let steps = step_times(&r.decisions, 0);
+            for w in steps.windows(2) {
+                let n = comps.iter().filter(|&&t| t > w[0] && t <= w[1]).count();
+                assert!(n >= 60, "re-fired after {n} completions");
+            }
+            eprintln!(
+                "[criterion 1] {mode:?}: {} miss steps after onset, Δ* 100000 -> {:?}, min completions between steps = {:?}",
+                us.len(),
+                us.iter().map(|u| u.to_us).take(7).collect::<Vec<_>>(),
+                steps.windows(2).map(|w| comps.iter().filter(|&&t| t > w[0] && t <= w[1]).count()).min()
+            );
+        }
+    }
+
+    /// Registration §2-1 criterion 2: once triggering windows stop and Q
+    /// targets stay low, the first Δ* decrease starts within W + T_dec + U
+    /// of the last triggering step; Δ_eff then returns to the low target
+    /// (compression: at most ⌈(Δ_max − D_min)/⌊interval/10⌋⌉ = 74 events).
+    #[test]
+    fn exp2_stability_criterion2_recovery_bound() {
+        let l = ledger(1200);
+        let p = params();
+        let bound = p.window_us + p.t_dec_us + p.update_period_us;
+        let trace = loss_trace(&l, |i| (300..700).contains(&i) && i % 12 == 5);
+        for mode in [Exp2Mode::P0, Exp2Mode::P0Np] {
+            let r = run(mode, p, &l, &trace);
+            let t_last = *step_times(&r.decisions, 0).last().expect("steps fired");
+            let first_dec = deltas(&r.decisions)
+                .into_iter()
+                .find(|u| u.controller == 0 && u.at_us > t_last && u.cause == DeltaCause::QDecrease)
+                .expect("Δ* decreases after the loss");
+            let lag = first_dec.at_us - t_last;
+            assert!(lag <= bound, "{mode:?}: first decrease {lag} µs after last step > {bound}");
+            assert!(!deltas(&r.decisions).iter().any(|u| u.controller == 0
+                && u.at_us > first_dec.at_us && u.cause != DeltaCause::QDecrease), "no re-rise");
+            let target = first_dec.to_us;
+            assert_eq!(target, 100_000);
+            let cs = commits(&r.decisions);
+            let reach = cs
+                .iter()
+                .find(|c| c.at_us > first_dec.at_us && c.pc.delta_eff_us == target)
+                .expect("Δ_eff returns to the low target");
+            let compressing = cs
+                .iter()
+                .filter(|c| c.at_us > first_dec.at_us && c.at_us <= reach.at_us && c.compression_us[0] > 0)
+                .count();
+            assert!(compressing <= 74, "{compressing} compression events");
+            assert!(cs.iter().skip(reach.event as usize).all(|c| c.pc.delta_eff_us == target), "stays there");
+            eprintln!(
+                "[criterion 2] {mode:?}: last step t0+{} µs; first decrease after {lag} µs (bound {bound}); Δ* {} -> {target}; \
+                 Δ_eff reached {target} {} µs after the decrease ({compressing} compression events, event {})",
+                t_last - T0, first_dec.from_us, reach.at_us - first_dec.at_us, reach.event
+            );
+        }
+    }
+
+    /// Registration §2-1 criterion 3: exact 3/60 · 5/60 alternating trace
+    /// (60-event blocks) — steady-state Δ* amplitude <= s_up and zero net
+    /// drift over each 120-event period.
+    #[test]
+    fn exp2_stability_criterion3_alternating_3_and_5_per_60() {
         let l = ledger(1200);
         let lost = |i: u32| {
             let (block, pos) = (i / 60, i % 60);
             let k = if block % 2 == 0 { 3 } else { 5 };
             pos % 12 == 5 && pos / 12 < k
         };
-        let a = run(Exp2Mode::P0, params(), &l, &loss_trace(&l, lost));
-        let b = run(Exp2Mode::P0, params(), &l, &loss_trace(&l, lost));
-        assert_eq!(a.decisions, b.decisions);
-        let traj: Vec<(u64, &str, u64)> = deltas(&a.decisions)
-            .iter()
-            .map(|u| ((u.at_us - T0) / 1000, u.cause.as_str(), u.to_us))
-            .collect();
-        let at_max = commits(&a.decisions).iter().filter(|c| c.pc.delta_eff_us == DMAX).count();
-        eprintln!(
-            "[record] alternating 3/60,5/60 blocks: {} miss steps; events committed at Δ_max = {at_max}/1200; Δ* trajectory (ms, cause, µs) = {traj:?}",
-            step_times(&a.decisions, 0).len()
-        );
+        for mode in [Exp2Mode::P0, Exp2Mode::P0Np] {
+            let a = run(mode, params(), &l, &loss_trace(&l, lost));
+            let b = run(mode, params(), &l, &loss_trace(&l, lost));
+            assert_eq!(a.decisions, b.decisions);
+            // steady state: from the second period (event 240, t0 + 8 s) on
+            let ss = T0 + l.pc_pts_us[240];
+            let mut vals = vec![delta_star_at(&a.decisions, 0, ss)];
+            vals.extend(deltas(&a.decisions).iter().filter(|u| u.controller == 0 && u.at_us > ss).map(|u| u.to_us));
+            let amp = vals.iter().max().unwrap() - vals.iter().min().unwrap();
+            assert!(amp <= 50_000, "{mode:?}: steady-state amplitude {amp} µs > s_up");
+            let at_period: Vec<u64> = (2..10u32)
+                .map(|k| delta_star_at(&a.decisions, 0, T0 + l.pc_pts_us[(120 * k) as usize]))
+                .collect();
+            assert!(at_period.windows(2).all(|w| w[0] == w[1]), "{mode:?}: net drift per 120-event period {at_period:?}");
+            let traj: Vec<(u64, &str, u64)> = deltas(&a.decisions)
+                .iter()
+                .filter(|u| u.controller == 0)
+                .map(|u| ((u.at_us - T0) / 1000, u.cause.as_str(), u.to_us))
+                .collect();
+            eprintln!(
+                "[criterion 3] {mode:?}: steady-state amplitude {amp} µs; Δ* at period boundaries {at_period:?}; trajectory (ms, cause, µs) = {traj:?}"
+            );
+        }
     }
 
     #[test]
