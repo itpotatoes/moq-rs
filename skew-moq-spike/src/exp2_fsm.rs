@@ -102,19 +102,21 @@ pub struct FsmObservation {
 }
 
 impl FsmObservation {
-    pub fn from_pair(rec: &PairCompleteRecord) -> Self {
-        // [INTERPRETATION] P0 has one shared Δ_eff; if the two ever differed
-        // (impossible in P0) the smaller is used, so "all = Δ_max" is strict.
+    /// P0 shares one Δ_eff, so both modalities' committed values must exist
+    /// and be equal.  A mismatch or a missing value is an integrity error
+    /// (never silently reconciled).
+    pub fn from_pair(rec: &PairCompleteRecord) -> Result<Self, &'static str> {
         let d = match rec.delta_eff_us {
-            [Some(a), Some(b)] => Some(a.min(b)),
-            _ => None,
+            [Some(a), Some(b)] if a == b => a,
+            [Some(_), Some(_)] => return Err("P0 shared-Δ invariant violated: Δ_eff differs by modality"),
+            _ => return Err("P0 pair result without a committed Δ_eff"),
         };
-        Self {
+        Ok(Self {
             event: rec.event,
             at_us: rec.at_us,
             pair_miss: rec.pair_miss(),
-            delta_eff_us: d,
-        }
+            delta_eff_us: Some(d),
+        })
     }
 }
 
@@ -356,7 +358,7 @@ impl Exp2P1 {
         let mut requests = Vec::new();
         for d in &decisions {
             if let Exp2Decision::PairComplete(p) = d {
-                if let Some(r) = self.fsm.observe(FsmObservation::from_pair(p))? {
+                if let Some(r) = self.fsm.observe(FsmObservation::from_pair(p)?)? {
                     requests.push(r);
                 }
             }
@@ -526,6 +528,24 @@ mod tests {
     }
 
     #[test]
+    fn exp2_fsm_from_pair_enforces_shared_delta() {
+        let rec = |a: Option<u64>, b: Option<u64>| PairCompleteRecord {
+            event: 0,
+            event_id: 1,
+            at_us: T0,
+            completed_at_us: T0,
+            pc_miss: true,
+            haptic_miss: false,
+            delta_eff_us: [a, b],
+        };
+        let ok = FsmObservation::from_pair(&rec(Some(DMAX), Some(DMAX))).unwrap();
+        assert_eq!((ok.delta_eff_us, ok.pair_miss), (Some(DMAX), true));
+        assert!(FsmObservation::from_pair(&rec(Some(DMAX), Some(DMAX - 1))).is_err());
+        assert!(FsmObservation::from_pair(&rec(Some(DMAX), None)).is_err());
+        assert!(FsmObservation::from_pair(&rec(None, None)).is_err());
+    }
+
+    #[test]
     fn exp2_fsm_rejects_out_of_order_results() {
         let mut f = fsm();
         f.observe(FsmObservation { event: 0, at_us: T0, pair_miss: false, delta_eff_us: Some(DMAX) })
@@ -670,7 +690,7 @@ mod tests {
         let mut max_sat_misses = 0;
         for x in &d {
             if let Exp2Decision::PairComplete(p) = x {
-                f.observe(FsmObservation::from_pair(p)).unwrap();
+                f.observe(FsmObservation::from_pair(p).unwrap()).unwrap();
                 let s = f.snapshot();
                 if s.window_saturated {
                     max_sat_misses = max_sat_misses.max(s.window_misses);

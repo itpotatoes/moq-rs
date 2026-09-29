@@ -411,6 +411,19 @@ pub struct DiagnosticRecord {
     pub at_us: u64,
 }
 
+/// Wire delivery-timeout notification.  **Not a terminal decision**: the
+/// object may still arrive and be released.  The contract precedence
+/// (released > receiver drop > delivery_timeout > pending_at_horizon >
+/// no_object) is resolved only in `finalize`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryTimeoutObservedRecord {
+    pub modality: Modality,
+    pub index: u32,
+    pub at_us: u64,
+    /// `None` if observed before `ref(i)` commit.
+    pub committed: Option<CommittedDue>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Exp2Decision {
     Commit(CommitRecord),
@@ -419,6 +432,7 @@ pub enum Exp2Decision {
     Miss(MissRecord),
     PairComplete(PairCompleteRecord),
     DeltaUpdate(DeltaUpdateRecord),
+    DeliveryTimeoutObserved(DeliveryTimeoutObservedRecord),
     Diagnostic(DiagnosticRecord),
 }
 
@@ -431,8 +445,17 @@ impl Exp2Decision {
             Self::Miss(r) => r.at_us,
             Self::PairComplete(r) => r.at_us,
             Self::DeltaUpdate(r) => r.at_us,
+            Self::DeliveryTimeoutObserved(r) => r.at_us,
             Self::Diagnostic(r) => r.at_us,
         }
+    }
+
+    /// Terminal decisions: exactly one per opportunity over a run, together
+    /// with the `pending_at_horizon` / `no_object` states sealed by `finalize`.
+    /// `Miss` (controller timeout at c) and `DeliveryTimeoutObserved` are not
+    /// scheduler terminals; a late arrival after a `Miss` yields `Drop(late)`.
+    pub fn is_scheduler_terminal(&self) -> bool {
+        matches!(self, Self::Release(_) | Self::Drop(_))
     }
 }
 
@@ -805,12 +828,13 @@ impl Exp2Playout {
 
     /// The wire reported that `(m, index)` hit its delivery timeout.
     ///
-    /// [INTERPRETATION] label only: it does not create an early controller
-    /// terminal (spec §4 terminal = receiver release/drop, or `c`), so the
-    /// controller dynamics do not depend on wire notification timing.  It
-    /// becomes the scheduler terminal `dropped(delivery_timeout)` only if the
-    /// object is never released or receiver-dropped.  Ignored (diagnostic) if
-    /// the object already arrived.
+    /// [INTERPRETATION] label only: it emits the non-terminal
+    /// `DeliveryTimeoutObserved` and creates no controller terminal (spec §4
+    /// terminal = receiver release/drop, or `c`), so the controller dynamics
+    /// do not depend on wire notification timing.  It becomes the scheduler
+    /// terminal `dropped(delivery_timeout)` at `finalize` only if the object is
+    /// never released or receiver-dropped.  Ignored (diagnostic) if the object
+    /// already arrived or a timeout was already observed.
     pub fn delivery_timeout(
         &mut self,
         m: Modality,
@@ -832,14 +856,14 @@ impl Exp2Playout {
             return Ok(out);
         }
         slot.wire_timeout_us = Some(t_us);
-        out.push(Exp2Decision::Drop(DropRecord {
-            modality: m,
-            index,
-            at_us: t_us,
-            t_recv_us: None,
-            reason: DropReason::DeliveryTimeout,
-            committed: slot.committed,
-        }));
+        out.push(Exp2Decision::DeliveryTimeoutObserved(
+            DeliveryTimeoutObservedRecord {
+                modality: m,
+                index,
+                at_us: t_us,
+                committed: slot.committed,
+            },
+        ));
         Ok(out)
     }
 
@@ -2248,9 +2272,43 @@ pub(crate) mod tests {
         assert_eq!(base.ledger.pc[5].terminal, SchedulerTerminal::NoObject);
         // controller-visible stream unchanged (miss still at c)
         let strip = |d: &[Exp2Decision]| -> Vec<Exp2Decision> {
-            d.iter().filter(|x| !matches!(x, Exp2Decision::Drop(r) if r.reason == DropReason::DeliveryTimeout)).cloned().collect()
+            d.iter().filter(|x| !matches!(x, Exp2Decision::DeliveryTimeoutObserved(_))).cloned().collect()
         };
         assert_eq!(strip(&dec), strip(&base.decisions));
+        assert!(!dec.iter().any(|x| matches!(x, Exp2Decision::Drop(r) if r.reason == DropReason::DeliveryTimeout)),
+            "delivery timeout never appears as a Drop decision");
+    }
+
+    /// Regression (Codex 83): a wire timeout followed by a real arrival must
+    /// yield exactly one terminal (Release) plus one observed-timeout label.
+    #[test]
+    fn exp2_delivery_timeout_then_arrival_has_single_terminal() {
+        let l = ledger(30);
+        for mode in [Exp2Mode::P0, Exp2Mode::P0Np, Exp2Mode::S3npaPrime] {
+            let mut core = Exp2Playout::new(mode, params(), l.clone()).unwrap();
+            let r5 = T0 + l.pc_pts_us[5];
+            let mut dec = Vec::new();
+            dec.extend(core.delivery_timeout(Modality::Pc, 5, r5 + 50_000).unwrap());
+            dec.extend(core.arrive(Modality::Pc, 5, r5 + 100_000).unwrap());
+            let due5 = core.committed(Modality::Pc, 5).unwrap().due_us;
+            dec.extend(core.advance_to(due5).unwrap());
+            let mine: Vec<&Exp2Decision> = dec
+                .iter()
+                .filter(|x| match x {
+                    Exp2Decision::Release(r) => r.modality == Modality::Pc && r.index == 5,
+                    Exp2Decision::Drop(r) => r.modality == Modality::Pc && r.index == 5,
+                    Exp2Decision::Miss(r) => r.modality == Modality::Pc && r.index == 5,
+                    Exp2Decision::DeliveryTimeoutObserved(r) => r.modality == Modality::Pc && r.index == 5,
+                    _ => false,
+                })
+                .collect();
+            assert_eq!(mine.len(), 2, "{mode:?}: {mine:?}");
+            assert!(matches!(mine[0], Exp2Decision::DeliveryTimeoutObserved(o) if o.at_us == r5 + 50_000));
+            assert!(matches!(mine[1], Exp2Decision::Release(r) if r.t_release_us == due5 && !r.grace));
+            assert_eq!(mine.iter().filter(|x| x.is_scheduler_terminal()).count(), 1);
+            let (_, sealed) = core.finalize(horizon(&l)).unwrap();
+            assert_eq!(sealed.pc[5].terminal, SchedulerTerminal::Released { t_release_us: due5, grace: false });
+        }
     }
 
     // ------------------------------------------------ §3 stability assertions
