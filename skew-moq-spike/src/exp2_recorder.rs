@@ -1,5 +1,5 @@
 //! Experiment-2 WP3 recorder: the receiver-side producer of the L1-R output
-//! ledger (contract `md/20260929_실험2_계약.md`, exp2-contract-v3).
+//! ledger (contract `md/20260929_실험2_계약.md`, exp2-contract-v4 (§9, §10)).
 //!
 //! The recorder owns the run's exp2 JSONL file and, for the core methods, the
 //! WP1 core (`Exp2Playout` for S3NPA'/P0-NP/P0, `Exp2P1` for P1).  B1 and S1
