@@ -57,6 +57,8 @@ pub const ROUTE_COPY_DISCARD: &str = "route_copy_discard";
 /// discarded by the P1 switch gate on every route (never admitted) is a
 /// terminal drop with this reason (P1's switching cost), not `no_object`.
 pub const SWITCH_BARRIER: &str = "switch_barrier";
+/// Contract v4 §9 `wire` counter kind (sender/relay delivery timeouts).
+pub const WIRE_COUNTER_KIND: &str = "delivery_timeout_counter";
 /// S1 slot that was admitted but neither released nor dropped by H and whose
 /// due is not after H (or unknown): none of the contract §4 states applies, so
 /// it is an explicit discard with this reason (WP3 interpretation, reported).
@@ -1591,8 +1593,26 @@ impl<W: Write> Exp2Recorder<W> {
         }
     }
 
-    /// Called by the S1 scheduler task at its first wake with `now >= H`,
-    /// before it dispatches anything at that wake.
+    /// When the S1 scheduler task seals: `H + PLAIN_SEAL_EXECUTION_DELAY_US`
+    /// (Codex 85), the same execution delay as B1, so an object stamped
+    /// `t_recv <= H` that reaches the recorder just after H is still admitted
+    /// before the seal. S1 actions with `at_us > H` stay suppressed.
+    pub fn s1_seal_at_us(&self) -> u64 {
+        self.h + PLAIN_SEAL_EXECUTION_DELAY_US
+    }
+
+    /// Called by the S1 scheduler task (which owns every admitted object's
+    /// due) at each wake, before it dispatches anything; seals once
+    /// `now >= s1_seal_at_us()`.  Returns whether this call sealed.
+    pub fn seal_s1_if_due(&mut self, now_us: u64, deadline: &dyn Fn(u64) -> Option<u64>) -> Result<bool> {
+        if self.sealed || self.ended || now_us < self.s1_seal_at_us() {
+            return Ok(false);
+        }
+        self.seal_s1(deadline)?;
+        Ok(true)
+    }
+
+    /// Seal unconditionally (tests and `seal_s1_if_due`).
     pub fn seal_s1(&mut self, deadline: &dyn Fn(u64) -> Option<u64>) -> Result<()> {
         if self.sealed || self.ended {
             return Ok(());
@@ -1639,35 +1659,47 @@ impl<W: Write> Exp2Recorder<W> {
     }
 
     /// Import a sender/relay cumulative timeout counter sample (contract v4
-    /// §9 `wire` row, `source` "sender" | "relay") into this run's JSONL.
-    /// `t_us` is this write; the producer's own sample time is kept as
-    /// `t_sample_us`.
-    pub fn import_wire_counter(&mut self, sample: &Map<String, Value>, imported_from: &str) -> Result<()> {
+    /// §9 `wire` row) into this run's JSONL. The sample must be exactly a
+    /// counter row: role `wire`, source `sender` | `relay`, kind
+    /// `delivery_timeout_counter`, this run's `run_id`, an integer
+    /// `delivery_timeout_count` (Codex 85). A malformed sample is NOT
+    /// imported: an `integrity_warning` names it and the counter stays absent
+    /// (analyzer: null). `t_us` is this write; the producer's sample time is
+    /// kept as `t_sample_us`. Returns whether the sample was imported.
+    pub fn import_wire_counter(&mut self, sample: &Map<String, Value>, imported_from: &str) -> Result<bool> {
         let source = sample.get("source").and_then(Value::as_str).unwrap_or_default();
-        ensure!(matches!(source, "sender" | "relay"), "wire counter source {source:?}");
-        ensure!(
-            sample.get("role").and_then(Value::as_str) == Some("wire"),
-            "wire counter sample must have role wire"
-        );
-        ensure!(
-            sample.get("run_id").and_then(Value::as_str) == Some(self.run_id.as_str()),
-            "wire counter sample of another run"
-        );
-        let count = sample
-            .get("delivery_timeout_count")
-            .and_then(Value::as_u64)
-            .context("delivery_timeout_count must be a non-negative integer")?;
+        let count = sample.get("delivery_timeout_count").and_then(Value::as_u64);
+        let problem = if sample.get("role").and_then(Value::as_str) != Some("wire") {
+            Some("role is not wire")
+        } else if !matches!(source, "sender" | "relay") {
+            Some("source is not sender or relay")
+        } else if sample.get("kind").and_then(Value::as_str) != Some(WIRE_COUNTER_KIND) {
+            Some("kind is not delivery_timeout_counter")
+        } else if sample.get("run_id").and_then(Value::as_str) != Some(self.run_id.as_str()) {
+            Some("run_id differs from this run")
+        } else if count.is_none() {
+            Some("delivery_timeout_count is not a non-negative integer")
+        } else {
+            None
+        };
+        if let Some(problem) = problem {
+            self.warn(
+                "wire_counter_malformed",
+                json!({"imported_from": imported_from, "problem": problem}),
+            )?;
+            return Ok(false);
+        }
         let mut row = Map::new();
         for (key, value) in sample {
             if !matches!(key.as_str(), "run_id" | "t_us") {
                 row.insert(key.clone(), value.clone());
             }
         }
-        row.insert("delivery_timeout_count".into(), json!(count));
         row.insert("t_sample_us".into(), sample.get("t_us").cloned().unwrap_or(Value::Null));
         row.insert("t_us".into(), json!((self.clock)()));
         row.insert("imported_from".into(), json!(imported_from));
-        self.write_value(row, false)
+        self.write_value(row, false)?;
+        Ok(true)
     }
 
     /// `tier_switch` row: a requested switch took effect (make-before-break
@@ -1765,21 +1797,65 @@ impl<W: Write> Exp2Recorder<W> {
 // Contract v4 §9: sender-side delivery-timeout counter (`wire`, source sender)
 // --------------------------------------------------------------------------
 
+/// Contract v4 §9 measurement-scope rule for delivery-timeout counts
+/// (Codex 85): an expiry counts iff the expired object belongs to the 40 s
+/// measurement, i.e. it was CREATED at or after t0. Warm-up objects are all
+/// generated before t0 (the registered warm-up window is [t0 − 3 s, t0)), so
+/// a warm-up object that times out after t0 (e.g. created t0 − 30 ms,
+/// expiring t0 + 315 ms) is excluded. The rule is about the object, never
+/// about when the timeout fired.
+///
+/// At the SENDER the hop's `received_at` is the object's creation instant,
+/// so this predicate is exact. At a RELAY `received_at` is the relay's
+/// receipt, which can be after t0 for a backlogged warm-up object: the WP4
+/// relay aggregation must decide scope by the object identity instead
+/// (warm-up seq flag bit 31 of the sender's object, joined through the relay
+/// trace's group/object identity), with the same "warm-up objects never
+/// count" outcome.
+pub fn delivery_timeout_in_measurement_scope(object_created_us: u64, t0_us: u64) -> bool {
+    object_created_us >= t0_us
+}
+
 /// Counts DELIVERY_TIMEOUT expiries at this process's forwarding hop through
 /// moq-transport's object-boundary hook (`ForwardTimeout` is emitted on both
 /// timeout paths of `Subscribed::serve_subgroup*`: the stream that never
 /// opened and the stream reset mid-object). Lock-free, allocation-free.
-#[derive(Debug, Default)]
+/// Nothing is counted until t0 is known (`set_t0`); expiries of objects
+/// created before t0 (warm-up) are counted separately as excluded.
+#[derive(Debug)]
 pub struct DeliveryTimeoutCounter {
+    t0_us: std::sync::atomic::AtomicU64,
     pc: std::sync::atomic::AtomicU64,
     haptic: std::sync::atomic::AtomicU64,
     other: std::sync::atomic::AtomicU64,
+    excluded_warmup: std::sync::atomic::AtomicU64,
+}
+
+impl Default for DeliveryTimeoutCounter {
+    fn default() -> Self {
+        Self {
+            t0_us: std::sync::atomic::AtomicU64::new(u64::MAX),
+            pc: Default::default(),
+            haptic: Default::default(),
+            other: Default::default(),
+            excluded_warmup: Default::default(),
+        }
+    }
 }
 
 impl DeliveryTimeoutCounter {
-    /// Count one expiry on a wire track (`pc*` / `haptic*` route names).
-    pub fn note(&self, track_name: &[u8]) {
-        use std::sync::atomic::Ordering::Relaxed;
+    pub fn set_t0(&self, t0_us: u64) {
+        self.t0_us.store(t0_us, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Count one expiry of an object created at `created_us` on a wire track
+    /// (`pc*` / `haptic*` route names), subject to the measurement scope.
+    pub fn note(&self, track_name: &[u8], created_us: u64) {
+        use std::sync::atomic::Ordering::{Acquire, Relaxed};
+        if !delivery_timeout_in_measurement_scope(created_us, self.t0_us.load(Acquire)) {
+            self.excluded_warmup.fetch_add(1, Relaxed);
+            return;
+        }
         if track_name.starts_with(b"pc") {
             self.pc.fetch_add(1, Relaxed);
         } else if track_name.starts_with(b"haptic") {
@@ -1789,11 +1865,16 @@ impl DeliveryTimeoutCounter {
         }
     }
 
-    /// `(total, pc, haptic, other)`.
+    /// `(total, pc, haptic, other)` of in-scope expiries.
     pub fn snapshot(&self) -> (u64, u64, u64, u64) {
         use std::sync::atomic::Ordering::Relaxed;
         let (pc, haptic, other) = (self.pc.load(Relaxed), self.haptic.load(Relaxed), self.other.load(Relaxed));
         (pc + haptic + other, pc, haptic, other)
+    }
+
+    /// Expiries of objects created before t0 (warm-up), not counted.
+    pub fn excluded_warmup(&self) -> u64 {
+        self.excluded_warmup.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -1807,10 +1888,15 @@ impl moq_transport::object_trace::Observer for DeliveryTimeoutCounter {
         boundary: moq_transport::object_trace::Boundary,
         object: &std::sync::Arc<moq_transport::serve::SubgroupObject>,
         _track_alias: u64,
-        _timestamp_us: u64,
+        timestamp_us: u64,
     ) {
         if boundary == moq_transport::object_trace::Boundary::ForwardTimeout {
-            self.note(object.group.track.name.as_bytes());
+            // The object's creation instant on this host's monotonic µs
+            // clock: the observation time minus the object's age.
+            let age_us = tokio::time::Instant::now()
+                .saturating_duration_since(object.received_at)
+                .as_micros() as u64;
+            self.note(object.group.track.name.as_bytes(), timestamp_us.saturating_sub(age_us));
         }
     }
 }
@@ -1841,6 +1927,13 @@ impl SenderWireSidecar {
         Ok(Self { file: std::sync::Mutex::new(file), run_id: run_id.to_string(), counter })
     }
 
+    /// Start the measurement scope (objects created at or after t0 count).
+    pub fn set_t0(&self, t0_us: u64) {
+        if let Some(counter) = &self.counter {
+            counter.set_t0(t0_us);
+        }
+    }
+
     /// One cumulative sample, labelled with when it was taken
     /// (`t0` / `horizon` / `shutdown`).
     pub fn sample(&self, at: &str, t_us: u64) -> Result<()> {
@@ -1850,11 +1943,13 @@ impl SenderWireSidecar {
             .map(|c| c.snapshot())
             .unwrap_or((0, 0, 0, 0));
         let row = json!({
-            "role": "wire", "source": "sender", "kind": "delivery_timeout_counter",
+            "role": "wire", "source": "sender", "kind": WIRE_COUNTER_KIND,
             "run_id": self.run_id, "t_us": t_us, "sample": at,
             "delivery_timeout_count": total,
             "by_track": {"pc": pc, "haptic": haptic, "other": other},
             "delivery_timeout_configured": self.counter.is_some(),
+            "warmup_timeouts_excluded": self.counter.as_ref().map(|c| c.excluded_warmup()).unwrap_or(0),
+            "scope_rule": "object created at or after t0 (warm-up objects excluded)",
         });
         let mut line = serde_json::to_vec(&row)?;
         line.push(b'\n');
@@ -2662,32 +2757,55 @@ mod tests {
         sample.insert("run_id".into(), json!("run-1"));
         sample.insert("t_us".into(), json!(T0 + 41_000_000));
         sample.insert("delivery_timeout_count".into(), json!(3));
-        r.rec.import_wire_counter(&sample, "/x/sender_wire.jsonl").unwrap();
+        assert!(r.rec.import_wire_counter(&sample, "/x/sender_wire.jsonl").unwrap());
         let rows = r.sink.rows();
         let wire = rows.iter().find(|r| r["role"] == json!("wire")).unwrap();
         assert_eq!(wire["source"], json!("sender"));
         assert_eq!(wire["delivery_timeout_count"], json!(3));
         assert_eq!(wire["t_sample_us"], json!(T0 + 41_000_000));
-        let mut other = sample.clone();
-        other.insert("run_id".into(), json!("run-2"));
-        assert!(r.rec.import_wire_counter(&other, "x").is_err());
-        let mut receiver = sample.clone();
-        receiver.insert("source".into(), json!("receiver"));
-        assert!(r.rec.import_wire_counter(&receiver, "x").is_err());
+        // Codex 85: malformed counter rows are not imported -> warning only
+        let mut bad = Vec::new();
+        for (key, value) in [
+            ("run_id", json!("run-2")),
+            ("source", json!("receiver")),
+            ("kind", json!("receiver_summary")),
+            ("role", json!("info")),
+            ("delivery_timeout_count", json!(-1)),
+            ("delivery_timeout_count", json!("3")),
+        ] {
+            let mut m = sample.clone();
+            m.insert(key.into(), value);
+            bad.push(m);
+        }
+        let mut missing_kind = sample.clone();
+        missing_kind.remove("kind");
+        bad.push(missing_kind);
+        for m in &bad {
+            assert!(!r.rec.import_wire_counter(m, "x").unwrap(), "{m:?}");
+        }
+        let rows = r.sink.rows();
+        assert_eq!(rows.iter().filter(|r| r["role"] == json!("wire")).count(), 1, "nothing else imported");
+        assert_eq!(
+            rows.iter().filter(|r| r["kind"] == json!("wire_counter_malformed")).count(),
+            bad.len()
+        );
     }
 
 
     #[test]
     fn exp2_sender_timeout_counter_and_sidecar_rows() {
         let counter = Arc::new(DeliveryTimeoutCounter::default());
-        counter.note(b"pc");
-        counter.note(b"pc-d7");
-        counter.note(b"haptic");
+        counter.set_t0(100);
+        counter.note(b"pc", 100);
+        counter.note(b"pc-d7", 150);
+        counter.note(b"haptic", 200);
+        counter.note(b"pc", 99); // created before t0: warm-up, excluded
+        assert_eq!(counter.excluded_warmup(), 1);
         assert_eq!(counter.snapshot(), (3, 2, 1, 0));
         let path = std::env::temp_dir().join(format!("skew-exp2-sidecar-{}-{}", std::process::id(), crate::now_us()));
         let side = SenderWireSidecar::create(&path, "run-1", Some(counter.clone())).unwrap();
         side.sample("t0", 10).unwrap();
-        counter.note(b"pc");
+        counter.note(b"pc", 300);
         side.sample("horizon", 20).unwrap();
         assert!(SenderWireSidecar::create(&path, "run-1", None).is_err(), "create-only");
         let rows: Vec<Value> = std::fs::read_to_string(&path).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
@@ -2698,7 +2816,7 @@ mod tests {
         assert_eq!(rows[1]["by_track"]["pc"], json!(3));
         // the receiver imports the latest sample as-is
         let mut r = rig(Exp2Method::P0);
-        r.rec.import_wire_counter(rows[1].as_object().unwrap(), "x").unwrap();
+        assert!(r.rec.import_wire_counter(rows[1].as_object().unwrap(), "x").unwrap());
         let imported = r.sink.rows().into_iter().find(|r| r["role"] == json!("wire")).unwrap();
         assert_eq!(imported["delivery_timeout_count"], json!(4));
         assert_eq!(imported["sample"], json!("horizon"));
@@ -2729,13 +2847,63 @@ mod tests {
             writer.create(32, None).unwrap().info.clone()
         };
         let counter = DeliveryTimeoutCounter::default();
+        // Codex 85: a warm-up PC object created at t0 − 30 ms that times out
+        // at t0 + 315 ms is NOT counted; scope follows the object's creation.
+        let warmup = object("pc");
+        let t0 = crate::now_us() + 30_000;
+        counter.set_t0(t0);
+        std::thread::sleep(std::time::Duration::from_micros(t0 + 315_000 - crate::now_us()));
+        counter.record(Boundary::ForwardTimeout, &warmup, 1, crate::now_us());
+        assert_eq!(counter.snapshot().0, 0, "warm-up expiry after t0 is not counted");
+        assert_eq!(counter.excluded_warmup(), 1);
+        // only ForwardTimeout counts; measurement objects (created >= t0) do
         for boundary in [Boundary::ForwardStart, Boundary::ForwardAccepted, Boundary::ReceiveTimeout] {
-            counter.record(boundary, &object("pc"), 1, 1);
+            counter.record(boundary, &object("pc"), 1, crate::now_us());
         }
         assert_eq!(counter.snapshot().0, 0);
-        counter.record(Boundary::ForwardTimeout, &object("pc-d6"), 1, 1);
-        counter.record(Boundary::ForwardTimeout, &object("haptic-essential"), 2, 1);
+        counter.record(Boundary::ForwardTimeout, &object("pc-d6"), 1, crate::now_us());
+        counter.record(Boundary::ForwardTimeout, &object("haptic-essential"), 2, crate::now_us());
         assert_eq!(counter.snapshot(), (2, 1, 1, 0));
+        // nothing is counted before t0 is known
+        let fresh = DeliveryTimeoutCounter::default();
+        fresh.record(Boundary::ForwardTimeout, &object("pc"), 1, crate::now_us());
+        assert_eq!((fresh.snapshot().0, fresh.excluded_warmup()), (0, 1));
+        assert!(delivery_timeout_in_measurement_scope(t0, t0));
+        assert!(!delivery_timeout_in_measurement_scope(t0 - 30_000, t0));
+    }
+
+
+    #[test]
+    fn exp2_recorder_s1_seal_waits_for_late_admission_codex85() {
+        // An S1 object stamped t_recv = H − 1 µs is admitted by the receive
+        // task only at H + ε.  The S1 seal must not run at H (it would mark
+        // the slot no_object); it runs at H + delay and sees the admission.
+        let h = horizon_us(T0);
+        let mut r = rig(Exp2Method::S1);
+        r.set(T0 + 1);
+        r.rec.advance(T0 + 1).unwrap();
+        let last = (N_PC - 1) as u32;
+        r.set(h);
+        assert!(!r.rec.seal_s1_if_due(h, &|_| None).unwrap(), "no seal at H");
+        let eps = 300;
+        r.set(h + eps);
+        let rx = Exp2Rx { header: header(Modality::Pc, last, slot_ref(Modality::Pc, last)), route_generation: 0, t_recv_us: h - 1 };
+        assert!(matches!(r.rec.admit(rx).unwrap(), Admission::Admitted(..)));
+        // S1 dispatches it after H: suppressed, its due is learned
+        r.rec.s1_release(&header(Modality::Pc, last, 0), h + eps + 10, Some(h - 50)).unwrap();
+        assert!(!r.rec.seal_s1_if_due(h + PLAIN_SEAL_EXECUTION_DELAY_US - 1, &|_| None).unwrap());
+        r.set(h + PLAIN_SEAL_EXECUTION_DELAY_US);
+        assert!(r.rec.seal_s1_if_due(h + PLAIN_SEAL_EXECUTION_DELAY_US, &|_| None).unwrap());
+        r.set(h + G_REPORT_R_US);
+        assert!(r.rec.finish(h + G_REPORT_R_US, None).unwrap());
+        let rows = r.sink.rows();
+        assert_contract_shape(&rows);
+        let terminals = assert_single_terminal(&rows);
+        let slot = &terminals[&("pc".to_string(), pc_slot_identity(last as u64).0)];
+        assert_ne!(slot["role"], json!("no_object"), "an arrived object is not no_object");
+        assert_eq!(slot["role"], json!("drop"));
+        assert_eq!(slot["reason"], json!(S1_UNRELEASED_AT_HORIZON));
+        assert_eq!(r.rec.stats().post_horizon_terminals_suppressed, 1);
     }
 
 }

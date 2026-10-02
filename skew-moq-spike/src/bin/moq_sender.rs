@@ -1806,6 +1806,8 @@ fn exp2_wire_start(
     t0_us: u64,
 ) -> Result<()> {
     let Some(wire) = wire else { return Ok(()) };
+    // Measurement scope (Codex 85): only objects created at or after t0 count.
+    wire.set_t0(t0_us);
     wire.sample("t0", now_us())?;
     let wire = wire.clone();
     tokio::spawn(async move {

@@ -1225,7 +1225,11 @@ fn exp2_import_sender_wire(cli: &Exp2Cli, recorder: &mut Exp2Recorder<Exp2File>)
             .last()
     });
     match latest.as_ref().and_then(|row| row.as_object()) {
-        Some(sample) => recorder.import_wire_counter(sample, &path.display().to_string()),
+        // A malformed sample becomes an integrity_warning inside (counter
+        // absent); only a write failure is an error.
+        Some(sample) => recorder
+            .import_wire_counter(sample, &path.display().to_string())
+            .map(|_| ()),
         None => recorder.warn(
             "sender_wire_counter_missing",
             serde_json::json!({"path": path.display().to_string()}),
@@ -1305,23 +1309,23 @@ fn exp2_drain_ingress_drop(
 
 /// S1 hook: seal the exp2 ledger from inside the S1 task (which owns the
 /// scheduler and therefore every admitted object's due) at its first wake
-/// with `now >= H`, before anything is dispatched at that wake.
+/// with `now >= H + PLAIN_SEAL_EXECUTION_DELAY_US` (Codex 85: not at H, so a
+/// `t_recv <= H` object admitted just after H is seen), before anything is
+/// dispatched at that wake.
 fn exp2_s1_seal_if_due(exp2: &Option<Exp2Shared>, scheduler: &PlayoutScheduler) -> std::io::Result<()> {
     let Some(exp2) = exp2 else { return Ok(()) };
     let mut guard = exp2
         .lock()
         .map_err(|_| std::io::Error::other("exp2 recorder poisoned"))?;
     let Some(recorder) = guard.as_mut() else { return Ok(()) };
-    if recorder.is_sealed() || now_us() < recorder.horizon_us() {
-        return Ok(());
-    }
     recorder
-        .seal_s1(&|pts| scheduler.deadline_us(pts))
+        .seal_s1_if_due(now_us(), &|pts| scheduler.deadline_us(pts))
+        .map(|_| ())
         .map_err(|error| std::io::Error::other(format!("exp2 S1 seal: {error:#}")))
 }
 
 /// How long the S1 task may sleep before it must check the exp2 seal: until
-/// H once the recorder exists, a short poll before that; `None` (branch
+/// H + delay once the recorder exists, a short poll before that; `None` (branch
 /// disabled, S1 loop unchanged) without exp2 or after the seal.
 fn exp2_s1_seal_wait(exp2: &Option<Exp2Shared>) -> Option<Duration> {
     let exp2 = exp2.as_ref()?;
@@ -1330,7 +1334,7 @@ fn exp2_s1_seal_wait(exp2: &Option<Exp2Shared>) -> Option<Duration> {
         None => Some(Duration::from_millis(100)),
         Some(recorder) if recorder.is_sealed() => None,
         Some(recorder) => Some(Duration::from_micros(
-            recorder.horizon_us().saturating_sub(now_us()),
+            recorder.s1_seal_at_us().saturating_sub(now_us()),
         )),
     }
 }
@@ -5100,6 +5104,29 @@ fn p1_switch_row(phase: &str, request: &SwitchRequest) -> serde_json::Map<String
     row
 }
 
+/// Codex 85: why a P1 switch is still unresolved at `H + G_report`, if it is.
+fn p1_unresolved_switch(
+    opening_in_flight: bool,
+    request_unsettled: bool,
+    gate_pending: bool,
+    parked_events: usize,
+) -> Option<String> {
+    let mut reasons = Vec::new();
+    if opening_in_flight {
+        reasons.push("target SUBSCRIBEs in flight".to_string());
+    }
+    if request_unsettled {
+        reasons.push("request not settled".to_string());
+    }
+    if gate_pending {
+        reasons.push("gate switch pending (no first effect)".to_string());
+    }
+    if parked_events > 0 {
+        reasons.push(format!("{parked_events} parked target-route events"));
+    }
+    (!reasons.is_empty()).then(|| reasons.join(", "))
+}
+
 /// Name a fatal P1 run error in the exp2 JSONL (diagnostic); the run is
 /// invalid anyway because the loop stops before the sentinel.
 fn p1_mark_switch_failure<H>(state: &mut P1Loop<H>, kind: &str) {
@@ -5403,12 +5430,13 @@ fn handle_p1_wire_event<H>(
 /// switch ingress/gate, subscription helpers, retirement queue and the
 /// shared route-terminal handler; the playout is the WP1 core.
 ///
-/// Known property (reported): `request_s3_switch` awaits the target
-/// SUBSCRIBE_OKs (bounded by the effect timeout) inside this loop, as S3
-/// does.  During that wait core timers are not executed; queued arrivals are
-/// processed afterwards with their own receive times, so decisions are those
-/// of a timely run, but the rows' `t_log_arrival_us` (report_lag) carry the
-/// delay.
+/// The switch handshake never blocks this loop (contract v4 follow-up J):
+/// the gate request is synchronous, the target SUBSCRIBEs are a future polled
+/// by the select (arrivals, core ticks and row writes continue), and the
+/// SUBSCRIBE_OK records are applied when it completes; target-route events
+/// are parked until then. Fail closed: an effect timeout, any switch failure,
+/// or a switch still unresolved at `H + G_report` (in flight, parked events,
+/// or gate pending — Codex 85) ends the run without a sentinel.
 #[allow(clippy::too_many_arguments)]
 async fn run_exp2_p1_control<S, T>(
     args: &Args,
@@ -5903,6 +5931,23 @@ where
         if let Some(recorder) = state.recorder.as_mut() {
             let now = now_us();
             if recorder.is_sealed() && now >= recorder.end_at_us() {
+                // Codex 85: the ledger may only be closed when no switch is
+                // unresolved; otherwise the run is instrumentation-invalid
+                // (no sentinel), never silently closed.
+                let unresolved = p1_unresolved_switch(
+                    opening.is_some(),
+                    opening_request.is_some(),
+                    state.ingress.gate().pending_request().is_some(),
+                    parked.len(),
+                );
+                if let Some(reason) = unresolved {
+                    keep_first_cause(
+                        &mut state.outcome_error,
+                        anyhow::anyhow!("P1 switch unresolved at H + G_report: {reason}"),
+                    );
+                    p1_mark_switch_failure(&mut state, "p1_switch_unresolved_at_end");
+                    continue;
+                }
                 if let Err(error) = exp2_import_sender_wire(&cli, recorder) {
                     keep_first_cause(&mut state.outcome_error, error);
                     continue;
@@ -5919,11 +5964,11 @@ where
         }
     }
 
-    // A switch whose target SUBSCRIBEs were still in flight when the run
-    // ended (a request just before the window end): let step 2 settle (it is
-    // bounded by the effect deadline), then release whatever opened and drop
-    // the request. Not a fault if the effect deadline had not passed; an
-    // effect timeout already failed the run inside the loop.
+    // A switch whose target SUBSCRIBEs were still in flight when the loop
+    // stopped: this only happens on an error exit (an unresolved switch at
+    // H + G_report is itself a fail-closed error, Codex 85). Let step 2
+    // settle (bounded by the effect deadline) and release whatever opened, so
+    // no drain task outlives the run.
     if let Some(mut pending_open) = opening.take() {
         let (opened, _timed_out) = pending_open.as_mut().await;
         drop(pending_open);
@@ -12548,20 +12593,22 @@ mod s3_control_loop_tests {
         ]
     }
 
-    /// Contract v4 follow-up J: while a P1 switch's target SUBSCRIBEs are in
-    /// flight (held 1.5 s by the seam), the release/recording path keeps
-    /// running — current-route objects are released and logged inside the
-    /// request→SUBSCRIBE_OK window. The switch then never takes effect (no
-    /// target object), so the registered effect timeout fires: the run fails
-    /// closed — loop error, an exp2 integrity_warning, and NO sentinel
-    /// (analyzer: instrumentation_ended_early -> invalid).
-    #[tokio::test]
-    async fn exp2_p1_switch_handshake_does_not_block_releases_and_timeout_fails_closed() {
+    /// Drive the real P1 control loop with the scripted seam: the forced
+    /// switch is requested at `t0 + force_ms`; both target SUBSCRIBEs answer
+    /// after `hold_ms`; `publish` adds current-route objects of events 0..12.
+    async fn p1_loop_case(
+        name: &str,
+        t0: u64,
+        force_ms: u64,
+        hold_ms: u64,
+        publish: bool,
+    ) -> (Result<()>, Vec<serde_json::Value>) {
+        let force_ms = force_ms.to_string();
         use skew_moq::exp2_recorder::{canonical_json_bytes, haptic_slot_identity, pc_slot_identity};
-        let dir = test_log_path("p1-nonblocking");
+        let dir = test_log_path(name);
         std::fs::create_dir_all(&dir).unwrap();
         let run_id = "p1-loop-test";
-        let t0 = now_us() + 300_000;
+        
         let pc: Vec<serde_json::Value> = (0..1200u64)
             .map(|i| {
                 let (pts, e) = pc_slot_identity(i);
@@ -12608,7 +12655,7 @@ mod s3_control_loop_tests {
             "--s3-effect-timeout-ms", "2000", "--s3-initial-retry-limit", "20",
             "--s3-switch-retry-limit", "2", "--s3-producer-shutdown-timeout-ms", "2000",
             "--batch-id", "b", "--phase-control", "/unused", "--delta-max-us", "345000",
-            "--exp2-test-mode", "--exp2-test-force-hc-at-ms", "100",
+            "--exp2-test-mode", "--exp2-test-force-hc-at-ms", &force_ms,
         ]);
         for (flag, path) in [
             ("--out", &legacy),
@@ -12635,8 +12682,8 @@ mod s3_control_loop_tests {
         let script = vec![
             Call { track: PC_NORMAL, before: Vec::new(), answer: Answer::Accept(Vec::new()) },
             Call { track: HAPTIC_FULL, before: Vec::new(), answer: Answer::Accept(Vec::new()) },
-            Call { track: PC_CRITICAL, before: vec![Step::Sleep(1_500)], answer: Answer::Accept(Vec::new()) },
-            Call { track: HAPTIC_ESSENTIAL, before: vec![Step::Sleep(1_500)], answer: Answer::Accept(Vec::new()) },
+            Call { track: PC_CRITICAL, before: vec![Step::Sleep(hold_ms)], answer: Answer::Accept(Vec::new()) },
+            Call { track: HAPTIC_ESSENTIAL, before: vec![Step::Sleep(hold_ms)], answer: Answer::Accept(Vec::new()) },
         ];
         let seam = ScriptedSeam::new(script);
         // Current-route objects of events 0..12 arrive while the switch is
@@ -12644,6 +12691,9 @@ mod s3_control_loop_tests {
         let side = {
             let seam = seam.clone();
             tokio::spawn(async move {
+                if !publish {
+                    return;
+                }
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 for i in 0..12u32 {
                     let (pts, e) = pc_slot_identity(i as u64);
@@ -12684,6 +12734,20 @@ mod s3_control_loop_tests {
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
         std::fs::remove_dir_all(&dir).ok();
+        (result, rows)
+    }
+
+    /// Contract v4 follow-up J: while a P1 switch's target SUBSCRIBEs are in
+    /// flight (held 1.5 s by the seam), the release/recording path keeps
+    /// running — current-route objects are released and logged inside the
+    /// request→SUBSCRIBE_OK window. The switch then never takes effect (no
+    /// target object), so the registered effect timeout fires: the run fails
+    /// closed — loop error, an exp2 integrity_warning, and NO sentinel
+    /// (analyzer: instrumentation_ended_early -> invalid).
+    #[tokio::test]
+    async fn exp2_p1_switch_handshake_does_not_block_releases_and_timeout_fails_closed() {
+        let (result, rows) =
+            p1_loop_case("p1-nonblocking", now_us() + 300_000, 100, 1_500, true).await;
         let error = format!("{:#}", result.expect_err("an unapplied switch must fail the run"));
         assert!(error.contains("effect timeout"), "{error}");
         let requested = rows
@@ -12715,6 +12779,34 @@ mod s3_control_loop_tests {
         assert!(rows.iter().any(|r| r["role"] == "integrity_warning"
             && r["kind"] == "p1_switch_effect_timeout"));
         assert!(!rows.iter().any(|r| r["role"] == "instrumentation_end"), "fail closed: no sentinel");
+    }
+
+    /// Codex 85: a switch requested late in the window whose SUBSCRIBEs are
+    /// still in flight (2 s effect timeout, not yet expired) is still
+    /// unresolved at H + G_report = t0 + 41.4 s: the run must end without a
+    /// sentinel (invalid), never close the ledger over an open switch.
+    #[tokio::test]
+    async fn exp2_p1_switch_unresolved_at_end_fails_closed() {
+        // t0 lies 39.55 s in the past and no object ever arrives, so the
+        // FSM's catch-up (saturated pair misses) requests Haptic-Critical at
+        // the loop's first tick, ~t0 + 39.7 s, still inside the window. Its
+        // effect timeout would expire ~t0 + 41.7 s, but H + G_report =
+        // t0 + 41.4 s comes first with both SUBSCRIBEs still held (2.5 s).
+        let t0 = now_us() - 39_550_000;
+        let (result, rows) = p1_loop_case("p1-late-switch", t0, 39_990, 2_500, false).await;
+        if std::env::var_os("SKEW_TEST_DUMP").is_some() {
+            for r in rows.iter().filter(|r| !matches!(r["role"].as_str(), Some("decision" | "no_object" | "controller"))) {
+                eprintln!("{r}");
+            }
+        }
+        let error = format!("{:#}", result.expect_err("an unresolved switch fails the run"));
+        assert!(error.contains("unresolved at H + G_report"), "{error}");
+        assert!(rows.iter().any(|r| r["role"] == "tier_switch" && r["phase"] == "requested"));
+        assert!(rows.iter().any(|r| r["role"] == "integrity_warning"
+            && r["kind"] == "p1_switch_unresolved_at_end"));
+        assert!(!rows.iter().any(|r| r["role"] == "instrumentation_end"), "no sentinel");
+        // the ledger itself was sealed (the seal is at H, before the check)
+        assert!(rows.iter().any(|r| r["role"] == "no_object"));
     }
 
     /// The sender's "my current routes finished producing" refusal, built by
