@@ -42,7 +42,7 @@ use crate::s3_controller::HapticMode;
 use crate::{is_warmup_seq, Header, TRACK_HAPTIC, TRACK_PC};
 
 pub const EXP2_CONTRACT_VERSION: &str = "exp2-contract-v4";
-pub const EXP2_METRIC_SCHEMA_VERSION: &str = "exp2-v2";
+pub const EXP2_METRIC_SCHEMA_VERSION: &str = "exp2-v3";
 /// Registration §1: run length, B_play, ε_ref, G_report,R (integer µs).
 pub const RUN_DURATION_US: u64 = 40_000_000;
 pub const B_PLAY_US: u64 = 400_000;
