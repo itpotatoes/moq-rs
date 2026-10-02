@@ -213,6 +213,20 @@ enum Arm {
     /// `S3R - S3NP` a clean scheduler comparison at an identical sender stream.
     #[value(name = "s3r")]
     S3r,
+    /// Experiment 2 (registration §2 wire-policy table): S3NPA', P0-NP and P0
+    /// share one static wire policy — frame-per-subgroup PC, haptic 0 / PC 1,
+    /// PC DELIVERY_TIMEOUT = T_pc (= Δ_max, NOT the stage-9 67 ms). The three
+    /// differ only in the receiver's playout controller.
+    #[value(name = "s3npa-prime")]
+    S3npaPrime,
+    #[value(name = "p0np")]
+    P0np,
+    #[value(name = "p0")]
+    P0,
+    /// Experiment 2 P1: the same wire policy plus the subscription-scoped
+    /// producer (the S3 tier routes), PC DELIVERY_TIMEOUT = T_pc.
+    #[value(name = "p1")]
+    P1,
 }
 
 impl Arm {
@@ -226,18 +240,42 @@ impl Arm {
             Self::S3 => "s3",
             Self::S3np => "s3np",
             Self::S3r => "s3r",
+            Self::S3npaPrime => "s3npa-prime",
+            Self::P0np => "p0np",
+            Self::P0 => "p0",
+            Self::P1 => "p1",
         }
+    }
+
+    /// Experiment-2 core arms (T_pc instead of the stage-9 67 ms).
+    fn is_exp2_core(self) -> bool {
+        matches!(self, Self::S3npaPrime | Self::P0np | Self::P0 | Self::P1)
+    }
+
+    /// Arms that publish through subscription-scoped producers (S3 tier
+    /// routes): stage-9 S3 and exp2 P1.
+    fn subscription_scoped(self) -> bool {
+        matches!(self, Self::S3 | Self::P1)
     }
 
     fn pc_frame_subgroups(self) -> bool {
         matches!(
             self,
-            Self::M1 | Self::S2 | Self::S2Eq | Self::S3 | Self::S3np | Self::S3r
+            Self::M1
+                | Self::S2
+                | Self::S2Eq
+                | Self::S3
+                | Self::S3np
+                | Self::S3r
+                | Self::S3npaPrime
+                | Self::P0np
+                | Self::P0
+                | Self::P1
         )
     }
 
     fn pc_priority(self) -> u8 {
-        if matches!(self, Self::S2 | Self::S3 | Self::S3np | Self::S3r) {
+        if matches!(self, Self::S2 | Self::S3 | Self::S3np | Self::S3r) || self.is_exp2_core() {
             1
         } else {
             128
@@ -245,7 +283,7 @@ impl Arm {
     }
 
     fn haptic_priority(self) -> u8 {
-        if matches!(self, Self::S2 | Self::S3 | Self::S3np | Self::S3r) {
+        if matches!(self, Self::S2 | Self::S3 | Self::S3np | Self::S3r) || self.is_exp2_core() {
             0
         } else {
             128
@@ -263,7 +301,7 @@ impl Arm {
 
     /// Arms that need the three S3 PC tier directories.
     fn needs_pc_tier_dirs(self) -> bool {
-        matches!(self, Self::S3 | Self::S3np | Self::S3r)
+        matches!(self, Self::S3 | Self::S3np | Self::S3r | Self::P1)
     }
 }
 
@@ -473,6 +511,24 @@ fn object_buffer(payload: &[u8]) -> Vec<u8> {
     bytes.reserve_exact(payload.len());
     bytes.extend_from_slice(payload);
     bytes
+}
+
+/// Static-path PC identity of slot `i`: `(pts = floor(i·10⁶/rate), event_id = i + 1)`.
+/// Extracted (behaviour unchanged) so the exp2 i <-> 3i production test
+/// exercises the code the PC loop runs.
+fn static_pc_identity(i: u64, pc_rate_hz: u64) -> (u64, u32) {
+    (timestamp_us(i, pc_rate_hz), (i + 1) as u32)
+}
+
+/// Static-path haptic identity of tick `k`: the anchor tick `k = ratio·i`
+/// carries PC `i`'s pts and event_id; other ticks are fillers with their own
+/// pts and event_id 0.  Extracted from the haptic loop, behaviour unchanged.
+fn static_haptic_identity(k: u64, ratio: u64, pc_rate_hz: u64, haptic_rate_hz: u64) -> (u64, u32) {
+    if k % ratio == 0 {
+        static_pc_identity(k / ratio, pc_rate_hz)
+    } else {
+        (timestamp_us(k, haptic_rate_hz), 0u32)
+    }
 }
 
 impl TrackSel {
@@ -861,7 +917,8 @@ fn phase4_transport(args: &Args) -> Result<Option<Phase4TransportMeta>> {
             args.arm.as_str()
         );
     }
-    if matches!(args.arm, Arm::S2 | Arm::S2Eq | Arm::S3 | Arm::S3np | Arm::S3r)
+    if (matches!(args.arm, Arm::S2 | Arm::S2Eq | Arm::S3 | Arm::S3np | Arm::S3r)
+        || args.arm.is_exp2_core())
         && args.data_priority_mapping != DataPriorityMapping::MoqtV2
     {
         anyhow::bail!(
@@ -870,6 +927,29 @@ fn phase4_transport(args: &Args) -> Result<Option<Phase4TransportMeta>> {
         );
     }
     match args.arm {
+        Arm::S3npaPrime | Arm::P0np | Arm::P0 | Arm::P1 => {
+            // Registration §2: PC DELIVERY_TIMEOUT = T_pc (= Δ_max). The
+            // stage-9 67 ms check does NOT apply; the value is a slot input
+            // and the receiver enforces T_pc · 1000 == Δ_max.
+            let timeout = args.pc_delivery_timeout_ms.with_context(|| {
+                format!(
+                    "--arm {} requires --pc-delivery-timeout-ms (= T_pc)",
+                    args.arm.as_str()
+                )
+            })?;
+            if timeout == 0 {
+                anyhow::bail!("--pc-delivery-timeout-ms must be greater than zero");
+            }
+            Ok(Some(Phase4TransportMeta {
+                arm: args.arm.as_str(),
+                pc_subgroup_mapping: "frame-per-subgroup",
+                pc_publisher_priority: args.arm.pc_priority(),
+                haptic_publisher_priority: args.arm.haptic_priority(),
+                publisher_priority_profile: "relative-haptic0-pc1",
+                data_priority_mapping: args.data_priority_mapping.as_str(),
+                pc_delivery_timeout_ms: Some(timeout),
+            }))
+        }
         Arm::B1 | Arm::S1 => {
             if args.pc_delivery_timeout_ms.is_some() {
                 anyhow::bail!("PC delivery timeout requires --arm s2");
@@ -973,11 +1053,11 @@ fn validate_s3_args(args: &Args) -> Result<()> {
     if !args.arm.needs_pc_tier_dirs() {
         if tier_dirs {
             anyhow::bail!(
-                "S3 PC tier frame directories require --arm s3, --arm s3np or --arm s3r"
+                "S3 PC tier frame directories require --arm s3, --arm s3np, --arm s3r or --arm p1"
             );
         }
         if s3_only {
-            anyhow::bail!("S3 lifecycle options require --arm s3");
+            anyhow::bail!("S3 lifecycle options require --arm s3 or --arm p1");
         }
         if replay_only {
             anyhow::bail!("--tier-schedule and --d-play-ms require --arm s3np or --arm s3r");
@@ -988,7 +1068,7 @@ fn validate_s3_args(args: &Args) -> Result<()> {
         return Ok(());
     }
     let arm = args.arm.as_str();
-    if args.arm == Arm::S3 && (replay_only || s3np_only) {
+    if args.arm.subscription_scoped() && (replay_only || s3np_only) {
         anyhow::bail!(
             "--tier-schedule, --d-play-ms and --s3np-release-rule require a replay arm; \
              S3 runs its own FSM and must never replay a recorded schedule"
@@ -1021,10 +1101,10 @@ fn validate_s3_args(args: &Args) -> Result<()> {
     args.s3_critical_frames_dir
         .as_ref()
         .with_context(|| format!("--arm {arm} requires --s3-critical-frames-dir d6"))?;
-    if args.arm == Arm::S3 {
-        let timeout = args
-            .s3_producer_shutdown_timeout_ms
-            .context("--arm s3 requires --s3-producer-shutdown-timeout-ms")?;
+    if args.arm.subscription_scoped() {
+        let timeout = args.s3_producer_shutdown_timeout_ms.with_context(|| {
+            format!("--arm {arm} requires --s3-producer-shutdown-timeout-ms")
+        })?;
         if timeout == 0 {
             anyhow::bail!("--s3-producer-shutdown-timeout-ms must be greater than zero");
         }
@@ -1062,6 +1142,15 @@ fn validate_phase_args(args: &Args) -> Result<()> {
     }
     if supplied.iter().all(|value| *value) && args.tracks != TrackSel::Both {
         anyhow::bail!("registered warmup phase control requires --tracks both");
+    }
+    // Experiment 2: t0 comes from the runner's PhaseControl file and the
+    // receiver reads the same file (registration §1), so the exp2 core arms
+    // cannot run on a sender-local t0.
+    if args.arm.is_exp2_core() && !supplied.iter().all(|value| *value) {
+        anyhow::bail!(
+            "--arm {} requires --batch-id, --phase-control and --warmup-pass (shared t0)",
+            args.arm.as_str()
+        );
     }
     Ok(())
 }
@@ -1896,7 +1985,7 @@ async fn main() -> Result<()> {
         args.accept_trace && (args.payload_mode == PayloadMode::Frame || args.chunk_trace);
     let s3_accept_routes: AcceptRouteMap = Arc::new(Mutex::new(HashMap::new()));
     let accept_trace = if accept_trace_enabled {
-        if args.arm == Arm::S3 {
+        if args.arm.subscription_scoped() {
             Some(AcceptTrace::install(
                 args.accept_trace_capacity,
                 Arc::new(Mutex::new(S3AcceptSink {
@@ -1974,7 +2063,7 @@ async fn main() -> Result<()> {
 
         let namespace = TrackNamespace::from_utf8_path(&args.run_id);
 
-        if args.arm == Arm::S3 {
+        if args.arm.subscription_scoped() {
             let duration_us = Duration::from_secs_f64(args.duration).as_micros() as u64;
             let (recovery_frames, critical_frames) =
                 s3_frames.as_ref().expect("validated S3 frames");
@@ -2000,6 +2089,12 @@ async fn main() -> Result<()> {
                     args.s3_producer_shutdown_timeout_ms
                         .expect("validated S3 shutdown timeout"),
                 ),
+                // Stage-9 S3 keeps its frozen 67 ms; exp2 P1 takes T_pc.
+                pc_delivery_timeout_ms: if args.arm == Arm::P1 {
+                    args.pc_delivery_timeout_ms.expect("validated P1 T_pc")
+                } else {
+                    skew_moq::s3_sender::S3_PC_DELIVERY_TIMEOUT_MS
+                },
             });
             // Producer tasks record their final outcome within their
             // shutdown timeout; allow that plus a margin before the verdict
@@ -2504,7 +2599,7 @@ async fn main() -> Result<()> {
                     if now_us() >= end_us {
                         break;
                     }
-                    let pts = timestamp_us(i, pc_rate_hz);
+                    let (pts, pc_event_id) = static_pc_identity(i, pc_rate_hz);
                     // s3np: the replayed tier for this slot, looked up on the
                     // NOMINAL slot offset (== pts) so the switch instant is
                     // deterministic and within one frame period of the recorded
@@ -2523,7 +2618,7 @@ async fn main() -> Result<()> {
                         // t_gen + header + append under the FIFO lock.
                         let buffer = object_buffer(payload);
                         let appended = shared_fifo_append(shared, buffer, |t_gen| {
-                            pack_header(TRACK_PC, tier, i as u32, pts, (i + 1) as u32, t_gen, payload.len() as u32)
+                            pack_header(TRACK_PC, tier, i as u32, pts, pc_event_id, t_gen, payload.len() as u32)
                         })?;
                         (appended.t_gen, Some(appended.t_ready), Some(appended.identity), 1u64, 0u64)
                     } else {
@@ -2552,7 +2647,7 @@ async fn main() -> Result<()> {
                                 tier,
                                 i as u32,
                                 pts,
-                                (i + 1) as u32,
+                                pc_event_id,
                                 t_gen,
                                 object_payload.len() as u32,
                             );
@@ -2582,7 +2677,7 @@ async fn main() -> Result<()> {
                         tier,
                         i as u32,
                         pts,
-                        (i + 1) as u32,
+                        pc_event_id,
                         payload.len(),
                         t_gen,
                         now_us(),
@@ -2633,12 +2728,8 @@ async fn main() -> Result<()> {
                         k += 1;
                         continue;
                     }
-                    let (pts, event_id) = if k % ratio == 0 {
-                        let fi = k / ratio;
-                        (timestamp_us(fi, pc_rate_hz), (fi + 1) as u32)
-                    } else {
-                        (timestamp_us(k, haptic_rate_hz), 0u32)
-                    };
+                    let (pts, event_id) =
+                        static_haptic_identity(k, ratio, pc_rate_hz, haptic_rate_hz);
                     let payload = pcm_tick_payload(&pcm, k, PCM_SAMPLE_RATE_HZ, haptic_rate_hz)?;
                     let (t_gen, t_ready, frame_obj, objects, padding) = if let Some(shared) = &shared {
                         let buffer = object_buffer(&payload);
@@ -2878,7 +2969,7 @@ async fn main() -> Result<()> {
         // Setup failed before anything was spawned: nothing can call back.
         None => ProducerJoins::none_started(),
     };
-    if args.arm == Arm::S3 {
+    if args.arm.subscription_scoped() {
         let tracks_fin = s3_registry
             .as_ref()
             .and_then(|registry| registry.lock().ok().map(|r| r.tracks_finished_on_wire()))
@@ -3021,7 +3112,8 @@ mod tests {
         CliReleaseRule, DataPriorityMapping, DirectFinHandoff, Duration, PayloadMode,
         Phase4TransportMeta, PublisherPriorityProfile, QueuePolicy, Representation, RunVerdict,
         SharedFifoWriter, TierReplay, Topology, TrackSel, TransportEnd, TransportEndKind, Url, HDR,
-        wait_registered_direct_fin_handoff,
+        wait_registered_direct_fin_handoff, static_haptic_identity, static_pc_identity,
+        validate_phase_args, validate_v5_rates,
     };
     use std::path::PathBuf;
     use std::sync::Mutex;
@@ -3191,6 +3283,86 @@ mod tests {
         assert_eq!((p1.pc_publisher_priority, p1.haptic_publisher_priority), (128, 128));
         assert_eq!(p1.publisher_priority_profile, "equal-128");
         assert_eq!(p1.pc_delivery_timeout_ms, None);
+    }
+
+    #[test]
+    fn exp2_static_identity_is_the_ledger_rule_i_to_3i() {
+        // The code the static loops run produces exactly the contract §1/§3
+        // ledger identities: PC i -> (floor(i·10⁶/30), i+1); haptic k ->
+        // (floor(k·10⁶/90), anchor id or 0), so the anchor 3i equals PC i.
+        use skew_moq::exp2_recorder::{haptic_slot_identity, pc_slot_identity, N_HAPTIC, N_PC};
+        let ratio = validate_v5_rates(30, 90).unwrap();
+        assert_eq!(ratio, 3);
+        for i in 0..N_PC as u64 {
+            assert_eq!(static_pc_identity(i, 30), pc_slot_identity(i));
+        }
+        for k in 0..N_HAPTIC as u64 {
+            assert_eq!(static_haptic_identity(k, ratio, 30, 90), haptic_slot_identity(k));
+        }
+    }
+
+    #[test]
+    fn exp2_arms_take_t_pc_and_stage9_arms_keep_67() {
+        for arm in [Arm::S3npaPrime, Arm::P0np, Arm::P0, Arm::P1] {
+            let mut args = arm_args(arm);
+            args.pc_delivery_timeout_ms = Some(345);
+            let meta = phase4_transport(&args).unwrap().unwrap();
+            assert_eq!(meta.pc_delivery_timeout_ms, Some(345), "{}", arm.as_str());
+            assert_eq!(meta.pc_subgroup_mapping, "frame-per-subgroup");
+            assert_eq!((meta.pc_publisher_priority, meta.haptic_publisher_priority), (1, 0));
+            assert!(arm.pc_frame_subgroups());
+            args.pc_delivery_timeout_ms = None;
+            assert!(phase4_transport(&args).is_err(), "T_pc is required");
+            args.pc_delivery_timeout_ms = Some(0);
+            assert!(phase4_transport(&args).is_err());
+            args.pc_delivery_timeout_ms = Some(345);
+            args.data_priority_mapping = DataPriorityMapping::LegacyV1;
+            assert!(phase4_transport(&args).is_err(), "moqt-v2 required");
+        }
+        for arm in [Arm::S3, Arm::S3np, Arm::S3r] {
+            let mut args = arm_args(arm);
+            args.pc_delivery_timeout_ms = Some(345);
+            assert!(phase4_transport(&args).is_err(), "{} keeps the frozen 67", arm.as_str());
+            args.pc_delivery_timeout_ms = Some(67);
+            assert_eq!(phase4_transport(&args).unwrap().unwrap().pc_delivery_timeout_ms, Some(67));
+        }
+        // B1/S1 are unchanged: no PC delivery timeout at all.
+        for arm in [Arm::B1, Arm::S1] {
+            let mut args = arm_args(arm);
+            assert!(phase4_transport(&args).is_ok());
+            args.pc_delivery_timeout_ms = Some(345);
+            assert!(phase4_transport(&args).is_err());
+            assert!(!arm.pc_frame_subgroups());
+            assert_eq!((arm.pc_priority(), arm.haptic_priority()), (128, 128));
+        }
+    }
+
+    #[test]
+    fn exp2_arms_require_the_shared_phase_control_and_p1_is_subscription_scoped() {
+        for arm in [Arm::S3npaPrime, Arm::P0np, Arm::P0, Arm::P1] {
+            let mut args = arm_args(arm);
+            assert!(validate_phase_args(&args).is_err(), "{}", arm.as_str());
+            args.batch_id = Some("b".into());
+            args.phase_control = Some(PathBuf::from("/x/phase.json"));
+            args.warmup_pass = Some(PathBuf::from("/x/pass.json"));
+            assert!(validate_phase_args(&args).is_ok());
+        }
+        assert!(validate_phase_args(&arm_args(Arm::B1)).is_ok(), "B1 unchanged");
+        assert!(Arm::P1.subscription_scoped() && Arm::S3.subscription_scoped());
+        assert!(!Arm::P0.subscription_scoped() && !Arm::P0.needs_pc_tier_dirs());
+        // P1 owns the S3 producer lifecycle and tier directories.
+        let mut p1 = arm_args(Arm::P1);
+        assert!(validate_s3_args(&p1).is_err());
+        p1.s3_recovery_frames_dir = Some("d7".into());
+        p1.s3_critical_frames_dir = Some("d6".into());
+        assert!(validate_s3_args(&p1).is_err(), "shutdown timeout required");
+        p1.s3_producer_shutdown_timeout_ms = Some(2000);
+        assert!(validate_s3_args(&p1).is_ok());
+        p1.tier_schedule = Some(PathBuf::from("/x"));
+        assert!(validate_s3_args(&p1).is_err(), "P1 never replays");
+        let mut p0 = arm_args(Arm::P0);
+        p0.s3_producer_shutdown_timeout_ms = Some(2000);
+        assert!(validate_s3_args(&p0).is_err(), "static exp2 arms own no producers");
     }
 
     /// Minimal `Args` fixture for the arm-boundary validators. Every field is

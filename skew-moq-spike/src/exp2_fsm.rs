@@ -384,6 +384,19 @@ impl Exp2P1 {
         self.feed(d)
     }
 
+    /// WP3 API addition (no behaviour change): pass a wire delivery-timeout
+    /// observation to the P0 core exactly as `Exp2Playout::delivery_timeout`
+    /// does, so P1 has the same input surface as the other core modes.
+    pub fn delivery_timeout(
+        &mut self,
+        m: Modality,
+        index: u32,
+        t_us: u64,
+    ) -> Result<(Vec<Exp2Decision>, Vec<TierRequest>), &'static str> {
+        let d = self.core.delivery_timeout(m, index, t_us)?;
+        self.feed(d)
+    }
+
     pub fn finalize(
         &mut self,
         horizon_us: u64,

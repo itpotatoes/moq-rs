@@ -100,6 +100,9 @@ pub struct SenderContext {
     pub haptic_pcm: Arc<Vec<u8>>,
     pub logger: Arc<Mutex<JsonlLogger>>,
     pub shutdown_timeout: Duration,
+    /// The only PC DELIVERY_TIMEOUT a direct peer may carry on a PC
+    /// SUBSCRIBE: the frozen 67 ms for stage-9 S3, T_pc for exp2 P1.
+    pub pc_delivery_timeout_ms: u64,
 }
 
 impl SenderContext {
@@ -108,6 +111,9 @@ impl SenderContext {
             .context("S3 requires the v5 30:90 Hz rate contract")?;
         if self.shutdown_timeout.is_zero() {
             bail!("S3 producer shutdown timeout must be greater than zero");
+        }
+        if self.pc_delivery_timeout_ms == 0 {
+            bail!("the registered PC delivery timeout must be greater than zero");
         }
         if self.normal_frames.is_empty()
             || self.recovery_frames.is_empty()
@@ -257,15 +263,34 @@ impl RequestValidity {
 /// enforced by the relay on relay->receiver forwarding and need not be
 /// repeated on relay->publisher. If a direct peer does send it here, only the
 /// frozen value is accepted; haptic must not carry one at all.
+#[cfg(test)]
 fn classify_subscription_request(name: &str, delivery_timeout_ms: Option<u64>) -> RequestValidity {
+    classify_subscription_request_for(name, delivery_timeout_ms, S3_PC_DELIVERY_TIMEOUT_MS)
+}
+
+/// Stage-9 S3's frozen PC DELIVERY_TIMEOUT.
+pub const S3_PC_DELIVERY_TIMEOUT_MS: u64 = 67;
+
+/// The request check with the run's registered PC timeout: 67 ms for the
+/// stage-9 S3 arm (unchanged), T_pc for exp2 P1.
+fn classify_subscription_request_for(
+    name: &str,
+    delivery_timeout_ms: Option<u64>,
+    expected_pc_timeout_ms: u64,
+) -> RequestValidity {
     let Some(role) = role_for_track(name) else {
         return RequestValidity::UnsupportedTrack;
     };
     match role {
-        TrackRole::Pc if delivery_timeout_ms.is_some() && delivery_timeout_ms != Some(67) => {
-            RequestValidity::BadDeliveryTimeout(
-                "S3 PC subscription carried a non-67ms DELIVERY_TIMEOUT",
-            )
+        TrackRole::Pc
+            if delivery_timeout_ms.is_some()
+                && delivery_timeout_ms != Some(expected_pc_timeout_ms) =>
+        {
+            RequestValidity::BadDeliveryTimeout(if expected_pc_timeout_ms == S3_PC_DELIVERY_TIMEOUT_MS {
+                "S3 PC subscription carried a non-67ms DELIVERY_TIMEOUT"
+            } else {
+                "P1 PC subscription carried a DELIVERY_TIMEOUT other than T_pc"
+            })
         }
         TrackRole::Haptic if delivery_timeout_ms.is_some() => RequestValidity::BadDeliveryTimeout(
             "S3 haptic subscription must not carry DELIVERY_TIMEOUT",
@@ -879,17 +904,36 @@ async fn drain_children(
     registry: &Arc<Mutex<SubscriptionProducerRegistry>>,
     logger: &Arc<Mutex<JsonlLogger>>,
     bound: Duration,
+    pc_timeout_ms: u64,
 ) -> anyhow::Result<Option<String>> {
-    drain_children_with(tasks, || publish.subscribed(), registry, logger, bound).await
+    drain_children_with_timeout(tasks, || publish.subscribed(), registry, logger, bound, pc_timeout_ms)
+        .await
+}
+
+#[cfg(test)]
+async fn drain_children_with<F, Fut>(
+    tasks: &mut JoinSet<ChildOutcome>,
+    subscribed: F,
+    registry: &Arc<Mutex<SubscriptionProducerRegistry>>,
+    logger: &Arc<Mutex<JsonlLogger>>,
+    bound: Duration,
+) -> anyhow::Result<Option<String>>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Option<moq_transport::session::Subscribed>, moq_transport::serve::ServeError>>,
+{
+    drain_children_with_timeout(tasks, subscribed, registry, logger, bound, S3_PC_DELIVERY_TIMEOUT_MS)
+        .await
 }
 
 // Injectable subscription source; production uses PublishNamespace::subscribed.
-async fn drain_children_with<F, Fut>(
+async fn drain_children_with_timeout<F, Fut>(
     tasks: &mut JoinSet<ChildOutcome>,
     mut subscribed: F,
     registry: &Arc<Mutex<SubscriptionProducerRegistry>>,
     logger: &Arc<Mutex<JsonlLogger>>,
     bound: Duration,
+    pc_timeout_ms: u64,
 ) -> anyhow::Result<Option<String>>
 where
     F: FnMut() -> Fut,
@@ -934,9 +978,10 @@ where
                             // happened to land inside the drain window would be
                             // absorbed by the receiver's non-fatal path.
                             let name = subscribed.info.track_name.to_string_lossy().into_owned();
-                            let validity = classify_subscription_request(
+                            let validity = classify_subscription_request_for(
                                 &name,
                                 subscribed.info.delivery_timeout_ms,
+                                pc_timeout_ms,
                             );
                             if let Some(refusal) = validity.refusal(&name) {
                                 // No `refused` row: the row's `error_code` is
@@ -1065,9 +1110,10 @@ async fn run_namespace_inner(
                     // the post-run drain window applies. Both refusals keep
                     // the codes they have always had (0x10 / internal), which
                     // stay fatal for the receiver.
-                    if let Some(refusal) = classify_subscription_request(
+                    if let Some(refusal) = classify_subscription_request_for(
                         &name,
                         subscribed.info.delivery_timeout_ms,
+                        context.pc_delivery_timeout_ms,
                     )
                     .refusal(&name)
                     {
@@ -1247,13 +1293,13 @@ async fn run_namespace_inner(
     match loop_exit {
         Ok(LoopExit::Drained) => {
             let subscribe_end =
-                drain_children(&mut tasks, &publish, &registry, &context.logger, child_join_bound)
+                drain_children(&mut tasks, &publish, &registry, &context.logger, child_join_bound, context.pc_delivery_timeout_ms)
                     .await?;
             Ok(NamespaceEnd::Drained { subscribe_end })
         }
         Ok(LoopExit::StateDropped(source)) => {
             let subscribe_end =
-                drain_children(&mut tasks, &publish, &registry, &context.logger, child_join_bound)
+                drain_children(&mut tasks, &publish, &registry, &context.logger, child_join_bound, context.pc_delivery_timeout_ms)
                     .await?;
             Ok(NamespaceEnd::StateDropped {
                 source,
@@ -1340,6 +1386,36 @@ mod tests {
     /// loop, because both call this one function. An unsupported name and an
     /// invalid DELIVERY_TIMEOUT keep their own fatal codes; only a valid S3
     /// track can reach the run-ended refusal.
+    #[test]
+    fn exp2_p1_pc_timeout_is_t_pc_and_s3_keeps_67() {
+        // Stage-9 S3 keeps the frozen 67 ms check; exp2 P1 (T_pc = Δ_max,
+        // provisional 345 ms) accepts exactly T_pc and nothing else.
+        assert!(matches!(
+            classify_subscription_request_for(PC_NORMAL_TRACK, Some(67), S3_PC_DELIVERY_TIMEOUT_MS),
+            RequestValidity::Valid(TrackRole::Pc)
+        ));
+        assert!(matches!(
+            classify_subscription_request_for(PC_NORMAL_TRACK, Some(345), S3_PC_DELIVERY_TIMEOUT_MS),
+            RequestValidity::BadDeliveryTimeout(_)
+        ));
+        assert!(matches!(
+            classify_subscription_request_for(PC_RECOVERY_TRACK, Some(345), 345),
+            RequestValidity::Valid(TrackRole::Pc)
+        ));
+        assert!(matches!(
+            classify_subscription_request_for(PC_NORMAL_TRACK, Some(67), 345),
+            RequestValidity::BadDeliveryTimeout(_)
+        ));
+        assert!(matches!(
+            classify_subscription_request_for(HAPTIC_FULL_TRACK, Some(345), 345),
+            RequestValidity::BadDeliveryTimeout(_)
+        ));
+        assert!(matches!(
+            classify_subscription_request(PC_NORMAL_TRACK, Some(67)),
+            RequestValidity::Valid(TrackRole::Pc)
+        ));
+    }
+
     #[test]
     fn request_validity_is_one_rule_for_the_accept_loop_and_the_drain_window() {
         assert_eq!(

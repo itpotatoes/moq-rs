@@ -12,6 +12,7 @@ use anyhow::Context;
 
 pub mod exp2_fsm;
 pub mod exp2_playout;
+pub mod exp2_recorder;
 pub mod phase;
 pub mod receive_trace;
 pub mod playout;

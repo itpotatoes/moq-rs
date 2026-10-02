@@ -142,6 +142,10 @@ pub enum TransitionCause {
     ViolationRatio,
     StableRecovery,
     StableNormal,
+    /// Experiment-2 P1 FSM degrade cause (exp2_fsm `SaturatedPairMiss`).
+    /// Additive: the stage-9 S3 controller never produces it; it exists so a
+    /// P1 request through the shared switch gate is not mislabelled.
+    SaturatedPairMiss,
 }
 
 impl TransitionCause {
@@ -151,6 +155,7 @@ impl TransitionCause {
             Self::ViolationRatio => "violation_ratio",
             Self::StableRecovery => "stable_recovery",
             Self::StableNormal => "stable_normal",
+            Self::SaturatedPairMiss => "saturated_pair_miss",
         }
     }
 }
