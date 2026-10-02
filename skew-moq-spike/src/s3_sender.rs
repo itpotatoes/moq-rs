@@ -103,6 +103,10 @@ pub struct SenderContext {
     /// The only PC DELIVERY_TIMEOUT a direct peer may carry on a PC
     /// SUBSCRIBE: the frozen 67 ms for stage-9 S3, T_pc for exp2 P1.
     pub pc_delivery_timeout_ms: u64,
+    /// Exp2 P1 only (Codex 88): open each route generation's groups at the
+    /// disjoint base `exp2_route_group_base(generation)`, so the relay join
+    /// key is unique across generations. False for stage-9 S3 (unchanged).
+    pub generation_group_base: bool,
 }
 
 impl SenderContext {
@@ -268,6 +272,57 @@ fn classify_subscription_request(name: &str, delivery_timeout_ms: Option<u64>) -
     classify_subscription_request_for(name, delivery_timeout_ms, S3_PC_DELIVERY_TIMEOUT_MS)
 }
 
+/// Exp2 P1 relay join key (Codex 88). Every subscription-scoped producer
+/// writes a NEW `Track`, whose `SubgroupsWriter` restarts at group 0, and P1
+/// reuses the wire track names (pc, pc-d6, pc-d7, haptic, haptic-essential)
+/// across route generations, so `(wire_track, group_id, subgroup_id,
+/// object_id)` collides across generations. With this base the producer of
+/// generation g opens its first group at `g << 32` (later groups follow by
+/// +1; a run produces < 2^32 groups per producer), so the key is unique over
+/// the whole run and `group_id >> 32` is the route generation — visible in the
+/// sender tx row (with `route_generation`) and in every relay object-trace
+/// row (which carries `track` and `group_id` but no generation). Wire format
+/// unchanged (group ids are varints); generation 0 keeps base 0.
+pub const EXP2_ROUTE_GROUP_SHIFT: u32 = 32;
+
+pub fn exp2_route_group_base(generation: u64) -> u64 {
+    generation << EXP2_ROUTE_GROUP_SHIFT
+}
+
+/// The route generation encoded in a P1 group id (inverse of the base).
+pub fn exp2_route_generation_of_group(group_id: u64) -> u64 {
+    group_id >> EXP2_ROUTE_GROUP_SHIFT
+}
+
+/// Next subgroup of a producer: the first one opens at `first_group` when
+/// set (P1 generation base), every later one follows by `append`.
+fn next_subgroup(
+    subgroups: &mut moq_transport::serve::SubgroupsWriter,
+    first_group: &mut Option<u64>,
+    priority: u8,
+) -> Result<moq_transport::serve::SubgroupWriter, moq_transport::serve::ServeError> {
+    match first_group.take() {
+        Some(group_id) => subgroups.create(moq_transport::serve::Subgroup {
+            group_id,
+            subgroup_id: 0,
+            priority,
+        }),
+        None => subgroups.append(priority),
+    }
+}
+
+/// The first group of `route`'s producer: `None` (append from 0) unless the
+/// generation base is on (exp2 P1) and the generation is >= 1.
+fn producer_first_group(generation_group_base: bool, route: Route) -> Option<u64> {
+    (generation_group_base && route.generation > 0).then(|| exp2_route_group_base(route.generation))
+}
+
+impl SenderContext {
+    fn first_group(&self, route: Route) -> Option<u64> {
+        producer_first_group(self.generation_group_base, route)
+    }
+}
+
 /// Stage-9 S3's frozen PC DELIVERY_TIMEOUT.
 pub const S3_PC_DELIVERY_TIMEOUT_MS: u64 = 67;
 
@@ -327,6 +382,7 @@ async fn sleep_until_us(target_us: u64) {
 #[allow(clippy::too_many_arguments)]
 fn write_pc_object(
     subgroups: &mut moq_transport::serve::SubgroupsWriter,
+    first_group: &mut Option<u64>,
     lease: &ProducerLease,
     context: &SenderContext,
     route: Route,
@@ -361,7 +417,8 @@ fn write_pc_object(
             .record_object()
             .map_err(|error| anyhow!("authorize S3 PC object: {error:?}"))?;
     }
-    let mut subgroup = subgroups.append(S3_PC_PRIORITY).context("S3 PC append")?;
+    let mut subgroup =
+        next_subgroup(subgroups, first_group, S3_PC_PRIORITY).context("S3 PC append")?;
     let identity = (subgroup.group_id, subgroup.subgroup_id);
     let mut object = subgroup.create(bytes.len(), None).context("S3 PC create")?;
     let object_id = object.object_id;
@@ -425,6 +482,7 @@ async fn produce_pc(
         .clone();
     let schedule = context.await_schedule().await?;
     let mut subgroups = writer.subgroups().context("S3 PC subgroups")?;
+    let mut first_group = context.first_group(route);
     let mut count = 0u64;
 
     if route.name == PC_NORMAL_TRACK {
@@ -445,6 +503,7 @@ async fn produce_pc(
                 }
                 write_pc_object(
                     &mut subgroups,
+                    &mut first_group,
                     &lease,
                     &context,
                     route,
@@ -484,6 +543,7 @@ async fn produce_pc(
             .context("S3 PC event overflow")?;
         write_pc_object(
             &mut subgroups,
+            &mut first_group,
             &lease,
             &context,
             route,
@@ -591,8 +651,8 @@ async fn produce_haptic(
 ) -> anyhow::Result<u64> {
     let essential = lease.route().name == HAPTIC_ESSENTIAL_TRACK;
     let mut subgroups = writer.subgroups().context("S3 haptic subgroups")?;
-    let mut subgroup = subgroups
-        .append(S3_HAPTIC_PRIORITY)
+    let mut first_group = context.first_group(lease.route());
+    let mut subgroup = next_subgroup(&mut subgroups, &mut first_group, S3_HAPTIC_PRIORITY)
         .context("S3 haptic append")?;
     let mut count = 0u64;
     let schedule = context.await_schedule().await?;
@@ -1759,4 +1819,69 @@ mod tests {
             Some(TrackRole::Haptic)
         );
     }
+
+    /// Codex 88: a P1 multi-generation fixture through real moq-transport
+    /// writers and the producers' own `next_subgroup` path. Every relay
+    /// forward_timeout key `(namespace, wire_track, group_id, subgroup_id,
+    /// object_id)` must join to exactly ONE sender object (with its route
+    /// generation, warm-up or measurement); the stage-9 rule (no base)
+    /// demonstrably collides.
+    #[test]
+    fn exp2_p1_relay_join_key_is_unique_across_route_generations() {
+        use moq_transport::coding::TrackNamespace;
+        use moq_transport::serve::Track;
+        use std::collections::HashMap;
+        // (wire track, generation, warm-up objects, measurement objects)
+        let pc = [("pc", 0u64, 90u32, 300u32), ("pc-d6", 1, 0, 300), ("pc-d7", 2, 0, 300), ("pc", 3, 0, 600)];
+        let haptic = [("haptic", 0u64, 270u32, 900u32), ("haptic-essential", 1, 0, 300), ("haptic", 2, 0, 1800)];
+        type Key = (&'static str, u64, u64, u64);
+        let run = |base_on: bool| -> HashMap<Key, Vec<(u64, bool)>> {
+            let mut keys: HashMap<Key, Vec<(u64, bool)>> = HashMap::new();
+            let ns = TrackNamespace::from_utf8_path("run-1");
+            for (name, generation, warm, meas) in pc {
+                let (writer, _reader) = Track::new(ns.clone(), name).produce();
+                let mut subgroups = writer.subgroups().unwrap();
+                let mut first = producer_first_group(base_on, Route { name, generation });
+                for n in 0..warm + meas {
+                    let mut sg = next_subgroup(&mut subgroups, &mut first, S3_PC_PRIORITY).unwrap();
+                    let object = sg.create(1, None).unwrap();
+                    keys.entry((name, sg.group_id, sg.subgroup_id, object.object_id))
+                        .or_default()
+                        .push((generation, n < warm));
+                }
+            }
+            for (name, generation, warm, meas) in haptic {
+                let (writer, _reader) = Track::new(ns.clone(), name).produce();
+                let mut subgroups = writer.subgroups().unwrap();
+                let mut first = producer_first_group(base_on, Route { name, generation });
+                let mut sg = next_subgroup(&mut subgroups, &mut first, S3_HAPTIC_PRIORITY).unwrap();
+                for n in 0..warm + meas {
+                    let object = sg.create(1, None).unwrap();
+                    keys.entry((name, sg.group_id, sg.subgroup_id, object.object_id))
+                        .or_default()
+                        .push((generation, n < warm));
+                }
+            }
+            keys
+        };
+        let p1 = run(true);
+        let total: u32 = pc.iter().map(|r| r.2 + r.3).sum::<u32>() + haptic.iter().map(|r| r.2 + r.3).sum::<u32>();
+        assert_eq!(p1.len() as u32, total, "one key per object");
+        for (key, objects) in &p1 {
+            // every relay forward_timeout on this key joins exactly one object
+            assert_eq!(objects.len(), 1, "{key:?}");
+            assert_eq!(exp2_route_generation_of_group(key.1), objects[0].0, "group encodes generation");
+        }
+        // generation 0 (incl. warm-up) keeps the historical ids from 0
+        assert!(p1.contains_key(&("pc", 0, 0, 0)));
+        assert_eq!(p1[&("pc", 0, 0, 0)], vec![(0, true)]);
+        assert!(p1.contains_key(&("pc", exp2_route_group_base(3), 0, 0)));
+        // the stage-9 S3 rule (no base) collides across generations
+        let s3 = run(false);
+        let colliding = s3.values().filter(|o| o.len() > 1).count();
+        assert!(colliding > 0, "without the base the key is ambiguous");
+        assert!(s3[&("pc", 0, 0, 0)].len() == 2, "gen0 warm-up vs gen3 measurement");
+        assert_eq!(producer_first_group(false, Route { name: "pc", generation: 3 }), None, "S3 unchanged");
+    }
+
 }

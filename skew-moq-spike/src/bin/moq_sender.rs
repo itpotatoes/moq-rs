@@ -2158,6 +2158,8 @@ async fn main() -> Result<()> {
                 } else {
                     skew_moq::s3_sender::S3_PC_DELIVERY_TIMEOUT_MS
                 },
+                // Codex 88: disjoint per-generation group bases, P1 only.
+                generation_group_base: args.arm == Arm::P1,
             });
             // Producer tasks record their final outcome within their
             // shutdown timeout; allow that plus a margin before the verdict
