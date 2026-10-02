@@ -676,6 +676,13 @@ struct Args {
     /// none either.
     #[arg(long, value_enum)]
     s3np_release_rule: Option<CliReleaseRule>,
+    /// Experiment 2 (contract v4 §9): create-only sidecar of cumulative
+    /// sender-hop DELIVERY_TIMEOUT counts (`wire` rows, source "sender"),
+    /// sampled at t0, at H = t0 + 40.4 s and at shutdown; the receiver copies
+    /// the latest sample into the exp2 JSONL. Required by the exp2 core arms;
+    /// optional for B1/S1 (always 0: no timeout configured).
+    #[arg(long)]
+    exp2_wire_out: Option<PathBuf>,
 }
 
 /// CLI mirror of `skew_moq::s3np::ReleaseRule`. Kept a separate type so clap's
@@ -1151,6 +1158,20 @@ fn validate_phase_args(args: &Args) -> Result<()> {
             "--arm {} requires --batch-id, --phase-control and --warmup-pass (shared t0)",
             args.arm.as_str()
         );
+    }
+    if args.arm.is_exp2_core() && args.exp2_wire_out.is_none() {
+        anyhow::bail!(
+            "--arm {} requires --exp2-wire-out (contract v4 sender timeout counter)",
+            args.arm.as_str()
+        );
+    }
+    if args.exp2_wire_out.is_some() {
+        if !supplied.iter().all(|value| *value) {
+            anyhow::bail!("--exp2-wire-out requires the registered phase control (t0 and H)");
+        }
+        if !(args.arm.is_exp2_core() || matches!(args.arm, Arm::B1 | Arm::S1)) {
+            anyhow::bail!("--exp2-wire-out is an experiment-2 option (b1, s1 and the exp2 arms)");
+        }
     }
     Ok(())
 }
@@ -1778,6 +1799,24 @@ async fn connect(
     Ok((session, transport))
 }
 
+/// Experiment 2: sample the sender timeout counter at t0 and schedule the
+/// sample at H (every sender timeout happens by t0 + 40 s + T_pc < H).
+fn exp2_wire_start(
+    wire: &Option<Arc<skew_moq::exp2_recorder::SenderWireSidecar>>,
+    t0_us: u64,
+) -> Result<()> {
+    let Some(wire) = wire else { return Ok(()) };
+    wire.sample("t0", now_us())?;
+    let wire = wire.clone();
+    tokio::spawn(async move {
+        sleep_monotonic_until(skew_moq::exp2_recorder::horizon_us(t0_us)).await;
+        if let Err(error) = wire.sample("horizon", now_us()) {
+            eprintln!("[tx] exp2 wire horizon sample failed: {error:#}");
+        }
+    });
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -1963,6 +2002,28 @@ async fn main() -> Result<()> {
         }),
     )?));
     logger.lock().unwrap().log_info(&preflight_info(pf));
+    // Experiment 2 (contract v4 §9): sender-hop delivery-timeout counter. The
+    // observer is installed only for the exp2 core arms (the only exp2 arms
+    // with a PC DELIVERY_TIMEOUT); B1/S1 sidecars report 0, not configured.
+    let exp2_wire: Option<Arc<skew_moq::exp2_recorder::SenderWireSidecar>> =
+        if let (Some(path), false) = (&args.exp2_wire_out, args.preflight_only) {
+            let counter = if args.arm.is_exp2_core() {
+                let counter = Arc::new(skew_moq::exp2_recorder::DeliveryTimeoutCounter::default());
+                moq_transport::object_trace::install(counter.clone()).map_err(|_| {
+                    anyhow::anyhow!("an object-boundary observer is already installed")
+                })?;
+                Some(counter)
+            } else {
+                None
+            };
+            Some(Arc::new(skew_moq::exp2_recorder::SenderWireSidecar::create(
+                path,
+                &args.run_id,
+                counter,
+            )?))
+        } else {
+            None
+        };
     if args.preflight_only {
         logger
             .lock()
@@ -2176,6 +2237,7 @@ async fn main() -> Result<()> {
                     .map_err(|_| anyhow::anyhow!("TX logger poisoned"))?
                     .log_measurement_start(schedule.measurement_start_us, 0)
                     .context("failed to record the S3 measurement epoch")?;
+                exp2_wire_start(&exp2_wire, schedule.measurement_start_us)?;
                 measurement_tx
                     .send(true)
                     .map_err(|_| anyhow::anyhow!("S3 measurement gate consumers closed"))?;
@@ -2570,6 +2632,7 @@ async fn main() -> Result<()> {
             .unwrap()
             .log_measurement_start(t0_us, 0)
             .context("failed to record the measurement epoch")?;
+        exp2_wire_start(&exp2_wire, t0_us)?;
         let duration_us = Duration::from_secs_f64(args.duration).as_micros() as u64;
         let end_us = t0_us
             .checked_add(duration_us)
@@ -3042,6 +3105,12 @@ async fn main() -> Result<()> {
         {
             record_io_failed = true;
         }
+        if let Some(wire) = &exp2_wire {
+            if let Err(error) = wire.sample("shutdown", now_us()) {
+                eprintln!("[tx] exp2 wire shutdown sample failed: {error:#}");
+                record_io_failed = true;
+            }
+        }
         let s3_fields = s3_shutdown_fields(s3_verdict.as_ref(), &s3_transport_ends);
         if lg
             .try_log_info(&format!(
@@ -3345,9 +3414,22 @@ mod tests {
             args.batch_id = Some("b".into());
             args.phase_control = Some(PathBuf::from("/x/phase.json"));
             args.warmup_pass = Some(PathBuf::from("/x/pass.json"));
+            assert!(validate_phase_args(&args).is_err(), "contract v4: sender wire sidecar required");
+            args.exp2_wire_out = Some(PathBuf::from("/x/sender_wire.jsonl"));
             assert!(validate_phase_args(&args).is_ok());
         }
         assert!(validate_phase_args(&arm_args(Arm::B1)).is_ok(), "B1 unchanged");
+        // the sidecar needs t0/H from phase control, and is exp2-only
+        let mut b1 = arm_args(Arm::B1);
+        b1.exp2_wire_out = Some(PathBuf::from("/x/w.jsonl"));
+        assert!(validate_phase_args(&b1).is_err());
+        b1.batch_id = Some("b".into());
+        b1.phase_control = Some(PathBuf::from("/x/phase.json"));
+        b1.warmup_pass = Some(PathBuf::from("/x/pass.json"));
+        assert!(validate_phase_args(&b1).is_ok());
+        let mut s3 = b1;
+        s3.arm = Arm::S3;
+        assert!(validate_phase_args(&s3).is_err(), "stage-9 arms take no exp2 sidecar");
         assert!(Arm::P1.subscription_scoped() && Arm::S3.subscription_scoped());
         assert!(!Arm::P0.subscription_scoped() && !Arm::P0.needs_pc_tier_dirs());
         // P1 owns the S3 producer lifecycle and tier directories.
@@ -3410,6 +3492,7 @@ mod tests {
             tier_schedule: None,
             d_play_ms: None,
             s3np_release_rule: None,
+            exp2_wire_out: None,
         }
     }
 

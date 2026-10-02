@@ -41,7 +41,7 @@ use crate::exp2_playout::{
 use crate::s3_controller::HapticMode;
 use crate::{is_warmup_seq, Header, TRACK_HAPTIC, TRACK_PC};
 
-pub const EXP2_CONTRACT_VERSION: &str = "exp2-contract-v3";
+pub const EXP2_CONTRACT_VERSION: &str = "exp2-contract-v4";
 pub const EXP2_METRIC_SCHEMA_VERSION: &str = "exp2-v2";
 /// Registration §1: run length, B_play, ε_ref, G_report,R (integer µs).
 pub const RUN_DURATION_US: u64 = 40_000_000;
@@ -53,6 +53,10 @@ pub const N_HAPTIC: usize = 3_600;
 pub const PC_RATE_HZ: u64 = 30;
 pub const HAPTIC_RATE_HZ: u64 = 90;
 pub const ROUTE_COPY_DISCARD: &str = "route_copy_discard";
+/// Contract v4 §9 / registration §2-2: an object that arrived but was
+/// discarded by the P1 switch gate on every route (never admitted) is a
+/// terminal drop with this reason (P1's switching cost), not `no_object`.
+pub const SWITCH_BARRIER: &str = "switch_barrier";
 /// S1 slot that was admitted but neither released nor dropped by H and whose
 /// due is not after H (or unknown): none of the contract §4 states applies, so
 /// it is an explicit discard with this reason (WP3 interpretation, reported).
@@ -285,6 +289,10 @@ pub const RECEIVER_META_KEYS: &[&str] = &[
     "C_mbps",
     "S_bytes",
     "t_us",
+    "scientific_eligible",
+    "exp2_test_mode",
+    "exp2_test_force_hc_at_ms",
+    "p1_switch_settings",
 ];
 
 pub struct ReceiverMeta<'a> {
@@ -295,9 +303,15 @@ pub struct ReceiverMeta<'a> {
     pub t0_us: u64,
     pub opportunities_sha256: &'a str,
     pub delta_max_us: u64,
-    pub t_pc_ms: u64,
+    /// `None` (JSON null) for B1/S1, which apply no delivery timeout
+    /// (contract v4 §9).
+    pub t_pc_ms: Option<u64>,
     pub c_mbps: f64,
     pub s_bytes: u64,
+    /// False only in the hidden receiver test mode (contract v4 §9).
+    pub scientific_eligible: bool,
+    /// Receiver-owned additions (P1 switch settings, test-mode fields).
+    pub extra: Map<String, Value>,
 }
 
 /// Merge the runner meta document with the receiver's own fields.  Returns
@@ -356,6 +370,14 @@ pub fn build_meta(runner: &Value, own: &ReceiverMeta<'_>) -> Result<(Map<String,
     meta.insert("t_pc_ms".into(), json!(own.t_pc_ms));
     meta.insert("C_mbps".into(), json!(own.c_mbps));
     meta.insert("S_bytes".into(), json!(own.s_bytes));
+    meta.insert("scientific_eligible".into(), json!(own.scientific_eligible));
+    for (key, value) in &own.extra {
+        ensure!(
+            RECEIVER_META_KEYS.contains(&key.as_str()),
+            "receiver meta extra {key:?} is not a receiver-owned key"
+        );
+        meta.insert(key.clone(), value.clone());
+    }
     for (key, value) in runner {
         meta.insert(key.clone(), value.clone());
     }
@@ -462,6 +484,9 @@ struct Slot {
     /// Route copies of this slot discarded without admission (P1 switch
     /// barrier / stale generation); written on a sealing row as a diagnostic.
     copies_discarded: u32,
+    /// First transport (switch-gate) discard of a never-admitted copy:
+    /// `(t_recv, reason)`.
+    first_gate_discard: Option<(u64, &'static str)>,
 }
 
 /// Counters written into the closing `wire` and `instrumentation_end` rows.
@@ -532,6 +557,9 @@ pub struct Exp2Recorder<W: Write> {
     s1_finished: bool,
     stats: Exp2RecorderStats,
     side_rows: Vec<String>,
+    max_write_lag_us: u64,
+    /// Last committed Δ_eff per modality (controller rows on change).
+    last_delta_eff: [Option<u64>; 2],
 }
 
 impl<W: Write> Exp2Recorder<W> {
@@ -594,6 +622,8 @@ impl<W: Write> Exp2Recorder<W> {
             s1_finished: false,
             stats: Exp2RecorderStats::default(),
             side_rows: Vec::new(),
+            max_write_lag_us: 0,
+            last_delta_eff: [None, None],
         })
     }
 
@@ -658,19 +688,26 @@ impl<W: Write> Exp2Recorder<W> {
         }
         ensure!(self.meta_written, "exp2 row before the meta line");
         row.insert("run_id".into(), json!(self.run_id));
+        // Contract v4 §9: `t_log_arrival_us` is the pre-write stamp (a row
+        // cannot contain its own write-completion instant); the write lag
+        // (completion − this stamp, serialisation included) is measured for
+        // every row and its maximum goes on `instrumentation_end`.
+        let t_before = (self.clock)();
         if log_arrival {
-            // [INTERPRETATION] the receipt is stamped immediately before the
-            // synchronous write of this row; a row cannot contain the
-            // completion instant of its own write.
-            let t = (self.clock)();
-            row.insert("t_log_arrival_us".into(), json!(t));
+            row.insert("t_log_arrival_us".into(), json!(t_before));
         }
-        let mut line = serde_json::to_vec(&Value::Object(row))?;
+        self.write_line(Value::Object(row), t_before)
+    }
+
+    fn write_line(&mut self, row: Value, t_before: u64) -> Result<()> {
+        let mut line = serde_json::to_vec(&row)?;
         line.push(b'\n');
         if let Err(error) = self.out.write_all(&line).and_then(|_| self.out.flush()) {
             self.write_failed = true;
             return Err(error).context("write exp2 JSONL row");
         }
+        let lag = (self.clock)().saturating_sub(t_before);
+        self.max_write_lag_us = self.max_write_lag_us.max(lag);
         Ok(())
     }
 
@@ -689,15 +726,10 @@ impl<W: Write> Exp2Recorder<W> {
             meta.get("method").and_then(Value::as_str) == Some(self.method.label()),
             "meta method differs"
         );
-        meta.insert("t_us".into(), json!((self.clock)()));
+        let t_before = (self.clock)();
+        meta.insert("t_us".into(), json!(t_before));
         self.meta_written = true;
-        let mut line = serde_json::to_vec(&Value::Object(meta))?;
-        line.push(b'\n');
-        if let Err(error) = self.out.write_all(&line).and_then(|_| self.out.flush()) {
-            self.write_failed = true;
-            return Err(error).context("write exp2 meta line");
-        }
-        Ok(())
+        self.write_line(Value::Object(meta), t_before)
     }
 
     fn slot_fields(&self, m: Modality, index: u32) -> Map<String, Value> {
@@ -887,7 +919,7 @@ impl<W: Write> Exp2Recorder<W> {
                 self.stats.post_horizon_arrivals += 1;
             } else {
                 // Registration §2 / contract §4: B1 release := t_recv.
-                self.write_release(m, index, rx.t_recv_us, None, None, None)?;
+                self.write_release(m, index, rx.t_recv_us, None, None)?;
             }
         }
         Ok(Admission::Admitted(m, index))
@@ -895,7 +927,7 @@ impl<W: Write> Exp2Recorder<W> {
 
     /// A transport-level discard of a route copy that was never admitted
     /// (P1 switch barrier / stale generation): rx row + `route_copy_discard`.
-    pub fn discard_route_copy(&mut self, rx: Exp2Rx, transport_reason: &str) -> Result<()> {
+    pub fn discard_route_copy(&mut self, rx: Exp2Rx, transport_reason: &'static str) -> Result<()> {
         if self.ended {
             self.stats.rows_refused_after_end += 1;
             return Ok(());
@@ -903,6 +935,10 @@ impl<W: Write> Exp2Recorder<W> {
         let Some((m, index)) = self.locate_and_log_rx(&rx)? else {
             return Ok(());
         };
+        let slot = &mut self.slots[m.ix()][index as usize];
+        if slot.first_gate_discard.is_none() && rx.t_recv_us <= self.h {
+            slot.first_gate_discard = Some((rx.t_recv_us, transport_reason));
+        }
         self.copy_discard(m, index, &rx, Some(transport_reason))
     }
 
@@ -974,6 +1010,7 @@ impl<W: Write> Exp2Recorder<W> {
         }
         let mut row = self.slot_fields(m, index);
         row.insert("role".into(), json!("wire"));
+        row.insert("source".into(), json!("receiver"));
         row.insert("kind".into(), json!("delivery_timeout_observed"));
         row.insert("t_observed_us".into(), json!(now_us));
         row.insert("t_us".into(), json!((self.clock)()));
@@ -1111,19 +1148,42 @@ impl<W: Write> Exp2Recorder<W> {
                         row.insert("compression_us".into(), json!(compression));
                         self.write_value(row, false)?;
                     }
+                    // Contract v4 §9 `controller`: Δ_eff changes per modality.
+                    // P0-NP has one Δ per modality; P0/P1 share one Δ and
+                    // S3NPA' a fixed one, so those are written once as "shared".
+                    let per_modality = self.method == Exp2Method::P0np;
+                    for (m, due, g, compression) in [
+                        (Modality::Pc, rec.pc, rec.hold_g_us[0], rec.compression_us[0]),
+                        (Modality::Haptic, rec.haptic[0], rec.hold_g_us[1], rec.compression_us[1]),
+                    ] {
+                        if !per_modality && m == Modality::Haptic {
+                            continue;
+                        }
+                        let modality = if per_modality { m.as_str() } else { "shared" };
+                        let previous = self.last_delta_eff[m.ix()];
+                        if previous == Some(due.delta_eff_us) {
+                            continue;
+                        }
+                        self.last_delta_eff[m.ix()] = Some(due.delta_eff_us);
+                        let mut row = self.controller_row("delta_eff_commit", modality, due.delta_eff_us);
+                        row.insert("i".into(), json!(rec.event));
+                        row.insert("at_us".into(), json!(rec.at_us));
+                        row.insert("from_us".into(), json!(previous));
+                        row.insert("delta_generation".into(), json!(due.delta_generation));
+                        row.insert("hold_g_us".into(), json!(g));
+                        row.insert("compression_us".into(), json!(compression));
+                        self.write_value(row, false)?;
+                    }
                 }
                 Exp2Decision::Release(r) => {
                     if self.slots[r.modality.ix()][r.index as usize].terminal {
                         bail!("core released an opportunity that already has a terminal row");
                     }
-                    self.write_release(
-                        r.modality,
-                        r.index,
-                        r.t_release_us,
-                        Some(r.committed),
-                        Some(r.grace),
-                        Some(r.t_recv_us),
-                    )?;
+                    // Contract v4 §9: the release time is the ACTUAL dispatch
+                    // instant (the scheduled due stays in the decision row).
+                    let actual = (self.clock)().max(r.t_release_us);
+                    let t_in = self.slots[r.modality.ix()][r.index as usize].t_in_us;
+                    self.write_release(r.modality, r.index, actual, Some(r.grace), t_in)?;
                 }
                 Exp2Decision::Drop(r) => {
                     if self.slots[r.modality.ix()][r.index as usize].terminal {
@@ -1165,6 +1225,38 @@ impl<W: Write> Exp2Recorder<W> {
                             self.stats.delta_updates_q_decrease += 1
                         }
                     }
+                    let modality = match self.method {
+                        Exp2Method::P0np if u.controller == 0 => "pc",
+                        Exp2Method::P0np => "haptic",
+                        _ => "shared",
+                    };
+                    // Contract v4 §9 controller rows: the cause row
+                    // (miss_step: value = Δ* after the step; q_update: value =
+                    // the nearest-rank Q that moved Δ*), then the Δ* row.
+                    let mut cause = match u.cause {
+                        crate::exp2_playout::DeltaCause::MissStep => {
+                            let mut r = self.controller_row("miss_step", modality, u.to_us);
+                            r.insert("window_misses".into(), json!(u.window_misses));
+                            r
+                        }
+                        _ => {
+                            let q = u.q_us.map(|q| q.max(0) as u64);
+                            let mut r = self.controller_row("q_update", modality, q.unwrap_or(0));
+                            r.insert("value_us".into(), json!(q));
+                            r.insert("direction".into(), json!(u.cause.as_str()));
+                            r
+                        }
+                    };
+                    cause.insert("at_us".into(), json!(u.at_us));
+                    cause.insert("controller".into(), json!(u.controller));
+                    self.write_value(cause, false)?;
+                    let mut star = self.controller_row("delta_star", modality, u.to_us);
+                    star.insert("at_us".into(), json!(u.at_us));
+                    star.insert("controller".into(), json!(u.controller));
+                    star.insert("from_us".into(), json!(u.from_us));
+                    star.insert("cause".into(), json!(u.cause.as_str()));
+                    star.insert("delta_generation".into(), json!(u.delta_generation));
+                    self.write_value(star, false)?;
                     self.side_rows.push(format!(
                         "\"event\":\"exp2_delta_update\",\"controller\":{},\"at_us\":{},\"cause\":\"{}\",\"from_us\":{},\"to_us\":{},\"delta_generation\":{},\"window_misses\":{},\"q_us\":{}",
                         u.controller,
@@ -1193,12 +1285,21 @@ impl<W: Write> Exp2Recorder<W> {
         Ok(requests)
     }
 
+    fn controller_row(&mut self, event: &str, modality: &str, value_us: u64) -> Map<String, Value> {
+        let mut row = Map::new();
+        row.insert("role".into(), json!("controller"));
+        row.insert("t_us".into(), json!((self.clock)()));
+        row.insert("modality".into(), json!(modality));
+        row.insert("event".into(), json!(event));
+        row.insert("value_us".into(), json!(value_us));
+        row
+    }
+
     fn write_release(
         &mut self,
         m: Modality,
         index: u32,
         t_release_us: u64,
-        committed: Option<CommittedDue>,
         grace: Option<bool>,
         core_t_in: Option<u64>,
     ) -> Result<()> {
@@ -1213,11 +1314,6 @@ impl<W: Write> Exp2Recorder<W> {
         }
         if let Some(t) = core_t_in {
             row.insert("t_core_in_us".into(), json!(t));
-        }
-        if let Some(c) = committed {
-            row.insert("due_us".into(), json!(c.due_us));
-            row.insert("delta_eff_us".into(), json!(c.delta_eff_us));
-            row.insert("delta_generation".into(), json!(c.delta_generation));
         }
         if let Some(g) = grace {
             row.insert("grace".into(), json!(g));
@@ -1258,23 +1354,65 @@ impl<W: Write> Exp2Recorder<W> {
         self.write_value(row, true)
     }
 
+    /// A sealing row (contract v4 §9): `t_us` is the ACTUAL write instant
+    /// (>= H) and `seal_horizon_us = H` names the horizon it seals.
     fn write_sealing(&mut self, m: Modality, index: u32, role: &str, due: Option<u64>) -> Result<()> {
         let mut row = self.slot_fields(m, index);
         row.insert("role".into(), json!(role));
-        row.insert("t_us".into(), json!(self.h));
+        row.insert("t_us".into(), json!((self.clock)()));
+        row.insert("seal_horizon_us".into(), json!(self.h));
         if let Some(d) = due {
             row.insert("due_us".into(), json!(d));
         }
-        // [INTERPRETATION] a slot whose received copies were all discarded by
-        // the route gate (never given to the scheduler) is sealed as
-        // no_object — "no object reached the scheduler" — with the count of
-        // discarded copies as a diagnostic, never as a different state.
-        let copies = self.slots[m.ix()][index as usize].copies_discarded;
-        if copies > 0 {
-            row.insert("route_copies_discarded".into(), json!(copies));
-        }
         self.slots[m.ix()][index as usize].terminal = true;
         self.write_value(row, false)
+    }
+
+    /// A drop decided by the seal (delivery timeout label, S1 unreleased,
+    /// P1 switch barrier): `t_us` = actual write instant, `seal_horizon_us = H`.
+    fn write_seal_drop(
+        &mut self,
+        m: Modality,
+        index: u32,
+        reason: &str,
+        due: Option<u64>,
+        extra: Map<String, Value>,
+    ) -> Result<()> {
+        let mut row = self.slot_fields(m, index);
+        row.insert("role".into(), json!("drop"));
+        row.insert("reason".into(), json!(reason));
+        row.insert("t_us".into(), json!((self.clock)()));
+        row.insert("seal_horizon_us".into(), json!(self.h));
+        if let Some(t) = self.slots[m.ix()][index as usize].t_recv_us {
+            row.insert("t_recv_us".into(), json!(t));
+        }
+        if let Some(d) = due {
+            row.insert("due_us".into(), json!(d));
+        }
+        for (k, v) in extra {
+            row.insert(k, v);
+        }
+        self.slots[m.ix()][index as usize].terminal = true;
+        self.write_value(row, true)
+    }
+
+    /// Contract v4 §9 / registration §2-2: a slot never admitted but with an
+    /// arrived copy discarded by the switch gate on every route is a terminal
+    /// `switch_barrier` drop.  Returns whether it wrote one.
+    fn seal_switch_barrier(&mut self, m: Modality, index: u32) -> Result<bool> {
+        let slot = &self.slots[m.ix()][index as usize];
+        if slot.terminal || slot.admitted_gen.is_some() {
+            return Ok(false);
+        }
+        let Some((t_first, transport_reason)) = slot.first_gate_discard else {
+            return Ok(false);
+        };
+        let mut extra = Map::new();
+        extra.insert("t_first_discard_us".into(), json!(t_first));
+        extra.insert("transport_reason".into(), json!(transport_reason));
+        extra.insert("route_copies_discarded".into(), json!(slot.copies_discarded));
+        self.write_seal_drop(m, index, SWITCH_BARRIER, None, extra)?;
+        Ok(true)
     }
 
     fn seal_core(&mut self) -> Result<Vec<TierRequest>> {
@@ -1289,6 +1427,9 @@ impl<W: Write> Exp2Recorder<W> {
             ensure!(entries.len() == self.slots[m.ix()].len(), "sealed ledger size");
             for (index, entry) in entries.into_iter().enumerate() {
                 let index = index as u32;
+                if self.seal_switch_barrier(m, index)? {
+                    continue;
+                }
                 let written = self.slots[m.ix()][index as usize].terminal;
                 match entry.terminal {
                     SchedulerTerminal::Released { .. } => {
@@ -1299,21 +1440,21 @@ impl<W: Write> Exp2Recorder<W> {
                         at_us,
                     } => {
                         if !written {
-                            // Codex 84: t_us = H (seal decision); the
+                            // Seal-decided drop (contract v4 §9); the
                             // observation instant is in the earlier wire row
                             // (the core's label time can be 1 µs later when
                             // the input was clamped).
                             let observed = self.slots[m.ix()][index as usize]
                                 .timeout_observed_us
                                 .unwrap_or(at_us);
-                            self.write_drop(
+                            let mut extra = Map::new();
+                            extra.insert("t_observed_us".into(), json!(observed));
+                            self.write_seal_drop(
                                 m,
                                 index,
-                                self.h,
                                 "delivery_timeout",
-                                None,
-                                entry.committed,
-                                Some(observed),
+                                entry.committed.map(|c| c.due_us),
+                                extra,
                             )?;
                         }
                     }
@@ -1351,6 +1492,9 @@ impl<W: Write> Exp2Recorder<W> {
         self.sealed = true;
         for m in Modality::ALL {
             for index in 0..self.slots[m.ix()].len() as u32 {
+                if self.seal_switch_barrier(m, index)? {
+                    continue;
+                }
                 let slot = self.slots[m.ix()][index as usize].clone();
                 if slot.terminal {
                     continue;
@@ -1364,15 +1508,7 @@ impl<W: Write> Exp2Recorder<W> {
                     if due.is_some_and(|d| d > self.h) {
                         self.write_sealing(m, index, "pending_at_horizon", due)?;
                     } else {
-                        let mut row = self.slot_fields(m, index);
-                        row.insert("role".into(), json!("drop"));
-                        row.insert("reason".into(), json!(S1_UNRELEASED_AT_HORIZON));
-                        row.insert("t_us".into(), json!(self.h));
-                        if let Some(d) = due {
-                            row.insert("due_us".into(), json!(d));
-                        }
-                        self.slots[m.ix()][index as usize].terminal = true;
-                        self.write_value(row, true)?;
+                        self.write_seal_drop(m, index, S1_UNRELEASED_AT_HORIZON, due, Map::new())?;
                     }
                 } else {
                     self.write_sealing(m, index, "no_object", None)?;
@@ -1432,9 +1568,6 @@ impl<W: Write> Exp2Recorder<W> {
                 row.insert("t_release_us".into(), json!(at_us));
                 if let Some(t) = self.slots[m.ix()][index as usize].t_recv_us {
                     row.insert("t_recv_us".into(), json!(t));
-                }
-                if let Some(d) = due_us {
-                    row.insert("due_us".into(), json!(d));
                 }
                 self.slots[m.ix()][index as usize].terminal = true;
                 self.write_value(row, true)
@@ -1496,6 +1629,47 @@ impl<W: Write> Exp2Recorder<W> {
         self.write_value(row, false)
     }
 
+    /// A public `integrity_warning` row (diagnostic, never invalidating).
+    pub fn warn(&mut self, kind: &str, fields: Value) -> Result<()> {
+        let fields = match fields {
+            Value::Object(map) => map,
+            _ => Map::new(),
+        };
+        self.integrity_warning(kind, fields)
+    }
+
+    /// Import a sender/relay cumulative timeout counter sample (contract v4
+    /// §9 `wire` row, `source` "sender" | "relay") into this run's JSONL.
+    /// `t_us` is this write; the producer's own sample time is kept as
+    /// `t_sample_us`.
+    pub fn import_wire_counter(&mut self, sample: &Map<String, Value>, imported_from: &str) -> Result<()> {
+        let source = sample.get("source").and_then(Value::as_str).unwrap_or_default();
+        ensure!(matches!(source, "sender" | "relay"), "wire counter source {source:?}");
+        ensure!(
+            sample.get("role").and_then(Value::as_str) == Some("wire"),
+            "wire counter sample must have role wire"
+        );
+        ensure!(
+            sample.get("run_id").and_then(Value::as_str) == Some(self.run_id.as_str()),
+            "wire counter sample of another run"
+        );
+        let count = sample
+            .get("delivery_timeout_count")
+            .and_then(Value::as_u64)
+            .context("delivery_timeout_count must be a non-negative integer")?;
+        let mut row = Map::new();
+        for (key, value) in sample {
+            if !matches!(key.as_str(), "run_id" | "t_us") {
+                row.insert(key.clone(), value.clone());
+            }
+        }
+        row.insert("delivery_timeout_count".into(), json!(count));
+        row.insert("t_sample_us".into(), sample.get("t_us").cloned().unwrap_or(Value::Null));
+        row.insert("t_us".into(), json!((self.clock)()));
+        row.insert("imported_from".into(), json!(imported_from));
+        self.write_value(row, false)
+    }
+
     /// `tier_switch` row: a requested switch took effect (make-before-break
     /// exact-pair first effect) or was abandoned.
     pub fn log_tier_switch(&mut self, fields: Map<String, Value>) -> Result<()> {
@@ -1527,6 +1701,7 @@ impl<W: Write> Exp2Recorder<W> {
             .map(|c| [c.max_occupancy(Modality::Pc), c.max_occupancy(Modality::Haptic)]);
         let mut wire = Map::new();
         wire.insert("role".into(), json!("wire"));
+        wire.insert("source".into(), json!("receiver"));
         wire.insert("kind".into(), json!("receiver_summary"));
         wire.insert("t_us".into(), json!((self.clock)()));
         // Receiver-side service after the committed due: defined only where a
@@ -1556,6 +1731,8 @@ impl<W: Write> Exp2Recorder<W> {
         row.insert("role".into(), json!("instrumentation_end"));
         row.insert("t_us".into(), json!(end));
         row.insert("end_us".into(), json!(end));
+        // Contract v4 §9: max write lag over every row written before this one.
+        row.insert("max_write_lag_us".into(), json!(self.max_write_lag_us));
         row.insert(
             "counters".into(),
             json!({
@@ -1584,6 +1761,108 @@ impl<W: Write> Exp2Recorder<W> {
     }
 }
 
+// --------------------------------------------------------------------------
+// Contract v4 §9: sender-side delivery-timeout counter (`wire`, source sender)
+// --------------------------------------------------------------------------
+
+/// Counts DELIVERY_TIMEOUT expiries at this process's forwarding hop through
+/// moq-transport's object-boundary hook (`ForwardTimeout` is emitted on both
+/// timeout paths of `Subscribed::serve_subgroup*`: the stream that never
+/// opened and the stream reset mid-object). Lock-free, allocation-free.
+#[derive(Debug, Default)]
+pub struct DeliveryTimeoutCounter {
+    pc: std::sync::atomic::AtomicU64,
+    haptic: std::sync::atomic::AtomicU64,
+    other: std::sync::atomic::AtomicU64,
+}
+
+impl DeliveryTimeoutCounter {
+    /// Count one expiry on a wire track (`pc*` / `haptic*` route names).
+    pub fn note(&self, track_name: &[u8]) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if track_name.starts_with(b"pc") {
+            self.pc.fetch_add(1, Relaxed);
+        } else if track_name.starts_with(b"haptic") {
+            self.haptic.fetch_add(1, Relaxed);
+        } else {
+            self.other.fetch_add(1, Relaxed);
+        }
+    }
+
+    /// `(total, pc, haptic, other)`.
+    pub fn snapshot(&self) -> (u64, u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (pc, haptic, other) = (self.pc.load(Relaxed), self.haptic.load(Relaxed), self.other.load(Relaxed));
+        (pc + haptic + other, pc, haptic, other)
+    }
+}
+
+impl moq_transport::object_trace::Observer for DeliveryTimeoutCounter {
+    fn now_us(&self) -> u64 {
+        crate::now_us()
+    }
+
+    fn record(
+        &self,
+        boundary: moq_transport::object_trace::Boundary,
+        object: &std::sync::Arc<moq_transport::serve::SubgroupObject>,
+        _track_alias: u64,
+        _timestamp_us: u64,
+    ) {
+        if boundary == moq_transport::object_trace::Boundary::ForwardTimeout {
+            self.note(object.group.track.name.as_bytes());
+        }
+    }
+}
+
+/// The sender's exp2 `wire` sidecar: cumulative `delivery_timeout_count`
+/// samples in the contract v4 row format (role wire, source sender, kind
+/// delivery_timeout_counter). The receiver copies the latest sample into
+/// the run's exp2 JSONL before its sentinel. Create-only.
+pub struct SenderWireSidecar {
+    file: std::sync::Mutex<std::fs::File>,
+    run_id: String,
+    counter: Option<std::sync::Arc<DeliveryTimeoutCounter>>,
+}
+
+impl SenderWireSidecar {
+    /// `counter` is `None` when the arm applies no delivery timeout (B1/S1):
+    /// every sample is then 0 with `delivery_timeout_configured: false`.
+    pub fn create(
+        path: &std::path::Path,
+        run_id: &str,
+        counter: Option<std::sync::Arc<DeliveryTimeoutCounter>>,
+    ) -> Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .with_context(|| format!("create sender wire sidecar {} (create-only)", path.display()))?;
+        Ok(Self { file: std::sync::Mutex::new(file), run_id: run_id.to_string(), counter })
+    }
+
+    /// One cumulative sample, labelled with when it was taken
+    /// (`t0` / `horizon` / `shutdown`).
+    pub fn sample(&self, at: &str, t_us: u64) -> Result<()> {
+        let (total, pc, haptic, other) = self
+            .counter
+            .as_ref()
+            .map(|c| c.snapshot())
+            .unwrap_or((0, 0, 0, 0));
+        let row = json!({
+            "role": "wire", "source": "sender", "kind": "delivery_timeout_counter",
+            "run_id": self.run_id, "t_us": t_us, "sample": at,
+            "delivery_timeout_count": total,
+            "by_track": {"pc": pc, "haptic": haptic, "other": other},
+            "delivery_timeout_configured": self.counter.is_some(),
+        });
+        let mut line = serde_json::to_vec(&row)?;
+        line.push(b'\n');
+        let mut file = self.file.lock().map_err(|_| anyhow!("sender wire sidecar poisoned"))?;
+        file.write_all(&line).and_then(|_| file.flush()).context("write sender wire sample")
+    }
+}
+
 /// Resident set size of this process (bytes), from `/proc/self/statm`.
 pub fn current_rss_bytes() -> Option<u64> {
     let text = std::fs::read_to_string("/proc/self/statm").ok()?;
@@ -1605,6 +1884,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     const T0: u64 = 50_000_000;
+    const G_report_R_US_FOR_TEST: u64 = G_REPORT_R_US;
     const DMAX: u64 = 345_000; // provisional slot value, test input only
 
     #[derive(Clone, Default)]
@@ -1786,16 +2066,32 @@ mod tests {
         assert_eq!(last["role"], json!("instrumentation_end"));
         assert_eq!(last["end_us"], last["t_us"]);
         assert!(last["end_us"].as_u64().unwrap() >= h + G_REPORT_R_US);
+        assert!(last["max_write_lag_us"].is_u64(), "v4 write lag on the sentinel");
         for row in rows {
             assert!(row["t_us"].is_u64(), "integer µs t_us: {row}");
             assert_eq!(row["run_id"], json!("run-1"));
             let role = row["role"].as_str().unwrap();
-            if matches!(role, "pending_at_horizon" | "no_object") {
-                assert_eq!(row["t_us"].as_u64().unwrap(), h, "sealing row at H");
+            if matches!(role, "pending_at_horizon" | "no_object") || row.get("seal_horizon_us").is_some() {
+                // contract v4 §9: actual write time inside [H, H + G_report)
+                assert_eq!(row["seal_horizon_us"].as_u64().unwrap(), h, "seal_horizon_us == H");
+                let t = row["t_us"].as_u64().unwrap();
+                assert!(t >= h && t < h + G_report_R_US_FOR_TEST, "sealing row written in the window");
             }
             if role == "release" {
-                assert!(row["t_release_us"].as_u64().unwrap() <= h);
+                assert!(row.get("due_us").is_none(), "due stays in decision rows only");
+                assert_eq!(row["t_us"], row["t_release_us"]);
                 assert!(row["t_log_arrival_us"].as_u64().unwrap() >= row["t_release_us"].as_u64().unwrap());
+            }
+            if role == "wire" {
+                assert!(row["source"].is_string(), "v4 wire rows carry source");
+            }
+            if role == "controller" {
+                assert!(matches!(row["modality"].as_str(), Some("pc" | "haptic" | "shared")));
+                assert!(matches!(
+                    row["event"].as_str(),
+                    Some("q_update" | "miss_step" | "delta_star" | "delta_eff_commit")
+                ));
+                assert!(row["value_us"].is_u64() || row["value_us"].is_null());
             }
             if role == "drop" {
                 assert!(row["reason"].is_string());
@@ -1876,7 +2172,8 @@ mod tests {
         let pc20 = &terminals[&("pc".to_string(), pc_slot_identity(20).0)];
         assert_eq!(pc20["role"], json!("drop"));
         assert_eq!(pc20["reason"], json!("delivery_timeout"));
-        assert_eq!(pc20["t_us"].as_u64().unwrap(), horizon_us(T0));
+        assert_eq!(pc20["seal_horizon_us"].as_u64().unwrap(), horizon_us(T0));
+        assert!(pc20["t_us"].as_u64().unwrap() >= horizon_us(T0));
         assert_eq!(pc20["t_observed_us"].as_u64().unwrap(), t20 + 1_000);
         let wire: Vec<_> = rows
             .iter()
@@ -1938,7 +2235,7 @@ mod tests {
         assert_eq!(at_h["t_us"].as_u64().unwrap(), h);
         let after_h = &terminals[&("pc".to_string(), pc_slot_identity(last as u64 - 1).0)];
         assert_eq!(after_h["role"], json!("no_object"));
-        assert_eq!(after_h["t_us"].as_u64().unwrap(), h);
+        assert_eq!(after_h["seal_horizon_us"].as_u64().unwrap(), h);
         // the post-H object still has its rx row (reception), not a terminal
         assert!(rows.iter().any(|r| r["role"] == json!("rx") && r["pts_us"] == json!(pc_slot_identity(last as u64 - 1).0)));
         assert_eq!(r.rec.stats().post_horizon_arrivals, 1);
@@ -1998,7 +2295,7 @@ mod tests {
         expected.sort();
         assert_eq!(keys, expected);
         for row in pending {
-            assert_eq!(row["t_us"].as_u64().unwrap(), h, "sealing row at H");
+            assert_eq!(row["seal_horizon_us"].as_u64().unwrap(), h, "seals H");
             assert!(row["due_us"].as_u64().unwrap() > h, "due after H");
             assert!(row["seq"].is_u64(), "the buffered object is identified");
         }
@@ -2111,7 +2408,7 @@ mod tests {
         let terminals = assert_single_terminal(&rows);
         let get = |i: u64| &terminals[&("pc".to_string(), pc_slot_identity(i).0)];
         assert_eq!(get(0)["role"], json!("release"));
-        assert_eq!(get(0)["due_us"].as_u64().unwrap(), T0 + 101_000);
+        assert_eq!(get(0)["t_release_us"].as_u64().unwrap(), T0 + 101_000);
         assert_eq!(get(1)["reason"], json!("late"));
         assert_eq!(get(2)["role"], json!("pending_at_horizon"));
         assert_eq!(get(2)["due_us"].as_u64().unwrap(), h + 5);
@@ -2221,7 +2518,8 @@ mod tests {
     fn own() -> ReceiverMeta<'static> {
         ReceiverMeta { run_id: "run-1", method: Exp2Method::P0np, topology: "direct",
                        representation: "bin", t0_us: T0, opportunities_sha256: "ab",
-                       delta_max_us: DMAX, t_pc_ms: 345, c_mbps: 131.9, s_bytes: 1 }
+                       delta_max_us: DMAX, t_pc_ms: Some(345), c_mbps: 131.9, s_bytes: 1,
+                       scientific_eligible: true, extra: Map::new() }
     }
 
     #[test]
@@ -2232,6 +2530,21 @@ mod tests {
         assert_eq!(meta["contract"], json!(EXP2_CONTRACT_VERSION));
         assert_eq!(meta["metric_schema_version"], json!(EXP2_METRIC_SCHEMA_VERSION));
         assert_eq!(meta["t_pc_ms"], json!(345));
+        assert_eq!(meta["scientific_eligible"], json!(true));
+        let mut b1 = own();
+        b1.method = Exp2Method::B1;
+        b1.t_pc_ms = None;
+        b1.scientific_eligible = false;
+        b1.extra.insert("exp2_test_mode".into(), json!(true));
+        let (meta_b1, _) = build_meta(&runner_meta(), &b1).unwrap();
+        assert!(meta_b1["t_pc_ms"].is_null(), "B1/S1 t_pc_ms is null");
+        assert_eq!(meta_b1["scientific_eligible"], json!(false));
+        let mut foreign = own();
+        foreign.extra.insert("campaign".into(), json!("x"));
+        assert!(build_meta(&runner_meta(), &foreign).is_err(), "extra must be receiver-owned");
+        let mut eligible = runner_meta();
+        eligible["scientific_eligible"] = json!(true);
+        assert!(build_meta(&eligible, &own()).is_err(), "runner cannot set eligibility");
         let mut owned = runner_meta();
         owned["t0_us"] = json!(1);
         assert!(build_meta(&owned, &own()).is_err(), "receiver-owned key");
@@ -2263,4 +2576,166 @@ mod tests {
         assert!(pc_slot_identity(N_PC as u64 - 1).0 < RUN_DURATION_US);
         assert!(haptic_slot_identity(N_HAPTIC as u64 - 1).0 < RUN_DURATION_US);
     }
+
+    #[test]
+    fn exp2_recorder_v4_switch_barrier_is_a_terminal_drop() {
+        // An arrived object discarded by the switch gate on every route and
+        // never admitted: terminal drop(switch_barrier) at the seal, not
+        // no_object.  A slot whose copy was discarded but that was admitted
+        // from another route keeps its release.
+        let mut r = rig(Exp2Method::P1);
+        let t = slot_ref(Modality::Pc, 100) + 20_000;
+        r.set(t);
+        r.rec.advance(t - 1).unwrap();
+        for (index, gen) in [(100u32, 1u64), (101, 1)] {
+            let rx = Exp2Rx { header: header(Modality::Pc, index, slot_ref(Modality::Pc, index)), route_generation: gen, t_recv_us: t };
+            r.rec.discard_route_copy(rx, "switch_barrier").unwrap();
+        }
+        let rows = drive(&mut r, |m, i| (!(m == Modality::Pc && i == 100)).then_some(30_000), |_, _| 0);
+        assert_contract_shape(&rows);
+        let terminals = assert_single_terminal(&rows);
+        let barrier = &terminals[&("pc".to_string(), pc_slot_identity(100).0)];
+        assert_eq!(barrier["role"], json!("drop"));
+        assert_eq!(barrier["reason"], json!(SWITCH_BARRIER));
+        assert_eq!(barrier["seal_horizon_us"].as_u64().unwrap(), horizon_us(T0));
+        assert_eq!(barrier["t_first_discard_us"].as_u64().unwrap(), t);
+        assert!(barrier["t_log_arrival_us"].is_u64());
+        let admitted = &terminals[&("pc".to_string(), pc_slot_identity(101).0)];
+        assert_eq!(admitted["role"], json!("release"));
+    }
+
+    #[test]
+    fn exp2_recorder_v4_release_is_actual_dispatch_time() {
+        // A buffered object released at its due is logged at the instant the
+        // recorder actually dispatches it (later than the due when the tick
+        // is late); the due is only in the decision row.
+        let mut r = rig(Exp2Method::S3npaPrime);
+        let t_arr = slot_ref(Modality::Pc, 0) + 10_000;
+        r.set(t_arr);
+        let rx = Exp2Rx { header: header(Modality::Pc, 0, T0), route_generation: 0, t_recv_us: t_arr };
+        let Admission::Admitted(m, i) = r.rec.admit(rx).unwrap() else { panic!() };
+        r.rec.feed_arrival(m, i, t_arr).unwrap();
+        let due = T0 + DMAX;
+        let late_tick = due + 700; // the loop woke 700 µs after the due
+        r.set(late_tick);
+        r.rec.advance(late_tick).unwrap();
+        let rows = r.sink.rows();
+        let release = rows.iter().find(|r| r["role"] == json!("release")).unwrap();
+        assert!(release["t_release_us"].as_u64().unwrap() >= late_tick);
+        let decision = rows.iter().find(|r| r["role"] == json!("decision") && r["track"] == json!("pc")).unwrap();
+        assert_eq!(decision["due_us"].as_u64().unwrap(), due);
+    }
+
+    #[test]
+    fn exp2_recorder_v4_controller_rows_and_write_lag() {
+        for method in [Exp2Method::P0, Exp2Method::P0np, Exp2Method::S3npaPrime] {
+            let mut r = rig(method);
+            // sustained loss drives miss steps / Q updates in the adaptive modes
+            let rows = drive(&mut r, lossy(11), |_, _| 0);
+            assert_contract_shape(&rows);
+            let controller: Vec<_> = rows.iter().filter(|r| r["role"] == json!("controller")).collect();
+            let commits: Vec<_> = controller.iter().filter(|r| r["event"] == json!("delta_eff_commit")).collect();
+            assert!(!commits.is_empty(), "{method:?}: initial Δ_eff commit row");
+            assert_eq!(commits[0]["i"], json!(0));
+            assert_eq!(commits[0]["value_us"].as_u64().unwrap(), DMAX);
+            if method == Exp2Method::P0np {
+                assert!(commits.iter().any(|r| r["modality"] == json!("pc")));
+                assert!(commits.iter().any(|r| r["modality"] == json!("haptic")));
+            } else {
+                assert!(commits.iter().all(|r| r["modality"] == json!("shared")));
+            }
+            if method == Exp2Method::S3npaPrime {
+                assert_eq!(controller.len(), 1, "fixed Δ: only the initial commit");
+            } else {
+                assert!(controller.iter().any(|r| r["event"] == json!("delta_star")), "{method:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn exp2_recorder_v4_imports_sender_wire_counter() {
+        let mut r = rig(Exp2Method::P0);
+        let mut sample = Map::new();
+        sample.insert("role".into(), json!("wire"));
+        sample.insert("source".into(), json!("sender"));
+        sample.insert("kind".into(), json!("delivery_timeout_counter"));
+        sample.insert("run_id".into(), json!("run-1"));
+        sample.insert("t_us".into(), json!(T0 + 41_000_000));
+        sample.insert("delivery_timeout_count".into(), json!(3));
+        r.rec.import_wire_counter(&sample, "/x/sender_wire.jsonl").unwrap();
+        let rows = r.sink.rows();
+        let wire = rows.iter().find(|r| r["role"] == json!("wire")).unwrap();
+        assert_eq!(wire["source"], json!("sender"));
+        assert_eq!(wire["delivery_timeout_count"], json!(3));
+        assert_eq!(wire["t_sample_us"], json!(T0 + 41_000_000));
+        let mut other = sample.clone();
+        other.insert("run_id".into(), json!("run-2"));
+        assert!(r.rec.import_wire_counter(&other, "x").is_err());
+        let mut receiver = sample.clone();
+        receiver.insert("source".into(), json!("receiver"));
+        assert!(r.rec.import_wire_counter(&receiver, "x").is_err());
+    }
+
+
+    #[test]
+    fn exp2_sender_timeout_counter_and_sidecar_rows() {
+        let counter = Arc::new(DeliveryTimeoutCounter::default());
+        counter.note(b"pc");
+        counter.note(b"pc-d7");
+        counter.note(b"haptic");
+        assert_eq!(counter.snapshot(), (3, 2, 1, 0));
+        let path = std::env::temp_dir().join(format!("skew-exp2-sidecar-{}-{}", std::process::id(), crate::now_us()));
+        let side = SenderWireSidecar::create(&path, "run-1", Some(counter.clone())).unwrap();
+        side.sample("t0", 10).unwrap();
+        counter.note(b"pc");
+        side.sample("horizon", 20).unwrap();
+        assert!(SenderWireSidecar::create(&path, "run-1", None).is_err(), "create-only");
+        let rows: Vec<Value> = std::fs::read_to_string(&path).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1]["source"], json!("sender"));
+        assert_eq!(rows[1]["kind"], json!("delivery_timeout_counter"));
+        assert_eq!(rows[1]["delivery_timeout_count"], json!(4));
+        assert_eq!(rows[1]["by_track"]["pc"], json!(3));
+        // the receiver imports the latest sample as-is
+        let mut r = rig(Exp2Method::P0);
+        r.rec.import_wire_counter(rows[1].as_object().unwrap(), "x").unwrap();
+        let imported = r.sink.rows().into_iter().find(|r| r["role"] == json!("wire")).unwrap();
+        assert_eq!(imported["delivery_timeout_count"], json!(4));
+        assert_eq!(imported["sample"], json!("horizon"));
+        let _ = std::fs::remove_file(&path);
+        // B1/S1: no timeout configured -> 0
+        let path2 = std::env::temp_dir().join(format!("skew-exp2-sidecar0-{}-{}", std::process::id(), crate::now_us()));
+        let none = SenderWireSidecar::create(&path2, "run-1", None).unwrap();
+        none.sample("shutdown", 30).unwrap();
+        let row: Value = serde_json::from_str(std::fs::read_to_string(&path2).unwrap().lines().next().unwrap()).unwrap();
+        assert_eq!(row["delivery_timeout_count"], json!(0));
+        assert_eq!(row["delivery_timeout_configured"], json!(false));
+        let _ = std::fs::remove_file(&path2);
+    }
+
+
+    #[test]
+    fn exp2_sender_counter_observes_only_forward_timeouts() {
+        use moq_transport::object_trace::{Boundary, Observer};
+        use moq_transport::{coding::TrackNamespace, serve::{SubgroupInfo, Track}};
+        let object = |name: &str| {
+            let (mut writer, _reader) = SubgroupInfo {
+                track: Arc::new(Track::new(TrackNamespace::from_utf8_path("run"), name)),
+                group_id: 0,
+                subgroup_id: 0,
+                priority: 0,
+            }
+            .produce();
+            writer.create(32, None).unwrap().info.clone()
+        };
+        let counter = DeliveryTimeoutCounter::default();
+        for boundary in [Boundary::ForwardStart, Boundary::ForwardAccepted, Boundary::ReceiveTimeout] {
+            counter.record(boundary, &object("pc"), 1, 1);
+        }
+        assert_eq!(counter.snapshot().0, 0);
+        counter.record(Boundary::ForwardTimeout, &object("pc-d6"), 1, 1);
+        counter.record(Boundary::ForwardTimeout, &object("haptic-essential"), 2, 1);
+        assert_eq!(counter.snapshot(), (2, 1, 1, 0));
+    }
+
 }

@@ -410,6 +410,16 @@ struct Args {
     /// switch path runs on a loss-free loopback. The FSM itself is untouched.
     #[arg(long, hide = true)]
     exp2_test_force_hc_at_ms: Option<u64>,
+    /// Contract v4 §9: the sender's exp2 `wire` counter sidecar
+    /// (`moq_sender --exp2-wire-out`). Its latest cumulative
+    /// `delivery_timeout_count` sample is copied into the exp2 JSONL before
+    /// the sentinel. Required by the exp2 core arms (B1/S1: optional).
+    #[arg(long)]
+    exp2_sender_wire: Option<PathBuf>,
+    /// `--arm p1` only: the sender's registered producer shutdown timeout,
+    /// echoed so the exp2 meta records all four inherited P1 switch settings.
+    #[arg(long)]
+    s3_producer_shutdown_timeout_ms: Option<u64>,
 }
 
 /// `--duration-s` as exact integer microseconds. A fractional microsecond would
@@ -584,14 +594,19 @@ struct Exp2Cli {
     batch_id: String,
     phase_control: PathBuf,
     delta_max_us: u64,
-    /// The PC DELIVERY_TIMEOUT recorded as `t_pc_ms` (T_pc for the core arms;
-    /// for B1/S1, which apply none, the Δ_max slot in ms).
-    t_pc_ms: u64,
+    /// `t_pc_ms`: T_pc for the core arms; `None` (null) for B1/S1, which
+    /// apply no delivery timeout (contract v4 §9).
+    t_pc_ms: Option<u64>,
     c_mbps: f64,
     run_id: String,
     topology: Topology,
     representation: Representation,
     s_bytes: u64,
+    /// False only in the hidden test mode.
+    scientific_eligible: bool,
+    /// Receiver-owned meta additions (P1 switch settings, test-mode fields).
+    meta_extra: serde_json::Map<String, serde_json::Value>,
+    sender_wire: Option<PathBuf>,
 }
 
 fn exp2_cli_config(args: &Args) -> Result<Option<Exp2Cli>> {
@@ -607,6 +622,9 @@ fn exp2_cli_config(args: &Args) -> Result<Option<Exp2Cli>> {
     let all = supplied.iter().all(|v| *v);
     let arm = args.arm.as_str();
     if !any {
+        if args.exp2_sender_wire.is_some() {
+            bail!("--exp2-sender-wire requires the exp2 recorder options");
+        }
         if args.exp2_test_mode || args.exp2_test_force_hc_at_ms.is_some() {
             bail!("the exp2 test options require the exp2 recorder options");
         }
@@ -641,6 +659,9 @@ fn exp2_cli_config(args: &Args) -> Result<Option<Exp2Cli>> {
         // L2 presentation/DAC output is WP6; the core arms release headless.
         bail!("--arm {arm} is the L1-R release layer only; --render/--audio are WP6 (L2)");
     }
+    if args.arm.is_exp2_core() && args.exp2_sender_wire.is_none() {
+        bail!("--arm {arm} requires --exp2-sender-wire (contract v4 §9 sender timeout counter)");
+    }
     let delta_max_us = args.delta_max_us.expect("all supplied");
     let t_pc_ms = if args.arm.is_exp2_core() {
         let t_pc_ms = exp2_core_transport_check(args)?;
@@ -651,33 +672,47 @@ fn exp2_cli_config(args: &Args) -> Result<Option<Exp2Cli>> {
                  (T_pc = Δ_max)"
             );
         }
-        t_pc_ms
+        Some(t_pc_ms)
     } else {
-        if delta_max_us % 1_000 != 0 {
-            bail!("--delta-max-us must be a whole number of milliseconds");
-        }
-        delta_max_us / 1_000
+        // Contract v4 §9: B1/S1 apply no delivery timeout -> t_pc_ms null.
+        None
     };
-    let c_mbps = args
-        .c_mbps
-        .context("the exp2 recorder requires --c-mbps (contract §6 meta C_mbps)")?;
-    let meta_path = args.exp2_meta.clone().expect("all supplied");
-    let mut meta: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(&meta_path).with_context(|| format!("read {}", meta_path.display()))?,
-    )
-    .context("parse --exp2-meta JSON")?;
+    let mut meta_extra = serde_json::Map::new();
+    if args.arm == Arm::P1 {
+        // Registration §2-2: the stage-9 inherited switch settings, explicit
+        // CLI inputs, recorded in meta (and in the freeze manifest by WP7).
+        let shutdown = args
+            .s3_producer_shutdown_timeout_ms
+            .context("--arm p1 requires --s3-producer-shutdown-timeout-ms (sender echo)")?;
+        meta_extra.insert(
+            "p1_switch_settings".into(),
+            serde_json::json!({
+                "effect_timeout_ms": args.s3_effect_timeout_ms,
+                "initial_retry_limit": args.s3_initial_retry_limit,
+                "switch_retry_limit": args.s3_switch_retry_limit,
+                "producer_shutdown_timeout_ms": shutdown,
+                "source": "stage-9 inherited (registration §2-2)",
+            }),
+        );
+    } else if args.s3_producer_shutdown_timeout_ms.is_some() {
+        bail!("--s3-producer-shutdown-timeout-ms is a receiver echo only for --arm p1");
+    }
     if args.exp2_test_mode {
-        let object = meta.as_object_mut().context("exp2 meta must be a JSON object")?;
-        if object.contains_key("scientific_eligible") || object.contains_key("exp2_test_mode") {
-            bail!("the exp2 meta must not carry the receiver-owned test-mode keys");
-        }
-        object.insert("exp2_test_mode".into(), serde_json::json!(true));
-        object.insert("scientific_eligible".into(), serde_json::json!(false));
-        object.insert(
+        meta_extra.insert("exp2_test_mode".into(), serde_json::json!(true));
+        meta_extra.insert(
             "exp2_test_force_hc_at_ms".into(),
             serde_json::json!(args.exp2_test_force_hc_at_ms),
         );
     }
+    let scientific_eligible = !args.exp2_test_mode;
+    let c_mbps = args
+        .c_mbps
+        .context("the exp2 recorder requires --c-mbps (contract §6 meta C_mbps)")?;
+    let meta_path = args.exp2_meta.clone().expect("all supplied");
+    let meta: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&meta_path).with_context(|| format!("read {}", meta_path.display()))?,
+    )
+    .context("parse --exp2-meta JSON")?;
     // Shape is validated now (fail before connecting); t0/ledger later.
     skew_moq::exp2_recorder::build_meta(
         &meta,
@@ -692,6 +727,8 @@ fn exp2_cli_config(args: &Args) -> Result<Option<Exp2Cli>> {
             t_pc_ms,
             c_mbps,
             s_bytes: args.s_bytes,
+            scientific_eligible,
+            extra: meta_extra.clone(),
         },
     )?;
     Ok(Some(Exp2Cli {
@@ -708,6 +745,9 @@ fn exp2_cli_config(args: &Args) -> Result<Option<Exp2Cli>> {
         topology: args.topology,
         representation: args.representation,
         s_bytes: args.s_bytes,
+        scientific_eligible,
+        meta_extra,
+        sender_wire: args.exp2_sender_wire.clone(),
     }))
 }
 
@@ -1146,6 +1186,8 @@ fn exp2_open_recorder(cli: &Exp2Cli, t0_us: u64) -> Result<Exp2Recorder<Exp2File
             t_pc_ms: cli.t_pc_ms,
             c_mbps: cli.c_mbps,
             s_bytes: cli.s_bytes,
+            scientific_eligible: cli.scientific_eligible,
+            extra: cli.meta_extra.clone(),
         },
     )?;
     let file = std::fs::OpenOptions::new()
@@ -1166,6 +1208,29 @@ fn exp2_open_recorder(cli: &Exp2Cli, t0_us: u64) -> Result<Exp2Recorder<Exp2File
     )?;
     recorder.write_meta(meta)?;
     Ok(recorder)
+}
+
+/// Contract v4 §9: copy the sender's latest cumulative delivery-timeout
+/// sample into the exp2 JSONL (just before the sentinel). Every sender
+/// timeout happens by `t0 + 40 s + T_pc < H` (T_pc = Δ_max < B_play), and
+/// the sender samples at H, so the sample read at `H + G_report` is final.
+/// A missing/unreadable sidecar is an `integrity_warning` (the analyzer then
+/// reports the sender count as null) — never a silently filled value.
+fn exp2_import_sender_wire(cli: &Exp2Cli, recorder: &mut Exp2Recorder<Exp2File>) -> Result<()> {
+    let Some(path) = &cli.sender_wire else { return Ok(()) };
+    let latest = std::fs::read_to_string(path).ok().and_then(|text| {
+        text.lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|row| row.get("source").and_then(|v| v.as_str()) == Some("sender"))
+            .last()
+    });
+    match latest.as_ref().and_then(|row| row.as_object()) {
+        Some(sample) => recorder.import_wire_counter(sample, &path.display().to_string()),
+        None => recorder.warn(
+            "sender_wire_counter_missing",
+            serde_json::json!({"path": path.display().to_string()}),
+        ),
+    }
 }
 
 /// Copy the recorder's legacy-only diagnostics (controller updates, misses)
@@ -1360,6 +1425,7 @@ async fn run_exp2_static_task(
         recorder.advance(now)?;
         exp2_flush_side_rows(recorder, &logger)?;
         if recorder.is_sealed() && now >= recorder.end_at_us() {
+            exp2_import_sender_wire(&cli, recorder)?;
             if recorder.finish(now, skew_moq::exp2_recorder::current_rss_bytes())? {
                 break;
             }
@@ -2975,26 +3041,23 @@ fn apply_s3_route_barrier(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn request_s3_switch<S: S3SubscribeSeam>(
+/// Outcome of the synchronous first step of a switch request.
+enum SwitchBegin {
+    NoTransition,
+    SuppressedAfterEnd,
+    Requested(SwitchRequest),
+}
+
+/// Step 1 of a switch (synchronous): legacy transition row, window-end
+/// suppression, gate request and the request row.
+fn begin_s3_switch(
     update: S3Update,
     ingress: &mut S3ReceiverIngress,
-    subscriber: &mut S,
-    namespace: &TrackNamespace,
-    live: &mut HashMap<(TrackRole, u64), S3LiveSubscription<S::Handle>>,
-    switch_retry_limit: u32,
-    args: &Args,
-    logger: Arc<Mutex<JsonlLogger>>,
-    events: mpsc::Sender<S3WireEvent>,
-    bad_headers: Arc<AtomicU64>,
-    ingress_drops: Arc<AtomicU64>,
-    log_failed: Arc<AtomicU64>,
+    logger: &Arc<Mutex<JsonlLogger>>,
     window_end_us: Option<u64>,
-    stats: &mut PlayoutStats,
-    faults: &mut S3SwitchTargetFaults,
-) -> Result<SwitchOutcome> {
+) -> Result<SwitchBegin> {
     let Some(transition) = update.transition else {
-        return Ok(SwitchOutcome::NoTransition);
+        return Ok(SwitchBegin::NoTransition);
     };
     let request_at = now_us().max(transition.at_us);
     {
@@ -3005,7 +3068,7 @@ async fn request_s3_switch<S: S3SubscribeSeam>(
         if !switch_allowed_at(request_at, window_end_us) {
             let window_end_us = window_end_us.expect("a disallowed request has a window end");
             logger.try_log_s3_switch_suppressed_after_end(transition, request_at, window_end_us)?;
-            return Ok(SwitchOutcome::SuppressedAfterEnd);
+            return Ok(SwitchBegin::SuppressedAfterEnd);
         }
     }
     let request = ingress
@@ -3016,6 +3079,27 @@ async fn request_s3_switch<S: S3SubscribeSeam>(
         .map_err(|_| anyhow::anyhow!("RX logger poisoned"))?
         .try_log_s3_switch_request(request)?;
 
+    Ok(SwitchBegin::Requested(request))
+}
+
+/// Step 2 of a switch (async, touches no gate/ingress/live state): open the
+/// changed roles' target subscriptions concurrently, each bounded by the
+/// switch's effect deadline. Returns the per-role results and whether a role
+/// hit the effect deadline.
+#[allow(clippy::too_many_arguments)]
+async fn open_s3_switch_targets<S: S3SubscribeSeam>(
+    request: SwitchRequest,
+    effect_timeout_us: u64,
+    subscriber: &mut S,
+    namespace: &TrackNamespace,
+    switch_retry_limit: u32,
+    args: &Args,
+    logger: Arc<Mutex<JsonlLogger>>,
+    events: mpsc::Sender<S3WireEvent>,
+    bad_headers: Arc<AtomicU64>,
+    ingress_drops: Arc<AtomicU64>,
+    log_failed: Arc<AtomicU64>,
+) -> (Vec<SwitchSubscribeResult<S3LiveSubscription<S::Handle>>>, bool) {
     // Open the changed roles' target subscriptions CONCURRENTLY. Each SUBSCRIBE
     // costs several RTT; opening them one after the other doubled the time to
     // the haptic SUBSCRIBE_OK and pushed the switch past its effect timeout
@@ -3030,9 +3114,7 @@ async fn request_s3_switch<S: S3SubscribeSeam>(
     // down and the gate is poisoned exactly as a late SUBSCRIBE_OK would
     // poison it, so a stalled SUBSCRIBE cannot hold the control loop for the
     // transport's request timeout.
-    let effect_deadline_us = request
-        .request_at_us
-        .saturating_add(ingress.gate().config().effect_timeout_us);
+    let effect_deadline_us = request.request_at_us.saturating_add(effect_timeout_us);
     let effect_remaining = Duration::from_micros(effect_deadline_us.saturating_sub(now_us()));
     let timed_out = AtomicBool::new(false);
     let mut haptic_subscriber = subscriber.clone();
@@ -3097,7 +3179,24 @@ async fn request_s3_switch<S: S3SubscribeSeam>(
         Some((TrackRole::Haptic, route, result))
     };
     let (pc, haptic) = tokio::join!(pc_open, haptic_open);
-    let ready = match settle_switch_subscribes(pc.into_iter().chain(haptic).collect()) {
+    (pc.into_iter().chain(haptic).collect(), timed_out.load(Ordering::Relaxed))
+}
+
+/// Step 3 of a switch: settle the opened targets against the gate (refusal
+/// after run end, failure teardown, or SUBSCRIBE_OK records in t_ok order).
+#[allow(clippy::too_many_arguments)]
+async fn finish_s3_switch<H>(
+    request: SwitchRequest,
+    opened: Vec<SwitchSubscribeResult<S3LiveSubscription<H>>>,
+    timed_out: bool,
+    ingress: &mut S3ReceiverIngress,
+    live: &mut HashMap<(TrackRole, u64), S3LiveSubscription<H>>,
+    logger: Arc<Mutex<JsonlLogger>>,
+    window_end_us: Option<u64>,
+    stats: &mut PlayoutStats,
+    faults: &mut S3SwitchTargetFaults,
+) -> Result<SwitchOutcome> {
+    let ready = match settle_switch_subscribes(opened) {
         SwitchSubscribeOutcome::Ready(ready) => ready,
         SwitchSubscribeOutcome::Failed {
             error,
@@ -3108,7 +3207,7 @@ async fn request_s3_switch<S: S3SubscribeSeam>(
                 subscriptions: cleanup,
                 live_keys: Vec::new(),
             };
-            if timed_out.load(Ordering::Relaxed) {
+            if timed_out {
                 // Fail through the gate so it is poisoned like a late
                 // SUBSCRIBE_OK; the run then ends loudly either way.
                 let gate = ingress.check_timeout(now_us());
@@ -3240,6 +3339,52 @@ async fn request_s3_switch<S: S3SubscribeSeam>(
         }
     }
     Ok(SwitchOutcome::Requested)
+}
+
+/// The stage-9 S3 switch: the three steps back to back (unchanged
+/// behaviour; the exp2 P1 loop runs step 2 concurrently instead).
+#[allow(clippy::too_many_arguments)]
+async fn request_s3_switch<S: S3SubscribeSeam>(
+    update: S3Update,
+    ingress: &mut S3ReceiverIngress,
+    subscriber: &mut S,
+    namespace: &TrackNamespace,
+    live: &mut HashMap<(TrackRole, u64), S3LiveSubscription<S::Handle>>,
+    switch_retry_limit: u32,
+    args: &Args,
+    logger: Arc<Mutex<JsonlLogger>>,
+    events: mpsc::Sender<S3WireEvent>,
+    bad_headers: Arc<AtomicU64>,
+    ingress_drops: Arc<AtomicU64>,
+    log_failed: Arc<AtomicU64>,
+    window_end_us: Option<u64>,
+    stats: &mut PlayoutStats,
+    faults: &mut S3SwitchTargetFaults,
+) -> Result<SwitchOutcome> {
+    let request = match begin_s3_switch(update, ingress, &logger, window_end_us)? {
+        SwitchBegin::NoTransition => return Ok(SwitchOutcome::NoTransition),
+        SwitchBegin::SuppressedAfterEnd => return Ok(SwitchOutcome::SuppressedAfterEnd),
+        SwitchBegin::Requested(request) => request,
+    };
+    let effect_timeout_us = ingress.gate().config().effect_timeout_us;
+    let (opened, timed_out) = open_s3_switch_targets(
+        request,
+        effect_timeout_us,
+        subscriber,
+        namespace,
+        switch_retry_limit,
+        args,
+        logger.clone(),
+        events,
+        bad_headers,
+        ingress_drops,
+        log_failed,
+    )
+    .await;
+    finish_s3_switch(
+        request, opened, timed_out, ingress, live, logger, window_end_us, stats, faults,
+    )
+    .await
 }
 
 /// Terminally account target objects the ingress returned from behind the
@@ -4906,6 +5051,116 @@ fn p1_snapshot(
     }
 }
 
+/// Step 2 of a P1 switch in flight (target SUBSCRIBEs), polled by the loop.
+type P1Opening<'a, H> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = (Vec<SwitchSubscribeResult<S3LiveSubscription<H>>>, bool),
+            > + 'a,
+    >,
+>;
+
+/// Await the in-flight opening, or never resolve if there is none (so the
+/// select branch can be evaluated unconditionally).
+async fn poll_p1_opening<H>(
+    opening: &mut Option<P1Opening<'_, H>>,
+) -> (Vec<SwitchSubscribeResult<S3LiveSubscription<H>>>, bool) {
+    match opening.as_mut() {
+        Some(future) => future.await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Whether a wire event belongs to a changed target route of `request`.
+fn p1_event_on_target(event: &S3WireEvent, request: SwitchRequest) -> bool {
+    let (role, route) = match event {
+        S3WireEvent::Object(routed) => (routed.role, routed.route),
+        S3WireEvent::Ended { role, route, .. } => (*role, *route),
+    };
+    let changed = match role {
+        TrackRole::Pc => request.pc_changed,
+        TrackRole::Haptic => request.haptic_changed,
+    };
+    changed && request.target.for_role(role) == route
+}
+
+/// `tier_switch` row fields of one switch request (request / target times).
+fn p1_switch_row(phase: &str, request: &SwitchRequest) -> serde_json::Map<String, serde_json::Value> {
+    let mut row = serde_json::Map::new();
+    row.insert("phase".into(), serde_json::json!(phase));
+    row.insert("from".into(), serde_json::json!(request.from.as_str()));
+    row.insert("to".into(), serde_json::json!(request.to.as_str()));
+    row.insert("cause".into(), serde_json::json!(request.cause.as_str()));
+    row.insert("decision_at_us".into(), serde_json::json!(request.decision_at_us));
+    row.insert("request_at_us".into(), serde_json::json!(request.request_at_us));
+    row.insert("pc_route".into(), serde_json::json!(request.target.pc.name));
+    row.insert("pc_route_generation".into(), serde_json::json!(request.target.pc.generation));
+    row.insert("haptic_route".into(), serde_json::json!(request.target.haptic.name));
+    row.insert("haptic_route_generation".into(), serde_json::json!(request.target.haptic.generation));
+    row
+}
+
+/// Name a fatal P1 run error in the exp2 JSONL (diagnostic); the run is
+/// invalid anyway because the loop stops before the sentinel.
+fn p1_mark_switch_failure<H>(state: &mut P1Loop<H>, kind: &str) {
+    let detail = state
+        .outcome_error
+        .as_ref()
+        .map(|error| format!("{error:#}"))
+        .unwrap_or_default();
+    if let Some(recorder) = state.recorder.as_mut() {
+        let _ = recorder.warn(kind, serde_json::json!({ "detail": detail }));
+    }
+}
+
+/// A parked target-route event whose switch was refused after run end: the
+/// objects are switch-barrier route copies, the ends go through the shared
+/// route-terminal handler.
+fn p1_discard_parked<H>(
+    event: S3WireEvent,
+    now: u64,
+    state: &mut P1Loop<H>,
+    logger: &Arc<Mutex<JsonlLogger>>,
+) {
+    match event {
+        S3WireEvent::Object(routed) => {
+            let header = routed.object.header;
+            let result: Result<()> = (|| {
+                logger
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("RX logger poisoned"))?
+                    .try_log_drop_s3(
+                        routed.role,
+                        routed.route,
+                        header.tier,
+                        header.seq,
+                        header.pts_us,
+                        header.event_id,
+                        now.max(routed.object.t_recv),
+                        skew_moq::s3_receiver::DROP_SWITCH_BARRIER,
+                        None,
+                    )?;
+                state.stats.dropped += 1;
+                if let Some(recorder) = state.recorder.as_mut() {
+                    recorder.discard_route_copy(
+                        skew_moq::exp2_recorder::Exp2Rx {
+                            header,
+                            route_generation: routed.route.generation,
+                            t_recv_us: routed.object.t_recv,
+                        },
+                        skew_moq::s3_receiver::DROP_SWITCH_BARRIER,
+                    )?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                keep_first_cause(&mut state.outcome_error, error);
+            }
+        }
+        ended => handle_p1_wire_event(ended, now, state, logger),
+    }
+}
+
 async fn run_exp2_p1_receiver(
     args: &Args,
     runtime: P1RuntimeConfig,
@@ -5182,7 +5437,7 @@ where
             runtime.initial_retry_limit,
             runtime.switch_retry_limit,
             P1_BARRIER_MAX_OBJECTS_PER_ROLE,
-            cli.t_pc_ms,
+            cli.t_pc_ms.expect("P1 has T_pc"),
         ))?;
     let (event_tx, mut event_rx) =
         mpsc::channel::<S3WireEvent>(P1_BARRIER_MAX_OBJECTS_PER_ROLE * 4);
@@ -5191,7 +5446,10 @@ where
     let log_failed = Arc::new(AtomicU64::new(0));
     // Old routes stay subscribed for one T_pc after apply, as S3 defers by its
     // PC delivery timeout (the in-flight objects resolve normally).
-    let retiring = S3RetirementQueue::new(ms_to_us(cli.t_pc_ms, "pc-delivery-timeout-ms")?)
+    let retiring = S3RetirementQueue::new(ms_to_us(
+        cli.t_pc_ms.expect("P1 has T_pc"),
+        "pc-delivery-timeout-ms",
+    )?)
         .map_err(anyhow::Error::msg)?;
     let mut state = P1Loop {
         ingress,
@@ -5284,6 +5542,17 @@ where
     // reconciliation is delayed by this rule.
     let switch_spacing_us = skew_moq::exp2_fsm::Exp2FsmParams::registered(cli.delta_max_us).cooldown_us;
     let mut last_switch_request_us: Option<u64> = None;
+    // Contract v4 / WP3 follow-up J: the switch handshake never blocks the
+    // release/recording path. Step 1 (gate request) is synchronous; step 2
+    // (target SUBSCRIBEs, bounded by the effect timeout) is a future polled
+    // by the select below while arrivals, core ticks and rows continue;
+    // step 3 (SUBSCRIBE_OK records) runs when it completes. Target-route
+    // events that arrive before step 3 are parked and replayed afterwards,
+    // so the gate sees them in the same order relative to its SUBSCRIBE_OK
+    // records as in the blocking stage-9 path.
+    let mut opening: Option<P1Opening<'_, S::Handle>> = None;
+    let mut opening_request: Option<SwitchRequest> = None;
+    let mut parked: Vec<S3WireEvent> = Vec::new();
 
     loop {
         if state.outcome_error.is_some() || ended {
@@ -5307,6 +5576,7 @@ where
         .unwrap_or(max_end_us);
         let wait = Duration::from_micros(wakeup.saturating_sub(now));
         let mut events = Vec::new();
+        let mut opened_result = None;
         tokio::select! {
             event = event_rx.recv() => {
                 if let Some(event) = event {
@@ -5354,6 +5624,10 @@ where
                     Err(error) => keep_first_cause(&mut state.outcome_error, error),
                 }
             }
+            opened = poll_p1_opening(&mut opening), if opening.is_some() => {
+                opening = None;
+                opened_result = Some(opened);
+            }
             _ = tokio::time::sleep(wait) => {}
         }
         // Process everything already queued so arrivals precede the tick.
@@ -5385,16 +5659,104 @@ where
             }
         }
         for event in events {
-            handle_p1_wire_event(event, now, &mut state, &logger);
+            if opening_request.is_some_and(|request| p1_event_on_target(&event, request)) {
+                if parked.len() >= 2 * P1_BARRIER_MAX_OBJECTS_PER_ROLE {
+                    keep_first_cause(
+                        &mut state.outcome_error,
+                        anyhow::anyhow!("P1 parked target-route events exceed the barrier bound"),
+                    );
+                    break;
+                }
+                parked.push(event);
+            } else {
+                handle_p1_wire_event(event, now, &mut state, &logger);
+            }
         }
         if state.outcome_error.is_some() {
+            p1_mark_switch_failure(&mut state, "p1_run_error");
             continue;
         }
+        // Step 3 of a switch whose target SUBSCRIBEs settled this iteration.
+        if let Some((opened, timed_out)) = opened_result {
+            let request = opening_request.take().expect("an opening has its request");
+            let subscribed: Vec<(TrackRole, u64)> = opened
+                .iter()
+                .filter_map(|(role, _, result)| result.as_ref().ok().map(|(_, t_ok, _)| (*role, *t_ok)))
+                .collect();
+            let outcome = finish_s3_switch(
+                request,
+                opened,
+                timed_out,
+                &mut state.ingress,
+                &mut state.live,
+                logger.clone(),
+                state.window_end_us,
+                &mut state.stats,
+                &mut state.faults,
+            )
+            .await;
+            match outcome {
+                Ok(outcome) => {
+                    count_switch_outcome(
+                        outcome,
+                        &mut state.suppressed_after_end,
+                        &mut state.refused_after_run_end,
+                    );
+                    if let Some(recorder) = state.recorder.as_mut() {
+                        let mut row = p1_switch_row(
+                            match outcome {
+                                SwitchOutcome::Requested => "subscribed",
+                                SwitchOutcome::RefusedAfterRunEnd => "refused_after_run_end",
+                                SwitchOutcome::SuppressedAfterEnd => "suppressed_after_window_end",
+                                SwitchOutcome::NoTransition => "no_transition",
+                            },
+                            &request,
+                        );
+                        for (role, t_ok) in &subscribed {
+                            row.insert(
+                                format!("t_subscribe_ok_{}_us", role.as_str()),
+                                serde_json::json!(t_ok),
+                            );
+                        }
+                        if let Err(error) = recorder.log_tier_switch(row) {
+                            keep_first_cause(&mut state.outcome_error, error);
+                        }
+                    }
+                    if outcome == SwitchOutcome::RefusedAfterRunEnd {
+                        recompute_s3_normal_end(
+                            &state.ingress,
+                            &state.current_finished,
+                            &mut state.normal_end,
+                        );
+                        // The targets were torn down: their parked objects are
+                        // switch-barrier discards, their parked ends are routed
+                        // through the shared terminal rules.
+                        for event in parked.drain(..) {
+                            p1_discard_parked(event, now_us(), &mut state, &logger);
+                        }
+                    } else {
+                        for event in parked.drain(..) {
+                            handle_p1_wire_event(event, now_us(), &mut state, &logger);
+                        }
+                    }
+                }
+                Err(error) => keep_first_cause(&mut state.outcome_error, error),
+            }
+            if state.outcome_error.is_some() {
+                p1_mark_switch_failure(&mut state, "p1_switch_failed");
+                continue;
+            }
+        }
         if let Err(error) = state.ingress.check_timeout(now) {
+            // Fail closed: an effect timeout poisons the gate and ends the
+            // run before H + G_report, so the exp2 JSONL gets no sentinel
+            // (analyzer: instrumentation_ended_early -> run INVALID), the
+            // receiver exits non-zero and an integrity_warning names it.
             keep_first_cause(
                 &mut state.outcome_error,
-                anyhow::anyhow!("P1 switch timeout: {error:?}"),
+                anyhow::anyhow!("P1 switch effect timeout: {error:?}"),
             );
+            p1_mark_switch_failure(&mut state, "p1_switch_effect_timeout");
             continue;
         }
         if let Some(recorder) = state.recorder.as_mut() {
@@ -5456,6 +5818,7 @@ where
         let applied = state.ingress.gate().applied_state();
         let spacing_ok = last_switch_request_us.is_none_or(|t| now_us() >= t + switch_spacing_us);
         if state.ingress.gate().pending_request().is_none()
+            && opening.is_none()
             && !state.ingress.gate().is_failed()
             && state.retiring.is_empty()
             && spacing_ok
@@ -5473,71 +5836,66 @@ where
                     to,
                     state.recorder.as_ref().and_then(|r| r.p1_fsm_snapshot()),
                 );
-                let outcome = request_s3_switch(
+                let begun = begin_s3_switch(
                     S3Update {
                         transition: Some(transition),
                         snapshot,
                     },
                     &mut state.ingress,
-                    &mut subscriber,
-                    &namespace,
-                    &mut state.live,
-                    runtime.switch_retry_limit,
-                    args,
-                    logger.clone(),
-                    event_tx.clone(),
-                    bad_headers.clone(),
-                    ingress_drops.clone(),
-                    log_failed.clone(),
+                    &logger,
                     state.window_end_us,
-                    &mut state.stats,
-                    &mut state.faults,
-                )
-                .await;
-                match outcome {
-                    Ok(outcome) => {
-                        count_switch_outcome(
-                            outcome,
-                            &mut state.suppressed_after_end,
-                            &mut state.refused_after_run_end,
-                        );
-                        let phase = match outcome {
-                            SwitchOutcome::Requested => "requested",
-                            SwitchOutcome::SuppressedAfterEnd => "suppressed_after_window_end",
-                            SwitchOutcome::RefusedAfterRunEnd => "refused_after_run_end",
-                            SwitchOutcome::NoTransition => "no_transition",
-                        };
-                        if outcome == SwitchOutcome::RefusedAfterRunEnd {
-                            recompute_s3_normal_end(
-                                &state.ingress,
-                                &state.current_finished,
-                                &mut state.normal_end,
-                            );
+                );
+                match begun {
+                    Ok(SwitchBegin::Requested(request)) => {
+                        if let Some(recorder) = state.recorder.as_mut() {
+                            let mut row = p1_switch_row("requested", &request);
+                            row.insert("decision_at_us".into(), serde_json::json!(transition.at_us));
+                            if let Err(error) = recorder.log_tier_switch(row) {
+                                keep_first_cause(&mut state.outcome_error, error);
+                            }
                         }
-                        if outcome == SwitchOutcome::SuppressedAfterEnd {
-                            // After the window end the routes stay as they
-                            // are; stop reconciling toward a state that will
-                            // never be applied.
-                            desired = applied;
-                        }
+                        let switch_subscriber = subscriber.clone();
+                        let effect_timeout_us = runtime.switch.effect_timeout_us;
+                        let retry_limit = runtime.switch_retry_limit;
+                        let (log, events_tx) = (logger.clone(), event_tx.clone());
+                        let (bad, drops, failed) =
+                            (bad_headers.clone(), ingress_drops.clone(), log_failed.clone());
+                        let namespace_ref = &namespace;
+                        opening = Some(Box::pin(async move {
+                            let mut switch_subscriber = switch_subscriber;
+                            open_s3_switch_targets(
+                                request,
+                                effect_timeout_us,
+                                &mut switch_subscriber,
+                                namespace_ref,
+                                retry_limit,
+                                args,
+                                log,
+                                events_tx,
+                                bad,
+                                drops,
+                                failed,
+                            )
+                            .await
+                        }));
+                        opening_request = Some(request);
+                    }
+                    Ok(SwitchBegin::SuppressedAfterEnd) => {
+                        state.suppressed_after_end += 1;
+                        // After the window end the routes stay as they are.
+                        desired = applied;
                         if let Some(recorder) = state.recorder.as_mut() {
                             let mut row = serde_json::Map::new();
-                            row.insert("phase".into(), serde_json::json!(phase));
+                            row.insert("phase".into(), serde_json::json!("suppressed_after_window_end"));
                             row.insert("from".into(), serde_json::json!(applied.as_str()));
                             row.insert("to".into(), serde_json::json!(to.as_str()));
-                            row.insert("cause".into(), serde_json::json!(p1_transition_cause(to).as_str()));
                             row.insert("decision_at_us".into(), serde_json::json!(transition.at_us));
-                            if let Some(request) = state.ingress.gate().pending_request() {
-                                row.insert("pc_route".into(), serde_json::json!(request.target.pc.name));
-                                row.insert("pc_route_generation".into(), serde_json::json!(request.target.pc.generation));
-                                row.insert("haptic_route".into(), serde_json::json!(request.target.haptic.name));
-                                row.insert("haptic_route_generation".into(), serde_json::json!(request.target.haptic.generation));
-                            }
                             if let Err(error) = recorder.log_tier_switch(row) {
                                 keep_first_cause(&mut state.outcome_error, error);
                             }
                         }
                     }
+                    Ok(SwitchBegin::NoTransition) => {}
                     Err(error) => keep_first_cause(&mut state.outcome_error, error),
                 }
             }
@@ -5545,6 +5903,10 @@ where
         if let Some(recorder) = state.recorder.as_mut() {
             let now = now_us();
             if recorder.is_sealed() && now >= recorder.end_at_us() {
+                if let Err(error) = exp2_import_sender_wire(&cli, recorder) {
+                    keep_first_cause(&mut state.outcome_error, error);
+                    continue;
+                }
                 match recorder.finish(now, skew_moq::exp2_recorder::current_rss_bytes()) {
                     Ok(true) => ended = true,
                     Ok(false) => keep_first_cause(
@@ -5557,6 +5919,30 @@ where
         }
     }
 
+    // A switch whose target SUBSCRIBEs were still in flight when the run
+    // ended (a request just before the window end): let step 2 settle (it is
+    // bounded by the effect deadline), then release whatever opened and drop
+    // the request. Not a fault if the effect deadline had not passed; an
+    // effect timeout already failed the run inside the loop.
+    if let Some(mut pending_open) = opening.take() {
+        let (opened, _timed_out) = pending_open.as_mut().await;
+        drop(pending_open);
+        for (_, _, result) in opened {
+            if let Ok((subscription, _, _)) = result {
+                let join = discard_s3_subscription(subscription).await;
+                let mut unjoined = 0;
+                note_s3_drain_join(join, &logger, &mut unjoined, &mut state.outcome_error);
+            }
+        }
+        let _ = state.ingress.abandon_pending(now_us());
+        logger
+            .lock()
+            .map_err(|_| anyhow::anyhow!("RX logger poisoned"))?
+            .try_log_info("\"event\":\"p1_switch_open_at_exit\",\"action\":\"targets_released\"")?;
+    }
+    for event in parked.drain(..) {
+        p1_discard_parked(event, now_us(), &mut state, &logger);
+    }
     // ---- shutdown: no exp2 row can follow the sentinel (the recorder
     // refuses), so the legacy stage-9 teardown order is kept as is.
     if !phase_pending {
@@ -8114,6 +8500,8 @@ mod rx_ending_tests {
             delta_max_us: None,
             exp2_test_mode: false,
             exp2_test_force_hc_at_ms: None,
+            exp2_sender_wire: None,
+            s3_producer_shutdown_timeout_ms: None,
         };
 
         let a = base(RxTrackSel::Both, Some(60.0));
@@ -8401,6 +8789,8 @@ mod rx_ending_tests {
             delta_max_us: None,
             exp2_test_mode: false,
             exp2_test_force_hc_at_ms: None,
+            exp2_sender_wire: None,
+            s3_producer_shutdown_timeout_ms: None,
         };
         let cfg = playout_config(&base).unwrap().unwrap();
         assert_eq!(cfg.d_play_us, 50_000);
@@ -8499,6 +8889,8 @@ mod rx_ending_tests {
             delta_max_us: None,
             exp2_test_mode: false,
             exp2_test_force_hc_at_ms: None,
+            exp2_sender_wire: None,
+            s3_producer_shutdown_timeout_ms: None,
         };
 
         assert!(playout_config(&args).is_ok());
@@ -12156,6 +12548,175 @@ mod s3_control_loop_tests {
         ]
     }
 
+    /// Contract v4 follow-up J: while a P1 switch's target SUBSCRIBEs are in
+    /// flight (held 1.5 s by the seam), the release/recording path keeps
+    /// running — current-route objects are released and logged inside the
+    /// request→SUBSCRIBE_OK window. The switch then never takes effect (no
+    /// target object), so the registered effect timeout fires: the run fails
+    /// closed — loop error, an exp2 integrity_warning, and NO sentinel
+    /// (analyzer: instrumentation_ended_early -> invalid).
+    #[tokio::test]
+    async fn exp2_p1_switch_handshake_does_not_block_releases_and_timeout_fails_closed() {
+        use skew_moq::exp2_recorder::{canonical_json_bytes, haptic_slot_identity, pc_slot_identity};
+        let dir = test_log_path("p1-nonblocking");
+        std::fs::create_dir_all(&dir).unwrap();
+        let run_id = "p1-loop-test";
+        let t0 = now_us() + 300_000;
+        let pc: Vec<serde_json::Value> = (0..1200u64)
+            .map(|i| {
+                let (pts, e) = pc_slot_identity(i);
+                serde_json::json!({"i": i, "pts_us": pts, "event_id": e, "ref_us": t0 + pts})
+            })
+            .collect();
+        let hap: Vec<serde_json::Value> = (0..3600u64)
+            .map(|k| {
+                let (pts, e) = haptic_slot_identity(k);
+                serde_json::json!({"k": k, "pts_us": pts, "event_id": e,
+                    "anchor_i": if k % 3 == 0 { serde_json::json!(k / 3) } else { serde_json::Value::Null }})
+            })
+            .collect();
+        let ledger = dir.join("opportunities.exp2.json");
+        std::fs::write(
+            &ledger,
+            canonical_json_bytes(&serde_json::json!({"contract": "exp2-contract-v4",
+                "run_id": run_id, "t0_us": t0, "pc": pc, "haptic": hap})),
+        )
+        .unwrap();
+        let meta = dir.join("meta.json");
+        std::fs::write(
+            &meta,
+            serde_json::json!({"batch_id": "b", "campaign": "L1-R", "condition": "c",
+                "block_id": "k", "trajectory_seed": 1, "attempt": 1,
+                "planned_predecessor": null, "actual_predecessor": null,
+                "epsilon_output_us": 40000, "g_report_us": 1000000,
+                "threshold_profile": "middle", "thresh_pos_ms": 77.0, "thresh_neg_ms": -118.0,
+                "threshold_citation_id": "di_luca_2019", "threshold_verified": true})
+            .to_string(),
+        )
+        .unwrap();
+        let exp2_out = dir.join("exp2.jsonl");
+        let legacy = dir.join("rx.jsonl");
+        let strings = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let mut cli = strings(&[
+            "moq_receiver", "--relay", "https://127.0.0.1:4443", "--run-id", run_id,
+            "--s-bytes", "1", "--c-mbps", "131.9", "--pc-rate-hz", "30", "--haptic-rate-hz", "90",
+            "--payload-mode", "frame", "--representation", "bin", "--topology", "relay",
+            "--chunk-bytes", "178", "--reassembly-max-pending-frames", "64",
+            "--reassembly-max-pending-bytes", "67108864", "--reassembly-max-age-ms", "2000",
+            "--data-priority-mapping", "moqt-v2", "--tracks", "both", "--max-duration", "6",
+            "--seed", "1", "--arm", "p1", "--pc-delivery-timeout-ms", "345",
+            "--s3-effect-timeout-ms", "2000", "--s3-initial-retry-limit", "20",
+            "--s3-switch-retry-limit", "2", "--s3-producer-shutdown-timeout-ms", "2000",
+            "--batch-id", "b", "--phase-control", "/unused", "--delta-max-us", "345000",
+            "--exp2-test-mode", "--exp2-test-force-hc-at-ms", "100",
+        ]);
+        for (flag, path) in [
+            ("--out", &legacy),
+            ("--exp2-out", &exp2_out),
+            ("--opportunities", &ledger),
+            ("--exp2-meta", &meta),
+            ("--exp2-sender-wire", &dir.join("absent_sender_wire.jsonl")),
+        ] {
+            cli.push(flag.to_string());
+            cli.push(path.display().to_string());
+        }
+        let args = Args::try_parse_from(cli).expect("P1 CLI parses");
+        let runtime = p1_runtime_config(&args).unwrap().unwrap();
+        let exp2 = Arc::new(exp2_cli_config(&args).unwrap().unwrap());
+        let logger = Arc::new(Mutex::new(
+            JsonlLogger::new(
+                &legacy, run_id, "moq", "rx", None, 0.0, 0.0, 0.0, 1, 30, 90, 1, None, None,
+                Some("both"), Some(TERM_PROTOCOL_V), None, None, None,
+            )
+            .unwrap(),
+        ));
+        // The forced switch is requested at t0 + 100 ms; both target
+        // SUBSCRIBEs answer only after 1.5 s.
+        let script = vec![
+            Call { track: PC_NORMAL, before: Vec::new(), answer: Answer::Accept(Vec::new()) },
+            Call { track: HAPTIC_FULL, before: Vec::new(), answer: Answer::Accept(Vec::new()) },
+            Call { track: PC_CRITICAL, before: vec![Step::Sleep(1_500)], answer: Answer::Accept(Vec::new()) },
+            Call { track: HAPTIC_ESSENTIAL, before: vec![Step::Sleep(1_500)], answer: Answer::Accept(Vec::new()) },
+        ];
+        let seam = ScriptedSeam::new(script);
+        // Current-route objects of events 0..12 arrive while the switch is
+        // pending; their dues (ref + 345 ms) fall inside the 1.5 s window.
+        let side = {
+            let seam = seam.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                for i in 0..12u32 {
+                    let (pts, e) = pc_slot_identity(i as u64);
+                    seam.run(&[
+                        Step::Publish(PC_NORMAL, vec![(2, i, pts, e)]),
+                        Step::Publish(HAPTIC_FULL, vec![(0, 3 * i, pts, e)]),
+                    ])
+                    .await;
+                }
+            })
+        };
+        let phase = skew_moq::phase::PhaseControl {
+            schema_version: 1,
+            batch_id: "b".into(),
+            run_id: run_id.into(),
+            arm: "M".into(),
+            created_us: t0 - 3_500_000,
+            warmup_start_us: t0 - 3_000_000,
+            t0_us: t0,
+        };
+        let phase_task = tokio::spawn(async move { Ok(phase) });
+        let result = run_exp2_p1_control(
+            &args,
+            runtime,
+            exp2,
+            logger,
+            TrackNamespace::from_utf8_path(run_id),
+            seam.clone(),
+            SessionEnding::Never.spawn(),
+            phase_task,
+        )
+        .await;
+        side.abort();
+        let _ = side.await;
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(&exp2_out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        std::fs::remove_dir_all(&dir).ok();
+        let error = format!("{:#}", result.expect_err("an unapplied switch must fail the run"));
+        assert!(error.contains("effect timeout"), "{error}");
+        let requested = rows
+            .iter()
+            .find(|r| r["role"] == "tier_switch" && r["phase"] == "requested")
+            .expect("requested row");
+        let subscribed = rows
+            .iter()
+            .find(|r| r["role"] == "tier_switch" && r["phase"] == "subscribed")
+            .expect("subscribed row (request / SUBSCRIBE_OK times)");
+        let (t_req, t_sub) = (
+            requested["request_at_us"].as_u64().unwrap(),
+            subscribed["t_subscribe_ok_pc_us"].as_u64().unwrap(),
+        );
+        assert!(t_sub >= t_req + 1_400_000, "the seam held the SUBSCRIBE");
+        let inside = rows
+            .iter()
+            .filter(|r| r["role"] == "release")
+            .filter(|r| {
+                let t = r["t_log_arrival_us"].as_u64().unwrap();
+                t > t_req && t < t_sub
+            })
+            .count();
+        assert!(inside > 0, "releases are recorded while the SUBSCRIBEs are in flight");
+        for r in rows.iter().filter(|r| r["role"] == "release") {
+            let lag = r["t_log_arrival_us"].as_u64().unwrap() - r["t_release_us"].as_u64().unwrap();
+            assert!(lag < 100_000, "report lag unaffected by the switch handshake: {lag}");
+        }
+        assert!(rows.iter().any(|r| r["role"] == "integrity_warning"
+            && r["kind"] == "p1_switch_effect_timeout"));
+        assert!(!rows.iter().any(|r| r["role"] == "instrumentation_end"), "fail closed: no sentinel");
+    }
+
     /// The sender's "my current routes finished producing" refusal, built by
     /// the sender's OWN constructor so a drift there fails these cases instead
     /// of silently making the receiver's non-fatal path unreachable.
@@ -13692,6 +14253,8 @@ mod exp2_receiver_tests {
             "/nonexistent/phase.json".into(),
             "--delta-max-us".into(),
             delta_max_us.into(),
+            "--exp2-sender-wire".into(),
+            "/nonexistent/sender_wire.jsonl".into(),
         ]
     }
 
@@ -13705,9 +14268,9 @@ mod exp2_receiver_tests {
         "--late-tolerance-ms", "10", "--buffer-max-objects-per-track", "4096",
         "--buffer-max-span-ms", "3000", "--late-policy", "drop-late",
     ];
-    const P1_OPTS: [&str; 6] = [
+    const P1_OPTS: [&str; 8] = [
         "--s3-effect-timeout-ms", "2000", "--s3-initial-retry-limit", "20",
-        "--s3-switch-retry-limit", "2",
+        "--s3-switch-retry-limit", "2", "--s3-producer-shutdown-timeout-ms", "2000",
     ];
 
     fn strings(values: &[&str]) -> Vec<String> {
@@ -13726,7 +14289,23 @@ mod exp2_receiver_tests {
             let args = parse(arm, &extra);
             assert!(playout_config(&args).unwrap().is_none(), "{arm}: no S1 scheduler");
             let exp2 = exp2_cli_config(&args).unwrap().expect("exp2 enabled");
-            assert_eq!(exp2.t_pc_ms, 345);
+            assert_eq!(exp2.t_pc_ms, Some(345));
+            assert!(exp2.scientific_eligible);
+            assert_eq!(exp2.meta_extra.contains_key("p1_switch_settings"), arm == "p1");
+            if arm == "p1" {
+                let settings = &exp2.meta_extra["p1_switch_settings"];
+                assert_eq!(settings["effect_timeout_ms"], serde_json::json!(2000));
+                assert_eq!(settings["initial_retry_limit"], serde_json::json!(20));
+                assert_eq!(settings["switch_retry_limit"], serde_json::json!(2));
+                assert_eq!(settings["producer_shutdown_timeout_ms"], serde_json::json!(2000));
+            }
+            // the sender timeout counter sidecar is mandatory for core arms
+            let without_wire: Vec<String> = extra
+                .iter()
+                .cloned()
+                .filter(|a| a != "--exp2-sender-wire" && a != "/nonexistent/sender_wire.jsonl")
+                .collect();
+            assert!(exp2_cli_config(&parse(arm, &without_wire)).is_err(), "{arm}: sender wire");
             assert_eq!(exp2.delta_max_us, 345_000);
             let meta4 = phase4_transport(&args).unwrap();
             assert_eq!(meta4.pc_delivery_timeout_ms, Some(345));
@@ -13795,7 +14374,7 @@ mod exp2_receiver_tests {
         assert!(playout_config(&b1x).unwrap().is_none());
         let cfg = exp2_cli_config(&b1x).unwrap().unwrap();
         assert_eq!(cfg.method, Exp2Method::B1);
-        assert_eq!(cfg.t_pc_ms, 345, "recorded slot value; B1 applies no timeout");
+        assert_eq!(cfg.t_pc_ms, None, "contract v4: B1/S1 t_pc_ms is null");
         // S1 with exp2 logging: the identical S1 configuration.
         let s1 = parse("s1", &strings(&S1_OPTS));
         let mut s1x_args = strings(&S1_OPTS);
@@ -13866,6 +14445,41 @@ mod exp2_receiver_tests {
             }
         }
         assert_eq!(p1_transition_cause(HapticCritical).as_str(), "saturated_pair_miss");
+    }
+
+    #[test]
+    fn exp2_p1_target_route_events_are_parked_until_subscribe_ok() {
+        // J: while a switch's target SUBSCRIBEs are in flight, only events of
+        // the CHANGED target routes are parked; current/old routes flow.
+        use skew_moq::s3_controller::TransitionCause;
+        let request = SwitchRequest {
+            decision_at_us: 1,
+            request_at_us: 2,
+            from: S3State::Recovery,
+            to: S3State::Normal,
+            cause: TransitionCause::StableNormal,
+            target: skew_moq::s3_switch::Routes {
+                pc: Route { name: "pc", generation: 3 },
+                haptic: Route { name: "haptic", generation: 2 },
+            },
+            pc_changed: true,
+            haptic_changed: false,
+        };
+        let ended = |role, route| S3WireEvent::Ended {
+            role,
+            route,
+            end: TrackEnd::Fin,
+            detail: String::new(),
+            close_code: None,
+            source: TerminalSource::Remote,
+        };
+        assert!(p1_event_on_target(&ended(TrackRole::Pc, Route { name: "pc", generation: 3 }), request));
+        assert!(!p1_event_on_target(&ended(TrackRole::Pc, Route { name: "pc-d7", generation: 2 }), request));
+        // haptic is unchanged: its (current) route is never parked
+        assert!(!p1_event_on_target(&ended(TrackRole::Haptic, Route { name: "haptic", generation: 2 }), request));
+        let row = p1_switch_row("requested", &request);
+        assert_eq!(row["request_at_us"], serde_json::json!(2));
+        assert_eq!(row["pc_route_generation"], serde_json::json!(3));
     }
 
     #[test]
@@ -13943,7 +14557,8 @@ mod exp2_receiver_tests {
             text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
         let release: Vec<_> = rows.iter().filter(|r| r["role"] == "release").collect();
         assert_eq!(release.len(), 1);
-        assert_eq!(release[0]["due_us"].as_u64().unwrap(), due);
+        assert!(release[0].get("due_us").is_none(), "v4: due only in decision rows");
+        assert!(release[0]["t_release_us"].as_u64().unwrap() >= due);
         assert!(release[0]["t_log_arrival_us"].as_u64().unwrap() >= release[0]["t_release_us"].as_u64().unwrap());
         assert_eq!(rows.iter().filter(|r| r["role"] == "rx").count(), 1);
         let _ = std::fs::remove_file(&path);
