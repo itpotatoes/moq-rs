@@ -6816,8 +6816,9 @@ where
                 }
             }
         }
-        // L2 checkpoint before the only `.await` (a switch request) that can
-        // follow an error recorded earlier in this iteration.
+        // L2 checkpoint before the switch request below, an `.await` that is
+        // not guarded by `outcome_error.is_none()` (the forced-miss request
+        // above is) and can follow an error recorded in this iteration.
         note_l2_outcome_fault(l2_output.as_ref(), &outcome_error);
         let observations = match advance_tracker_checked(&mut tracker, &scheduler, now) {
             Ok(observations) => observations,
