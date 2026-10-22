@@ -5367,8 +5367,17 @@ fn drain_s3_events_at_exit<H>(
             faults,
             &mut failure,
         );
+        // Codex 107: `scheduler.push` above can ARM the common timeline (the
+        // carried anchor, or any anchor still queued at exit). Record that
+        // epoch exactly as the main loop does (`log_common_epochs`, the same
+        // row) BEFORE the releases/drops that depend on it are written.
+        // `take_new_epochs` drains, so an epoch is never written twice.
+        let config = scheduler.config();
+        let epoch_logged = log_common_epochs(scheduler, logger, config);
         // Same terminal accounting as the shutdown flush that follows: no
         // bridge, no render, no audio — this path is teardown, not playback.
+        // Dispatch even if the epoch row failed: every admitted object still
+        // gets its terminal, and the failure is the run's cause below.
         let dispatched = dispatch_s3_playout_actions(
             actions,
             object_routes,
@@ -5382,9 +5391,10 @@ fn drain_s3_events_at_exit<H>(
             &|action| scheduler.action_due_us(action),
             l2,
         );
-        // `failure` was stamped where it was stored; a dispatch error is
-        // stored (and stamped) here. Same first-writer-wins merge as before.
-        for error in [failure, dispatched.err()].into_iter().flatten() {
+        // `failure` was stamped where it was stored; an epoch-row or dispatch
+        // error is stored (and stamped) here, in the order they happened.
+        // Same first-writer-wins merge as before.
+        for error in [failure, epoch_logged.err(), dispatched.err()].into_iter().flatten() {
             keep_first_cause(outcome_error, error);
         }
     };
@@ -7289,6 +7299,14 @@ where
     }
 
     if scheduler.is_started() {
+        // Codex 107: an epoch not yet on record (armed during the exit
+        // passes) is written before the flush releases anything. `advance`
+        // never arms a timeline (only `push` calls `try_start`,
+        // playout.rs:316), so this one call covers the whole flush; it is a
+        // no-op when the epoch is already logged.
+        if let Err(error) = log_common_epochs(&mut scheduler, &logger, playout) {
+            keep_first_cause(&mut outcome_error, error);
+        }
         let budget_end = now_us()
             .saturating_add(playout.d_play_us)
             .saturating_add(playout.max_span_us)
@@ -12885,6 +12903,9 @@ mod s3_control_loop_tests {
         result: Result<()>,
         rows: Vec<serde_json::Value>,
         calls: Vec<String>,
+        /// The rx JSONL exactly as written (for fixtures handed to analyzers).
+        #[allow(dead_code)]
+        text: String,
     }
 
     impl CaseOutcome {
@@ -13189,6 +13210,7 @@ mod s3_control_loop_tests {
             result,
             rows,
             calls: seam.calls(),
+            text,
         }
     }
 
@@ -13949,6 +13971,18 @@ mod s3_control_loop_tests {
         let releases: Vec<&serde_json::Value> =
             outcome.rows.iter().filter(|r| r["role"] == "release").collect();
         assert_eq!(releases.len(), 4, "{releases:?}");
+        // Codex 107: wherever the epoch was armed (loop or exit pass 1), its
+        // row is on record exactly once and before the first release.
+        let epoch_at: Vec<usize> = outcome
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r["event"] == "timeline_epoch")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(epoch_at.len(), 1, "exactly one timeline_epoch row");
+        let first_release_at = outcome.rows.iter().position(|r| r["role"] == "release").unwrap();
+        assert!(epoch_at[0] < first_release_at);
         for release in &releases {
             let k = key(release);
             assert_eq!(l2.iter().filter(|r| r["role"] == "submit" && key(r) == k).count(), 1, "{k}");
@@ -13982,6 +14016,191 @@ mod s3_control_loop_tests {
             "forced S3 retirement release failure",
         )
         .await;
+    }
+
+    /// Where the rx fixtures of the epoch-at-exit cases are kept for the 1-C
+    /// analyzer: `tools/moq-rs/target/l2-fixtures/` (build output, not
+    /// evidence).
+    fn epoch_fixture_path(file: &str) -> PathBuf {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/l2-fixtures");
+        std::fs::create_dir_all(&dir).expect("create the fixture directory");
+        dir.join(file)
+    }
+
+    /// Codex 107 (a): the CARRIED event is the anchor that arms the common
+    /// timeline during exit drain pass 1. The `timeline_epoch` row must be
+    /// written exactly once, before every release that depends on it, with the
+    /// main loop's row shape, and every release's `t_due` must reproduce from
+    /// it. Runs with `--l2-sink none`: this is rx logging, so it holds without
+    /// L2. The produced rx JSONL is kept for the 1-C analyzer.
+    #[tokio::test]
+    async fn an_epoch_armed_by_the_carried_anchor_at_exit_is_logged_before_its_releases() {
+        let run_id = "epoch-at-exit-carried";
+        s3_test_seam::arm(run_id, 3, S3TestCutoff::MaxDuration);
+        let script = vec![
+            Call { track: PC_NORMAL, before: Vec::new(), answer: Answer::Accept(Vec::new()) },
+            Call {
+                track: HAPTIC_FULL,
+                before: Vec::new(),
+                answer: Answer::Accept(vec![
+                    // PC first and given time to be enqueued, so the queue is
+                    // [pc anchor, pc older, haptic anchor, haptic older] and
+                    // the 3rd dequeue -- the carried event -- is the haptic
+                    // ANCHOR that completes the exact pair.
+                    Step::Publish(PC_NORMAL, vec![(2, 30, 1_000_000, 31), (2, 27, 900_000, 28)]),
+                    Step::Sleep(30),
+                    Step::Publish(HAPTIC_FULL, vec![(0, 90, 1_000_000, 31), (0, 81, 900_000, 28)]),
+                ]),
+            },
+        ];
+        let outcome = run_case_core(
+            "epoch-exit-a", run_id, Some("30"), "600000", script, Vec::new(), SessionEnding::Never,
+            &[],
+        )
+        .await;
+        assert!(s3_test_seam::fired(run_id));
+        assert!(outcome.result.is_err(), "the cutoff ends the run");
+        outcome.assert_every_rx_object_is_terminated();
+        let rows = &outcome.rows;
+        // The 3rd rx row is the carried haptic anchor; no epoch before exit.
+        let rx_order: Vec<String> = rows
+            .iter()
+            .filter(|r| r["role"] == "rx")
+            .map(|r| format!("{}/{}", r["track"], r["seq"]))
+            .collect();
+        assert_eq!(rx_order[2], "\"haptic\"/90", "{rx_order:?}");
+        let epochs: Vec<(usize, &serde_json::Value)> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r["role"] == "info" && r["event"] == "timeline_epoch")
+            .collect();
+        assert_eq!(epochs.len(), 1, "exactly one epoch row");
+        let (epoch_at, epoch) = epochs[0];
+        assert_eq!(epoch["scope"], "common");
+        assert_eq!(epoch["anchor_pts_us"], 1_000_000);
+        assert_eq!(epoch["anchor_event_id"], 31);
+        assert_eq!(epoch["d_play_us"], 100_000);
+        assert_eq!(epoch["rearm_index"], 0);
+        let t_epoch = epoch["t_epoch"].as_u64().unwrap();
+        let releases: Vec<(usize, &serde_json::Value)> =
+            rows.iter().enumerate().filter(|(_, r)| r["role"] == "release").collect();
+        assert_eq!(releases.len(), 4);
+        for (at, release) in &releases {
+            assert!(*at > epoch_at, "the epoch row precedes every release");
+            let pts = release["pts_us"].as_u64().unwrap();
+            assert_eq!(release["t_due"].as_u64().unwrap(), t_epoch + pts + 100_000 - 1_000_000);
+            assert!(release["t_release"].as_u64().unwrap() >= t_epoch);
+        }
+        // The epoch was armed at exit, after the abort: the shutdown row says so.
+        let shutdown = outcome.shutdown();
+        assert!(shutdown["detail"].as_str().unwrap().contains("max-duration"));
+        let fixture = epoch_fixture_path("s3_exit_epoch_carried_rx.jsonl");
+        std::fs::write(&fixture, &outcome.text).unwrap();
+        eprintln!("1-C fixture (rx JSONL as written): {}", fixture.display());
+    }
+
+    /// Codex 107 (b), helper level (production `drain_s3_events_at_exit`,
+    /// called as the exit path does): the anchor pair is completed only in
+    /// PASS 2. The epoch row is written during pass 2, once, before pass 2's
+    /// releases; pass 1 writes none.
+    #[tokio::test]
+    async fn an_epoch_armed_in_exit_pass_two_is_logged_before_its_releases() {
+        let rx_path = test_log_path("epoch-exit-b-rx");
+        let args = s3_args_with(&rx_path, "epoch-exit-b", Some("30"), "600000", &[]);
+        let playout = playout_config(&args).unwrap().unwrap();
+        let runtime = s3_runtime_config(&args).unwrap().unwrap();
+        let logger = Arc::new(Mutex::new(
+            JsonlLogger::new(
+                &rx_path, "epoch-exit-b", "moq", "rx", None, 0.0, 0.0, 0.0, 1, 30, 90, 1, None, None,
+                Some("both"), Some(TERM_PROTOCOL_V), None, None, None,
+            )
+            .unwrap(),
+        ));
+        let gate = S3SwitchGate::new(runtime.switch).unwrap();
+        let routes = gate.active_routes();
+        let mut ingress = S3ReceiverIngress::new(gate, playout.max_objects_per_track).unwrap();
+        let mut scheduler = PlayoutScheduler::new(playout).unwrap();
+        let mut tracker = S3DeadlineTracker::new(runtime.deadline_max_anchors).unwrap();
+        let mut object_routes: HashMap<S3ObjectKey, (TrackRole, Route)> = HashMap::new();
+        let mut live: HashMap<(TrackRole, u64), S3LiveSubscription<&'static str>> = HashMap::new();
+        let mut retiring: S3RetirementQueue<S3LiveSubscription<&'static str>> =
+            S3RetirementQueue::new(67_000).unwrap();
+        let mut retired_drains = Vec::new();
+        let mut current_finished = [false, false];
+        let mut normal_end = false;
+        let (recv_pc, recv_haptic) = (AtomicU64::new(0), AtomicU64::new(0));
+        let mut stats = PlayoutStats::default();
+        let mut refused = 0u64;
+        let mut faults = S3SwitchTargetFaults::default();
+        let mut outcome_error: Option<anyhow::Error> = None;
+        let mut window_end_us = None;
+        let object = |role: TrackRole, tier: u16, seq: u32, pts_us: u64, event_id: u32| {
+            let (track_id, route) = match role {
+                TrackRole::Pc => (TRACK_PC, routes.pc),
+                TrackRole::Haptic => (TRACK_HAPTIC, routes.haptic),
+            };
+            let t = now_us();
+            let header =
+                unpack_header(&pack_header(track_id, tier, seq, pts_us, event_id, t, 4)).unwrap();
+            S3WireEvent::Object(RoutedObject {
+                role,
+                route,
+                object: PlayoutObject { header, t_recv: t, bytes: Bytes::from(vec![0u8; HDR + 4]) },
+            })
+        };
+        let rows_of = |path: &std::path::Path| -> Vec<serde_json::Value> {
+            std::fs::read_to_string(path)
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+                .collect()
+        };
+        let (tx, mut event_rx) = mpsc::channel::<S3WireEvent>(64);
+        // Pass 1: only PC objects -> no exact pair, no epoch.
+        tx.send(object(TrackRole::Pc, 2, 30, 1_000_000, 31)).await.unwrap();
+        tx.send(object(TrackRole::Pc, 2, 27, 900_000, 28)).await.unwrap();
+        let pass_one = drain_s3_events_at_exit(
+            &mut event_rx, None, &mut window_end_us, &mut ingress, &mut scheduler,
+            &mut tracker, &mut object_routes, &mut live, &mut retiring, &mut retired_drains,
+            &mut current_finished, &mut normal_end, &recv_pc, &recv_haptic, &logger,
+            &mut stats, &mut refused, &mut faults, &mut outcome_error, None, None,
+        );
+        assert_eq!(pass_one.drained, 2);
+        let after_one = rows_of(&rx_path);
+        assert!(after_one.iter().all(|r| r["event"] != "timeline_epoch"), "no pair, no epoch");
+        // Pass 2: the haptic anchor completes the pair and arms the epoch.
+        tx.send(object(TrackRole::Haptic, 0, 90, 1_000_000, 31)).await.unwrap();
+        tx.send(object(TrackRole::Haptic, 0, 81, 900_000, 28)).await.unwrap();
+        drop(tx);
+        let pass_two = drain_s3_events_at_exit(
+            &mut event_rx, None, &mut window_end_us, &mut ingress, &mut scheduler,
+            &mut tracker, &mut object_routes, &mut live, &mut retiring, &mut retired_drains,
+            &mut current_finished, &mut normal_end, &recv_pc, &recv_haptic, &logger,
+            &mut stats, &mut refused, &mut faults, &mut outcome_error, None, None,
+        );
+        assert_eq!((pass_two.drained, pass_two.disconnected), (2, true));
+        assert!(outcome_error.is_none(), "{outcome_error:?}");
+        let rows = rows_of(&rx_path);
+        let epochs: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r["event"] == "timeline_epoch")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(epochs.len(), 1, "exactly one epoch row");
+        let releases: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r["role"] == "release")
+            .map(|(i, _)| i)
+            .collect();
+        // The older pair (due at the epoch) is released in pass 2 itself.
+        assert_eq!(releases.len(), 2, "{rows:?}");
+        assert!(releases.iter().all(|&at| at > epochs[0]), "epoch row before the releases");
+        // The shutdown flush logs nothing more: the epoch is already on record.
+        log_common_epochs(&mut scheduler, &logger, playout).unwrap();
+        assert_eq!(rows_of(&rx_path).iter().filter(|r| r["event"] == "timeline_epoch").count(), 1);
+        std::fs::remove_file(&rx_path).ok();
     }
 
     /// (b) A transition whose request instant falls at/after the window end is
