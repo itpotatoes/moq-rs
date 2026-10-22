@@ -931,7 +931,6 @@ fn alsa_meta(alsa: &AlsaSinkConfig, ready: &LaneReady) -> serde_json::Value {
         "actual_first_status": audio_tstamp_type_name(first.audio_tstamp.actual_type),
         "report_valid_first_status": first.audio_tstamp.valid,
         "start_check": "the first snapshot must report valid = 1 and actual_type in 0..=5, otherwise the run is refused: plausibility that the request reached the driver as decoded, NOT proof that LINK was selected; every output row records its actual type",
-        "observed": "M2b probe (runs/l2_alsa_probe_20261022, non_evidence): actual LINK, valid, accuracy 42 ns on all 5,220 output rows",
     });
     serde_json::json!({
         "backend": alsa_backend_name(&alsa.backend),
@@ -962,7 +961,6 @@ fn alsa_meta(alsa: &AlsaSinkConfig, ready: &LaneReady) -> serde_json::Value {
         "silence_policy": "with an empty write queue, one period of silence when buffer_frames - avail < target_fill_frames; silence frames are never the output of any tick",
         "queue_policy": "Q counts every tick frame not yet written to the device (the waiting queue plus the unwritten remainder of the tick being written); a tick that would make it exceed queue_limit_frames is explicit_discard output_queue_full before submit",
         "hw_pos_definition": "from ONE snd_pcm_status snapshot: hw_pos = appl_pos - delay, appl_pos = frames written by this lane at that call; hw_ptr_pos = appl_pos - (buffer_frames - avail) is the DMA pointer (must never decrease); driver_delay_frames = delay - (buffer_frames - avail) is recorded per row",
-        "driver_delay_observation": "M2b probe (runs/l2_alsa_probe_20261022, non_evidence): driver_delay_frames constant 32 (0.667 ms) on hw:1,0 after the first snapshot, i.e. the reported delay includes 32 frames beyond the buffer, so hw_pos (the registered output position) is 32 frames behind the DMA pointer",
         "output_rule": "an output row only when hw_pos > n_k in that snapshot (strict); t_output_us = htstamp_us + round_half_away((n_k - hw_pos) * 1e6 / 48000); htstamp_us = sec*1e6 + floor(nsec/1000)",
         "htstamp_semantics": "inferred from the kernel source, to be confirmed on the device: with an audio timestamp of actual type LINK the status htstamp is the system time read next to the position read in that same status call; with DEFAULT it is the time the current position value was first observed",
         "audio_tstamp_policy": "the LINK audio timestamp is requested before every status call; the L2 JSONL records only its requested/actual type and report bits; the audio timestamp value (not CLOCK_MONOTONIC) and every raw ns value exist only in a probe diagnostics file (registration 11-11); comparison only, never the registered formula",
@@ -1131,35 +1129,8 @@ impl L2Output {
                 .name("l2-sink-haptic-alsa".into())
                 .spawn(move || alsa_lane_main(alsa, items_rx, rows, lane_shared, ready_tx, diagnostics))
                 .context("spawn L2 ALSA lane thread")?;
-            match ready_rx.recv_timeout(timeout) {
-                Ok(Ok(ready)) => alsa_ready = Some(ready),
-                Ok(Err(error)) => {
-                    drop(items_tx);
-                    let _ = lane.join();
-                    bail!("L2 ALSA haptic sink failed to start: {error} (lane joined, device closed)");
-                }
-                Err(timeout_or_gone) => {
-                    // The lane closes its stream by itself: a late `ready`
-                    // send fails (stop + close), and with `items_tx` gone
-                    // its loop exits. Wait (bounded) until the thread has
-                    // exited, so the device is released before any next
-                    // attempt, and say whether it was.
-                    drop(items_tx);
-                    let released = join_within(lane, release);
-                    let what = match timeout_or_gone {
-                        RecvTimeoutError::Timeout => format!("not ready within {} us", timeout.as_micros()),
-                        RecvTimeoutError::Disconnected => "lane exited without reporting".to_string(),
-                    };
-                    if released {
-                        bail!("L2 ALSA haptic sink {what}; the lane thread has exited and the device is closed");
-                    }
-                    bail!(
-                        "L2 ALSA haptic sink {what}; the lane thread has NOT exited within a further {} us, so the \
-                         device may stay open until this process exits: do not start another attempt before it has",
-                        release.as_micros()
-                    );
-                }
-            }
+            let (ready, lane, items_tx) = await_lane_ready(ready_rx, lane, items_tx, timeout, release)?;
+            alsa_ready = Some(ready);
             let lane_index = L2Modality::Haptic.index();
             senders[lane_index] = Some(items_tx);
             lane_threads[lane_index] = Some(lane);
@@ -1366,6 +1337,46 @@ impl FakePending {
 
 fn micros(us: u64) -> Duration {
     Duration::from_micros(us)
+}
+
+/// Wait for a device lane's ready report. On an error report the lane is
+/// joined (it has closed its device). On a timeout (or a lane that exits
+/// without reporting) its queue is closed — a late ready send then fails and
+/// the lane stops and closes its stream; with the queue gone its loop exits —
+/// and the lane is joined within `release`, so the device is released before
+/// any next attempt; the error says whether that happened.
+fn await_lane_ready<T>(
+    ready_rx: Receiver<std::result::Result<T, String>>,
+    lane: JoinHandle<()>,
+    items_tx: SyncSender<SinkMsg>,
+    timeout: Duration,
+    release: Duration,
+) -> Result<(T, JoinHandle<()>, SyncSender<SinkMsg>)> {
+    match ready_rx.recv_timeout(timeout) {
+        Ok(Ok(ready)) => Ok((ready, lane, items_tx)),
+        Ok(Err(error)) => {
+            drop(items_tx);
+            let _ = lane.join();
+            bail!("L2 ALSA haptic sink failed to start: {error} (lane joined, device closed)");
+        }
+        Err(timeout_or_gone) => {
+            drop(items_tx);
+            drop(ready_rx);
+            let released = join_within(lane, release);
+            let what = match timeout_or_gone {
+                RecvTimeoutError::Timeout => format!("not ready within {} us", timeout.as_micros()),
+                RecvTimeoutError::Disconnected => "lane exited without reporting".to_string(),
+            };
+            if released {
+                bail!("L2 ALSA haptic sink {what}; the lane thread has exited and the device is closed");
+            }
+            bail!(
+                "L2 ALSA haptic sink {what}; the lane thread has NOT exited within a further {} us, so the \
+                 device may stay open until this process exits: do not start another attempt before it has",
+                release.as_micros()
+            );
+        }
+    }
 }
 
 /// Join `thread` if it finishes within `bound`; `false` if it is still
@@ -1642,8 +1653,11 @@ impl DiagLog {
             writeln!(self.file, "{row}")?;
         }
         if let Some(failure) = failure {
+            let raw: serde_json::Map<String, serde_json::Value> =
+                failure.raw_ns.iter().map(|(name, value)| ((*name).to_string(), (*value).into())).collect();
             let row = serde_json::json!({
                 "role": "device_failure", "reason": failure.reason, "kernel_trigger_ns": failure.kernel_trigger_ns,
+                "raw_ns": raw,
             });
             writeln!(self.file, "{row}")?;
         }
@@ -1867,6 +1881,14 @@ impl AlsaLane {
         self.failed = Some(failure);
     }
 
+    /// Close statistics: frames of the latest tick that started being written
+    /// (its full extent, also when only partly written) not yet past
+    /// `hw_pos` in the last healthy snapshot before the stream is dropped —
+    /// an upper bound (after a device failure nothing more can be played).
+    fn record_close(&mut self) {
+        self.closed_unplayed_tick_frames = Some(self.engine.unplayed_tick_frames());
+    }
+
     fn stop_stream(&mut self) {
         if !self.stopped {
             self.stopped = true;
@@ -1980,9 +2002,7 @@ impl AlsaLane {
             let mut closing = true;
             let _ = self.drain(&items, &mut closing);
         }
-        // Whether the latest tick reached its end before the stream is
-        // dropped (after a device failure nothing more can be played).
-        self.closed_unplayed_tick_frames = Some(self.engine.unplayed_tick_frames());
+        self.record_close();
         self.stop_stream();
         // The stream is stopped: the diagnostics file and a blocking hand-off
         // of the counters cannot delay the device any more.
@@ -3684,6 +3704,30 @@ mod tests {
         }
     }
 
+    /// Codex 110: the given raw values must not appear anywhere in the rows —
+    /// neither as numbers nor inside strings (digit runs compared whole).
+    fn assert_raw_values_absent(rows: &[serde_json::Value], raw: &[u64]) {
+        fn walk(value: &serde_json::Value, raw: &[u64], path: &str) {
+            match value {
+                serde_json::Value::Number(n) => {
+                    assert!(!n.as_u64().is_some_and(|v| raw.contains(&v)), "raw value {n} at {path}");
+                }
+                serde_json::Value::String(text) => {
+                    for token in text.split(|c: char| !c.is_ascii_digit()).filter(|t| !t.is_empty()) {
+                        let leaked = token.parse::<u64>().is_ok_and(|v| raw.contains(&v));
+                        assert!(!leaked, "raw value {token} inside {path}: {text:?}");
+                    }
+                }
+                serde_json::Value::Object(map) => map.iter().for_each(|(k, v)| walk(v, raw, &format!("{path}.{k}"))),
+                serde_json::Value::Array(items) => items.iter().for_each(|v| walk(v, raw, path)),
+                _ => {}
+            }
+        }
+        for (i, row) in rows.iter().enumerate() {
+            walk(row, raw, &format!("row{i}"));
+        }
+    }
+
     /// Every released tick: one submit, one output, the snapshot evidence
     /// of the registered formula, release-order back-to-back placement,
     /// and the order rule; v1.2 meta and sentinel for an ALSA lane.
@@ -3728,7 +3772,9 @@ mod tests {
         assert_eq!(alsa["audio_tstamp_type"]["actual_first_status"], "LINK");
         assert_eq!(alsa["audio_tstamp_type"]["report_valid_first_status"], true);
         assert!(alsa["parameter_status"].as_str().unwrap().contains("provisional"));
-        assert!(alsa["driver_delay_observation"].as_str().unwrap().contains("32"));
+        // No hard-coded observation of a past run in the meta (Codex 110).
+        assert!(alsa.get("driver_delay_observation").is_none());
+        assert!(alsa["audio_tstamp_type"].get("observed").is_none());
         let t_start = alsa["stream_epoch"]["t_start_us"].as_u64().unwrap();
         assert!(t_start > 0 && alsa["stream_epoch"]["trigger_htstamp_us"].as_u64().unwrap() == t_start);
         assert_eq!(alsa["stream_epoch"]["prefill_frames"], 4_800);
@@ -3935,6 +3981,7 @@ mod tests {
             kernel_trigger_us: None,
             kernel_trigger_ns: None,
             detail: "test".into(),
+            raw_ns: Vec::new(),
         };
         lane.fail(failure);
         lane.accept(sub(4), Some(tick_payload(4)));
@@ -4085,50 +4132,152 @@ mod tests {
         }
     }
 
-    /// Ready timeout: `start` stops waiting, then waits (bounded) for the
-    /// lane to exit so the device is closed before any next attempt, and
-    /// says so; if the lane is still running it says the device may stay
-    /// open until the process exits.
-    #[test]
-    fn a_ready_timeout_releases_the_device_before_returning() {
-        use std::sync::atomic::AtomicBool;
-        let released = Arc::new(AtomicBool::new(false));
-        let mut config = alsa_config(Vec::new());
-        let alsa = config.alsa.as_mut().unwrap();
-        alsa.ready_timeout_us = 50_000;
-        alsa.release_timeout_us = 2_000_000;
-        if let AlsaBackend::Simulated(sim) = &mut alsa.backend {
-            sim.start_delay_us = 150_000;
-            sim.release_flag = Some(released.clone());
-        }
-        let path = tmp("alsa-sim-ready-timeout");
-        let error = format!("{:#}", L2Output::start(&path, config).err().expect("not ready"));
-        assert!(error.contains("not ready within 50000 us") && error.contains("device is closed"), "{error}");
-        assert!(released.load(Ordering::SeqCst), "the simulated device was closed before start returned");
-        assert_eq!(std::fs::read(&path).unwrap(), b"", "no meta row");
-        let _ = std::fs::remove_file(&path);
+    /// A stand-in lane for `await_lane_ready`: its behaviour is driven only
+    /// by channels, so every branch is deterministic (no sleeps).
+    fn stand_in_lane(
+        behaviour: impl FnOnce(mpsc::Sender<std::result::Result<u32, String>>, Receiver<SinkMsg>) + Send + 'static,
+    ) -> (Receiver<std::result::Result<u32, String>>, JoinHandle<()>, SyncSender<SinkMsg>) {
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (items_tx, items_rx) = mpsc::sync_channel::<SinkMsg>(4);
+        let lane = std::thread::spawn(move || behaviour(ready_tx, items_rx));
+        (ready_rx, lane, items_tx)
+    }
 
-        // A lane that does not exit within the release bound is reported.
-        let released = Arc::new(AtomicBool::new(false));
-        let mut config = alsa_config(Vec::new());
-        let alsa = config.alsa.as_mut().unwrap();
-        alsa.ready_timeout_us = 20_000;
-        alsa.release_timeout_us = 20_000;
-        if let AlsaBackend::Simulated(sim) = &mut alsa.backend {
-            sim.start_delay_us = 300_000;
-            sim.release_flag = Some(released.clone());
-        }
-        let path = tmp("alsa-sim-ready-timeout-held");
-        let error = format!("{:#}", L2Output::start(&path, config).err().expect("not ready"));
+    /// Ready timeout, deterministically: the stand-in lane never reports and
+    /// only exits (closing its "device") once its queue disconnects — which
+    /// happens only when `await_lane_ready` gave up waiting. The error then
+    /// says the device is closed, and it IS closed before the return.
+    #[test]
+    fn a_ready_timeout_closes_the_queue_and_returns_after_the_lane_released_the_device() {
+        use std::sync::atomic::AtomicBool;
+        let closed = Arc::new(AtomicBool::new(false));
+        let flag = closed.clone();
+        let (ready_rx, lane, items_tx) = stand_in_lane(move |_ready, items| {
+            while items.recv().is_ok() {}
+            flag.store(true, Ordering::SeqCst);
+        });
+        let error = await_lane_ready(ready_rx, lane, items_tx, Duration::from_millis(1), Duration::from_secs(60))
+            .err()
+            .expect("not ready");
+        let error = format!("{error:#}");
+        assert!(error.contains("not ready within 1000 us") && error.contains("device is closed"), "{error}");
+        assert!(closed.load(Ordering::SeqCst), "closed before await_lane_ready returned");
+    }
+
+    /// A lane that cannot exit within the release bound (held on a gate the
+    /// test controls) is reported as possibly still holding the device.
+    #[test]
+    fn a_lane_that_does_not_exit_within_the_release_bound_is_reported() {
+        use std::sync::atomic::AtomicBool;
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        let exited = Arc::new(AtomicBool::new(false));
+        let flag = exited.clone();
+        let (ready_rx, lane, items_tx) = stand_in_lane(move |_ready, _items| {
+            let _ = gate_rx.recv();
+            flag.store(true, Ordering::SeqCst);
+        });
+        let error = await_lane_ready(ready_rx, lane, items_tx, Duration::from_millis(1), Duration::from_millis(20))
+            .err()
+            .expect("not ready");
+        let error = format!("{error:#}");
         assert!(error.contains("may stay open until this process exits"), "{error}");
-        assert!(!released.load(Ordering::SeqCst));
-        // It still closes on its own once its start returns.
-        let started = std::time::Instant::now();
-        while !released.load(Ordering::SeqCst) {
-            assert!(started.elapsed() < Duration::from_secs(5));
-            std::thread::sleep(Duration::from_millis(5));
+        assert!(!exited.load(Ordering::SeqCst), "still held on the gate");
+        gate_tx.send(()).unwrap();
+        while !exited.load(Ordering::SeqCst) {
+            std::thread::yield_now();
         }
-        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The other branches: an error report (lane joined), a lane that exits
+    /// without reporting (joined, device closed), and a ready report.
+    #[test]
+    fn await_lane_ready_reports_errors_disconnects_and_ready() {
+        let (ready_rx, lane, items_tx) = stand_in_lane(|ready, _items| {
+            ready.send(Err("snd_pcm_open: Device or resource busy".into())).unwrap();
+        });
+        let error = format!("{:#}", await_lane_ready(ready_rx, lane, items_tx, Duration::from_secs(60), Duration::from_secs(60)).err().unwrap());
+        assert!(error.contains("failed to start: snd_pcm_open: Device or resource busy (lane joined, device closed)"), "{error}");
+
+        let (ready_rx, lane, items_tx) = stand_in_lane(|ready, _items| drop(ready));
+        let error = format!("{:#}", await_lane_ready(ready_rx, lane, items_tx, Duration::from_secs(60), Duration::from_secs(60)).err().unwrap());
+        assert!(error.contains("lane exited without reporting") && error.contains("device is closed"), "{error}");
+
+        let (ready_rx, lane, items_tx) = stand_in_lane(|ready, items| {
+            ready.send(Ok(42)).unwrap();
+            while items.recv().is_ok() {}
+        });
+        let (ready, lane, items_tx) =
+            await_lane_ready(ready_rx, lane, items_tx, Duration::from_secs(60), Duration::from_secs(60)).unwrap();
+        assert_eq!(ready, 42);
+        drop(items_tx);
+        lane.join().unwrap();
+    }
+
+    /// Codex 110: a tick only partly written when the stream is dropped is
+    /// never reported as played — the close statistics count its full extent
+    /// (534 frames, 64 written, hw_pos before n_k: 534 unplayed).
+    #[test]
+    fn a_partly_written_tick_at_close_is_reported_unplayed() {
+        let mut sim = SimPcmConfig::new(512, 16_384);
+        sim.max_frames_per_write = Some(64);
+        let (mut lane, rows_rx, shared) = virtual_lane(sim, 1_000);
+        let t = 1_000;
+        let s = L2Submission { identity: haptic(1), t_release_us: t, t_submit_us: t };
+        lane.accept(s, Some(tick_payload(1)));
+        let snapshot = lane.pcm.status(t).unwrap();
+        lane.engine.observe(&snapshot, t, t).unwrap();
+        lane.engine.fill(lane.pcm.as_mut(), snapshot.avail, &mut || t).unwrap();
+        assert_eq!(lane.engine.unwritten_tick_frames(), 534 - 64, "partly written");
+        lane.record_close();
+        let (_, rows) = ledger_of(&lane, &rows_rx, shared, "c110-partial-close");
+        let stats = &sentinel(&rows)["lanes"]["haptic"];
+        assert_eq!(stats["tail_played_at_close"], false);
+        assert_eq!(stats["unplayed_tick_frames_at_close"], 534);
+        assert_eq!(stats["last_tick_end_frame"], 4_800 + 534);
+    }
+
+    /// Codex 110: failure detail strings carry µs values only; the raw ns
+    /// behind them (a moved trigger, an htstamp that went back) appear only
+    /// in the diagnostics record, never anywhere in the L2 JSONL.
+    #[test]
+    fn device_failure_details_carry_no_raw_ns_and_the_raw_values_go_to_diagnostics() {
+        // A moved trigger: epoch trigger 1,000 us, restart at 3,000 us.
+        let mut sim = SimPcmConfig::new(512, 16_384);
+        sim.faults.push(SimFault::EpochReset { after_start_us: 2_000, rewind_frames: 0 });
+        let (mut lane, rows_rx, shared) = virtual_lane(sim, 1_000);
+        let snapshot = lane.pcm.status(4_000).unwrap();
+        let failure = lane.engine.observe(&snapshot, 4_000, 4_000).unwrap_err();
+        assert_eq!(failure.detail, "trigger moved: 3000 us != epoch trigger 1000 us");
+        assert_eq!(failure.raw_ns, vec![("trigger_htstamp_ns", 3_000_000), ("epoch_trigger_htstamp_ns", 1_000_000)]);
+        let diag_failure = failure.clone();
+        lane.fail(failure);
+        let (_, l2_rows) = ledger_of(&lane, &rows_rx, shared, "c110-detail-trigger");
+        assert_eq!(sentinel(&l2_rows)["lanes"]["haptic"]["device_failure"]["detail"], "trigger moved: 3000 us != epoch trigger 1000 us");
+        assert_no_raw_ns(&l2_rows);
+        assert_raw_values_absent(&l2_rows, &[3_000_000, 1_000_000]);
+        // ...and the raw values are in the diagnostics record.
+        let diag_path = tmp("c110-detail-diag");
+        let file = OpenOptions::new().write(true).create_new(true).open(&diag_path).unwrap();
+        let diag = DiagLog { file: BufWriter::new(file), run_id: "t".into(), outputs: Vec::new(), dropped: 0 };
+        diag.write(None, Some(&diag_failure)).unwrap();
+        let diag_rows = rows(&diag_path);
+        let record = diag_rows.iter().find(|r| r["role"] == "device_failure").unwrap();
+        assert_eq!(record["raw_ns"]["trigger_htstamp_ns"], 3_000_000);
+        assert_eq!(record["raw_ns"]["epoch_trigger_htstamp_ns"], 1_000_000);
+        let _ = std::fs::remove_file(&diag_path);
+
+        // An htstamp that went back by 13 ns: 3,000,000 -> 2,999,987 ns.
+        let (mut lane, rows_rx, shared) = virtual_lane(SimPcmConfig::new(512, 16_384), 1_000);
+        let healthy = lane.pcm.status(3_000).unwrap();
+        lane.engine.observe(&healthy, 3_000, 3_000).unwrap();
+        let mut back = lane.pcm.status(3_500).unwrap();
+        back.htstamp_ns = 2_999_987;
+        let failure = lane.engine.observe(&back, 3_500, 3_500).unwrap_err();
+        assert_eq!(failure.detail, "htstamp went back: 3000 us -> 2999 us");
+        assert_eq!(failure.raw_ns, vec![("previous_htstamp_ns", 3_000_000), ("htstamp_ns", 2_999_987)]);
+        lane.fail(failure);
+        let (_, l2_rows) = ledger_of(&lane, &rows_rx, shared, "c110-detail-htstamp");
+        assert_raw_values_absent(&l2_rows, &[3_000_000, 2_999_987]);
     }
 
     /// Registration 11-11: raw values go ONLY to the probe diagnostics file

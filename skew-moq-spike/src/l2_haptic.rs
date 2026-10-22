@@ -383,10 +383,20 @@ pub struct DeviceFailure {
     pub kernel_trigger_us: Option<u64>,
     /// The same, raw (diagnostics file only).
     pub kernel_trigger_ns: Option<u64>,
+    /// Reason text with integer µs CLOCK_MONOTONIC values or frame counts
+    /// only (it goes into the L2 JSONL, registration 11-11).
     pub detail: String,
+    /// Raw nanosecond values behind `detail` (diagnostics file only).
+    pub raw_ns: Vec<(&'static str, u64)>,
 }
 
 impl DeviceFailure {
+    /// Keep raw nanosecond values for the diagnostics file only.
+    pub fn with_raw_ns(mut self, values: &[(&'static str, u64)]) -> Self {
+        self.raw_ns.extend_from_slice(values);
+        self
+    }
+
     /// The ledger form (sentinel `lanes.haptic.device_failure`): integer µs
     /// CLOCK_MONOTONIC only.
     pub fn to_json(&self) -> serde_json::Value {
@@ -446,19 +456,27 @@ impl RawSnapshot {
     }
 }
 
-/// What `snd_pcm_status_get_audio_htstamp` measures for an ACTUAL type.
+/// What `snd_pcm_status_get_audio_htstamp` measures for an ACTUAL type
+/// (source: the enum comments of the local kernel UAPI
+/// `/usr/include/sound/asound.h`, `SNDRV_PCM_AUDIO_TSTAMP_TYPE_*`). None of
+/// these is CLOCK_MONOTONIC.
 pub fn audio_tstamp_domain(actual_type: u32) -> &'static str {
     match actual_type {
-        AUDIO_TSTAMP_TYPE_DEFAULT => {
-            "frames-derived audio time since stream start (hw_ptr / rate, kernel update_audio_tstamp); not CLOCK_MONOTONIC"
+        AUDIO_TSTAMP_TYPE_COMPAT => {
+            "COMPAT: backwards-compatibility type, maps to wallclock/link time for HDAudio playback and DEFAULT/DMA time for everything else; not CLOCK_MONOTONIC"
         }
-        AUDIO_TSTAMP_TYPE_LINK
-        | AUDIO_TSTAMP_TYPE_LINK_ABSOLUTE
-        | AUDIO_TSTAMP_TYPE_LINK_ESTIMATED
-        | AUDIO_TSTAMP_TYPE_LINK_SYNCHRONIZED => {
-            "link time of the audio interface (HDA: wall-clock counter since stream start); not CLOCK_MONOTONIC"
+        AUDIO_TSTAMP_TYPE_DEFAULT => "DEFAULT: DMA time, reported as per hw_ptr; not CLOCK_MONOTONIC",
+        AUDIO_TSTAMP_TYPE_LINK => {
+            "LINK: link time reported by sample or wallclock counter, reset on startup; not CLOCK_MONOTONIC"
         }
-        _ => "driver-defined audio time (compat/unknown type); not CLOCK_MONOTONIC",
+        AUDIO_TSTAMP_TYPE_LINK_ABSOLUTE => {
+            "LINK_ABSOLUTE: link time reported by sample or wallclock counter, not reset on startup; not CLOCK_MONOTONIC"
+        }
+        AUDIO_TSTAMP_TYPE_LINK_ESTIMATED => "LINK_ESTIMATED: link time estimated indirectly; not CLOCK_MONOTONIC",
+        AUDIO_TSTAMP_TYPE_LINK_SYNCHRONIZED => {
+            "LINK_SYNCHRONIZED: link time synchronized with system time (still the audio-timestamp domain, not the status htstamp)"
+        }
+        _ => "UNKNOWN audio timestamp type: domain not defined by the UAPI",
     }
 }
 
@@ -598,7 +616,8 @@ pub struct LaneStats {
     /// Max of every frame not yet written to the device (waiting queue +
     /// remainder of the tick being written) right after an admission.
     pub max_unwritten_tick_frames: u64,
-    /// `n_k + frames` of the latest tick written (one past its last frame).
+    /// `n_k + frames` of the latest tick that started being written (one
+    /// past its last frame; also while it is only partly written).
     pub last_tick_end_frame: Option<u64>,
     /// `hw_pos` of the last healthy snapshot.
     pub last_hw_pos: Option<i64>,
@@ -695,8 +714,9 @@ pub struct HapticPlacement {
     pending_frames: u64,
     current: Option<Current>,
     in_flight: VecDeque<WrittenTick>,
-    /// `n_k + frames` of the latest written tick (`None` before any).
-    tick_end: Option<u64>,
+    /// `(n_k, n_k + frames)` of the latest tick that started being written
+    /// (its FULL extent, also while only partly written; `None` before any).
+    tick_extent: Option<(u64, u64)>,
     /// `hw_pos` of the last healthy snapshot.
     last_hw_pos: Option<i64>,
     epoch: Option<EpochStart>,
@@ -726,7 +746,7 @@ impl HapticPlacement {
             pending_frames: 0,
             current: None,
             in_flight: VecDeque::new(),
-            tick_end: None,
+            tick_extent: None,
             last_hw_pos: None,
             epoch: None,
             last_good_status_t0_us: 0,
@@ -771,21 +791,25 @@ impl HapticPlacement {
             && self.tick_tail_played()
     }
 
-    /// Whether the last frame of the latest written tick has passed `hw_pos`
-    /// in the last healthy snapshot (true before any tick).
+    /// Whether the last frame of the latest tick that started being written
+    /// has passed `hw_pos` in the last healthy snapshot (true before any).
     pub fn tick_tail_played(&self) -> bool {
-        match self.tick_end {
+        match self.tick_extent {
             None => true,
-            Some(end) => self.last_hw_pos.is_some_and(|hw_pos| hw_pos >= end as i64),
+            Some((_, end)) => self.last_hw_pos.is_some_and(|hw_pos| hw_pos >= end as i64),
         }
     }
 
-    /// Frames of the latest written tick not yet past `hw_pos` (0 when played).
+    /// Frames of the latest tick that started being written — its full
+    /// extent, written or not — that are not yet past `hw_pos` in the last
+    /// healthy snapshot (0 when played). An upper bound for a partly written
+    /// tick and for anything that played after that snapshot.
     pub fn unplayed_tick_frames(&self) -> u64 {
-        match (self.tick_end, self.last_hw_pos) {
-            (None, _) => 0,
-            (Some(end), Some(hw_pos)) => (end as i64 - hw_pos).max(0) as u64,
-            (Some(end), None) => end,
+        let Some((n_k, end)) = self.tick_extent else { return 0 };
+        match self.last_hw_pos {
+            Some(hw_pos) if hw_pos >= end as i64 => 0,
+            Some(hw_pos) => end - (hw_pos.max(n_k as i64) as u64),
+            None => end - n_k,
         }
     }
 
@@ -902,6 +926,11 @@ impl HapticPlacement {
                     }
                     let tick = self.pending.pop_front().expect("head exists");
                     self.pending_frames -= tick.frames;
+                    // The tick's full extent counts from the moment n_k is
+                    // fixed, so a partly written tick is never "played".
+                    let extent = (self.w, self.w + tick.frames);
+                    self.tick_extent = Some(extent);
+                    self.stats.last_tick_end_frame = Some(extent.1);
                     self.current = Some(Current {
                         kind: ChunkKind::Tick {
                             submission: tick.submission,
@@ -980,9 +1009,6 @@ impl HapticPlacement {
             }
             let done = self.current.take().expect("the chunk is complete");
             if let ChunkKind::Tick { submission, n_k, samples_8k, t_write_us } = done.kind {
-                let end = n_k + done.total_frames;
-                self.tick_end = Some(self.tick_end.map_or(end, |e| e.max(end)));
-                self.stats.last_tick_end_frame = self.tick_end;
                 self.in_flight.push_back(WrittenTick {
                     submission,
                     n_k,
@@ -1023,8 +1049,16 @@ impl HapticPlacement {
                 FAIL_ALSA_EPOCH_RESET,
                 Some(s),
                 t1,
-                format!("trigger {} != epoch trigger {}", s.trigger_htstamp_ns, epoch.trigger_htstamp_ns),
-            ));
+                format!(
+                    "trigger moved: {} us != epoch trigger {} us",
+                    ns_to_us_floor(s.trigger_htstamp_ns),
+                    ns_to_us_floor(epoch.trigger_htstamp_ns)
+                ),
+            )
+            .with_raw_ns(&[
+                ("trigger_htstamp_ns", s.trigger_htstamp_ns),
+                ("epoch_trigger_htstamp_ns", epoch.trigger_htstamp_ns),
+            ]));
         }
         let appl_pos = self.w;
         let buffer = self.cfg.buffer_frames;
@@ -1062,8 +1096,13 @@ impl HapticPlacement {
                 FAIL_ALSA_STATUS_INCONSISTENT,
                 None,
                 t1,
-                format!("htstamp went back {} -> {}", self.last_htstamp_ns, s.htstamp_ns),
-            ));
+                format!(
+                    "htstamp went back: {} us -> {} us",
+                    ns_to_us_floor(self.last_htstamp_ns),
+                    ns_to_us_floor(s.htstamp_ns)
+                ),
+            )
+            .with_raw_ns(&[("previous_htstamp_ns", self.last_htstamp_ns), ("htstamp_ns", s.htstamp_ns)]));
         }
         let hw_pos = appl_pos as i64 - s.delay;
         let htstamp_us = ns_to_us_floor(s.htstamp_ns);
@@ -1160,6 +1199,7 @@ impl HapticPlacement {
             kernel_trigger_us: moved_trigger_ns.map(ns_to_us_floor),
             kernel_trigger_ns: moved_trigger_ns,
             detail,
+            raw_ns: Vec::new(),
         }
     }
 
@@ -1209,10 +1249,6 @@ pub struct SimPcmConfig {
     pub faults: Vec<SimFault>,
     /// Test knob: at most this many frames per `writei` (short writes).
     pub max_frames_per_write: Option<u64>,
-    /// Test knob: `start` blocks this long in real time (a slow device).
-    pub start_delay_us: u64,
-    /// Test knob: set when the stream is closed (the `SimPcm` dropped).
-    pub release_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl SimPcmConfig {
@@ -1225,8 +1261,6 @@ impl SimPcmConfig {
             audio_tstamp_actual: AUDIO_TSTAMP_TYPE_LINK,
             faults: Vec::new(),
             max_frames_per_write: None,
-            start_delay_us: 0,
-            release_flag: None,
         }
     }
 }
@@ -1378,12 +1412,8 @@ impl HapticPcm for SimPcm {
         if self.start_us.is_some() {
             return Err(PcmError::Other { errno: libc::EBADFD, call: "start" });
         }
-        if self.cfg.start_delay_us > 0 {
-            std::thread::sleep(std::time::Duration::from_micros(self.cfg.start_delay_us));
-        }
-        let at = now_us + self.cfg.start_delay_us;
-        self.start_us = Some(at);
-        self.trigger_us = at;
+        self.start_us = Some(now_us);
+        self.trigger_us = now_us;
         Ok(())
     }
 
@@ -1434,14 +1464,6 @@ impl HapticPcm for SimPcm {
     fn stop(&mut self) -> Result<(), PcmError> {
         self.dropped = true;
         Ok(())
-    }
-}
-
-impl Drop for SimPcm {
-    fn drop(&mut self) {
-        if let Some(flag) = &self.cfg.release_flag {
-            flag.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
     }
 }
 
@@ -1862,6 +1884,9 @@ mod tests {
         let failure = step(&mut engine, &mut pcm, t0 + 3_000).unwrap_err();
         assert_eq!((failure.reason, failure.kernel_trigger_us), (FAIL_ALSA_EPOCH_RESET, Some(t0 + 2_500)));
         assert_eq!(failure.last_good_status_t0_us, t0 + 2_000);
+        // µs only in the detail; the raw ns stay apart (Codex 110).
+        assert_eq!(failure.detail, format!("trigger moved: {} us != epoch trigger {} us", t0 + 2_500, t0));
+        assert_eq!(failure.raw_ns, vec![("trigger_htstamp_ns", (t0 + 2_500) * 1_000), ("epoch_trigger_htstamp_ns", t0 * 1_000)]);
 
         // Pointer regression with the trigger unchanged (observed directly).
         let (mut engine, mut pcm) = started(cfg(), SimPcmConfig::new(PERIOD, BUFFER), t0);
@@ -2000,5 +2025,23 @@ mod tests {
         assert!(engine.idle());
         let stats = engine.stats();
         assert_eq!(stats.frames_written, stats.tick_frames_written + stats.silence_frames_written);
+    }
+
+    /// Codex 110: the diagnostics domain text follows the ACTUAL type, per
+    /// the local UAPI enum comments (`/usr/include/sound/asound.h`).
+    #[test]
+    fn the_audio_timestamp_domain_follows_the_actual_type() {
+        let texts: Vec<&str> = (0..=6).map(audio_tstamp_domain).collect();
+        let mut unique = texts.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), 7, "one text per type");
+        assert!(texts[AUDIO_TSTAMP_TYPE_COMPAT as usize].contains("HDAudio playback"));
+        assert!(texts[AUDIO_TSTAMP_TYPE_DEFAULT as usize].contains("DMA time"));
+        assert!(texts[AUDIO_TSTAMP_TYPE_LINK as usize].contains("reset on startup"));
+        assert!(texts[AUDIO_TSTAMP_TYPE_LINK_ABSOLUTE as usize].contains("not reset on startup"));
+        assert!(texts[AUDIO_TSTAMP_TYPE_LINK_ESTIMATED as usize].contains("estimated indirectly"));
+        assert!(texts[AUDIO_TSTAMP_TYPE_LINK_SYNCHRONIZED as usize].contains("synchronized with system time"));
+        assert!(texts[6].starts_with("UNKNOWN"));
     }
 }
