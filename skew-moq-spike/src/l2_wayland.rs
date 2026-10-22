@@ -11,9 +11,11 @@
 //! suite calls [`WaylandBackend::connect`]; only the receiver with
 //! `--l2-sink pc=wayland,...` and the approval-gated `l2_wayland_probe` do.
 //!
-//! Startup (before the L2 meta row; every stage bounded by one deadline;
-//! any failure is a typed [`LaneStartError`] naming its stage, Codex 112
-//! P2-3): `connect` (`WAYLAND_DISPLAY`); `registry` (the globals and a
+//! Startup (before the L2 meta row; every WAIT for the compositor is bounded
+//! by one deadline, while `connect_to_env` — a local socket connect — and
+//! the synchronous buffer preparation have no internal deadline; any
+//! failure is a typed [`LaneStartError`] naming its stage, Codex 112 P2-3,
+//! Codex 114): `connect` (`WAYLAND_DISPLAY`); `registry` (the globals and a
 //! bounded `wl_display.sync` round trip — no unbounded `roundtrip`; bind
 //! `wl_compositor` >= 4, `wl_shm`, `xdg_wm_base`, `wp_presentation`, every
 //! `wl_output`); `clock` (`wp_presentation.clock_id` must be
@@ -483,8 +485,9 @@ impl WaitFailed {
 
 impl WaylandBackend {
     /// Connect and prepare the fullscreen surface (see the module docs);
-    /// every stage is bounded by `timeout_us` from the call. OPENS A WINDOW
-    /// ON THE USER'S DISPLAY.
+    /// every wait for the compositor ends by `timeout_us` from the call
+    /// (`connect_to_env` and the buffer preparation have no deadline of their
+    /// own). OPENS A WINDOW ON THE USER'S DISPLAY.
     pub fn connect(buffer_count: usize, timeout_us: u64) -> Result<Self, LaneStartError> {
         let fail = |stage: &'static str, detail: String| LaneStartError::new(stage, false, detail);
         if buffer_count < 2 {

@@ -183,6 +183,8 @@ fn main() {
             "source_tarball_sha256": info.source_tarball_sha256,
             "vendored_sources_sha256": info.vendored_sources_sha256,
             "compiler": info.compiler,
+            "compiler_resolved": info.compiler_resolved,
+            "compiler_command": info.compiler_command,
             "compiler_version": info.compiler_version,
             "fixed_flags": info.fixed_flags,
             "compiler_args": info.compiler_args,

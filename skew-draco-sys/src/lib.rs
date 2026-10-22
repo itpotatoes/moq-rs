@@ -338,11 +338,16 @@ pub struct DecoderInfo {
     pub vendored_files: &'static str,
     pub compiled_sources: &'static str,
     pub compiler: &'static str,
+    /// The compiler program after the PATH lookup and symlink resolution.
+    pub compiler_resolved: &'static str,
     pub compiler_version: &'static str,
     /// The registered flags as passed.
     pub fixed_flags: &'static str,
     /// The full compiler argument vector (`<crate>` = this crate's dir).
     pub compiler_args: &'static str,
+    /// The full validated command: program, then every argument (cc adds
+    /// `-o <obj> -c <src>` per file).
+    pub compiler_command: &'static str,
     /// `OPT_LEVEL` of this crate's Rust code (record packing).
     pub rust_opt_level: &'static str,
     /// The C++ runtime compiled against and the one loaded at run time.
@@ -362,14 +367,97 @@ pub fn decoder_info() -> DecoderInfo {
         vendored_files: env!("SKEW_DRACO_SOURCE_FILES"),
         compiled_sources: env!("SKEW_DRACO_COMPILED_SOURCES"),
         compiler: env!("SKEW_DRACO_CXX"),
+        compiler_resolved: env!("SKEW_DRACO_CXX_RESOLVED"),
         compiler_version: env!("SKEW_DRACO_CXX_VERSION"),
         fixed_flags: env!("SKEW_DRACO_FIXED_FLAGS"),
         compiler_args: env!("SKEW_DRACO_CXX_ARGS"),
+        compiler_command: env!("SKEW_DRACO_CXX_COMMAND"),
         rust_opt_level: env!("SKEW_DRACO_RUST_OPT_LEVEL"),
         cxx_runtime_build: cxx_runtime_build(),
         cxx_runtime_loaded: cxx_runtime_loaded(),
         threads: 1,
         rounding: "each dequantized float32 coordinate rounded half-to-even (explicit Rust implementation), then required to be an integer in 0..=1023; record = u32 LE (x | y<<10 | z<<20) + R G B 255",
+    }
+}
+
+/// The exact build-script check (`build_check.rs`), unit-tested.
+#[cfg(test)]
+mod build_check {
+    include!("../build_check.rs");
+
+    use std::ffi::{OsStr, OsString};
+    use std::path::Path;
+
+    fn allowed() -> Vec<String> {
+        ["-I", "/c/vendor/gen", "-I", "/c/vendor/draco-1.5.7/src", "-I", "/c/shim", "-std=c++17", "-O3", "-DNDEBUG", "-fPIC", "-ffp-contract=off"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    fn lc_all() -> Vec<(OsString, Option<OsString>)> {
+        vec![(OsString::from("LC_ALL"), Some(OsString::from("C")))]
+    }
+
+    fn args(extra: &[&str]) -> Vec<OsString> {
+        allowed().iter().map(OsString::from).chain(extra.iter().map(OsString::from)).collect()
+    }
+
+    #[test]
+    fn the_registered_command_passes() {
+        let gxx = Path::new("/usr/bin/x86_64-linux-gnu-g++-15");
+        assert_eq!(check_compiler_command(OsStr::new("c++"), Some(gxx), Path::new("c++"), &args(&[]), &lc_all(), &allowed()), Ok(()));
+    }
+
+    /// Codex 114 item 1: `CXX='c++ -ffast-math'` puts the flag into the
+    /// command (cc's wrapper args), not into `Tool::args()` — refused here.
+    #[test]
+    fn an_extra_flag_from_cxx_or_anywhere_is_refused() {
+        for extra in [&["-ffast-math"][..], &["-march=native"][..], &["-O0"][..]] {
+            let error = check_compiler_command(OsStr::new("c++"), None, Path::new("c++"), &args(extra), &lc_all(), &allowed()).unwrap_err();
+            assert!(error.contains("not exactly the registered ones") && error.contains(extra[0]), "{error}");
+        }
+        // A flag missing, or the order changed, is refused as well.
+        let mut missing = args(&[]);
+        missing.pop();
+        assert!(check_compiler_command(OsStr::new("c++"), None, Path::new("c++"), &missing, &lc_all(), &allowed()).is_err());
+        let mut reordered = args(&[]);
+        reordered.swap(6, 7);
+        assert!(check_compiler_command(OsStr::new("c++"), None, Path::new("c++"), &reordered, &lc_all(), &allowed()).is_err());
+    }
+
+    #[test]
+    fn compiler_wrappers_are_refused() {
+        // CXX='ccache c++' or RUSTC_WRAPPER=sccache: the command runs the wrapper.
+        for wrapper in ["ccache", "sccache", "/usr/bin/distcc"] {
+            let error = check_compiler_command(OsStr::new(wrapper), None, Path::new("c++"), &args(&[]), &lc_all(), &allowed()).unwrap_err();
+            assert!(error.contains("wrapper"), "{error}");
+        }
+        // A ccache symlink farm: `c++` resolves to ccache.
+        let error = check_compiler_command(OsStr::new("c++"), Some(Path::new("/usr/bin/ccache")), Path::new("c++"), &args(&[]), &lc_all(), &allowed())
+            .unwrap_err();
+        assert!(error.contains("wrapper"), "{error}");
+    }
+
+    /// cc's own `LC_ALL=C` is the only environment override allowed.
+    #[test]
+    fn environment_overrides_other_than_lc_all_c_are_refused() {
+        let check = |env: &[(OsString, Option<OsString>)]| {
+            check_compiler_command(OsStr::new("c++"), None, Path::new("c++"), &args(&[]), env, &allowed())
+        };
+        assert!(check(&lc_all()).is_ok());
+        assert!(check(&[]).is_err(), "cc always sets LC_ALL=C: its absence means another cc");
+        let mut more = lc_all();
+        more.push((OsString::from("CCACHE_DIR"), Some(OsString::from("/tmp"))));
+        assert!(check(&more).is_err());
+        assert!(check(&[(OsString::from("LC_ALL"), Some(OsString::from("de_DE")))]).is_err());
+    }
+
+    #[test]
+    fn programs_resolve_through_path_and_symlinks() {
+        let sh = resolve_program(OsStr::new("sh")).expect("sh is on PATH");
+        assert!(sh.is_absolute() && sh.is_file());
+        assert_eq!(resolve_program(OsStr::new("/nonexistent/compiler")), None);
     }
 }
 
@@ -519,6 +607,8 @@ mod tests {
         assert_eq!(info.rust_opt_level, "3", "the workspace profile override applies");
         assert!(info.cxx_runtime_build.starts_with("libstdc++ _GLIBCXX_RELEASE="), "{}", info.cxx_runtime_build);
         assert!(info.cxx_runtime_loaded.contains("libstdc++.so"), "{}", info.cxx_runtime_loaded);
+        assert_eq!(info.compiler_command, format!("{} {}", info.compiler, info.compiler_args), "the validated command");
+        assert!(!info.compiler_resolved.contains("ccache"), "{}", info.compiler_resolved);
     }
 
     /// Garbage, an empty buffer and a truncated stream are errors, never a

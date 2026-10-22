@@ -75,11 +75,17 @@ pub const FAIL_WAYLAND_CONNECTION_LOST: &str = "wayland_connection_lost";
 pub const FAIL_WAYLAND_WINDOW_CLOSED: &str = "wayland_window_closed";
 pub const FAIL_WAYLAND_RECONFIGURED: &str = "wayland_reconfigured";
 pub const FAIL_WAYLAND_FEEDBACK_MISSING: &str = "wayland_feedback_missing";
-pub const WAYLAND_DEVICE_FAILURE_REASONS: [&str; 4] = [
+/// Registration 3-3b (Codex 114): the frame callback of the last commit is
+/// still missing at close AND a rendered frame could therefore not be
+/// committed. (A last frame that got its `presented` but no callback, with
+/// nothing waiting, is not a failure.)
+pub const FAIL_WAYLAND_FRAME_CALLBACK_MISSING: &str = "wayland_frame_callback_missing";
+pub const WAYLAND_DEVICE_FAILURE_REASONS: [&str; 5] = [
     FAIL_WAYLAND_CONNECTION_LOST,
     FAIL_WAYLAND_WINDOW_CLOSED,
     FAIL_WAYLAND_RECONFIGURED,
     FAIL_WAYLAND_FEEDBACK_MISSING,
+    FAIL_WAYLAND_FRAME_CALLBACK_MISSING,
 ];
 
 pub fn presentation_flag_names(flags: u32) -> Vec<&'static str> {
@@ -835,6 +841,12 @@ impl PresentEngine {
         self.committed.contains_key(&commit_id)
     }
 
+    /// The commit whose frame callback has not fired (it blocks the next
+    /// commit), if any.
+    pub fn outstanding_frame_callback(&self) -> Option<u64> {
+        self.frame_callback.map(|(commit_id, _)| commit_id)
+    }
+
     pub fn stats(&self) -> &EngineStats {
         &self.stats
     }
@@ -1575,7 +1587,7 @@ mod tests {
         assert_eq!(refresh_index(1_000_000 - 16_667, 1_000_000, 16_666_667), Some(-1));
         assert_eq!(refresh_index(5, 1, 0), None, "unknown refresh");
         let mut e = engine().with_reference(Some(1_000_000), Some(SIM_OUTPUT));
-        let mut seq_one = |t_us: u64| Presented { seq: 1, ..presented(t_us) };
+        let seq_one = |t_us: u64| Presented { seq: 1, ..presented(t_us) };
         let (a, _) = e.commit(frame(1), 1, 1_010_000);
         let first = on(&mut e, BackendEvent::Presented { commit_id: a, presented: seq_one(1_016_667) }, 1_017_000);
         let Some(EngineOutcome::Output { timing, presented, .. }) = first else { panic!("{first:?}") };

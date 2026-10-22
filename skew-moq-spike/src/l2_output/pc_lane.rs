@@ -38,7 +38,7 @@ use crate::l2_pc::{
     presentation_flag_names, BackendEvent, EngineOutcome, FramePreparer, Offer, PendingSlot, PixelPool, PrepareError,
     PresentBackend, PresentEngine, Presented, SimCompositor, StartupInfo, Waker, CLOCK_MONOTONIC_ID,
     DISCARD_DECODE_FAILED, FAIL_PC_DECODE_FAILED, FAIL_PC_PAYLOAD_INVALID, FAIL_WAYLAND_CONNECTION_LOST,
-    FAIL_WAYLAND_FEEDBACK_MISSING,
+    FAIL_WAYLAND_FEEDBACK_MISSING, FAIL_WAYLAND_FRAME_CALLBACK_MISSING,
 };
 use crate::l2_wayland::{canvas_layout, WaylandBackend};
 use crate::now_us;
@@ -381,6 +381,9 @@ struct CommitLane {
     anomalies: Vec<String>,
     committed_without_feedback_at_close: u64,
     pending_at_close: bool,
+    /// The commit whose missing frame callback kept the pending frame from
+    /// being committed before close (registration 3-3b, Codex 114).
+    frame_callback_missing_at_close: Option<u64>,
     diagnostics: Option<PcDiagLog>,
 }
 
@@ -533,11 +536,7 @@ impl CommitLane {
 
     /// Close statistics; the worker has been joined.
     fn finish(mut self, startup: &StartupInfo, representation: &'static str, worker: WorkerStats) {
-        if let Some(frame) = self.link.pending.take() {
-            // Rendered, never committed before the close ended: unresolved.
-            self.pending_at_close = true;
-            self.link.pool.put(frame.pixels);
-        }
+        let pending = self.link.pending.take();
         let unresolved = self.engine.unresolved();
         if !unresolved.is_empty() {
             let detected = now_us();
@@ -551,6 +550,27 @@ impl CommitLane {
             // Recorded even after an earlier failure (the first one stays in
             // lanes.pc.device_failure; the count is in the lane counters).
             self.device_failure(FAIL_WAYLAND_FEEDBACK_MISSING, detected, detail);
+        }
+        if let Some(frame) = pending {
+            // Rendered, never committed before the close ended: it stays
+            // unresolved. Registration 3-3b (Codex 114): when the frame
+            // callback of the last commit is what kept it from its commit,
+            // that is an untimed PC device failure, not a timed unresolved
+            // submit. A pending frame can only be left at close when the
+            // deadline ended the close (the normal close commits it first).
+            // A last frame presented without its callback and with nothing
+            // waiting is no failure; nor, as registered, is a frame that
+            // waited for a free buffer after its callback had fired.
+            self.pending_at_close = true;
+            if let Some(blocking) = self.engine.outstanding_frame_callback() {
+                self.frame_callback_missing_at_close = Some(blocking);
+                let detail = format!(
+                    "the frame callback of commit {blocking} was still missing at close, so the rendered frame seq {} was never committed",
+                    frame.submission.identity.seq
+                );
+                self.device_failure(FAIL_WAYLAND_FRAME_CALLBACK_MISSING, now_us(), detail);
+            }
+            self.link.pool.put(frame.pixels);
         }
         let diagnostics = self.diagnostics.take().map(|diag| match diag.write(startup) {
             Ok((records, dropped)) => serde_json::json!({ "written": true, "presented_records": records, "dropped_records": dropped }),
@@ -576,6 +596,7 @@ impl CommitLane {
             "discards_not_emitted_after_deadline": worker.discards_not_emitted_after_deadline + self.out.discards_not_emitted_after_deadline,
             "committed_without_feedback_at_close": self.committed_without_feedback_at_close,
             "pending_at_close": self.pending_at_close,
+            "frame_callback_missing_at_close": self.frame_callback_missing_at_close,
             "anomalies": self.anomalies,
             "backend_lost": self.backend_lost,
             "device_failure": self.engine.failure().map_or(serde_json::Value::Null, |f| f.to_json()),
@@ -674,6 +695,7 @@ pub(crate) fn wayland_lane_main(
         anomalies: Vec::new(),
         committed_without_feedback_at_close: 0,
         pending_at_close: false,
+        frame_callback_missing_at_close: None,
         diagnostics,
     };
     let exit = lane.run();
@@ -695,7 +717,7 @@ pub(crate) fn wayland_lane_main(
 mod tests {
     use super::super::{writer_loop, L2Identity, L2SinkKind, L2Sinks, L2Summary};
     use super::*;
-    use crate::l2_pc::{FrameInfo, PcTiming, PendingFrame, SIM_OUTPUT};
+    use crate::l2_pc::{FrameInfo, Offer, PcTiming, PendingFrame, SIM_OUTPUT};
     use std::io::BufWriter as Buf;
 
     const SINKS: L2Sinks = L2Sinks { pc: L2SinkKind::Wayland, haptic: L2SinkKind::Null };
@@ -758,6 +780,7 @@ mod tests {
             anomalies: Vec::new(),
             committed_without_feedback_at_close: 0,
             pending_at_close: false,
+            frame_callback_missing_at_close: None,
             diagnostics,
         }
     }
@@ -872,6 +895,73 @@ mod tests {
                     }
                     assert_eq!(summary.receiver_fault.as_ref().map(|(t, _)| *t), abort.then_some(100), "{case}");
                 }
+            }
+        }
+    }
+
+    /// Codex 114 / registration 3-3b, deterministic. The last commit (A) was
+    /// presented but its frame callback never came; a rendered frame (B,
+    /// submit 210) therefore waited for its commit until the close deadline
+    /// (1,000), with and without a receiver abort at 100. With B waiting this
+    /// is the untimed PC device failure `wayland_frame_callback_missing` (first
+    /// failure time null, not determinable) — never a timed unresolved
+    /// submit at 210 that an abort exception could rescue. With nothing
+    /// waiting, A's missing callback is no failure.
+    #[test]
+    fn codex114_a_missing_frame_callback_that_blocks_a_pending_frame_is_an_untimed_device_failure() {
+        for pending in [true, false] {
+            for abort in [true, false] {
+                let case = format!("pending={pending} abort={abort}");
+                let (rows_tx, rows_rx) = mpsc::sync_channel(64);
+                let shared = Arc::new(Shared::default());
+                if abort {
+                    shared.note_receiver_fault(100, "receiver abort");
+                }
+                let mut lane = lane(rows_tx.clone(), shared.clone(), None);
+                let pc = |seq: u32, t_submit_us: u64| L2Submission {
+                    identity: L2Identity { modality: L2Modality::Pc, tier: 2, seq, pts_us: seq as u64 * 33_333, event_id: seq + 1, route: None },
+                    t_release_us: t_submit_us - 1,
+                    t_submit_us,
+                };
+                let frame = |s: L2Submission| PendingFrame {
+                    submission: s,
+                    timing: PcTiming { decode_us: None, t_render_start_us: s.t_submit_us + 1, t_render_end_us: s.t_submit_us + 2 },
+                    info: FrameInfo { points: 1, covered_pixels: 1, depth_scale: 4 },
+                    pixels: Vec::new(),
+                };
+                let a = pc(1, 150);
+                rows_tx.send(Row::Submit(a)).unwrap();
+                let (commit_a, _) = lane.engine.commit(frame(a), 1, 160);
+                lane.apply(BackendEvent::Presented { commit_id: commit_a, presented: presented(170) }, 180);
+                if pending {
+                    let b = pc(2, 210);
+                    rows_tx.send(Row::Submit(b)).unwrap();
+                    assert!(matches!(lane.link.pending.offer(frame(b)), Offer::Accepted { superseded: None }));
+                }
+                shared.finish_start_us.store(500, Ordering::SeqCst);
+                shared.close_deadline_us.store(1_000, Ordering::SeqCst);
+                lane.finish(&startup(), "bin", WorkerStats::default());
+                drop(rows_tx);
+                let (summary, rows) = ledger(rows_rx, shared, "c114-callback");
+                let pc_lane = &rows.last().unwrap()["lanes"]["pc"];
+                assert_eq!(rows.iter().filter(|r| r["role"] == "output").count(), 1, "{case}: A keeps its output");
+                if pending {
+                    assert_eq!(summary.submitted_unresolved, 1, "{case}: B has no terminal");
+                    assert_eq!(summary.first_integrity_failure_reason.as_deref(), Some(FAIL_WAYLAND_FRAME_CALLBACK_MISSING), "{case}");
+                    assert_eq!(summary.first_integrity_failure_us, None, "{case}");
+                    assert!(!summary.first_failure_time_determinable, "{case}");
+                    assert_eq!(pc_lane["device_failure"]["reason"], FAIL_WAYLAND_FRAME_CALLBACK_MISSING, "{case}");
+                    assert_eq!(pc_lane["device_failure"]["occurrence_time_determinable"], false, "{case}");
+                    assert_eq!(pc_lane["frame_callback_missing_at_close"], commit_a, "{case}");
+                    assert_eq!(pc_lane["pending_at_close"], true, "{case}");
+                    assert!(!summary.integrity_ok(SINKS), "{case}");
+                } else {
+                    assert!(summary.integrity_ok(SINKS), "{case}: {summary:?}");
+                    assert!(pc_lane["device_failure"].is_null(), "{case}");
+                    assert!(pc_lane["frame_callback_missing_at_close"].is_null(), "{case}");
+                    assert_eq!(pc_lane["pending_at_close"], false, "{case}");
+                }
+                assert_eq!(summary.receiver_fault.as_ref().map(|(t, _)| *t), abort.then_some(100), "{case}");
             }
         }
     }

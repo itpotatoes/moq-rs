@@ -19,6 +19,9 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+// `check_compiler_command` and `resolve_program`, shared with the unit tests.
+include!("build_check.rs");
+
 /// Draco's own decoder-only source list (CMakeLists.txt, the Emscripten
 /// `draco_decoder_src` groups without the JS glue), minus the two
 /// transcoder-only mesh files (`mesh_splitter.cc`, `mesh_utils.cc`, appended
@@ -148,6 +151,10 @@ fn main() {
     let root = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"));
     let target = std::env::var("TARGET").expect("cargo sets TARGET");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=build_check.rs");
+    println!("cargo:rerun-if-env-changed=RUSTC_WRAPPER");
+    println!("cargo:rerun-if-env-changed=CC_KNOWN_WRAPPER_CUSTOM");
+    println!("cargo:rerun-if-env-changed=PATH");
     println!("cargo:rerun-if-changed=vendor");
     println!("cargo:rerun-if-changed=shim");
     println!("cargo:rerun-if-env-changed=CXX");
@@ -182,24 +189,33 @@ fn main() {
     }
     build.file(root.join("shim/skew_draco_shim.cc"));
 
-    // Record exactly what compiles the sources, and refuse ANY argument
-    // outside the allowlist: the three include paths and the fixed flags,
-    // in this order (the per-file `-o <obj> -c <src>` follow them).
+    // Record exactly what compiles the sources and refuse anything else
+    // (Codex 114 item 1): the FULL command cc runs (`Tool::to_command()`:
+    // program, every argument, environment overrides) must be the compiler
+    // itself — no wrapper such as ccache/sccache, also not behind a symlink
+    // or via RUSTC_WRAPPER — with exactly the three include paths and the
+    // fixed flags in this order (cc appends `-o <obj> -c <src>` per file).
+    // Extra words in `CXX` (e.g. `CXX='c++ -ffast-math'`) end up in that
+    // command, not in `Tool::args()`, so `args()` alone is not checked.
     let tool = build.get_compiler();
-    let args: Vec<String> = tool.args().iter().map(|a| a.to_string_lossy().into_owned()).collect();
+    let command = tool.to_command();
+    let program = command.get_program().to_owned();
+    let command_args: Vec<std::ffi::OsString> = command.get_args().map(|a| a.to_owned()).collect();
+    let command_env: Vec<(std::ffi::OsString, Option<std::ffi::OsString>)> =
+        command.get_envs().map(|(k, v)| (k.to_owned(), v.map(|v| v.to_owned()))).collect();
+    let resolved = resolve_program(&program);
     let mut allowed: Vec<String> = Vec::new();
     for dir in [root.join("vendor/gen"), draco.join("src"), root.join("shim")] {
         allowed.push("-I".into());
         allowed.push(dir.to_str().expect("UTF-8 include path").to_string());
     }
     allowed.extend(FIXED_FLAGS.iter().map(|f| f.to_string()));
-    if args != allowed {
-        let extra: Vec<&String> = args.iter().filter(|a| !allowed.contains(a)).collect();
-        let missing: Vec<&String> = allowed.iter().filter(|a| !args.contains(a)).collect();
-        panic!(
-            "skew-draco-sys: the compiler arguments are not exactly the registered ones\n  got:     {args:?}\n  allowed: {allowed:?}\n  extra:   {extra:?}\n  missing: {missing:?}"
-        );
+    if let Err(error) =
+        check_compiler_command(&program, resolved.as_deref(), tool.path(), &command_args, &command_env, &allowed)
+    {
+        panic!("skew-draco-sys: {error}");
     }
+    let args: Vec<String> = command_args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
     let version = std::process::Command::new(tool.path())
         .arg("--version")
         .output()
@@ -220,8 +236,18 @@ fn main() {
     let root_str = root.to_str().expect("UTF-8 crate path");
     let args_rel: Vec<String> = args.iter().map(|a| a.replace(root_str, "<crate>")).collect();
     println!("cargo:rustc-env=SKEW_DRACO_CXX={}", tool.path().display());
+    println!(
+        "cargo:rustc-env=SKEW_DRACO_CXX_RESOLVED={}",
+        resolved.as_ref().map_or_else(|| "unresolved".to_string(), |p| p.display().to_string())
+    );
     println!("cargo:rustc-env=SKEW_DRACO_CXX_VERSION={version}");
     println!("cargo:rustc-env=SKEW_DRACO_CXX_ARGS={}", args_rel.join(" "));
+    // The full command as validated: program, then every argument.
+    println!(
+        "cargo:rustc-env=SKEW_DRACO_CXX_COMMAND={} {}",
+        program.to_string_lossy(),
+        args_rel.join(" ")
+    );
     println!("cargo:rustc-env=SKEW_DRACO_FIXED_FLAGS={}", FIXED_FLAGS.join(" "));
     println!("cargo:rustc-env=SKEW_DRACO_SOURCE_SHA256={digest}");
     println!("cargo:rustc-env=SKEW_DRACO_SOURCE_FILES={files}");
