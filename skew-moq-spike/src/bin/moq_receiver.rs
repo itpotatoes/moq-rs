@@ -90,12 +90,53 @@ enum Arm {
     P1,
 }
 
-/// `--l2-sink`. `None` is the pre-L2 receiver.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+/// `--l2-sink`. `None` is the pre-L2 receiver; otherwise the sink of each
+/// track (schema v1.2: one lane per modality).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum L2SinkArg {
     None,
-    Null,
-    Fake,
+    Sinks(skew_moq::l2_output::L2Sinks),
+}
+
+/// Parse `--l2-sink`: `none`; `null` or `fake` for both tracks; or per track
+/// `pc=<kind>,haptic=<kind>` (both keys, once each, any order). PC kinds:
+/// `null`, `fake` (`wayland` is milestone M3); haptic kinds: `null`, `fake`.
+fn parse_l2_sink(value: &str) -> std::result::Result<L2SinkArg, String> {
+    use skew_moq::l2_output::{L2SinkKind, L2Sinks};
+    let kind_of = |track: &str, kind: &str| -> std::result::Result<L2SinkKind, String> {
+        match (track, kind) {
+            (_, "null") => Ok(L2SinkKind::Null),
+            (_, "fake") => Ok(L2SinkKind::Fake),
+            ("pc", "wayland") => Err("the PC Wayland sink is milestone M3 and not available yet".into()),
+            ("pc", "alsa") => Err("alsa is a haptic sink; use pc=<null|fake>,haptic=<kind>".into()),
+            _ => Err(format!("unknown {track} sink kind {kind:?}")),
+        }
+    };
+    match value {
+        "none" => return Ok(L2SinkArg::None),
+        "null" => return Ok(L2SinkArg::Sinks(L2Sinks::both(L2SinkKind::Null))),
+        "fake" => return Ok(L2SinkArg::Sinks(L2Sinks::both(L2SinkKind::Fake))),
+        _ => {}
+    }
+    let (mut pc, mut haptic) = (None, None);
+    for part in value.split(',') {
+        let (track, kind) = part
+            .split_once('=')
+            .ok_or_else(|| format!("expected none|null|fake|pc=<kind>,haptic=<kind>, got {value:?}"))?;
+        let slot = match track {
+            "pc" => &mut pc,
+            "haptic" => &mut haptic,
+            other => return Err(format!("unknown track {other:?} in --l2-sink {value:?}")),
+        };
+        if slot.is_some() {
+            return Err(format!("track {track} given twice in --l2-sink {value:?}"));
+        }
+        *slot = Some(kind_of(track, kind)?);
+    }
+    match (pc, haptic) {
+        (Some(pc), Some(haptic)) => Ok(L2SinkArg::Sinks(L2Sinks { pc, haptic })),
+        _ => Err(format!("--l2-sink {value:?} must name both pc= and haptic=")),
+    }
 }
 
 impl Arm {
@@ -213,15 +254,17 @@ struct Args {
     /// the planned object count; overflow is counted and fails the seal.
     #[arg(long, default_value_t = 4096)]
     receive_trace_capacity: usize,
-    /// L2 output stage (experiment 1-D, milestone M1, device-free). `none`
-    /// (the default) constructs nothing: no thread, no file, no row, and the
-    /// rx log is byte-identical to a build without this option. `null` accepts
-    /// releases and never resolves them (overhead measurement only); `fake`
-    /// emits a synthetic `output` at `t_submit + offset`. Only the ACTUAL
-    /// release points of b1/s1/s2/s3/s3r submit.
-    #[arg(long, value_enum, default_value = "none")]
+    /// L2 output stage (experiment 1-D). `none` (the default) constructs
+    /// nothing: no thread, no file, no row, no device, no clock read, and the
+    /// rx log is byte-identical to a build without this option. Otherwise the
+    /// sink of each track: `null` or `fake` for both, or per track
+    /// `pc=<kind>,haptic=<kind>` (e.g. `pc=fake,haptic=null`). `null`
+    /// accepts releases and never resolves them (overhead measurement only);
+    /// `fake` emits a synthetic `output` at `t_submit + offset`. Only the
+    /// ACTUAL release points of b1/s1/s2/s3/s3r submit.
+    #[arg(long, default_value = "none", value_parser = parse_l2_sink)]
     l2_sink: L2SinkArg,
-    /// Separate L2 JSONL (schema `skew_moq::l2_output::L2_SCHEMA`, v1.1).
+    /// Separate L2 JSONL (schema `skew_moq::l2_output::L2_SCHEMA`, v1.2).
     /// Required iff `--l2-sink` is not `none`; must not exist yet and must
     /// not be the rx log.
     #[arg(long)]
@@ -232,7 +275,7 @@ struct Args {
     /// Fake sink: `t_output_us = t_submit_us + offset` for haptic objects.
     #[arg(long)]
     l2_fake_haptic_offset_us: Option<u64>,
-    /// Bound of the non-blocking release -> sink submission queue.
+    /// Bound of EACH track's non-blocking release -> sink submission queue.
     #[arg(long)]
     l2_queue_capacity: Option<usize>,
     /// Close grace in ms, anchored at the start of the L2 close (meta
@@ -1152,23 +1195,23 @@ const L2_MAX_TRACKED_OBJECTS: usize = 65_536;
 /// Validate the L2 output-stage options before any log is opened. `Ok(None)`
 /// for `--l2-sink none`, which must also carry no other L2 option.
 fn l2_output_config(args: &Args) -> Result<Option<(PathBuf, skew_moq::l2_output::L2Config)>> {
-    use skew_moq::l2_output::{FakeSinkConfig, L2Config, L2SinkKind};
+    use skew_moq::l2_output::{FakeSinkConfig, L2Config, L2Modality, L2SinkKind};
     let fake_given =
         args.l2_fake_pc_offset_us.is_some() || args.l2_fake_haptic_offset_us.is_some();
-    let sink = match args.l2_sink {
+    let sinks = match args.l2_sink {
         L2SinkArg::None => {
             if args.l2_log.is_some()
                 || fake_given
                 || args.l2_queue_capacity.is_some()
                 || args.l2_report_window_ms.is_some()
             {
-                bail!("--l2-log/--l2-fake-*/--l2-queue-capacity/--l2-report-window-ms require --l2-sink null|fake");
+                bail!("--l2-log/--l2-fake-*/--l2-queue-capacity/--l2-report-window-ms require an --l2-sink other than none");
             }
             return Ok(None);
         }
-        L2SinkArg::Null => L2SinkKind::Null,
-        L2SinkArg::Fake => L2SinkKind::Fake,
+        L2SinkArg::Sinks(sinks) => sinks,
     };
+    let any_fake = L2Modality::ALL.iter().any(|m| sinks.of(*m) == L2SinkKind::Fake);
     // The registered 1-D ladder (B1, S1, S2, S3, S3R). M1/S2Eq share the S1
     // dispatcher but are not 1-D methods; s3np and the exp2 arms have no hook.
     if !matches!(args.arm, Arm::B1 | Arm::S1 | Arm::S2 | Arm::S3 | Arm::S3r) {
@@ -1180,7 +1223,7 @@ fn l2_output_config(args: &Args) -> Result<Option<(PathBuf, skew_moq::l2_output:
     if args.render || args.audio {
         bail!("--l2-sink replaces the Stage A bridge; do not combine it with --render/--audio");
     }
-    let path = args.l2_log.clone().context("--l2-sink null|fake requires --l2-log")?;
+    let path = args.l2_log.clone().context("--l2-sink other than none requires --l2-log")?;
     if path == args.out {
         bail!("--l2-log must differ from --out");
     }
@@ -1190,24 +1233,25 @@ fn l2_output_config(args: &Args) -> Result<Option<(PathBuf, skew_moq::l2_output:
     if std::fs::symlink_metadata(&path).is_ok() {
         bail!("--l2-log {} already exists; the L2 log is never overwritten", path.display());
     }
-    let fake = match sink {
-        L2SinkKind::Fake => Some(FakeSinkConfig::offsets(
+    // Both offsets are required whenever any track is fake (the meta row
+    // records both), and refused when none is.
+    let fake = if any_fake {
+        Some(FakeSinkConfig::offsets(
             args.l2_fake_pc_offset_us
-                .context("--l2-sink fake requires --l2-fake-pc-offset-us")?,
+                .context("a fake L2 sink requires --l2-fake-pc-offset-us")?,
             args.l2_fake_haptic_offset_us
-                .context("--l2-sink fake requires --l2-fake-haptic-offset-us")?,
-        )),
-        L2SinkKind::Null => {
-            if fake_given {
-                bail!("--l2-fake-* options require --l2-sink fake");
-            }
-            None
+                .context("a fake L2 sink requires --l2-fake-haptic-offset-us")?,
+        ))
+    } else {
+        if fake_given {
+            bail!("--l2-fake-* options require a fake L2 sink on some track");
         }
+        None
     };
     let config = L2Config {
         run_id: args.run_id.clone(),
         method: args.arm.as_str().to_string(),
-        sink,
+        sinks,
         fake,
         queue_capacity: args.l2_queue_capacity.unwrap_or(L2_DEFAULT_QUEUE_CAPACITY),
         row_capacity: L2_ROW_CAPACITY,
@@ -1421,11 +1465,11 @@ mod s3_test_seam {
 /// Close the L2 output stage (registration §3-5 order, see `L2Output::finish`)
 /// off the async runtime. Returns whether the instrumentation is intact.
 async fn finish_l2_output(output: skew_moq::l2_output::L2Output) -> Result<skew_moq::l2_output::L2Summary> {
-    let sink = output.sink_kind();
+    let sinks = output.sinks();
     let summary = tokio::task::spawn_blocking(move || output.finish())
         .await
         .context("L2 finish task join")??;
-    if !summary.integrity_ok(sink) {
+    if !summary.integrity_ok(sinks) {
         eprintln!("[rx] L2 instrumentation integrity failure: {summary:?}");
     }
     Ok(summary)
@@ -1436,13 +1480,23 @@ async fn finish_l2_output(output: skew_moq::l2_output::L2Output) -> Result<skew_
 /// `t_play == t_recv`, is its release), `dispatch_playout_actions` after
 /// `try_log_release` (S1/S2/S3R) and `dispatch_s3_playout_actions` after
 /// `try_log_release_s3` (S3, the released route copy only). Never blocks.
-fn submit_l2_release(l2: &skew_moq::l2_output::L2Submitter, h: &Header, t_release: u64, route: Option<(&'static str, u64)>) {
+/// `object` is the released object's bytes (header + payload); the payload
+/// slice after the 32-byte header is handed over by reference count only (no
+/// copy) — the haptic device sink plays it, the null/fake sinks drop it.
+fn submit_l2_release(
+    l2: &skew_moq::l2_output::L2Submitter,
+    h: &Header,
+    t_release: u64,
+    route: Option<(&'static str, u64)>,
+    object: &Bytes,
+) {
     let modality = match h.track_id {
         TRACK_PC => skew_moq::l2_output::L2Modality::Pc,
         TRACK_HAPTIC => skew_moq::l2_output::L2Modality::Haptic,
         _ => return,
     };
-    l2.submit(
+    let payload = (object.len() >= HDR).then(|| object.slice(HDR..));
+    l2.submit_payload(
         skew_moq::l2_output::L2Identity {
             modality,
             tier: h.tier,
@@ -1452,6 +1506,7 @@ fn submit_l2_release(l2: &skew_moq::l2_output::L2Submitter, h: &Header, t_releas
             route,
         },
         t_release,
+        payload,
     );
 }
 
@@ -1853,7 +1908,7 @@ fn dispatch_playout_actions(
                     t_due,
                 )?;
                 if let Some(l2) = l2 {
-                    submit_l2_release(l2, &h, action_time, None);
+                    submit_l2_release(l2, &h, action_time, None, &object.bytes);
                 }
                 exp2_s1_action(exp2, &h, action_time, t_due, None)?;
                 stats.released += 1;
@@ -3348,6 +3403,7 @@ fn dispatch_s3_playout_actions(
                         &header,
                         now.max(object.t_recv),
                         Some((route.name, route.generation)),
+                        &object.bytes,
                     );
                 }
                 if let Some(t_due) = t_due {
@@ -8367,7 +8423,7 @@ async fn main() -> Result<()> {
                         // the scheduler branch above and submits at its own
                         // release in `dispatch_playout_actions`.
                         if let Some(l2) = &l2_b1 {
-                            submit_l2_release(l2, &h, t, None);
+                            submit_l2_release(l2, &h, t, None, &logical_obj);
                         }
                         if fwd {
                             if let Some(tx) = &ftx {
@@ -13905,7 +13961,7 @@ mod s3_control_loop_tests {
             L2Config {
                 run_id: "g4".into(),
                 method: "s3".into(),
-                sink: L2SinkKind::Fake,
+                sinks: skew_moq::l2_output::L2Sinks::both(L2SinkKind::Fake),
                 fake: Some(FakeSinkConfig::offsets(800, 300)),
                 queue_capacity: 64,
                 row_capacity: 1024,
@@ -13984,7 +14040,7 @@ mod s3_control_loop_tests {
         assert_eq!(pts_of(&all), vec![800_000, 800_000, 900_000, 900_000], "pass 2 released its pair");
         drop(submitter);
         let summary = tokio::task::spawn_blocking(move || output.finish()).await.unwrap().unwrap();
-        assert!(summary.integrity_ok(L2SinkKind::Fake), "{summary:?}");
+        assert!(summary.integrity_ok(skew_moq::l2_output::L2Sinks::both(L2SinkKind::Fake)), "{summary:?}");
         assert_eq!((summary.submitted, summary.output), (4, 4));
         let l2: Vec<serde_json::Value> = std::fs::read_to_string(&l2_path)
             .unwrap()
@@ -16270,7 +16326,7 @@ mod l2_hook_tests {
             L2Config {
                 run_id: "l2-hook".into(),
                 method: "s1".into(),
-                sink: L2SinkKind::Fake,
+                sinks: skew_moq::l2_output::L2Sinks::both(L2SinkKind::Fake),
                 fake: Some(FakeSinkConfig::offsets(pc, haptic)),
                 queue_capacity: 64,
                 row_capacity: 1024,
@@ -16379,7 +16435,7 @@ mod l2_hook_tests {
         let l2_path = tmp("l2-b1");
         let output = fake_output(&l2_path, 0, 0);
         let o = object(TRACK_HAPTIC, 0, 7, 77_777, 8, now_us());
-        submit_l2_release(&output.submitter(), &o.header, o.t_recv, None);
+        submit_l2_release(&output.submitter(), &o.header, o.t_recv, None, &o.bytes);
         output.finish().unwrap();
         let l2 = rows(&l2_path);
         let s = l2.iter().find(|r| r["role"] == "submit").unwrap();
@@ -16466,6 +16522,57 @@ mod l2_hook_tests {
         assert!(!fresh.exists(), "validation never creates the L2 log");
     }
 
+    /// v1.2 per-track sinks (1-D §11-7 M2 work order (1)): `--l2-sink`
+    /// accepts one kind for both tracks or `pc=<kind>,haptic=<kind>` in any
+    /// order; malformed specs are refused by the CLI parser itself.
+    #[test]
+    fn per_track_l2_sinks_parse_and_validate() {
+        use skew_moq::l2_output::L2Sinks;
+        let fresh = tmp("cli-per-track");
+        let fresh_s = fresh.display().to_string();
+        for (spec, pc, haptic) in [
+            ("null", L2SinkKind::Null, L2SinkKind::Null),
+            ("fake", L2SinkKind::Fake, L2SinkKind::Fake),
+            ("pc=fake,haptic=null", L2SinkKind::Fake, L2SinkKind::Null),
+            ("haptic=fake,pc=null", L2SinkKind::Null, L2SinkKind::Fake),
+        ] {
+            let args = b1_cli(&[
+                "--l2-sink", spec, "--l2-log", &fresh_s,
+                "--l2-fake-pc-offset-us", "1000", "--l2-fake-haptic-offset-us", "200",
+            ]);
+            let sinks = L2Sinks { pc, haptic };
+            if pc == L2SinkKind::Null && haptic == L2SinkKind::Null {
+                // Fake offsets are refused without a fake track.
+                assert!(l2_output_config(&args.unwrap()).is_err(), "{spec}");
+                let args = b1_cli(&["--l2-sink", spec, "--l2-log", &fresh_s]).unwrap();
+                assert_eq!(args.l2_sink, L2SinkArg::Sinks(sinks));
+                let (_, config) = l2_output_config(&args).unwrap().unwrap();
+                assert_eq!(config.sinks, sinks);
+                assert!(config.fake.is_none());
+                continue;
+            }
+            let args = args.unwrap();
+            assert_eq!(args.l2_sink, L2SinkArg::Sinks(sinks), "{spec}");
+            let (_, config) = l2_output_config(&args).unwrap().unwrap();
+            assert_eq!(config.sinks, sinks, "{spec}");
+            assert!(!config.device_output(), "{spec}: null/fake is never a device output");
+            let fake = config.fake.expect("a fake track records both offsets");
+            assert_eq!((fake.pc_offset_us, fake.haptic_offset_us), (1000, 200));
+        }
+        // A fake track without its offsets is refused.
+        let args = b1_cli(&["--l2-sink", "pc=fake,haptic=null", "--l2-log", &fresh_s]).unwrap();
+        assert!(l2_output_config(&args).is_err());
+        // Malformed specs never parse.
+        for spec in [
+            "pc=fake", "haptic=fake", "pc=fake,haptic=null,pc=null", "pc=alsa,haptic=null",
+            "pc=wayland,haptic=fake", "pc=fake,haptic=bogus", "video=fake,haptic=null",
+            "pc=fake;haptic=null", "", "pc=,haptic=null", "fake,null",
+        ] {
+            assert!(b1_cli(&["--l2-sink", spec, "--l2-log", &fresh_s]).is_err(), "{spec:?}");
+        }
+        assert!(!fresh.exists(), "validation never creates the L2 log");
+    }
+
     /// F2: an existing L2 path (regular file, symlink to the rx log, dangling
     /// symlink) is refused before any log is opened, and by the start helper
     /// after the rx log is open; the existing bytes are never touched.
@@ -16517,7 +16624,7 @@ mod l2_hook_tests {
             L2Config {
                 run_id: "l2-hook".into(),
                 method: "s3".into(),
-                sink: L2SinkKind::Fake,
+                sinks: skew_moq::l2_output::L2Sinks::both(L2SinkKind::Fake),
                 fake: Some(fake),
                 queue_capacity: 64,
                 row_capacity: 1024,
