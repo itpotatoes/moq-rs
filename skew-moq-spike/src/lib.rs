@@ -1467,6 +1467,14 @@ impl JsonlLogger {
     pub fn flush(&mut self) {
         let _ = self.w.flush();
     }
+
+    /// `(st_dev, st_ino)` of the open log file (fstat), so a second log can
+    /// refuse to be the same file. Reads metadata only; writes nothing.
+    pub fn file_identity(&self) -> std::io::Result<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = self.w.get_ref().metadata()?;
+        Ok((metadata.dev(), metadata.ino()))
+    }
 }
 
 #[cfg(test)]

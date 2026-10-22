@@ -1142,6 +1142,8 @@ fn validate_queue_policy(
 const L2_DEFAULT_QUEUE_CAPACITY: usize = 256;
 const L2_ROW_CAPACITY: usize = 65_536;
 const L2_DEFAULT_REPORT_WINDOW_MS: u64 = 1_000;
+/// Bound of the per-object tracking sets (a 30 s run has 3,600 objects).
+const L2_MAX_TRACKED_OBJECTS: usize = 65_536;
 
 /// Validate the L2 output-stage options before any log is opened. `Ok(None)`
 /// for `--l2-sink none`, which must also carry no other L2 option.
@@ -1178,6 +1180,12 @@ fn l2_output_config(args: &Args) -> Result<Option<(PathBuf, skew_moq::l2_output:
     if path == args.out {
         bail!("--l2-log must differ from --out");
     }
+    // Refuse before the rx log is opened. `L2Output::start` (create_new) and
+    // the fstat comparison with the open rx log are the authoritative checks;
+    // this one only fails earlier. `symlink_metadata` sees a dangling link.
+    if std::fs::symlink_metadata(&path).is_ok() {
+        bail!("--l2-log {} already exists; the L2 log is never overwritten", path.display());
+    }
     let fake = match sink {
         L2SinkKind::Fake => Some(FakeSinkConfig::offsets(
             args.l2_fake_pc_offset_us
@@ -1203,9 +1211,62 @@ fn l2_output_config(args: &Args) -> Result<Option<(PathBuf, skew_moq::l2_output:
             args.l2_report_window_ms.unwrap_or(L2_DEFAULT_REPORT_WINDOW_MS),
             "l2-report-window-ms",
         )?,
+        max_tracked_objects: L2_MAX_TRACKED_OBJECTS,
     };
     config.validate()?;
     Ok(Some((path, config)))
+}
+
+/// Start the L2 output stage AFTER the rx log is open, so the new file can be
+/// compared with it: `create_new` refuses any existing path (symlinks and hard
+/// links included), and the fstat `(dev, ino)` of the open rx log is excluded
+/// before the L2 meta row is written. Checked again on the open handles.
+fn start_l2_output(
+    args: &Args,
+    logger: &Arc<Mutex<JsonlLogger>>,
+) -> Result<Option<skew_moq::l2_output::L2Output>> {
+    let Some((path, config)) = l2_output_config(args)? else {
+        return Ok(None);
+    };
+    let rx_identity = logger
+        .lock()
+        .map_err(|_| anyhow::anyhow!("RX logger poisoned"))?
+        .file_identity()
+        .context("fstat the rx log")?;
+    let output = skew_moq::l2_output::L2Output::start_excluding(&path, config, &[rx_identity])?;
+    ensure_l2_distinct_from_rx(rx_identity, output.file_identity())?;
+    Ok(Some(output))
+}
+
+fn ensure_l2_distinct_from_rx(rx: (u64, u64), l2: (u64, u64)) -> Result<()> {
+    if rx == l2 {
+        bail!("--l2-log and --out are the same file (dev {}, ino {})", rx.0, rx.1);
+    }
+    Ok(())
+}
+
+/// Report the receiver's first fatal error to the L2 log (registration §6-1
+/// needs its time). Inert unless L2 is enabled: no clock read, no allocation.
+fn note_l2_fault(l2: Option<&skew_moq::l2_output::L2Output>, cause: impl FnOnce() -> String) {
+    if let Some(l2) = l2 {
+        if !l2.receiver_fault_noted() {
+            let t_us = now_us();
+            l2.receiver_fault(t_us, &cause());
+        }
+    }
+}
+
+/// `note_l2_fault` for the S3 `outcome_error` slot: called at checkpoints
+/// that follow every place the slot can first be filled. Inside the control
+/// loop no `.await` separates the recording from the checkpoint after the
+/// loop; on the exit path each checkpoint follows one exit step.
+fn note_l2_outcome_fault(
+    l2: Option<&skew_moq::l2_output::L2Output>,
+    outcome_error: &Option<anyhow::Error>,
+) {
+    if let Some(error) = outcome_error {
+        note_l2_fault(l2, || format!("{error:#}"));
+    }
 }
 
 /// Close the L2 output stage (registration §3-5 order, see `L2Output::finish`)
@@ -1731,7 +1792,33 @@ fn dispatch_common_actions(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_playout_scheduler(
+    config: PlayoutConfig,
+    input: mpsc::Receiver<PlayoutObject>,
+    logger: Arc<Mutex<JsonlLogger>>,
+    bridge: Option<mpsc::Sender<Bytes>>,
+    render: bool,
+    audio: bool,
+    exp2: Option<Exp2Shared>,
+    // Owned by the task so releases in the post-FIN drain are submitted too;
+    // dropped when the task returns.
+    l2: Option<skew_moq::l2_output::L2Submitter>,
+) -> Result<PlayoutStats> {
+    let result =
+        run_playout_scheduler_body(config, input, logger, bridge, render, audio, exp2, &l2).await;
+    // Registration §6-1: the moment the scheduler error is recorded (the task
+    // returning it), not when `main` later joins the task. Inert without L2.
+    if let (Err(error), Some(l2)) = (&result, &l2) {
+        if !l2.receiver_fault_noted() {
+            l2.receiver_fault(now_us(), &format!("S1 scheduler failed: {error:#}"));
+        }
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_playout_scheduler_body(
     config: PlayoutConfig,
     mut input: mpsc::Receiver<PlayoutObject>,
     logger: Arc<Mutex<JsonlLogger>>,
@@ -1739,9 +1826,7 @@ async fn run_playout_scheduler(
     render: bool,
     audio: bool,
     exp2: Option<Exp2Shared>,
-    // Owned by the task so releases in the post-FIN drain below are
-    // submitted too; dropped when the task returns.
-    l2: Option<skew_moq::l2_output::L2Submitter>,
+    l2: &Option<skew_moq::l2_output::L2Submitter>,
 ) -> Result<PlayoutStats> {
     let mut scheduler = PlayoutScheduler::new(config).map_err(anyhow::Error::msg)?;
     let mut stats = PlayoutStats::default();
@@ -1788,13 +1873,13 @@ async fn run_playout_scheduler(
             }
         };
         log_common_epochs(&mut scheduler, &logger, config)?;
-        dispatch_common_actions(actions, &scheduler, &logger, &bridge, render, audio, &mut stats, &exp2, &l2)?;
+        dispatch_common_actions(actions, &scheduler, &logger, &bridge, render, audio, &mut stats, &exp2, l2)?;
     }
 
     if !scheduler.is_started() {
         exp2_s1_seal_if_due(&exp2, &scheduler)?;
         let actions = scheduler.finish_without_epoch();
-        dispatch_common_actions(actions, &scheduler, &logger, &bridge, render, audio, &mut stats, &exp2, &l2)?;
+        dispatch_common_actions(actions, &scheduler, &logger, &bridge, render, audio, &mut stats, &exp2, l2)?;
     } else {
         // Producer ended: deterministically drain the bounded timeline, then
         // return so logger finalization cannot race a detached scheduler task.
@@ -1805,7 +1890,7 @@ async fn run_playout_scheduler(
             tokio::time::sleep(Duration::from_micros(wakeup.saturating_sub(now_us()))).await;
             exp2_s1_seal_if_due(&exp2, &scheduler)?;
             let actions = scheduler.advance(now_us());
-            dispatch_common_actions(actions, &scheduler, &logger, &bridge, render, audio, &mut stats, &exp2, &l2)?;
+            dispatch_common_actions(actions, &scheduler, &logger, &bridge, render, audio, &mut stats, &exp2, l2)?;
         }
     }
     Ok(stats)
@@ -6310,10 +6395,7 @@ where
 {
     // L2 output stage (1-D M1); `None` with `--l2-sink none`. An early `?`
     // return below leaves the L2 file without its sentinel (fail closed).
-    let mut l2_output = match l2_output_config(args)? {
-        Some((path, config)) => Some(skew_moq::l2_output::L2Output::start(&path, config)?),
-        None => None,
-    };
+    let mut l2_output = start_l2_output(args, &logger)?;
     let l2_submitter = l2_output.as_ref().map(|output| output.submitter());
     let mut controller = S3Controller::new(runtime.controller).map_err(anyhow::Error::msg)?;
     let gate = S3SwitchGate::new(runtime.switch)
@@ -6734,6 +6816,9 @@ where
                 }
             }
         }
+        // L2 checkpoint before the only `.await` (a switch request) that can
+        // follow an error recorded earlier in this iteration.
+        note_l2_outcome_fault(l2_output.as_ref(), &outcome_error);
         let observations = match advance_tracker_checked(&mut tracker, &scheduler, now) {
             Ok(observations) => observations,
             Err(error) => {
@@ -6847,6 +6932,10 @@ where
         }
     }
 
+    // L2 checkpoint (registration §6-1): an error recorded inside the loop
+    // ended it at the loop condition, with no `.await` in between.
+    note_l2_outcome_fault(l2_output.as_ref(), &outcome_error);
+
     // Drain-at-exit, pass 1 — BEFORE `finish_pending`, on the normal end and
     // on every error exit alike. Anything still queued (typically the objects
     // of a target route whose sibling role was refused) is routed through the
@@ -6891,6 +6980,7 @@ where
     if let Err(error) = flush_s3_barrier_drops(&mut ingress, &logger, &mut stats) {
         keep_first_cause(&mut outcome_error, error);
     }
+    note_l2_outcome_fault(l2_output.as_ref(), &outcome_error);
 
     // Stop every subscription before joining/aborting its drain, then stop the
     // session. No detached reader is allowed to write after shutdown logging.
@@ -6941,6 +7031,7 @@ where
         // timeout branch are documented there.
         join_s3_session_at_shutdown(&mut session_run, &logger, &mut outcome_error).await;
     }
+    note_l2_outcome_fault(l2_output.as_ref(), &outcome_error);
     // Every drain task has now been joined — or, for the `drains_unjoined`
     // ones that missed the bound, is still alive and still holds an
     // `S3WireEvent` sender clone, which is why pass 2 below then reports
@@ -6997,6 +7088,7 @@ where
     if let Some(cause) = switch_faults.take_cause() {
         keep_first_cause(&mut outcome_error, cause);
     }
+    note_l2_outcome_fault(l2_output.as_ref(), &outcome_error);
     drop(bridge_tx);
     if let Some(mut child) = bridge_child {
         let _ = child.start_kill();
@@ -7059,15 +7151,8 @@ where
         }
     }
 
-    // Submissions end with the shutdown flush above; close the L2 stage
-    // before the shutdown rows so no `?` below can skip it. Its integrity is
-    // judged from the L2 file, not from the rx log or the exit status.
-    drop(l2_submitter);
-    if let Some(output) = l2_output.take() {
-        if let Err(e) = finish_l2_output(output).await {
-            eprintln!("[rx] S3 L2 output stage failed to close: {e:#}");
-        }
-    }
+    // L2 checkpoint after the shutdown flush.
+    note_l2_outcome_fault(l2_output.as_ref(), &outcome_error);
 
     let n_pc = recv_pc.load(Ordering::Relaxed);
     let n_haptic = recv_haptic.load(Ordering::Relaxed);
@@ -7097,6 +7182,24 @@ where
         || !object_routes.is_empty()
         || !event_queue_closed
         || drains_unjoined > 0;
+    // Submissions ended with the shutdown flush above. A final-integrity
+    // failure without an earlier recorded cause is first recorded here. Close
+    // the L2 stage before the shutdown rows so no `?` below can skip it; its
+    // integrity is judged from the L2 file, not the rx log or exit status.
+    if failed {
+        note_l2_fault(l2_output.as_ref(), || {
+            format!(
+                "S3 final integrity failure: bad_headers={n_bad} ingress_drops={n_ingress_drop} route_residue={} event_queue_closed={event_queue_closed} drains_unjoined={drains_unjoined}",
+                object_routes.len()
+            )
+        });
+    }
+    drop(l2_submitter);
+    if let Some(output) = l2_output.take() {
+        if let Err(e) = finish_l2_output(output).await {
+            eprintln!("[rx] S3 L2 output stage failed to close: {e:#}");
+        }
+    }
     {
         let mut logger = logger
             .lock()
@@ -7497,10 +7600,7 @@ async fn main() -> Result<()> {
     // L2 output stage (1-D M1). `--l2-sink none` constructs nothing, so the
     // pre-L2 receiver path is unchanged. S3 owns its own instance inside
     // `run_s3_control`.
-    let mut l2_output = match l2_output_config(&args)? {
-        Some((path, config)) => Some(skew_moq::l2_output::L2Output::start(&path, config)?),
-        None => None,
-    };
+    let mut l2_output = start_l2_output(&args, &logger)?;
     let l2_submitter = l2_output.as_ref().map(|output| output.submitter());
 
     let receive_trace = args.receive_trace.as_ref()
@@ -7782,6 +7882,9 @@ async fn main() -> Result<()> {
         let ingress_log_failed = ingress_log_failed.clone();
         let wire_stats_out = wire_stats.clone();
         let l2_b1 = if args.arm == Arm::B1 { l2_submitter.clone() } else { None };
+        // Every L2-enabled drain reports a FAILED track end at the moment it
+        // happens (registration §6-1). `None` without L2.
+        let l2_fault = l2_submitter.clone();
         // Logical slots this drain owns: its own for pc/haptic, both for mixed.
         let owned_slots: Vec<usize> = if name == SHARED_FIFO_TRACK {
             vec![0, 1]
@@ -8006,11 +8109,17 @@ async fn main() -> Result<()> {
                     *wire_stats_out[slot].lock().unwrap() = frame_stats[slot].clone();
                 }
             }
-            match result {
+            let ended = match result {
                 Ok(()) => (name, TrackEnd::Fin, String::new()),
                 Err(DrainFail::Serve(e)) => (name, classify_track_end(&e), format!("{e}")),
                 Err(DrainFail::NonSubgroup) => (name, TrackEnd::Failed, "non-subgroup delivery".into()),
+            };
+            if let Some(l2) = &l2_fault {
+                if ended.1 == TrackEnd::Failed && !l2.receiver_fault_noted() {
+                    l2.receiver_fault(now_us(), &format!("track {name} ended Failed: {}", ended.2));
+                }
             }
+            ended
         }));
     }
     drop(ftx); // only the drain clones keep the channel open now
@@ -8046,6 +8155,17 @@ async fn main() -> Result<()> {
             Drained::Timeout
         }
     };
+    // L2 (registration §6-1): the session/max-duration end is recorded here,
+    // with no `.await` since the select returned. Inert without L2.
+    match &drained {
+        Drained::Timeout => note_l2_fault(l2_output.as_ref(), || {
+            "max-duration reached — reception is INCOMPLETE".to_string()
+        }),
+        Drained::SessionArm(detail) => note_l2_fault(l2_output.as_ref(), || {
+            format!("session ended before tracks closed: {detail}")
+        }),
+        Drained::Ends(_) => {}
+    }
 
     // A cancelled select branch must not detach receiver tasks. Abort and join
     // any outstanding producer before closing the scheduler input.
@@ -8068,14 +8188,21 @@ async fn main() -> Result<()> {
         match tokio::time::timeout(Duration::from_micros(budget_us), &mut task).await {
             Ok(Ok(Ok(stats))) => s1_stats = stats,
             Ok(Ok(Err(e))) => {
+                // The task itself already reported this to L2 when it
+                // returned the error; this is only a fallback.
+                note_l2_fault(l2_output.as_ref(), || format!("S1 scheduler failed: {e:#}"));
                 eprintln!("[rx] S1 scheduler failed: {e:#}");
                 scheduler_finalize_failed = true;
             }
             Ok(Err(e)) => {
+                note_l2_fault(l2_output.as_ref(), || format!("S1 scheduler task join failed: {e}"));
                 eprintln!("[rx] S1 scheduler task join failed: {e}");
                 scheduler_finalize_failed = true;
             }
             Err(_) => {
+                note_l2_fault(l2_output.as_ref(), || {
+                    format!("S1 scheduler shutdown exceeded {budget_us}us")
+                });
                 eprintln!("[rx] S1 scheduler shutdown exceeded {budget_us}us");
                 task.abort();
                 let _ = task.await;
@@ -8112,17 +8239,6 @@ async fn main() -> Result<()> {
         if exp2_outcome.as_deref() != Some("ok") {
             eprintln!("[rx] {}", exp2_outcome.as_deref().unwrap_or_default());
             scheduler_finalize_failed = true;
-        }
-    }
-
-    // L2: every submitter clone is gone (drains joined, scheduler task
-    // joined or aborted), so close the output stage now — before any
-    // `process::exit` below, which would skip it. An L2 integrity failure is
-    // judged from the L2 file (sentinel / its absence); it changes neither
-    // the rx log nor the exit code, whose meaning the batch driver owns.
-    if let Some(output) = l2_output.take() {
-        if let Err(e) = finish_l2_output(output).await {
-            eprintln!("[rx] L2 output stage failed to close: {e:#}");
         }
     }
 
@@ -8190,6 +8306,28 @@ async fn main() -> Result<()> {
     let n_bad = bad_headers.load(Ordering::Relaxed);
     if n_bad > 0 {
         eprintln!("[rx] {n_bad} object(s) failed header validation and were NOT logged");
+    }
+
+    // L2: the ending is now classified, so a not-yet-reported abnormal ending
+    // (or malformed headers) is the receiver's first fatal error. Every
+    // submitter clone is gone (drains joined, scheduler task joined or
+    // aborted), so close the output stage now — before the rx shutdown rows
+    // and every `process::exit` below, which would skip it. An L2 integrity
+    // failure is judged from the L2 file (sentinel / its absence); it changes
+    // neither the rx log nor the exit code, whose meaning the batch driver
+    // owns. Without L2 nothing here runs.
+    if ending != RxEnding::Normal {
+        note_l2_fault(l2_output.as_ref(), || {
+            format!("abnormal ending: {} ({detail})", ending.as_str())
+        });
+    }
+    if n_bad > 0 {
+        note_l2_fault(l2_output.as_ref(), || format!("{n_bad} malformed header(s)"));
+    }
+    if let Some(output) = l2_output.take() {
+        if let Err(e) = finish_l2_output(output).await {
+            eprintln!("[rx] L2 output stage failed to close: {e:#}");
+        }
     }
 
     // Same record convention as the sender, so the analyzer can classify a run
@@ -12262,6 +12400,11 @@ mod s3_control_loop_tests {
         /// task has to complete a multi-step read before the next scripted
         /// action is allowed to happen.
         Sleep(u64),
+        /// Publish ONE object whose writer is dropped before its declared
+        /// size is written — what an in-flight object cut at run end looks
+        /// like. The reader gets `ServeError::Size` ("wrong size"), so the
+        /// route ends `Failed` (moq-transport `serve/subgroup.rs` Drop).
+        Truncated(&'static str, (u16, u32, u64, u32)),
     }
 
     /// The scripted answer to one `subscribe_open` call.
@@ -12352,6 +12495,17 @@ mod s3_control_loop_tests {
                         .close(ServeError::Cancel)
                         .expect("cancel the track");
                 }
+                Step::Truncated(track, (tier, seq, pts_us, event_id)) => {
+                    let writer = state
+                        .open
+                        .get_mut(*track)
+                        .unwrap_or_else(|| panic!("publish on unopened track {track}"));
+                    let bytes = wire_bytes(*track, *tier, *seq, *pts_us, *event_id);
+                    let mut subgroup = writer.append(1).expect("append subgroup");
+                    let mut object = subgroup.create(bytes.len(), None).expect("create object");
+                    object.write(bytes.slice(..HDR)).expect("write the header only");
+                    drop(object);
+                }
                 Step::Yield(_) | Step::Sleep(_) => {}
             }
         }
@@ -12436,15 +12590,6 @@ mod s3_control_loop_tests {
     /// the registered switch effect timeout of 2000 ms. Only `--duration-s`,
     /// `--max-duration` and the test-mode forcing delay vary per case, and none
     /// of those is a registered control parameter.
-    fn s3_args(
-        out: &std::path::Path,
-        run_id: &str,
-        duration_s: Option<&str>,
-        force_ms: &str,
-    ) -> Args {
-        s3_args_with(out, run_id, duration_s, force_ms, &[])
-    }
-
     fn s3_args_with(
         out: &std::path::Path,
         run_id: &str,
@@ -13227,7 +13372,7 @@ mod s3_control_loop_tests {
         let l2: Vec<serde_json::Value> =
             l2_text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
         assert_eq!(l2[0]["role"], "meta");
-        assert_eq!(l2[0]["l2_schema"], "event-pair-l2-v0");
+        assert_eq!(l2[0]["l2_schema"], skew_moq::l2_output::L2_SCHEMA);
         assert_eq!(l2[0]["method"], "s3");
         assert_eq!(l2[0]["run_id"], "loop-test");
         let last = l2.last().unwrap();
@@ -13259,7 +13404,8 @@ mod s3_control_loop_tests {
             assert_eq!(s[0]["t_release_us"], release["t_release"], "{k}");
             assert_eq!(s[0]["run_id"], "loop-test");
             assert!(s[0]["t_submit_us"].as_u64() >= s[0]["t_release_us"].as_u64());
-            assert!(o[0]["t_log_arrival_us"].as_u64() >= o[0]["t_output_us"].as_u64());
+            assert!(o[0]["t_callback_us"].as_u64() >= o[0]["t_output_us"].as_u64());
+            assert!(o[0]["t_log_arrival_us"].as_u64() >= o[0]["t_callback_us"].as_u64());
         }
         for drop in &drops {
             let k = key(drop);
@@ -13276,6 +13422,107 @@ mod s3_control_loop_tests {
         assert_eq!(pc_dup[0]["route_generation"], 1);
         assert!(releases.iter().any(|r| r["wire_track"] == PC_CRITICAL && r["pts_us"] == 99_999));
         assert!(drops.iter().any(|r| r["wire_track"] == PC_NORMAL && r["pts_us"] == 99_999));
+    }
+
+    /// 1-D M1 / Codex 104 F5: a current route fails mid-run with
+    /// `ServeError::Size` ("wrong size", the in-flight-object cut seen in the
+    /// 1-C runs). With `--l2-sink fake` the error exit must still run both
+    /// exit drains and the shutdown flush, submit every release (each with
+    /// exactly one terminal), write one `receiver_fault` row at the moment the
+    /// error was recorded, and end the L2 log with the sentinel.
+    #[tokio::test]
+    async fn s3_l2_error_exit_drains_flushes_and_ends_with_the_sentinel() {
+        let l2_path = test_log_path("s3-l2-error");
+        let extra: Vec<String> = [
+            "--l2-sink", "fake", "--l2-log", &l2_path.display().to_string(),
+            "--l2-fake-pc-offset-us", "1500", "--l2-fake-haptic-offset-us", "400",
+            "--l2-report-window-ms", "300",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        // After the epoch: objects that are still buffered (due = epoch +
+        // pts + 100 ms) when the PC route fails, so the shutdown flush must
+        // release them.
+        let script = initial_calls(Vec::new());
+        let outcome = run_case_inner_with(
+            "s3-l2-error",
+            Some("30"),
+            // No forced deadline misses: no switch in this case.
+            "600000",
+            script,
+            // After both subscriptions are open and the epoch is armed (pc 0 /
+            // haptic 0 are then buffered until epoch + 100 ms).
+            vec![(
+                30,
+                vec![
+                    Step::Publish(PC_NORMAL, vec![(2, 2, 33_333, 2)]),
+                    Step::Publish(HAPTIC_FULL, vec![(0, 2, 33_333, 2), (0, 3, 44_444, 3)]),
+                    Step::Yield(50),
+                    Step::Truncated(PC_NORMAL, (2, 3, 66_666, 3)),
+                    Step::Yield(50),
+                ],
+            )],
+            SessionEnding::Never,
+            &extra,
+        )
+        .await;
+        let error = format!("{:#}", outcome.result.as_ref().expect_err("the route failure must fail the run"));
+        assert!(error.contains("wrong size"), "{error}");
+        outcome.assert_every_rx_object_is_terminated();
+        let shutdown = outcome.shutdown();
+        assert_eq!(shutdown["s3_event_queue_closed"], true, "pass 2 closed the window: {shutdown}");
+        assert_eq!(shutdown["s3_drains_unjoined"], 0);
+        assert!(shutdown["detail"].as_str().unwrap().contains("wrong size"));
+
+        let l2_text = std::fs::read_to_string(&l2_path).expect("L2 log written");
+        std::fs::remove_file(&l2_path).ok();
+        if std::env::var_os("SKEW_TEST_DUMP").is_some() {
+            eprintln!("---- L2 ----\n{l2_text}");
+        }
+        let l2: Vec<serde_json::Value> =
+            l2_text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        let last = l2.last().unwrap();
+        assert_eq!(last["role"], "instrumentation_end", "sentinel is last");
+        assert_eq!(l2.iter().filter(|r| r["role"] == "instrumentation_end").count(), 1);
+        assert_eq!(last["integrity_ok"], true, "{last}");
+        let faults: Vec<&serde_json::Value> =
+            l2.iter().filter(|r| r["role"] == "receiver_fault").collect();
+        assert_eq!(faults.len(), 1);
+        let fault_us = faults[0]["t_us"].as_u64().expect("integer µs");
+        assert!(faults[0]["cause"].as_str().unwrap().contains("wrong size"));
+        assert_eq!(last["receiver_fault_us"].as_u64(), Some(fault_us));
+
+        let key = |r: &serde_json::Value| {
+            format!(
+                "{}/{}/{}/{}/{}/{}/{}",
+                r["track"], r["wire_track"], r["route_generation"], r["tier"], r["seq"],
+                r["pts_us"], r["event_id"]
+            )
+        };
+        let releases: Vec<&serde_json::Value> =
+            outcome.rows.iter().filter(|r| r["role"] == "release").collect();
+        // pc 0/2 and haptic 0/2/3 were buffered at the failure; the truncated
+        // object never became an rx row.
+        assert_eq!(releases.len(), 5, "{releases:?}");
+        assert!(
+            releases.iter().all(|r| r["t_release"].as_u64().unwrap() > fault_us),
+            "these releases come from the shutdown flush, after the recorded fault"
+        );
+        let submits: Vec<_> = l2.iter().filter(|r| r["role"] == "submit").collect();
+        let terminals: Vec<_> =
+            l2.iter().filter(|r| r["role"] == "output" || r["role"] == "explicit_discard").collect();
+        assert_eq!(submits.len(), releases.len());
+        assert_eq!(terminals.len(), releases.len());
+        for release in &releases {
+            let k = key(release);
+            assert_eq!(submits.iter().filter(|r| key(r) == k).count(), 1, "{k}");
+            assert_eq!(terminals.iter().filter(|r| key(r) == k).count(), 1, "{k}");
+        }
+        assert!(outcome
+            .rows
+            .iter()
+            .all(|r| !(r["role"] == "rx" && r["track"] == "pc" && r["seq"] == 3)));
     }
 
     /// (b) A transition whose request instant falls at/after the window end is
@@ -15087,6 +15334,7 @@ mod l2_hook_tests {
                 queue_capacity: 64,
                 row_capacity: 1024,
                 report_window_us: 200_000,
+                max_tracked_objects: 1024,
             },
         )
         .unwrap()
@@ -15236,40 +15484,110 @@ mod l2_hook_tests {
 
     #[test]
     fn l2_options_are_validated_before_any_log_opens() {
+        let fresh = tmp("cli-fresh");
+        let fresh_s = fresh.display().to_string();
         let ok = b1_cli(&[
-            "--l2-sink", "fake", "--l2-log", "/tmp/skew-l2-unused.jsonl",
+            "--l2-sink", "fake", "--l2-log", &fresh_s,
             "--l2-fake-pc-offset-us", "1000", "--l2-fake-haptic-offset-us", "200",
         ])
         .unwrap();
         let (path, config) = l2_output_config(&ok).unwrap().unwrap();
-        assert_eq!(path, PathBuf::from("/tmp/skew-l2-unused.jsonl"));
+        assert_eq!(path, fresh);
         assert_eq!(config.method, "b1");
         assert_eq!(config.queue_capacity, L2_DEFAULT_QUEUE_CAPACITY);
         assert_eq!(config.report_window_us, L2_DEFAULT_REPORT_WINDOW_MS * 1_000);
-        let null = b1_cli(&["--l2-sink", "null", "--l2-log", "/tmp/skew-l2-unused.jsonl"]).unwrap();
+        assert_eq!(config.max_tracked_objects, L2_MAX_TRACKED_OBJECTS);
+        let null = b1_cli(&["--l2-sink", "null", "--l2-log", &fresh_s]).unwrap();
         assert!(l2_output_config(&null).unwrap().is_some());
         let refused: &[&[&str]] = &[
             // no log path
             &["--l2-sink", "null"],
             // fake without offsets
-            &["--l2-sink", "fake", "--l2-log", "/tmp/a.jsonl"],
+            &["--l2-sink", "fake", "--l2-log", &fresh_s],
             // fake offsets on the null sink
-            &["--l2-sink", "null", "--l2-log", "/tmp/a.jsonl", "--l2-fake-pc-offset-us", "1"],
-            // same file as the rx log
+            &["--l2-sink", "null", "--l2-log", &fresh_s, "--l2-fake-pc-offset-us", "1"],
+            // same path as the rx log
             &["--l2-sink", "null", "--l2-log", "/tmp/skew-l2-unused-rx.jsonl"],
             // Stage A bridge
-            &["--l2-sink", "null", "--l2-log", "/tmp/a.jsonl", "--render"],
+            &["--l2-sink", "null", "--l2-log", &fresh_s, "--render"],
             // not a 1-D method
-            &["--l2-sink", "null", "--l2-log", "/tmp/a.jsonl", "--arm", "s3np"],
-            &["--l2-sink", "null", "--l2-log", "/tmp/a.jsonl", "--arm", "m1"],
-            &["--l2-sink", "null", "--l2-log", "/tmp/a.jsonl", "--arm", "s2eq"],
-            &["--l2-sink", "null", "--l2-log", "/tmp/a.jsonl", "--arm", "p0"],
+            &["--l2-sink", "null", "--l2-log", &fresh_s, "--arm", "s3np"],
+            &["--l2-sink", "null", "--l2-log", &fresh_s, "--arm", "m1"],
+            &["--l2-sink", "null", "--l2-log", &fresh_s, "--arm", "s2eq"],
+            &["--l2-sink", "null", "--l2-log", &fresh_s, "--arm", "p0"],
             // zero queue
-            &["--l2-sink", "null", "--l2-log", "/tmp/a.jsonl", "--l2-queue-capacity", "0"],
+            &["--l2-sink", "null", "--l2-log", &fresh_s, "--l2-queue-capacity", "0"],
         ];
         for extra in refused {
             let args = b1_cli(extra).unwrap();
             assert!(l2_output_config(&args).is_err(), "{extra:?}");
         }
+        assert!(!fresh.exists(), "validation never creates the L2 log");
+    }
+
+    /// F2: an existing L2 path (regular file, symlink to the rx log, dangling
+    /// symlink) is refused before any log is opened, and by the start helper
+    /// after the rx log is open; the existing bytes are never touched.
+    #[test]
+    fn an_existing_or_aliased_l2_path_is_refused_and_left_unchanged() {
+        use sha2::{Digest, Sha256};
+        let rx_path = tmp("alias-rx");
+        let logger = rx_logger(&rx_path);
+        logger.lock().unwrap().try_log_info("\"event\":\"probe\"").unwrap();
+        let rx_before = std::fs::read(&rx_path).unwrap();
+        let existing = tmp("alias-existing");
+        std::fs::write(&existing, b"earlier evidence\n").unwrap();
+        let existing_digest = Sha256::digest(std::fs::read(&existing).unwrap());
+        let symlink = tmp("alias-symlink");
+        std::os::unix::fs::symlink(&rx_path, &symlink).unwrap();
+        let dangling = tmp("alias-dangling");
+        std::os::unix::fs::symlink(tmp("alias-nowhere"), &dangling).unwrap();
+        for path in [&existing, &symlink, &dangling] {
+            let p = path.display().to_string();
+            let args = b1_cli(&["--l2-sink", "null", "--l2-log", &p]).unwrap();
+            assert!(l2_output_config(&args).is_err(), "{p}");
+            assert!(start_l2_output(&args, &logger).is_err(), "{p}");
+        }
+        assert_eq!(std::fs::read(&rx_path).unwrap(), rx_before, "rx bytes unchanged");
+        assert_eq!(Sha256::digest(std::fs::read(&existing).unwrap()), existing_digest);
+        // A fresh path starts, is a different file from the open rx log, and
+        // the rx log is untouched by it.
+        let fresh = tmp("alias-fresh");
+        let p = fresh.display().to_string();
+        let args = b1_cli(&["--l2-sink", "null", "--l2-log", &p]).unwrap();
+        let output = start_l2_output(&args, &logger).unwrap().unwrap();
+        let rx_identity = logger.lock().unwrap().file_identity().unwrap();
+        assert_ne!(output.file_identity(), rx_identity);
+        assert!(ensure_l2_distinct_from_rx(rx_identity, rx_identity).is_err());
+        output.finish().unwrap();
+        assert_eq!(std::fs::read(&rx_path).unwrap(), rx_before);
+        for p in [&rx_path, &existing, &symlink, &dangling, &fresh] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    /// F4: `--l2-sink none` reports nothing (no clock read, no call); with L2
+    /// only the first fault is written.
+    #[test]
+    fn receiver_faults_are_inert_without_l2_and_first_only_with_it() {
+        let mut called = false;
+        note_l2_fault(None, || {
+            called = true;
+            String::new()
+        });
+        assert!(!called, "the cause is not even formatted without L2");
+        note_l2_outcome_fault(None, &Some(anyhow::anyhow!("x")));
+        let path = tmp("faults");
+        let output = fake_output(&path, 0, 0);
+        note_l2_outcome_fault(Some(&output), &None);
+        assert!(!output.receiver_fault_noted());
+        note_l2_outcome_fault(Some(&output), &Some(anyhow::anyhow!("first")));
+        note_l2_fault(Some(&output), || "second".to_string());
+        output.finish().unwrap();
+        let l2 = rows(&path);
+        let faults: Vec<_> = l2.iter().filter(|r| r["role"] == "receiver_fault").collect();
+        assert_eq!(faults.len(), 1);
+        assert_eq!(faults[0]["cause"], "first");
+        let _ = std::fs::remove_file(&path);
     }
 }
