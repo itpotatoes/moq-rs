@@ -61,6 +61,8 @@ mod ffi {
         ) -> c_int;
         pub fn skew_draco_cloud_free(cloud: *mut SkewDracoCloud);
         pub fn skew_draco_version() -> *const c_char;
+        pub fn skew_draco_cxx_runtime_build() -> *const c_char;
+        pub fn skew_draco_cxx_runtime_loaded() -> *const c_char;
     }
 }
 
@@ -303,6 +305,25 @@ pub fn library_version() -> String {
     unsafe { CStr::from_ptr(ffi::skew_draco_version()) }.to_string_lossy().into_owned()
 }
 
+/// The C++ runtime the shim was compiled against (header macros).
+pub fn cxx_runtime_build() -> String {
+    // SAFETY: a static NUL-terminated string literal of the shim.
+    unsafe { CStr::from_ptr(ffi::skew_draco_cxx_runtime_build()) }.to_string_lossy().into_owned()
+}
+
+/// The C++ runtime loaded in this process: the shared object of
+/// `std::terminate` and, if it is a symlink, what it resolves to (the
+/// versioned file, e.g. `libstdc++.so.6.0.34`).
+pub fn cxx_runtime_loaded() -> String {
+    // SAFETY: a NUL-terminated path owned by the dynamic loader (valid while
+    // the library is loaded), copied at once.
+    let path = unsafe { CStr::from_ptr(ffi::skew_draco_cxx_runtime_loaded()) }.to_string_lossy().into_owned();
+    match std::fs::canonicalize(&path) {
+        Ok(resolved) if resolved.to_string_lossy() != path => format!("{path} -> {}", resolved.display()),
+        _ => path,
+    }
+}
+
 /// Decoder identity for the L2 meta row and the freeze (registration §3-2:
 /// "디코더 id·버전·플래그·threads를 L2 meta에 기록").
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -324,6 +345,9 @@ pub struct DecoderInfo {
     pub compiler_args: &'static str,
     /// `OPT_LEVEL` of this crate's Rust code (record packing).
     pub rust_opt_level: &'static str,
+    /// The C++ runtime compiled against and the one loaded at run time.
+    pub cxx_runtime_build: String,
+    pub cxx_runtime_loaded: String,
     pub threads: u32,
     pub rounding: &'static str,
 }
@@ -342,6 +366,8 @@ pub fn decoder_info() -> DecoderInfo {
         fixed_flags: env!("SKEW_DRACO_FIXED_FLAGS"),
         compiler_args: env!("SKEW_DRACO_CXX_ARGS"),
         rust_opt_level: env!("SKEW_DRACO_RUST_OPT_LEVEL"),
+        cxx_runtime_build: cxx_runtime_build(),
+        cxx_runtime_loaded: cxx_runtime_loaded(),
         threads: 1,
         rounding: "each dequantized float32 coordinate rounded half-to-even (explicit Rust implementation), then required to be an integer in 0..=1023; record = u32 LE (x | y<<10 | z<<20) + R G B 255",
     }
@@ -491,6 +517,8 @@ mod tests {
         assert_eq!(info.vendored_sources_sha256.len(), 64);
         assert_eq!(info.compiled_sources, "64", "63 Draco sources + the shim");
         assert_eq!(info.rust_opt_level, "3", "the workspace profile override applies");
+        assert!(info.cxx_runtime_build.starts_with("libstdc++ _GLIBCXX_RELEASE="), "{}", info.cxx_runtime_build);
+        assert!(info.cxx_runtime_loaded.contains("libstdc++.so"), "{}", info.cxx_runtime_loaded);
     }
 
     /// Garbage, an empty buffer and a truncated stream are errors, never a

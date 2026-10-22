@@ -2685,6 +2685,14 @@ pub const EXIT_RX_NO_OBJECTS: i32 = 9;
 /// declared length). The rx log's measurement integrity is compromised.
 pub const EXIT_RX_HEADER_INVALID: i32 = 8;
 
+/// Exit code: an L2 device sink (PC Wayland, haptic ALSA) could not start
+/// before the run. The receiver wrote ONE machine-readable stderr line
+/// `L2_DEVICE_START_FAILURE {json}` (`l2_output::L2DeviceStartFailure`:
+/// track, sink, stage, timeout, whether the lane thread exited and so the
+/// device is closed, the start point relative to the session) before
+/// exiting; the L2 file holds no meta row.
+pub const EXIT_L2_DEVICE_START_FAILED: i32 = 10;
+
 /// Destination for drained accept records.
 ///
 /// Exists so the drain path is generic over the sink: production uses

@@ -32,15 +32,21 @@ Not from the release
   shim/skew_draco_shim.{h,cc}        extern "C" shim (exceptions -> codes)
 
 Build (build.rs)
-  cc 1.2.40, default flags disabled, exactly:
+  cc 1.2.40, default flags disabled, no RUSTFLAGS inheritance, exactly:
     -std=c++17 -O3 -DNDEBUG -fPIC -ffp-contract=off
-  plus the three include paths; CXXFLAGS and its target/host variants are
-  refused; the compiler identity, the argument vector and the digest below
-  are compiled into the crate (decoder_info()) for the L2 meta row.
+  plus the three include paths, checked against an allowlist (any other
+  argument fails the build); CXXFLAGS and CXXSTDLIB and their target/host
+  variants are refused; the compiler identity, the argument vector, the
+  digest below and the C++ runtime (compiled-against header macros and the
+  shared object loaded at run time) are reported by decoder_info() for the
+  L2 meta row.
 
 Source digest (what decoder_info().vendored_sources_sha256 reports)
   (cd skew-draco-sys && find vendor shim -type f | LC_ALL=C sort | xargs sha256sum) | sha256sum
-  = 23fd72a3b15ed5499d86199dfcae8927f3affd47bd8451926f1cc56a1f19341a (201 files)
+  = db09599bcdc6dc8d8174364784d82499ad351b7a7b1ba5be357e71bf7e0fdbbf (201 files)
+  (the vendor/ files are unchanged since the first vendoring; the shim
+  gained the C++ runtime identity functions, Codex 112 P2-2; the earlier
+  digest 23fd72a3...41a covered the shim without them)
 
 Verification
   cargo test -p skew-draco-sys                      unit tests, synthetic

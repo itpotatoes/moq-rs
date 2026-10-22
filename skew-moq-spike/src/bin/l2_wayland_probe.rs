@@ -6,7 +6,9 @@
 //! display backend, haptic lane `null`), once per representation given —
 //! `.bin` frames as sent and/or Draco frames decoded by the vendored Draco
 //! 1.5.7 — writes one schema v1.4 L2 JSONL per representation and prints ONE
-//! JSON report: presentation flags, refresh, MSC steps (missed refreshes),
+//! JSON report: presentation flags, refresh, refresh steps between
+//! consecutive outputs from the presentation TIMES (`refresh_index`; the
+//! compositor's `presentation_seq` is reported raw, never as vblanks),
 //! the latency distributions `t_output - t_release`, `t_output - t_commit`,
 //! `t_callback - t_output`, `report_lag = t_log_arrival - t_output` (§3-6
 //! needs it for `G_report`), decode and render times. It reports no
@@ -185,14 +187,21 @@ fn summarize(rows: &[serde_json::Value], plan: &[(u64, Vec<u64>)]) -> serde_json
         *flags.entry(names.unwrap_or_default()).or_default() += 1;
         *refresh.entry(detail(o, "refresh_us")).or_default() += 1;
     }
-    // MSC steps between consecutive outputs (in commit order): at 30 fps on
-    // a 60 Hz output an undisturbed step is 2; larger steps are missed
-    // refreshes or held frames (the plan has bursts and gaps).
-    let mut by_commit: Vec<(i64, i64)> = outputs.iter().map(|o| (detail(o, "commit_id"), detail(o, "msc"))).collect();
+    // Refresh steps between consecutive outputs (in commit order) from the
+    // presentation TIMES (refresh_index): at 30 fps on a 60 Hz output an
+    // undisturbed step is 2; larger steps are missed refreshes or held
+    // frames (the plan has bursts and gaps). The compositor's seq is shown
+    // raw beside it and is not read as a vblank count.
+    let mut by_commit: Vec<(i64, i64, i64)> = outputs
+        .iter()
+        .map(|o| (detail(o, "commit_id"), detail(o, "refresh_index"), detail(o, "presentation_seq")))
+        .collect();
     by_commit.sort_unstable();
-    let mut msc_steps: BTreeMap<i64, u64> = BTreeMap::new();
+    let mut refresh_steps: BTreeMap<i64, u64> = BTreeMap::new();
+    let mut seq_steps: BTreeMap<i64, u64> = BTreeMap::new();
     for w in by_commit.windows(2) {
-        *msc_steps.entry(w[1].1 - w[0].1).or_default() += 1;
+        *refresh_steps.entry(w[1].1 - w[0].1).or_default() += 1;
+        *seq_steps.entry(w[1].2 - w[0].2).or_default() += 1;
     }
     let decode: Vec<i64> = rows
         .iter()
@@ -220,7 +229,9 @@ fn summarize(rows: &[serde_json::Value], plan: &[(u64, Vec<u64>)]) -> serde_json
         "discard_reasons": discard_reasons,
         "presented_flags": flags,
         "refresh_us": refresh,
-        "msc_steps": msc_steps,
+        "refresh_steps": refresh_steps,
+        "presentation_seq_steps_raw": seq_steps,
+        "presented_delta_us": distribution(outputs.iter().filter(|o| !o["output_detail"]["presented_delta_us"].is_null()).map(|o| detail(o, "presented_delta_us")).collect()),
         "release_to_output_us": distribution(outputs.iter().map(|o| num(o, "t_output_us") - num(o, "t_release_us")).collect()),
         "commit_to_output_us": distribution(outputs.iter().map(|o| num(o, "t_output_us") - detail(o, "t_commit_us")).collect()),
         "output_to_callback_us": distribution(outputs.iter().map(|o| num(o, "t_callback_us") - num(o, "t_output_us")).collect()),
@@ -416,11 +427,11 @@ mod tests {
                 "wayland": {"representation": "draco", "canvas_side_px": 1080}}),
             serde_json::json!({"role": "output", "t_release_us": 100, "t_output_us": 20_100, "t_callback_us": 20_400,
                 "t_log_arrival_us": 20_900, "t_decode_start_us": 150, "t_decode_end_us": 6_150,
-                "output_detail": {"commit_id": 1, "msc": 10, "t_commit_us": 9_000, "t_render_start_us": 6_200,
+                "output_detail": {"commit_id": 1, "presentation_seq": 2, "refresh_index": 10, "presented_delta_us": null, "t_commit_us": 9_000, "t_render_start_us": 6_200,
                     "t_render_end_us": 8_200, "refresh_us": 16_666, "flag_names": ["vsync", "hw_clock"]}}),
             serde_json::json!({"role": "output", "t_release_us": 33_433, "t_output_us": 53_433, "t_callback_us": 53_533,
                 "t_log_arrival_us": 53_633, "t_decode_start_us": 33_500, "t_decode_end_us": 39_000,
-                "output_detail": {"commit_id": 2, "msc": 12, "t_commit_us": 41_000, "t_render_start_us": 39_100,
+                "output_detail": {"commit_id": 2, "presentation_seq": 3, "refresh_index": 12, "presented_delta_us": 33_333, "t_commit_us": 41_000, "t_render_start_us": 39_100,
                     "t_render_end_us": 40_100, "refresh_us": 16_666, "flag_names": ["vsync", "hw_clock"]}}),
             serde_json::json!({"role": "explicit_discard", "reason": "superseded_before_commit", "t_decode_start_us": 1, "t_decode_end_us": 5_001}),
             serde_json::json!({"role": "instrumentation_end", "integrity_ok": true, "output": 2, "lanes": {"pc": {"kind": "wayland"}}}),
@@ -430,7 +441,9 @@ mod tests {
         assert_eq!(report["report_lag_us"]["max"], 800);
         assert_eq!(report["commit_to_output_us"]["min"], 11_100);
         assert_eq!(report["output_to_callback_us"]["p50"], 200.0);
-        assert_eq!(report["msc_steps"]["2"], 1);
+        assert_eq!(report["refresh_steps"]["2"], 1, "from the presentation times");
+        assert_eq!(report["presentation_seq_steps_raw"]["1"], 1, "the raw seq is reported, not used");
+        assert_eq!(report["presented_delta_us"]["n"], 1);
         assert_eq!(report["presented_flags"]["vsync|hw_clock"], 2);
         assert_eq!(report["refresh_us"]["16666"], 2);
         assert_eq!(report["decode_us"]["n"], 3, "decode times of every decoded terminal");

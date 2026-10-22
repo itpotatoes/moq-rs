@@ -29,10 +29,10 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError
 use std::sync::Arc;
 
 use super::{
-    micros, L2Modality, L2Submission, OutputDetail, Row, Shared, SinkMsg, WaylandBackendKind, WaylandOutputDetail,
-    WaylandSinkConfig, DISCARD_COMPOSITOR_DISCARDED, DISCARD_DEVICE_FAILURE, DISCARD_PAYLOAD_INVALID,
-    DISCARD_SUPERSEDED_BEFORE_COMMIT, FAIL_PRODUCERS_ALIVE_AT_FINISH, FAIL_ROW_QUEUE_OVERFLOW, L2_SCHEMA,
-    L2_WAYLAND_DIAGNOSTICS_SCHEMA,
+    micros, L2Modality, L2Submission, LaneStartError, OutputDetail, Row, Shared, SinkMsg, WaylandBackendKind,
+    WaylandOutputDetail, WaylandSinkConfig, DISCARD_COMPOSITOR_DISCARDED, DISCARD_DEVICE_FAILURE,
+    DISCARD_PAYLOAD_INVALID, DISCARD_SUPERSEDED_BEFORE_COMMIT, FAIL_PRODUCERS_ALIVE_AT_FINISH,
+    FAIL_ROW_QUEUE_OVERFLOW, L2_SCHEMA, L2_WAYLAND_DIAGNOSTICS_SCHEMA,
 };
 use crate::l2_pc::{
     presentation_flag_names, BackendEvent, EngineOutcome, FramePreparer, Offer, PendingSlot, PixelPool, PrepareError,
@@ -62,12 +62,15 @@ pub(crate) struct PcDiagLog {
     file: BufWriter<File>,
     run_id: String,
     records: Vec<(u64, Presented, u64)>,
+    /// Anomalies with the raw presentation behind them (Codex 112 P2-5:
+    /// the L2 JSONL keeps only the reason and the commit id).
+    anomalies: Vec<(&'static str, u64, Presented)>,
     dropped: u64,
 }
 
 impl PcDiagLog {
     pub(crate) fn new(file: BufWriter<File>, run_id: String) -> Self {
-        Self { file, run_id, records: Vec::new(), dropped: 0 }
+        Self { file, run_id, records: Vec::new(), anomalies: Vec::new(), dropped: 0 }
     }
 
     fn note(&mut self, commit_id: u64, presented: Presented, t_callback_us: u64) {
@@ -78,12 +81,20 @@ impl PcDiagLog {
         }
     }
 
+    fn note_anomaly(&mut self, reason: &'static str, t_us: u64, raw: Presented) {
+        if self.anomalies.len() < DIAG_MAX_RECORDS {
+            self.anomalies.push((reason, t_us, raw));
+        } else {
+            self.dropped += 1;
+        }
+    }
+
     fn write(mut self, startup: &StartupInfo) -> std::io::Result<(u64, u64)> {
         let raw = |p: &Presented| {
             serde_json::json!({
                 "tv_sec": p.tv_sec, "tv_nsec": p.tv_nsec, "refresh_ns": p.refresh_ns,
                 "seq": p.seq, "flags": p.flags, "flag_names": presentation_flag_names(p.flags),
-                "sync_outputs": p.sync_outputs,
+                "sync_outputs": p.sync_outputs, "sync_output": p.sync_output,
             })
         };
         let header = serde_json::json!({
@@ -97,7 +108,7 @@ impl PcDiagLog {
                 "tv_sec": { "unit": "s", "clock": "the wp_presentation clock_id (verified CLOCK_MONOTONIC at start)", "origin": "presented tv_sec_hi << 32 | tv_sec_lo" },
                 "tv_nsec": { "unit": "ns", "clock": "same", "origin": "presented tv_nsec" },
                 "refresh_ns": { "unit": "ns", "kind": "duration predicted to the next refresh, 0 = unknown", "origin": "presented refresh" },
-                "seq": { "unit": "count", "kind": "MSC refresh counter, not a time", "origin": "presented seq_hi << 32 | seq_lo" },
+                "seq": { "unit": "count", "kind": "the compositor-reported sequence; not assumed to count vblanks, not a time", "origin": "presented seq_hi << 32 | seq_lo" },
                 "flags": { "unit": "bits", "origin": "presented flags (kind)" },
                 "t_callback_us": { "unit": "us", "clock": "CLOCK_MONOTONIC", "origin": "clock read when the event was handled (as in the L2 row)" },
             },
@@ -109,6 +120,10 @@ impl PcDiagLog {
         }
         for (commit_id, p, t_callback_us) in &self.records {
             let row = serde_json::json!({ "role": "presented", "commit_id": commit_id, "t_callback_us": t_callback_us, "raw": raw(p) });
+            writeln!(self.file, "{row}")?;
+        }
+        for (reason, t_us, p) in &self.anomalies {
+            let row = serde_json::json!({ "role": "anomaly", "reason": reason, "t_us": t_us, "raw": raw(p) });
             writeln!(self.file, "{row}")?;
         }
         let records = self.records.len() as u64;
@@ -359,7 +374,9 @@ struct CommitLane {
     /// The clock read before the last compositor call that succeeded.
     last_good_us: u64,
     waiting_for_buffer: bool,
-    outputs_after_deadline: u64,
+    /// Feedback received at or after the close deadline: not accepted, the
+    /// commit stays outstanding (Codex 112 P1).
+    feedback_after_deadline: u64,
     device_failure_discards: u64,
     anomalies: Vec<String>,
     committed_without_feedback_at_close: u64,
@@ -421,44 +438,56 @@ impl CommitLane {
 
     fn apply(&mut self, event: BackendEvent, t_callback_us: u64) {
         let deadline = self.out.shared.close_deadline();
-        match self.engine.on_event(event, t_callback_us) {
-            None => {}
-            Some(EngineOutcome::Output { frame, presented, t_output_us, t_callback_us }) => {
-                if deadline.is_some_and(|d| t_callback_us >= d) {
-                    // Not accepted: it stays unresolved.
-                    self.outputs_after_deadline += 1;
-                    return;
-                }
-                if let Some(diag) = self.diagnostics.as_mut() {
-                    diag.note(frame.commit_id, presented, t_callback_us);
-                }
-                let detail = WaylandOutputDetail {
-                    backend: self.backend_name,
-                    commit_id: frame.commit_id,
-                    buffer: frame.buffer,
-                    timing: frame.timing,
-                    t_commit_us: frame.t_commit_us,
-                    presented,
-                    info: frame.info,
-                };
-                let row = Row::Output {
-                    submission: frame.submission,
-                    t_output_us,
-                    t_callback_us,
-                    detail: OutputDetail::Wayland(Box::new(detail)),
-                };
-                self.out.row(row, t_callback_us);
+        // Codex 112 P1: a feedback received at or after the close deadline is
+        // not accepted AND its commit must stay outstanding, so that the
+        // close check records it as the PC device failure
+        // wayland_feedback_missing. Checked BEFORE the engine resolves
+        // (removes) the commit. Feedback for an unknown or resolved commit
+        // still goes to the engine (an anomaly at its receipt).
+        if let BackendEvent::Presented { commit_id, .. } | BackendEvent::Discarded { commit_id } = &event {
+            if deadline.is_some_and(|d| t_callback_us >= d) && self.engine.is_awaiting(*commit_id) {
+                self.feedback_after_deadline += 1;
+                return;
             }
-            Some(EngineOutcome::Discarded { frame, t_callback_us }) => {
-                self.out.discard_after(frame.submission, DISCARD_COMPOSITOR_DISCARDED, frame.timing.decode_us, t_callback_us);
-            }
-            Some(EngineOutcome::Anomaly { reason, t_us, detail }) => {
-                self.out.shared.fail_occurred(t_us, reason);
-                if self.anomalies.len() < MAX_ANOMALY_DETAILS {
-                    self.anomalies.push(format!("{reason}: {detail}"));
+        }
+        for outcome in self.engine.on_event(event, t_callback_us) {
+            match outcome {
+                EngineOutcome::Output { frame, presented, timing, t_output_us, t_callback_us } => {
+                    if let Some(diag) = self.diagnostics.as_mut() {
+                        diag.note(frame.commit_id, presented, t_callback_us);
+                    }
+                    let detail = WaylandOutputDetail {
+                        backend: self.backend_name,
+                        commit_id: frame.commit_id,
+                        buffer: frame.buffer,
+                        timing: frame.timing,
+                        t_commit_us: frame.t_commit_us,
+                        presented,
+                        presented_timing: timing,
+                        info: frame.info,
+                    };
+                    let row = Row::Output {
+                        submission: frame.submission,
+                        t_output_us,
+                        t_callback_us,
+                        detail: OutputDetail::Wayland(Box::new(detail)),
+                    };
+                    self.out.row(row, t_callback_us);
                 }
+                EngineOutcome::Discarded { frame, t_callback_us } => {
+                    self.out.discard_after(frame.submission, DISCARD_COMPOSITOR_DISCARDED, frame.timing.decode_us, t_callback_us);
+                }
+                EngineOutcome::Anomaly { reason, t_us, detail, raw } => {
+                    self.out.shared.fail_occurred(t_us, reason);
+                    if self.anomalies.len() < MAX_ANOMALY_DETAILS {
+                        self.anomalies.push(format!("{reason}: {detail}"));
+                    }
+                    if let (Some(diag), Some(raw)) = (self.diagnostics.as_mut(), raw) {
+                        diag.note_anomaly(reason, t_us, raw);
+                    }
+                }
+                EngineOutcome::DeviceFailure { reason, detail } => self.device_failure(reason, t_callback_us, detail),
             }
-            Some(EngineOutcome::DeviceFailure { reason, detail }) => self.device_failure(reason, t_callback_us, detail),
         }
     }
 
@@ -543,7 +572,7 @@ impl CommitLane {
             "render_us_max": worker.render_us_max,
             "first_frame_error": worker.first_frame_error,
             "engine": self.engine.stats().to_json(),
-            "outputs_after_deadline": self.outputs_after_deadline,
+            "feedback_after_deadline": self.feedback_after_deadline,
             "discards_not_emitted_after_deadline": worker.discards_not_emitted_after_deadline + self.out.discards_not_emitted_after_deadline,
             "committed_without_feedback_at_close": self.committed_without_feedback_at_close,
             "pending_at_close": self.pending_at_close,
@@ -552,6 +581,7 @@ impl CommitLane {
             "device_failure": self.engine.failure().map_or(serde_json::Value::Null, |f| f.to_json()),
             "row_overflow": worker.row_overflow + self.out.row_overflow,
             "diagnostics": diagnostics,
+            "compositor_log": self.backend.run_log(),
         });
         // The compositor is done with: a blocking hand-off is harmless now.
         let _ = self.out.rows.send(Row::LaneStats { modality: L2Modality::Pc, stats });
@@ -565,38 +595,46 @@ pub(crate) fn wayland_lane_main(
     items: Receiver<SinkMsg>,
     rows: SyncSender<Row>,
     shared: Arc<Shared>,
-    ready: mpsc::Sender<std::result::Result<PcLaneReady, String>>,
+    ready: mpsc::Sender<std::result::Result<PcLaneReady, LaneStartError>>,
     diagnostics: Option<PcDiagLog>,
 ) {
-    let fail = |message: String| {
-        let _ = ready.send(Err(message));
+    let fail = |error: LaneStartError| {
+        let _ = ready.send(Err(error));
     };
     let backend: Box<dyn PresentBackend> = match &cfg.backend {
-        WaylandBackendKind::Display => match WaylandBackend::connect(cfg.buffers, cfg.ready_timeout_us) {
-            Ok(backend) => Box::new(backend),
-            Err(error) => return fail(error),
-        },
+        // The lane's own startup deadline is shorter than the stage's
+        // outer ready timeout, so its stage-specific cause arrives first.
+        WaylandBackendKind::Display => {
+            match WaylandBackend::connect(cfg.buffers, cfg.ready_timeout_us - cfg.ready_timeout_us / 5) {
+                Ok(backend) => Box::new(backend),
+                Err(error) => return fail(error),
+            }
+        }
         WaylandBackendKind::Simulated(sim) => Box::new(SimCompositor::new(sim.clone())),
     };
     let startup = backend.startup().clone();
     // Registration 3-2: clk_id must be CLOCK_MONOTONIC before the first
     // sample, otherwise the run refuses to start (no meta row).
     if startup.clock_id != CLOCK_MONOTONIC_ID {
-        return fail(format!(
-            "wp_presentation clock_id {} is not CLOCK_MONOTONIC ({CLOCK_MONOTONIC_ID}): the run refuses to start",
-            startup.clock_id
+        return fail(LaneStartError::new(
+            "clock",
+            false,
+            format!(
+                "wp_presentation clock_id {} is not CLOCK_MONOTONIC ({CLOCK_MONOTONIC_ID}): the run refuses to start",
+                startup.clock_id
+            ),
         ));
     }
     if startup.buffers != cfg.buffers {
-        return fail(format!("{} buffers instead of {}", startup.buffers, cfg.buffers));
+        return fail(LaneStartError::new("buffers", false, format!("{} buffers instead of {}", startup.buffers, cfg.buffers)));
     }
     let (side, _, _) = canvas_layout(startup.width, startup.height);
     if side == 0 {
-        return fail("the surface has no pixels".into());
+        return fail(LaneStartError::new("configure", false, "the surface has no pixels"));
     }
     let waker = match Waker::new() {
         Ok(waker) => waker,
-        Err(error) => return fail(format!("eventfd: {error}")),
+        Err(error) => return fail(LaneStartError::new("worker", false, format!("eventfd: {error}"))),
     };
     let link = Arc::new(PcLink {
         pending: PendingSlot::new(),
@@ -614,25 +652,24 @@ pub(crate) fn wayland_lane_main(
     };
     let worker = match worker {
         Ok(worker) => worker,
-        Err(error) => return fail(format!("spawn the PC render worker: {error}")),
+        Err(error) => return fail(LaneStartError::new("worker", false, format!("spawn the PC render worker: {error}"))),
     };
     if ready.send(Ok(PcLaneReady { startup: startup.clone(), side })).is_err() {
         // `start` gave up and closed the queue: the worker abandons.
         let _ = worker.join();
         return;
     }
-    let held = startup.held.clone();
     let mut lane = CommitLane {
         backend,
         backend_name: cfg.backend.name(),
-        engine: PresentEngine::new(startup.buffers, &held),
+        engine: PresentEngine::from_startup(&startup),
         link: link.clone(),
         out: RowSink::new(rows, shared),
         side,
         backend_lost: false,
         last_good_us: now_us(),
         waiting_for_buffer: false,
-        outputs_after_deadline: 0,
+        feedback_after_deadline: 0,
         device_failure_discards: 0,
         anomalies: Vec::new(),
         committed_without_feedback_at_close: 0,
@@ -652,4 +689,236 @@ pub(crate) fn wayland_lane_main(
         return; // no counters, no sentinel: fail closed
     }
     lane.finish(&startup, cfg.representation.as_str(), stats);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{writer_loop, L2Identity, L2SinkKind, L2Sinks, L2Summary};
+    use super::*;
+    use crate::l2_pc::{FrameInfo, PcTiming, PendingFrame, SIM_OUTPUT};
+    use std::io::BufWriter as Buf;
+
+    const SINKS: L2Sinks = L2Sinks { pc: L2SinkKind::Wayland, haptic: L2SinkKind::Null };
+
+    /// A backend that does nothing (the tests drive `apply` directly).
+    struct ScriptBackend {
+        startup: StartupInfo,
+    }
+
+    impl PresentBackend for ScriptBackend {
+        fn startup(&self) -> &StartupInfo {
+            &self.startup
+        }
+        fn write_frame(&mut self, _: usize, _: u32, _: &[u32]) -> Result<(), crate::l2_pc::BackendError> {
+            Ok(())
+        }
+        fn commit(&mut self, _: usize, _: u64) -> Result<(), crate::l2_pc::BackendError> {
+            Ok(())
+        }
+        fn wait(&mut self, _: Option<u64>, _: &Waker) -> Result<Vec<BackendEvent>, crate::l2_pc::BackendError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn startup() -> StartupInfo {
+        StartupInfo {
+            backend: "simulated",
+            clock_id: CLOCK_MONOTONIC_ID,
+            width: 64,
+            height: 48,
+            buffers: 4,
+            held: Vec::new(),
+            startup_presented: None,
+            startup_commit_to_presented_us: None,
+            output: Some(SIM_OUTPUT),
+            details: serde_json::Value::Null,
+        }
+    }
+
+    fn lane(rows: SyncSender<Row>, shared: Arc<Shared>, diagnostics: Option<PcDiagLog>) -> CommitLane {
+        let link = Arc::new(PcLink {
+            pending: PendingSlot::new(),
+            waker: Waker::new().unwrap(),
+            pool: PixelPool::new(1),
+            worker_done: AtomicBool::new(true),
+            abandoned: AtomicBool::new(false),
+        });
+        CommitLane {
+            backend: Box::new(ScriptBackend { startup: startup() }),
+            backend_name: "simulated",
+            engine: PresentEngine::from_startup(&startup()),
+            link,
+            out: RowSink::new(rows, shared),
+            side: 48,
+            backend_lost: false,
+            last_good_us: 245,
+            waiting_for_buffer: false,
+            feedback_after_deadline: 0,
+            device_failure_discards: 0,
+            anomalies: Vec::new(),
+            committed_without_feedback_at_close: 0,
+            pending_at_close: false,
+            diagnostics,
+        }
+    }
+
+    fn presented(t_us: u64) -> Presented {
+        Presented {
+            tv_sec: t_us / 1_000_000,
+            tv_nsec: ((t_us % 1_000_000) * 1_000) as u32,
+            refresh_ns: 16_666_667,
+            seq: 1,
+            flags: 0x7,
+            sync_outputs: 1,
+            sync_output: Some(SIM_OUTPUT),
+        }
+    }
+
+    /// The lane's rows plus `End`, through the real writer.
+    fn ledger(rows_rx: Receiver<Row>, shared: Arc<Shared>, name: &str) -> (L2Summary, Vec<serde_json::Value>) {
+        let input: Vec<Row> = rows_rx.try_iter().collect();
+        let (tx, rx) = mpsc::sync_channel(input.len() + 1);
+        for row in input {
+            tx.send(row).unwrap();
+        }
+        tx.send(Row::End).unwrap();
+        drop(tx);
+        let path = std::env::temp_dir().join(format!("skew-pc-lane-{}-{}-{name}.jsonl", std::process::id(), now_us()));
+        let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).unwrap();
+        let summary = writer_loop(Buf::new(file), rx, "l2-test".into(), SINKS, false, shared, 64).unwrap();
+        let rows = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let _ = std::fs::remove_file(&path);
+        (summary, rows)
+    }
+
+    /// Codex 112 P1 regression, deterministic: submit 210, commit 240,
+    /// close deadline 1,000; the feedback (`presented` or `discarded`) is
+    /// handled at deadline-1, deadline, deadline+1, with and without a
+    /// receiver abort at 100. Before the deadline it is the frame's terminal;
+    /// at or after it the feedback is NOT accepted, the commit stays
+    /// outstanding and the close records the PC device failure
+    /// `wayland_feedback_missing` (untimed) — never a timed
+    /// `submitted_unresolved` at 210 that an abort exception could rescue.
+    #[test]
+    fn codex112_feedback_at_or_after_the_deadline_leaves_the_commit_to_the_feedback_missing_check() {
+        for presented_kind in [true, false] {
+            for offset in [-1i64, 0, 1] {
+                for abort in [false, true] {
+                    let case = format!("presented={presented_kind} offset={offset} abort={abort}");
+                    let (rows_tx, rows_rx) = mpsc::sync_channel(64);
+                    let shared = Arc::new(Shared::default());
+                    if abort {
+                        shared.note_receiver_fault(100, "receiver abort");
+                    }
+                    let mut lane = lane(rows_tx.clone(), shared.clone(), None);
+                    let identity = L2Identity {
+                        modality: L2Modality::Pc,
+                        tier: 2,
+                        seq: 3,
+                        pts_us: 100_000,
+                        event_id: 4,
+                        route: None,
+                    };
+                    let s = L2Submission { identity, t_release_us: 200, t_submit_us: 210 };
+                    rows_tx.send(Row::Submit(s)).unwrap();
+                    let frame = PendingFrame {
+                        submission: s,
+                        timing: PcTiming { decode_us: None, t_render_start_us: 220, t_render_end_us: 230 },
+                        info: FrameInfo { points: 1, covered_pixels: 1, depth_scale: 4 },
+                        pixels: Vec::new(),
+                    };
+                    let (commit_id, _) = lane.engine.commit(frame, 1, 240);
+                    shared.finish_start_us.store(500, Ordering::SeqCst);
+                    shared.close_deadline_us.store(1_000, Ordering::SeqCst);
+                    let t_callback = (1_000 + offset) as u64;
+                    let event = if presented_kind {
+                        BackendEvent::Presented { commit_id, presented: presented(300) }
+                    } else {
+                        BackendEvent::Discarded { commit_id }
+                    };
+                    lane.apply(event, t_callback);
+                    lane.finish(&startup(), "bin", WorkerStats::default());
+                    drop(rows_tx);
+                    let (summary, rows) = ledger(rows_rx, shared, "c112-p1");
+                    let end = rows.last().unwrap();
+                    let pc = &end["lanes"]["pc"];
+                    if offset < 0 {
+                        // Accepted: exactly one terminal, nothing missing.
+                        let terminals = rows
+                            .iter()
+                            .filter(|r| r["role"] == "output" || r["role"] == "explicit_discard")
+                            .count();
+                        assert_eq!(terminals, 1, "{case}");
+                        assert_eq!(summary.submitted_unresolved, 0, "{case}");
+                        assert!(pc["device_failure"].is_null(), "{case}");
+                        assert_eq!(pc["feedback_after_deadline"], 0, "{case}");
+                        assert!(summary.integrity_ok(SINKS), "{case}: {summary:?}");
+                    } else {
+                        // Not accepted: no terminal, the commit was outstanding
+                        // at close -> PC device failure, untimed.
+                        assert!(rows.iter().all(|r| r["role"] != "output" && r["role"] != "explicit_discard"), "{case}");
+                        assert_eq!(summary.submitted_unresolved, 1, "{case}");
+                        assert_eq!(summary.first_integrity_failure_reason.as_deref(), Some(FAIL_WAYLAND_FEEDBACK_MISSING), "{case}");
+                        assert_eq!(summary.first_integrity_failure_us, None, "{case}");
+                        assert!(!summary.first_failure_time_determinable, "{case}");
+                        assert_eq!(pc["device_failure"]["reason"], FAIL_WAYLAND_FEEDBACK_MISSING, "{case}");
+                        assert_eq!(pc["committed_without_feedback_at_close"], 1, "{case}");
+                        assert_eq!(pc["feedback_after_deadline"], 1, "{case}");
+                        assert!(!summary.integrity_ok(SINKS), "{case}");
+                    }
+                    assert_eq!(summary.receiver_fault.as_ref().map(|(t, _)| *t), abort.then_some(100), "{case}");
+                }
+            }
+        }
+    }
+
+    /// Codex 112 P2-5: an anomaly's L2 detail carries the reason and the
+    /// commit id only; the raw presentation goes to the probe diagnostics.
+    #[test]
+    fn a_bad_timestamp_keeps_raw_values_out_of_the_l2_jsonl() {
+        let (rows_tx, rows_rx) = mpsc::sync_channel(64);
+        let shared = Arc::new(Shared::default());
+        let diag_path = std::env::temp_dir().join(format!("skew-pc-lane-diag-{}-{}.jsonl", std::process::id(), now_us()));
+        let diag_file = std::fs::OpenOptions::new().write(true).create_new(true).open(&diag_path).unwrap();
+        let diag = PcDiagLog::new(BufWriter::new(diag_file), "t".into());
+        let mut lane = lane(rows_tx.clone(), shared.clone(), Some(diag));
+        let identity = L2Identity { modality: L2Modality::Pc, tier: 2, seq: 1, pts_us: 0, event_id: 1, route: None };
+        let s = L2Submission { identity, t_release_us: 10, t_submit_us: 11 };
+        rows_tx.send(Row::Submit(s)).unwrap();
+        let frame = PendingFrame {
+            submission: s,
+            timing: PcTiming { decode_us: None, t_render_start_us: 12, t_render_end_us: 13 },
+            info: FrameInfo { points: 1, covered_pixels: 1, depth_scale: 4 },
+            pixels: Vec::new(),
+        };
+        let (commit_id, _) = lane.engine.commit(frame, 1, 14);
+        let mut bad = presented(20);
+        bad.tv_nsec = 1_987_654_321;
+        lane.apply(BackendEvent::Presented { commit_id, presented: bad }, 30);
+        lane.finish(&startup(), "bin", WorkerStats::default());
+        drop(rows_tx);
+        let (summary, rows) = ledger(rows_rx, shared, "c112-raw");
+        // The frame has no terminal (its earlier submit is the first timed
+        // failure); the bad timestamp itself is counted and listed.
+        assert!(!summary.integrity_ok(SINKS));
+        assert_eq!(summary.submitted_unresolved, 1);
+        let pc = &rows.last().unwrap()["lanes"]["pc"];
+        assert_eq!(pc["engine"]["bad_timestamps"], 1);
+        assert!(pc["anomalies"][0].as_str().unwrap().starts_with(crate::l2_pc::FAIL_WAYLAND_BAD_TIMESTAMP));
+        let text = rows.iter().map(|r| r.to_string()).collect::<String>();
+        assert!(!text.contains("1987654321"), "no raw tv_nsec anywhere in the L2 JSONL");
+        assert!(rows.last().unwrap()["lanes"]["pc"]["anomalies"][0].as_str().unwrap().contains(&format!("commit {commit_id}")));
+        let diag: Vec<serde_json::Value> = std::fs::read_to_string(&diag_path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let anomaly = diag.iter().find(|r| r["role"] == "anomaly").expect("raw in the diagnostics");
+        assert_eq!(anomaly["raw"]["tv_nsec"], 1_987_654_321u64);
+        let _ = std::fs::remove_file(&diag_path);
+    }
 }

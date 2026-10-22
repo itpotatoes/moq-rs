@@ -1413,6 +1413,30 @@ fn start_l2_output(
     Ok(Some(output))
 }
 
+/// [`start_l2_output`], with a device start failure stamped with where the
+/// receiver started the stage (`before_session`: the static path starts it
+/// before connecting; `after_session_setup`: S3 starts it after SETUP and
+/// the namespace handshake).
+fn start_l2_output_at(
+    args: &Args,
+    logger: &Arc<Mutex<JsonlLogger>>,
+    start_point: &'static str,
+) -> Result<Option<skew_moq::l2_output::L2Output>> {
+    start_l2_output(args, logger).map_err(|error| stamp_l2_start_point(error, start_point))
+}
+
+/// Put the start point into a typed device start failure; any other error
+/// passes unchanged.
+fn stamp_l2_start_point(error: anyhow::Error, start_point: &'static str) -> anyhow::Error {
+    match error.downcast::<skew_moq::l2_output::L2DeviceStartFailure>() {
+        Ok(mut failure) => {
+            failure.receiver_start_point = Some(start_point);
+            anyhow::Error::new(failure)
+        }
+        Err(error) => error,
+    }
+}
+
 fn ensure_l2_distinct_from_rx(rx: (u64, u64), l2: (u64, u64)) -> Result<()> {
     if rx == l2 {
         bail!("--l2-log and --out are the same file (dev {}, ino {})", rx.0, rx.1);
@@ -6784,7 +6808,7 @@ where
     // whole control task (and every drain it spawns) runs inside the L2 fault
     // stamp scope, so a fatal cause is stamped where it is stored. Without L2
     // there is no scope and no stamp.
-    let l2_output = start_l2_output(args, &logger)?;
+    let l2_output = start_l2_output_at(args, &logger, "after_session_setup")?;
     match l2_output.as_ref().map(|output| output.fault_stamp()) {
         Some(stamp) => {
             S3_L2_FAULT
@@ -7856,6 +7880,21 @@ async fn ack_published_namespace(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let result = receiver_main().await;
+    if let Err(error) = &result {
+        // Codex 112 P2-3: a device sink that could not start is reported in
+        // a machine-readable line (no string parsing by the driver) with its
+        // own exit code; `receiver_main` has returned, so its logs are closed.
+        if let Some(failure) = error.downcast_ref::<skew_moq::l2_output::L2DeviceStartFailure>() {
+            eprintln!("{} {}", skew_moq::l2_output::L2_DEVICE_START_FAILURE_PREFIX, failure.to_json());
+            eprintln!("[rx] L2 device start failed: {error:#}");
+            std::process::exit(skew_moq::EXIT_L2_DEVICE_START_FAILED);
+        }
+    }
+    result
+}
+
+async fn receiver_main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -8055,7 +8094,7 @@ async fn main() -> Result<()> {
     // L2 output stage (1-D M1). `--l2-sink none` constructs nothing, so the
     // pre-L2 receiver path is unchanged. S3 owns its own instance inside
     // `run_s3_control`.
-    let mut l2_output = start_l2_output(&args, &logger)?;
+    let mut l2_output = start_l2_output_at(&args, &logger, "before_session")?;
     let l2_submitter = l2_output.as_ref().map(|output| output.submitter());
 
     let receive_trace = args.receive_trace.as_ref()
@@ -16860,6 +16899,39 @@ mod l2_hook_tests {
         }
         assert!(b1_cli(&["--l2-sink", "pc=null,haptic=wayland", "--l2-log", &fresh_s]).is_err());
         assert!(!fresh.exists(), "validation never creates the L2 log");
+    }
+
+    /// Codex 112 P2-3: a device start failure leaves the receiver as a
+    /// typed error stamped with where the stage was started, and `main`
+    /// prints `L2_DEVICE_START_FAILURE {json}` from it (never parsed text).
+    /// Other errors pass unchanged. (No device is opened here.)
+    #[test]
+    fn a_device_start_failure_is_stamped_with_the_start_point() {
+        use skew_moq::l2_output::{L2DeviceStartFailure, L2_DEVICE_START_FAILURE_PREFIX};
+        let failure = L2DeviceStartFailure {
+            track: "pc",
+            sink: "wayland",
+            stage: "startup_present",
+            timed_out: true,
+            ready_timeout_fired: false,
+            lane_exited: true,
+            detail: "timed out".into(),
+            torn_down: None,
+            receiver_start_point: None,
+        };
+        let stamped = stamp_l2_start_point(anyhow::Error::new(failure), "before_session");
+        let typed = stamped.downcast_ref::<L2DeviceStartFailure>().expect("still typed");
+        assert_eq!(typed.receiver_start_point, Some("before_session"));
+        let line = format!("{} {}", L2_DEVICE_START_FAILURE_PREFIX, typed.to_json());
+        let json: serde_json::Value = serde_json::from_str(line.strip_prefix("L2_DEVICE_START_FAILURE ").unwrap()).unwrap();
+        assert_eq!(json["status"], "device_start_failure");
+        assert_eq!((json["track"].as_str(), json["stage"].as_str()), (Some("pc"), Some("startup_present")));
+        assert_eq!((json["timed_out"].as_bool(), json["lane_exited"].as_bool()), (Some(true), Some(true)));
+        assert_eq!(json["receiver_start_point"], "before_session");
+        assert_eq!(skew_moq::EXIT_L2_DEVICE_START_FAILED, 10);
+        let other = stamp_l2_start_point(anyhow::anyhow!("not a device"), "before_session");
+        assert!(other.downcast_ref::<L2DeviceStartFailure>().is_none());
+        assert_eq!(format!("{other}"), "not a device");
     }
 
     /// F2: an existing L2 path (regular file, symlink to the rx log, dangling

@@ -59,6 +59,14 @@ void skew_draco_cloud_free(SkewDracoCloud *cloud);
 // The vendored library's own version string (draco::kDracoVersion).
 const char *skew_draco_version(void);
 
+// The C++ runtime the shim was COMPILED against (header macros, e.g.
+// "libstdc++ _GLIBCXX_RELEASE=15 __GLIBCXX__=20250813").
+const char *skew_draco_cxx_runtime_build(void);
+
+// The shared object the C++ runtime is LOADED from in this process (the
+// dladdr path of std::terminate), or "unknown".
+const char *skew_draco_cxx_runtime_loaded(void);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

@@ -187,6 +187,8 @@ fn main() {
             "fixed_flags": info.fixed_flags,
             "compiler_args": info.compiler_args,
             "rust_opt_level": info.rust_opt_level,
+            "cxx_runtime_build": info.cxx_runtime_build,
+            "cxx_runtime_loaded": info.cxx_runtime_loaded,
             "threads": info.threads,
         },
         "failures": failures.iter().take(50).collect::<Vec<_>>(),

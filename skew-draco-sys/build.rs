@@ -93,15 +93,18 @@ const DRACO_SOURCES: &[&str] = &[
 /// the source file follow them on every compiler command line).
 const FIXED_FLAGS: &[&str] = &["-std=c++17", "-O3", "-DNDEBUG", "-fPIC", "-ffp-contract=off"];
 
-/// Environment variables through which `cc` would append compiler flags.
+/// Environment variables through which `cc` would append compiler flags or
+/// swap the C++ runtime it links (`CXXSTDLIB`).
 fn refused_flag_variables(target: &str) -> Vec<String> {
-    vec![
-        "CXXFLAGS".into(),
-        "TARGET_CXXFLAGS".into(),
-        "HOST_CXXFLAGS".into(),
-        format!("CXXFLAGS_{target}"),
-        format!("CXXFLAGS_{}", target.replace('-', "_")),
-    ]
+    let mut vars = Vec::new();
+    for base in ["CXXFLAGS", "CXXSTDLIB"] {
+        vars.push(base.to_string());
+        vars.push(format!("TARGET_{base}"));
+        vars.push(format!("HOST_{base}"));
+        vars.push(format!("{base}_{target}"));
+        vars.push(format!("{base}_{}", target.replace('-', "_")));
+    }
+    vars
 }
 
 fn collect_files(dir: &Path, root: &Path, out: &mut Vec<String>) {
@@ -163,6 +166,8 @@ fn main() {
     let mut build = cc::Build::new();
     build
         .cpp(true)
+        // Codex 112 P2-2: no flag inherited from RUSTFLAGS either.
+        .inherit_rustflags(false)
         .no_default_flags(true)
         .warnings(false)
         .extra_warnings(false)
@@ -177,14 +182,23 @@ fn main() {
     }
     build.file(root.join("shim/skew_draco_shim.cc"));
 
-    // Record exactly what compiles the sources.
+    // Record exactly what compiles the sources, and refuse ANY argument
+    // outside the allowlist: the three include paths and the fixed flags,
+    // in this order (the per-file `-o <obj> -c <src>` follow them).
     let tool = build.get_compiler();
     let args: Vec<String> = tool.args().iter().map(|a| a.to_string_lossy().into_owned()).collect();
-    for flag in FIXED_FLAGS {
-        assert!(args.iter().any(|a| a == flag), "fixed flag {flag} missing from {args:?}");
+    let mut allowed: Vec<String> = Vec::new();
+    for dir in [root.join("vendor/gen"), draco.join("src"), root.join("shim")] {
+        allowed.push("-I".into());
+        allowed.push(dir.to_str().expect("UTF-8 include path").to_string());
     }
-    for forbidden in ["-march=native", "-ffast-math", "-Ofast", "-ffp-contract=fast"] {
-        assert!(!args.iter().any(|a| a == forbidden), "{forbidden} in {args:?}");
+    allowed.extend(FIXED_FLAGS.iter().map(|f| f.to_string()));
+    if args != allowed {
+        let extra: Vec<&String> = args.iter().filter(|a| !allowed.contains(a)).collect();
+        let missing: Vec<&String> = allowed.iter().filter(|a| !args.contains(a)).collect();
+        panic!(
+            "skew-draco-sys: the compiler arguments are not exactly the registered ones\n  got:     {args:?}\n  allowed: {allowed:?}\n  extra:   {extra:?}\n  missing: {missing:?}"
+        );
     }
     let version = std::process::Command::new(tool.path())
         .arg("--version")

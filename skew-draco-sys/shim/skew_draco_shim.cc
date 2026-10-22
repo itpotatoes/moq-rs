@@ -2,6 +2,8 @@
 
 #include "skew_draco_shim.h"
 
+#include <dlfcn.h>
+
 #include <cstring>
 #include <exception>
 #include <memory>
@@ -155,3 +157,25 @@ extern "C" void skew_draco_cloud_free(SkewDracoCloud *cloud) {
 }
 
 extern "C" const char *skew_draco_version(void) { return draco::kDracoVersion; }
+
+#define SKEW_STR2(x) #x
+#define SKEW_STR(x) SKEW_STR2(x)
+
+extern "C" const char *skew_draco_cxx_runtime_build(void) {
+#if defined(_GLIBCXX_RELEASE) && defined(__GLIBCXX__)
+  return "libstdc++ _GLIBCXX_RELEASE=" SKEW_STR(_GLIBCXX_RELEASE) " __GLIBCXX__=" SKEW_STR(__GLIBCXX__);
+#elif defined(_LIBCPP_VERSION)
+  return "libc++ _LIBCPP_VERSION=" SKEW_STR(_LIBCPP_VERSION);
+#else
+  return "unknown";
+#endif
+}
+
+extern "C" const char *skew_draco_cxx_runtime_loaded(void) {
+  Dl_info info;
+  void (*terminate)() noexcept = &std::terminate;
+  if (dladdr(reinterpret_cast<void *>(terminate), &info) != 0 && info.dli_fname != nullptr) {
+    return info.dli_fname;
+  }
+  return "unknown";
+}

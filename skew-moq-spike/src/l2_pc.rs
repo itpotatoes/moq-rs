@@ -31,6 +31,13 @@
 //! * [`PresentBackend`]: the compositor interface — the real Wayland client
 //!   (`crate::l2_wayland`) or [`SimCompositor`] (tests, never a device
 //!   output).
+//! * Presentation times only (v1.5): the compositor's `seq` is kept raw and
+//!   is NOT read as a vblank counter; missed refreshes are derived from the
+//!   presentation timestamps ([`PresentedTiming`]: the delta to the
+//!   previous output and the refresh index since the startup frame). Every
+//!   output records the `sync_output` it was presented on; a frame
+//!   presented on another output than the single output of the startup is
+//!   a PC device failure (the run never presents across outputs).
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -199,6 +206,8 @@ pub fn decoder_meta(representation: PcRepresentation) -> serde_json::Value {
                 "fixed_flags": info.fixed_flags,
                 "compiler_args": info.compiler_args,
                 "record_conversion_rust_opt_level": info.rust_opt_level,
+                "cxx_runtime_build": info.cxx_runtime_build,
+                "cxx_runtime_loaded": info.cxx_runtime_loaded,
                 "threads": info.threads,
                 "rounding": info.rounding,
                 "placement": "decoded in the PC render worker thread after release (registration 3-2), one frame at a time in release order",
@@ -500,18 +509,21 @@ impl Waker {
 
 // ---- presentation feedback ----------------------------------------------------
 
-/// The raw `wp_presentation_feedback.presented` values (+ the number of
-/// `sync_output` events before it).
+/// The raw `wp_presentation_feedback.presented` values, the number of
+/// `sync_output` events before it and the first of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Presented {
     pub tv_sec: u64,
     pub tv_nsec: u32,
     /// Nanoseconds; 0 = unknown.
     pub refresh_ns: u32,
-    /// The 64-bit MSC (`seq_hi << 32 | seq_lo`).
+    /// `seq_hi << 32 | seq_lo` exactly as the compositor reported it. Its
+    /// meaning is the compositor's; it is NOT assumed to count vblanks.
     pub seq: u64,
     pub flags: u32,
     pub sync_outputs: u32,
+    /// Registry (global) name of the output of the first `sync_output`.
+    pub sync_output: Option<u32>,
 }
 
 impl Presented {
@@ -531,6 +543,28 @@ impl Presented {
     }
 }
 
+/// Refresh facts of one `output` derived from presentation TIMES (v1.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PresentedTiming {
+    /// `t_output_us` minus the `t_output_us` of the previous output this
+    /// lane handled (arrival order); `None` for the first.
+    pub presented_delta_us: Option<i64>,
+    /// [`refresh_index`] of `t_output_us` from the startup presentation.
+    pub refresh_index: Option<i64>,
+}
+
+/// `round_half_away((t_us − origin_us) × 1000 / refresh_ns)`: the number of
+/// refresh periods (the presented event's own `refresh`) between the origin
+/// and `t_us`, in signed integer arithmetic; `None` when the refresh is
+/// unknown (0).
+pub fn refresh_index(t_us: u64, origin_us: u64, refresh_ns: u32) -> Option<i64> {
+    if refresh_ns == 0 {
+        return None;
+    }
+    let delta_ns = (t_us as i128 - origin_us as i128) * 1_000;
+    Some(crate::l2_haptic::div_round_half_away(delta_ns, refresh_ns as i128) as i64)
+}
+
 // ---- the compositor interface -------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq)]
@@ -542,7 +576,8 @@ pub enum BackendEvent {
     /// `wl_buffer.release`.
     BufferReleased { buffer: usize },
     /// After ready: a configure that changes the size or drops fullscreen,
-    /// or an output mode change.
+    /// the surface entering or leaving an output, a scale or output mode
+    /// change, or the startup output's removal.
     Reconfigured { detail: String },
     /// `xdg_toplevel.close`.
     Closed,
@@ -572,10 +607,13 @@ pub struct StartupInfo {
     pub buffers: usize,
     /// Buffers the startup commit still holds: `(buffer, startup commit id)`.
     pub held: Vec<(usize, u64)>,
-    /// The startup frame's presentation (not a ledger row).
+    /// The startup frame's presentation (not a ledger row); its time is
+    /// the origin of every output's `refresh_index`.
     pub startup_presented: Option<Presented>,
     pub startup_commit_to_presented_us: Option<i64>,
-    /// Backend-specific facts (globals, outputs, display name).
+    /// The single output (registry name) the surface was on at ready.
+    pub output: Option<u32>,
+    /// Backend-specific facts (globals, outputs, configures, display name).
     pub details: serde_json::Value,
 }
 
@@ -585,10 +623,11 @@ impl StartupInfo {
             serde_json::json!({
                 "t_presented_us": p.t_us(),
                 "refresh_us": p.refresh_us(),
-                "msc": p.seq,
+                "presentation_seq": p.seq,
                 "flags": p.flags,
                 "flag_names": presentation_flag_names(p.flags),
                 "sync_outputs": p.sync_outputs,
+                "sync_output": p.sync_output,
                 "commit_to_presented_us": self.startup_commit_to_presented_us,
             })
         });
@@ -600,6 +639,7 @@ impl StartupInfo {
             "surface_height": self.height,
             "buffers": self.buffers,
             "startup_presentation": presented,
+            "output": self.output,
             "details": self.details,
         })
     }
@@ -618,6 +658,12 @@ pub trait PresentBackend {
     /// Block until compositor events, a wake-up, or `until_us`; return the
     /// events (possibly none).
     fn wait(&mut self, until_us: Option<u64>, waker: &Waker) -> Result<Vec<BackendEvent>, BackendError>;
+    /// What the backend saw during the run besides ledger events (every
+    /// configure with its states, surface enter/leave, scale and mode
+    /// changes), for the sentinel's `lanes.pc.compositor_log`.
+    fn run_log(&self) -> serde_json::Value {
+        serde_json::Value::Null
+    }
 }
 
 // ---- the commit-side state machine --------------------------------------------
@@ -642,11 +688,13 @@ pub struct CommittedFrame {
 #[derive(Debug, Clone)]
 pub enum EngineOutcome {
     /// `presented`: the frame's `output`.
-    Output { frame: CommittedFrame, presented: Presented, t_output_us: u64, t_callback_us: u64 },
+    Output { frame: CommittedFrame, presented: Presented, timing: PresentedTiming, t_output_us: u64, t_callback_us: u64 },
     /// `discarded`: the frame's after-submit `compositor_discarded`.
     Discarded { frame: CommittedFrame, t_callback_us: u64 },
-    /// A timed integrity failure at its receipt.
-    Anomaly { reason: &'static str, t_us: u64, detail: String },
+    /// A timed integrity failure at its receipt. `detail` carries reasons
+    /// and ids only; a raw presentation behind it is in `raw` (probe
+    /// diagnostics only, never the L2 JSONL).
+    Anomaly { reason: &'static str, t_us: u64, detail: String, raw: Option<Presented> },
     /// A PC device failure (untimed).
     DeviceFailure { reason: &'static str, detail: String },
 }
@@ -685,6 +733,8 @@ pub struct EngineStats {
     pub unexpected_feedback: u64,
     pub unexpected_frame_callbacks: u64,
     pub bad_timestamps: u64,
+    /// Presented frames whose sync_output is not the startup output.
+    pub foreign_output_presentations: u64,
     pub commit_waits_for_buffer: u64,
     pub max_commit_to_presented_us: Option<i64>,
     pub max_commit_to_frame_callback_us: Option<u64>,
@@ -710,6 +760,7 @@ impl EngineStats {
             "unexpected_feedback": self.unexpected_feedback,
             "unexpected_frame_callbacks": self.unexpected_frame_callbacks,
             "bad_timestamps": self.bad_timestamps,
+            "foreign_output_presentations": self.foreign_output_presentations,
             "commit_waits_for_buffer": self.commit_waits_for_buffer,
             "max_commit_to_presented_us": self.max_commit_to_presented_us,
             "max_commit_to_frame_callback_us": self.max_commit_to_frame_callback_us,
@@ -731,6 +782,11 @@ pub struct PresentEngine {
     frame_callback: Option<(u64, u64)>,
     failure: Option<PcDeviceFailure>,
     stats: EngineStats,
+    /// The startup presentation time: origin of `refresh_index`.
+    origin_us: Option<u64>,
+    /// The single output of the startup (registry name).
+    output: Option<u32>,
+    last_presented_us: Option<u64>,
 }
 
 /// The first commit id of ledger frames (ids below it belong to startup).
@@ -752,7 +808,31 @@ impl PresentEngine {
             frame_callback: None,
             failure: None,
             stats: EngineStats::default(),
+            origin_us: None,
+            output: None,
+            last_presented_us: None,
         }
+    }
+
+    /// The engine of a started backend: its buffers (and those the startup
+    /// frame holds), the refresh-index origin and the startup output.
+    pub fn from_startup(startup: &StartupInfo) -> Self {
+        Self::new(startup.buffers, &startup.held).with_reference(
+            startup.startup_presented.and_then(|p| p.t_us()),
+            startup.output,
+        )
+    }
+
+    /// Set the refresh-index origin and the expected output.
+    pub fn with_reference(mut self, origin_us: Option<u64>, output: Option<u32>) -> Self {
+        self.origin_us = origin_us;
+        self.output = output;
+        self
+    }
+
+    /// Whether `commit_id` is committed and still waits for its feedback.
+    pub fn is_awaiting(&self, commit_id: u64) -> bool {
+        self.committed.contains_key(&commit_id)
     }
 
     pub fn stats(&self) -> &EngineStats {
@@ -821,7 +901,9 @@ impl PresentEngine {
         }
     }
 
-    pub fn on_event(&mut self, event: BackendEvent, t_callback_us: u64) -> Option<EngineOutcome> {
+    /// The outcomes of one compositor event, in order (a presented frame on
+    /// a foreign output gives its `output` and then a device failure).
+    pub fn on_event(&mut self, event: BackendEvent, t_callback_us: u64) -> Vec<EngineOutcome> {
         match event {
             BackendEvent::FrameDone { commit_id } => match self.frame_callback {
                 Some((outstanding, t_commit_us)) if outstanding == commit_id => {
@@ -830,35 +912,39 @@ impl PresentEngine {
                     let wait = t_callback_us.saturating_sub(t_commit_us);
                     self.stats.max_commit_to_frame_callback_us =
                         Some(self.stats.max_commit_to_frame_callback_us.map_or(wait, |m| m.max(wait)));
-                    None
+                    Vec::new()
                 }
                 _ => {
                     self.stats.unexpected_frame_callbacks += 1;
-                    Some(EngineOutcome::Anomaly {
+                    vec![EngineOutcome::Anomaly {
                         reason: FAIL_WAYLAND_UNEXPECTED_FRAME_CALLBACK,
                         t_us: t_callback_us,
                         detail: self.unknown_detail("frame callback", commit_id),
-                    })
+                        raw: None,
+                    }]
                 }
             },
             BackendEvent::Presented { commit_id, presented } => {
                 let Some(frame) = self.committed.remove(&commit_id) else {
                     self.stats.unexpected_feedback += 1;
-                    return Some(EngineOutcome::Anomaly {
+                    return vec![EngineOutcome::Anomaly {
                         reason: FAIL_WAYLAND_UNEXPECTED_FEEDBACK,
                         t_us: t_callback_us,
                         detail: self.unknown_detail("presented", commit_id),
-                    });
+                        raw: Some(presented),
+                    }];
                 };
                 let Some(t_output_us) = presented.t_us() else {
                     // The feedback came but carries no usable time: the
-                    // frame gets no terminal (it stays unresolved).
+                    // frame gets no terminal (it stays unresolved). The raw
+                    // values go to the probe diagnostics only.
                     self.stats.bad_timestamps += 1;
-                    return Some(EngineOutcome::Anomaly {
+                    return vec![EngineOutcome::Anomaly {
                         reason: FAIL_WAYLAND_BAD_TIMESTAMP,
                         t_us: t_callback_us,
-                        detail: format!("presented tv_nsec {} for commit {commit_id}", presented.tv_nsec),
-                    });
+                        detail: format!("presented with an invalid timestamp for commit {commit_id}"),
+                        raw: Some(presented),
+                    }];
                 };
                 self.stats.presented += 1;
                 let latency = t_output_us as i64 - frame.t_commit_us as i64;
@@ -868,20 +954,36 @@ impl PresentEngine {
                 self.stats.refresh_us_min = Some(self.stats.refresh_us_min.map_or(refresh, |m| m.min(refresh)));
                 self.stats.refresh_us_max = Some(self.stats.refresh_us_max.map_or(refresh, |m| m.max(refresh)));
                 *self.stats.flags_counts.entry(presented.flags).or_default() += 1;
-                Some(EngineOutcome::Output { frame, presented, t_output_us, t_callback_us })
+                let timing = PresentedTiming {
+                    presented_delta_us: self.last_presented_us.map(|last| t_output_us as i64 - last as i64),
+                    refresh_index: self.origin_us.and_then(|origin| refresh_index(t_output_us, origin, presented.refresh_ns)),
+                };
+                self.last_presented_us = Some(t_output_us);
+                let mut outcomes = vec![EngineOutcome::Output { frame, presented, timing, t_output_us, t_callback_us }];
+                if let (Some(expected), Some(actual)) = (self.output, presented.sync_output) {
+                    if actual != expected {
+                        self.stats.foreign_output_presentations += 1;
+                        outcomes.push(EngineOutcome::DeviceFailure {
+                            reason: FAIL_WAYLAND_RECONFIGURED,
+                            detail: format!("commit {commit_id} presented on output {actual}, not on the startup output {expected}"),
+                        });
+                    }
+                }
+                outcomes
             }
             BackendEvent::Discarded { commit_id } => match self.committed.remove(&commit_id) {
                 Some(frame) => {
                     self.stats.compositor_discarded += 1;
-                    Some(EngineOutcome::Discarded { frame, t_callback_us })
+                    vec![EngineOutcome::Discarded { frame, t_callback_us }]
                 }
                 None => {
                     self.stats.unexpected_feedback += 1;
-                    Some(EngineOutcome::Anomaly {
+                    vec![EngineOutcome::Anomaly {
                         reason: FAIL_WAYLAND_UNEXPECTED_FEEDBACK,
                         t_us: t_callback_us,
                         detail: self.unknown_detail("discarded", commit_id),
-                    })
+                        raw: None,
+                    }]
                 }
             },
             BackendEvent::BufferReleased { buffer } => {
@@ -893,15 +995,15 @@ impl PresentEngine {
                     // Not evidence of anything; counted, never acted on.
                     _ => self.stats.unexpected_buffer_releases += 1,
                 }
-                None
+                Vec::new()
             }
             BackendEvent::Reconfigured { detail } => {
-                Some(EngineOutcome::DeviceFailure { reason: FAIL_WAYLAND_RECONFIGURED, detail })
+                vec![EngineOutcome::DeviceFailure { reason: FAIL_WAYLAND_RECONFIGURED, detail }]
             }
-            BackendEvent::Closed => Some(EngineOutcome::DeviceFailure {
+            BackendEvent::Closed => vec![EngineOutcome::DeviceFailure {
                 reason: FAIL_WAYLAND_WINDOW_CLOSED,
                 detail: "xdg_toplevel.close".into(),
-            }),
+            }],
         }
     }
 
@@ -933,7 +1035,16 @@ pub enum SimWaylandFault {
     Reconfigure { after_start_us: u64 },
     /// No buffer is ever released.
     NeverRelease,
+    /// This commit is presented (and its frame callback fires) only
+    /// `extra_vblanks` refreshes later than normal: a compositor stall.
+    Stall { commit_id: u64, extra_vblanks: u64 },
+    /// This commit is presented on another output ([`SIM_OTHER_OUTPUT`]).
+    PresentOnOtherOutput { commit_id: u64 },
 }
+
+/// Registry names of the simulated outputs.
+pub const SIM_OUTPUT: u32 = 1;
+pub const SIM_OTHER_OUTPUT: u32 = 2;
 
 /// What a simulated compositor observed (shared with the test).
 #[derive(Debug, Default)]
@@ -998,6 +1109,16 @@ impl SimCompositor {
         if let Some(first) = held.first_mut() {
             *first = true;
         }
+        // The startup frame is "presented" at the startup instant (vblank 0).
+        let startup_presented = Presented {
+            tv_sec: t_start_us / 1_000_000,
+            tv_nsec: ((t_start_us % 1_000_000) * 1_000) as u32,
+            refresh_ns: (cfg.refresh_us * 1_000) as u32,
+            seq: 0,
+            flags: cfg.flags,
+            sync_outputs: 1,
+            sync_output: Some(SIM_OUTPUT),
+        };
         let startup = StartupInfo {
             backend: "simulated",
             clock_id: cfg.clock_id,
@@ -1005,8 +1126,9 @@ impl SimCompositor {
             height: cfg.height,
             buffers: cfg.buffers,
             held: if cfg.buffers > 0 { vec![(0, 0)] } else { Vec::new() },
-            startup_presented: None,
-            startup_commit_to_presented_us: None,
+            startup_presented: Some(startup_presented),
+            startup_commit_to_presented_us: Some(0),
+            output: Some(SIM_OUTPUT),
             details: serde_json::json!({ "refresh_us": cfg.refresh_us, "flags": cfg.flags }),
         };
         Self {
@@ -1052,9 +1174,19 @@ impl SimCompositor {
         self.t_start_us + k * self.cfg.refresh_us
     }
 
+    /// The vblank at which a commit made at `t` is handled (later for a
+    /// stalled commit).
+    fn vblank_for(&self, commit_id: u64, t: u64) -> u64 {
+        let extra = self.cfg.faults.iter().find_map(|f| match f {
+            SimWaylandFault::Stall { commit_id: id, extra_vblanks } if *id == commit_id => Some(*extra_vblanks),
+            _ => None,
+        });
+        self.vblank_after(t) + extra.unwrap_or(0) * self.cfg.refresh_us
+    }
+
     fn process_vblanks(&mut self, now: u64) {
-        while let Some(&(_, _, t_first)) = self.queued.first() {
-            let vblank = self.vblank_after(t_first);
+        while let Some(&(first_id, _, t_first)) = self.queued.first() {
+            let vblank = self.vblank_for(first_id, t_first);
             if vblank > now {
                 break;
             }
@@ -1063,6 +1195,7 @@ impl SimCompositor {
             let last = due.len() - 1;
             for (i, &(commit_id, buffer, _)) in due.iter().enumerate() {
                 self.events.push_back(BackendEvent::FrameDone { commit_id });
+                let other = self.fault(|f| *f == SimWaylandFault::PresentOnOtherOutput { commit_id });
                 let presented = Presented {
                     tv_sec: vblank / 1_000_000,
                     tv_nsec: ((vblank % 1_000_000) * 1_000) as u32,
@@ -1070,6 +1203,7 @@ impl SimCompositor {
                     seq: (vblank - self.t_start_us) / self.cfg.refresh_us,
                     flags: self.cfg.flags,
                     sync_outputs: 1,
+                    sync_output: Some(if other { SIM_OTHER_OUTPUT } else { SIM_OUTPUT }),
                 };
                 let shown = i == last;
                 if self.fault(|f| *f == SimWaylandFault::DropFeedback { commit_id }) {
@@ -1107,7 +1241,7 @@ impl SimCompositor {
     }
 
     fn next_due(&self) -> Option<u64> {
-        let vblank = self.queued.first().map(|&(_, _, t)| self.vblank_after(t));
+        let vblank = self.queued.first().map(|&(id, _, t)| self.vblank_for(id, t));
         let reconfigure = self.reconfigure_at().filter(|_| !self.reconfigure_sent);
         [vblank, reconfigure, self.disconnect_at()].into_iter().flatten().min()
     }
@@ -1168,6 +1302,10 @@ impl PresentBackend for SimCompositor {
             }
         }
     }
+
+    fn run_log(&self) -> serde_json::Value {
+        serde_json::json!({ "backend": "simulated", "reconfigure_sent": self.reconfigure_sent })
+    }
 }
 
 #[cfg(test)]
@@ -1200,7 +1338,15 @@ mod tests {
             seq: 42,
             flags: PRESENTATION_VSYNC | PRESENTATION_HW_CLOCK | PRESENTATION_HW_COMPLETION,
             sync_outputs: 1,
+            sync_output: Some(SIM_OUTPUT),
         }
+    }
+
+    /// One event with at most one outcome (the single-outcome cases).
+    fn on(e: &mut PresentEngine, event: BackendEvent, t_us: u64) -> Option<EngineOutcome> {
+        let mut outcomes = e.on_event(event, t_us);
+        assert!(outcomes.len() <= 1, "{outcomes:?}");
+        outcomes.pop()
     }
 
     fn tiers_meta() -> TierScales {
@@ -1212,7 +1358,7 @@ mod tests {
 
     #[test]
     fn presentation_time_is_truncated_to_integer_microseconds() {
-        let p = Presented { tv_sec: 12, tv_nsec: 345_678_999, refresh_ns: 16_666_667, seq: 1, flags: 0, sync_outputs: 0 };
+        let p = Presented { tv_sec: 12, tv_nsec: 345_678_999, refresh_ns: 16_666_667, seq: 1, flags: 0, sync_outputs: 0, sync_output: None };
         assert_eq!(p.t_us(), Some(12_345_678));
         assert_eq!(p.refresh_us(), 16_666);
         assert_eq!(Presented { tv_nsec: 1_000_000_000, ..p }.t_us(), None);
@@ -1336,11 +1482,11 @@ mod tests {
         assert!(matches!(slot.offer(frame(2)), Offer::Accepted { superseded: None }), "B released meanwhile");
         assert!(!e.commit_opportunity(), "A's frame callback has not fired");
         // A's buffer is released before its feedback: no terminal.
-        assert!(e.on_event(BackendEvent::BufferReleased { buffer: 1 }, 5_500).is_none());
+        assert!(on(&mut e, BackendEvent::BufferReleased { buffer: 1 }, 5_500).is_none());
         assert_eq!(e.awaiting_feedback(), 1);
-        assert!(e.on_event(BackendEvent::FrameDone { commit_id: a }, 6_000).is_none(), "a frame callback is no output");
+        assert!(on(&mut e, BackendEvent::FrameDone { commit_id: a }, 6_000).is_none(), "a frame callback is no output");
         assert_eq!(e.awaiting_feedback(), 1);
-        assert_eq!(output_of(e.on_event(BackendEvent::Presented { commit_id: a, presented: presented(5_900) }, 6_100)), (1, 5_900, 6_100));
+        assert_eq!(output_of(on(&mut e, BackendEvent::Presented { commit_id: a, presented: presented(5_900) }, 6_100)), (1, 5_900, 6_100));
         assert!(e.commit_opportunity());
         let b = slot.take().unwrap();
         assert_eq!(b.submission.identity.seq, 2);
@@ -1354,12 +1500,12 @@ mod tests {
     fn reversed_feedback_order_is_resolved_by_commit_id() {
         let mut e = engine();
         let (a, _) = e.commit(frame(1), 1, 1_000);
-        e.on_event(BackendEvent::FrameDone { commit_id: a }, 1_100);
+        on(&mut e, BackendEvent::FrameDone { commit_id: a }, 1_100);
         let (b, _) = e.commit(frame(2), 2, 1_200);
-        e.on_event(BackendEvent::FrameDone { commit_id: b }, 1_300);
+        on(&mut e, BackendEvent::FrameDone { commit_id: b }, 1_300);
         assert_eq!(e.awaiting_feedback(), 2);
-        assert_eq!(output_of(e.on_event(BackendEvent::Presented { commit_id: b, presented: presented(1_400) }, 1_450)).0, 2);
-        assert_eq!(output_of(e.on_event(BackendEvent::Presented { commit_id: a, presented: presented(1_350) }, 1_500)).0, 1);
+        assert_eq!(output_of(on(&mut e, BackendEvent::Presented { commit_id: b, presented: presented(1_400) }, 1_450)).0, 2);
+        assert_eq!(output_of(on(&mut e, BackendEvent::Presented { commit_id: a, presented: presented(1_350) }, 1_500)).0, 1);
         assert_eq!(e.awaiting_feedback(), 0);
     }
 
@@ -1367,7 +1513,7 @@ mod tests {
     fn a_compositor_discard_terminates_that_commit() {
         let mut e = engine();
         let (a, _) = e.commit(frame(7), 1, 1_000);
-        match e.on_event(BackendEvent::Discarded { commit_id: a }, 1_234) {
+        match on(&mut e, BackendEvent::Discarded { commit_id: a }, 1_234) {
             Some(EngineOutcome::Discarded { frame, t_callback_us }) => {
                 assert_eq!((frame.submission.identity.seq, t_callback_us), (7, 1_234));
             }
@@ -1382,14 +1528,14 @@ mod tests {
     fn duplicate_and_unknown_callbacks_are_anomalies() {
         let mut e = engine();
         let (a, _) = e.commit(frame(1), 1, 1_000);
-        output_of(e.on_event(BackendEvent::Presented { commit_id: a, presented: presented(1_100) }, 1_200));
+        output_of(on(&mut e, BackendEvent::Presented { commit_id: a, presented: presented(1_100) }, 1_200));
         for (event, reason, detail) in [
             (BackendEvent::Presented { commit_id: a, presented: presented(1_100) }, FAIL_WAYLAND_UNEXPECTED_FEEDBACK, "already resolved"),
             (BackendEvent::Discarded { commit_id: 99 }, FAIL_WAYLAND_UNEXPECTED_FEEDBACK, "never committed"),
             (BackendEvent::FrameDone { commit_id: 99 }, FAIL_WAYLAND_UNEXPECTED_FRAME_CALLBACK, "never committed"),
         ] {
-            match e.on_event(event, 2_000) {
-                Some(EngineOutcome::Anomaly { reason: r, t_us, detail: d }) => {
+            match on(&mut e, event, 2_000) {
+                Some(EngineOutcome::Anomaly { reason: r, t_us, detail: d, .. }) => {
                     assert_eq!((r, t_us), (reason, 2_000));
                     assert!(d.contains(detail), "{d}");
                 }
@@ -1397,16 +1543,71 @@ mod tests {
             }
         }
         // The real callback still clears the outstanding one.
-        assert!(e.on_event(BackendEvent::FrameDone { commit_id: a }, 2_100).is_none());
-        assert!(e.on_event(BackendEvent::FrameDone { commit_id: a }, 2_200).is_some(), "a second done is unexpected");
+        assert!(on(&mut e, BackendEvent::FrameDone { commit_id: a }, 2_100).is_none());
+        assert!(on(&mut e, BackendEvent::FrameDone { commit_id: a }, 2_200).is_some(), "a second done is unexpected");
         // A presented with an invalid timestamp: anomaly, no terminal.
         let (b, _) = e.commit(frame(2), e.free_buffer().unwrap(), 3_000);
         let mut bad = presented(3_100);
-        bad.tv_nsec = 1_000_000_000;
-        assert!(matches!(
-            e.on_event(BackendEvent::Presented { commit_id: b, presented: bad }, 3_200),
-            Some(EngineOutcome::Anomaly { reason: FAIL_WAYLAND_BAD_TIMESTAMP, .. })
-        ));
+        bad.tv_nsec = 1_234_567_891;
+        match on(&mut e, BackendEvent::Presented { commit_id: b, presented: bad }, 3_200) {
+            Some(EngineOutcome::Anomaly { reason: FAIL_WAYLAND_BAD_TIMESTAMP, detail, raw, .. }) => {
+                // Codex 112 P2-5: reason and commit id only; the raw value
+                // travels apart (probe diagnostics), never in the detail.
+                assert_eq!(detail, format!("presented with an invalid timestamp for commit {b}"));
+                assert!(!detail.contains("1234567891"));
+                assert_eq!(raw.map(|r| r.tv_nsec), Some(1_234_567_891));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(!e.is_awaiting(b), "no terminal, but no longer awaited either");
+    }
+
+    /// Codex 112 / M3b: missed refreshes come from presentation TIMES —
+    /// the delta to the previous output and the refresh index since the
+    /// startup presentation (refresh from the event, rounding half away) —
+    /// never from the compositor's seq, which is kept raw.
+    #[test]
+    fn refresh_steps_come_from_presentation_times_not_from_seq() {
+        assert_eq!(refresh_index(1_000_000 + 16_667, 1_000_000, 16_666_667), Some(1));
+        assert_eq!(refresh_index(1_000_000 + 100_000, 1_000_000, 16_666_667), Some(6));
+        assert_eq!(refresh_index(1_000_000 + 8_333, 1_000_000, 16_666_667), Some(0), "8,333,000 / 16,666,667 < 0.5");
+        assert_eq!(refresh_index(1_000_000 + 8_334, 1_000_000, 16_666_667), Some(1));
+        assert_eq!(refresh_index(1_000_000 - 16_667, 1_000_000, 16_666_667), Some(-1));
+        assert_eq!(refresh_index(5, 1, 0), None, "unknown refresh");
+        let mut e = engine().with_reference(Some(1_000_000), Some(SIM_OUTPUT));
+        let mut seq_one = |t_us: u64| Presented { seq: 1, ..presented(t_us) };
+        let (a, _) = e.commit(frame(1), 1, 1_010_000);
+        let first = on(&mut e, BackendEvent::Presented { commit_id: a, presented: seq_one(1_016_667) }, 1_017_000);
+        let Some(EngineOutcome::Output { timing, presented, .. }) = first else { panic!("{first:?}") };
+        assert_eq!(timing, PresentedTiming { presented_delta_us: None, refresh_index: Some(1) });
+        assert_eq!(presented.seq, 1, "kept raw");
+        on(&mut e, BackendEvent::FrameDone { commit_id: a }, 1_017_100);
+        let (b, _) = e.commit(frame(2), 2, 1_020_000);
+        // Six refreshes later, the same seq step of 1.
+        let second = on(&mut e, BackendEvent::Presented { commit_id: b, presented: seq_one(1_116_667) }, 1_117_000);
+        let Some(EngineOutcome::Output { timing, .. }) = second else { panic!("{second:?}") };
+        assert_eq!(timing, PresentedTiming { presented_delta_us: Some(100_000), refresh_index: Some(7) });
+    }
+
+    /// A frame presented on another output than the startup output: its
+    /// output row is kept, followed by a PC device failure.
+    #[test]
+    fn a_presentation_on_a_foreign_output_is_kept_and_fails_the_pc_device() {
+        let mut e = engine().with_reference(Some(1_000), Some(SIM_OUTPUT));
+        let (a, _) = e.commit(frame(1), 1, 2_000);
+        let mut p = presented(3_000);
+        p.sync_output = Some(SIM_OTHER_OUTPUT);
+        let outcomes = e.on_event(BackendEvent::Presented { commit_id: a, presented: p }, 3_100);
+        assert_eq!(outcomes.len(), 2, "{outcomes:?}");
+        assert!(matches!(outcomes[0], EngineOutcome::Output { .. }));
+        match &outcomes[1] {
+            EngineOutcome::DeviceFailure { reason, detail } => {
+                assert_eq!(*reason, FAIL_WAYLAND_RECONFIGURED);
+                assert!(detail.contains("output 2") && detail.contains("startup output 1"), "{detail}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(e.stats().foreign_output_presentations, 1);
     }
 
     /// A buffer the compositor holds is never chosen: with every buffer
@@ -1415,18 +1616,18 @@ mod tests {
     fn held_buffers_are_never_reused() {
         let mut e = PresentEngine::new(2, &[(0, 0)]);
         let (a, _) = e.commit(frame(1), e.free_buffer().unwrap(), 1_000);
-        e.on_event(BackendEvent::FrameDone { commit_id: a }, 1_100);
+        on(&mut e, BackendEvent::FrameDone { commit_id: a }, 1_100);
         assert!(e.commit_opportunity());
         assert_eq!(e.free_buffer(), None, "0 (startup) and 1 (A) are held");
-        e.on_event(BackendEvent::Presented { commit_id: a, presented: presented(1_050) }, 1_150);
+        on(&mut e, BackendEvent::Presented { commit_id: a, presented: presented(1_050) }, 1_150);
         assert_eq!(e.free_buffer(), None, "presentation does not free a buffer");
-        e.on_event(BackendEvent::BufferReleased { buffer: 0 }, 1_200);
+        on(&mut e, BackendEvent::BufferReleased { buffer: 0 }, 1_200);
         assert_eq!(e.free_buffer(), Some(0));
         let (b, _) = e.commit(frame(2), 0, 1_300);
         assert_eq!(e.buffer_states(), &[BufferState::Held { commit_id: b }, BufferState::Held { commit_id: a }]);
         // A release of a free buffer is counted, nothing else.
-        e.on_event(BackendEvent::BufferReleased { buffer: 1 }, 1_400);
-        e.on_event(BackendEvent::BufferReleased { buffer: 1 }, 1_500);
+        on(&mut e, BackendEvent::BufferReleased { buffer: 1 }, 1_400);
+        on(&mut e, BackendEvent::BufferReleased { buffer: 1 }, 1_500);
         assert_eq!(e.stats().unexpected_buffer_releases, 1);
     }
 
@@ -1441,10 +1642,10 @@ mod tests {
     fn reconfigure_and_close_are_device_failures_and_only_the_first_counts() {
         let mut e = engine();
         assert!(matches!(
-            e.on_event(BackendEvent::Reconfigured { detail: "size".into() }, 1),
+            on(&mut e, BackendEvent::Reconfigured { detail: "size".into() }, 1),
             Some(EngineOutcome::DeviceFailure { reason: FAIL_WAYLAND_RECONFIGURED, .. })
         ));
-        assert!(matches!(e.on_event(BackendEvent::Closed, 2), Some(EngineOutcome::DeviceFailure { reason: FAIL_WAYLAND_WINDOW_CLOSED, .. })));
+        assert!(matches!(on(&mut e, BackendEvent::Closed, 2), Some(EngineOutcome::DeviceFailure { reason: FAIL_WAYLAND_WINDOW_CLOSED, .. })));
         assert!(e.fail(FAIL_WAYLAND_RECONFIGURED, 100, 200, "size".into()));
         assert!(!e.fail(FAIL_WAYLAND_CONNECTION_LOST, 300, 400, "later".into()));
         assert_eq!(e.failure().unwrap().reason, FAIL_WAYLAND_RECONFIGURED);
@@ -1460,7 +1661,7 @@ mod tests {
     fn committed_frames_without_feedback_are_listed_at_close() {
         let mut e = engine();
         let (a, _) = e.commit(frame(1), 1, 1_000);
-        e.on_event(BackendEvent::FrameDone { commit_id: a }, 1_100);
+        on(&mut e, BackendEvent::FrameDone { commit_id: a }, 1_100);
         let (b, _) = e.commit(frame(2), 2, 1_200);
         let missing: Vec<u64> = e.unresolved().iter().map(|f| f.commit_id).collect();
         assert_eq!(missing, vec![a, b]);

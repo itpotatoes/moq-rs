@@ -158,10 +158,126 @@ mod pc_lane;
 /// (`pc_*` timed, `wayland_*` device failures untimed in `lanes.pc`) and
 /// the sentinel's `lanes.pc`. µs-only time fields as before (raw ns only in
 /// the probe's diagnostics file).
-pub const L2_SCHEMA: &str = "event-pair-l2-v1.4";
+/// v1.5 (Codex 112 + M3b): PC `output_detail` renames `msc` to
+/// `presentation_seq` (the compositor's raw seq, NOT a vblank counter) and
+/// adds the time-derived `presented_delta_us` and `refresh_index` and the
+/// presenting output `sync_output`; a presentation on another output than
+/// the startup output, the surface entering/leaving an output and a scale
+/// change after ready are PC device failures; a `presented`/`discarded`
+/// received at or after the close deadline leaves its commit outstanding
+/// (`wayland_feedback_missing` at close); anomaly details carry ids only;
+/// the sentinel's `lanes.pc` has `feedback_after_deadline` and
+/// `compositor_log` (every configure with its states, surface/output
+/// changes); meta `wayland.startup.details` lists every configure before
+/// ready and the decoder meta names the C++ runtime. A device that cannot
+/// start is reported as a typed [`L2DeviceStartFailure`] (stage, timeout,
+/// lane exit) instead of a bare string.
+pub const L2_SCHEMA: &str = "event-pair-l2-v1.5";
 pub const L2_CLOCK: &str = "CLOCK_MONOTONIC";
 /// The M1 grace is anchored at `finish`, not at the registration's H.
 pub const REPORT_WINDOW_ANCHOR: &str = "close";
+
+/// Prefix of the one machine-readable stderr line the receiver writes when
+/// a device sink cannot start (`L2_DEVICE_START_FAILURE {json}`), before it
+/// exits with `EXIT_L2_DEVICE_START_FAILED`.
+pub const L2_DEVICE_START_FAILURE_PREFIX: &str = "L2_DEVICE_START_FAILURE";
+
+/// Why a device lane could not become ready, as the lane reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaneStartError {
+    /// The startup stage that failed: wayland `connect`, `registry`,
+    /// `clock`, `shm_format`, `configure`, `buffers`, `startup_present`,
+    /// `startup_callback`, `single_output`, `worker`; alsa `open`,
+    /// `placement`, `prefill`, `start`, `first_status`, `epoch`.
+    pub stage: &'static str,
+    /// The stage ran into its deadline (as opposed to an explicit refusal).
+    pub timed_out: bool,
+    pub detail: String,
+}
+
+impl LaneStartError {
+    pub fn new(stage: &'static str, timed_out: bool, detail: impl Into<String>) -> Self {
+        Self { stage, timed_out, detail: detail.into() }
+    }
+}
+
+/// A device sink that could not start before the run (typed, so that a
+/// driver can classify a preflight failure without parsing text; the
+/// receiver prints [`Self::to_json`] after [`L2_DEVICE_START_FAILURE_PREFIX`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct L2DeviceStartFailure {
+    /// `pc` or `haptic`.
+    pub track: &'static str,
+    /// `wayland` or `alsa`.
+    pub sink: &'static str,
+    /// The lane's own stage, or `ready_timeout` / `lane_exited_without_report`
+    /// when the lane never said why.
+    pub stage: &'static str,
+    /// The failing stage hit a deadline (the lane's own, or the outer ready
+    /// timeout).
+    pub timed_out: bool,
+    /// The outer ready timeout fired before the lane reported.
+    pub ready_timeout_fired: bool,
+    /// The lane thread has exited (its device is closed) when `start`
+    /// returned. `false`: the device may stay held until the process exits;
+    /// no next attempt may start before it has.
+    pub lane_exited: bool,
+    pub detail: String,
+    /// A device lane that was already ready and was closed because of this
+    /// failure: `(track, its lane exited)`.
+    pub torn_down: Option<(&'static str, bool)>,
+    /// Where the receiver started the stage (set by the receiver):
+    /// `before_session` or `after_session_setup`.
+    pub receiver_start_point: Option<&'static str>,
+}
+
+impl L2DeviceStartFailure {
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "status": "device_start_failure",
+            "l2_schema": L2_SCHEMA,
+            "track": self.track,
+            "sink": self.sink,
+            "stage": self.stage,
+            "timed_out": self.timed_out,
+            "ready_timeout_fired": self.ready_timeout_fired,
+            "lane_exited": self.lane_exited,
+            "device_may_still_be_held": !self.lane_exited,
+            "detail": self.detail,
+            "torn_down": self.torn_down.map(|(track, exited)| serde_json::json!({ "track": track, "lane_exited": exited, "device_may_still_be_held": !exited })),
+            "receiver_start_point": self.receiver_start_point,
+        })
+    }
+}
+
+impl std::fmt::Display for L2DeviceStartFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "L2 {} {} sink failed to start at stage {}{}: {}",
+            self.sink,
+            self.track,
+            self.stage,
+            if self.timed_out { " (timed out)" } else { "" },
+            self.detail
+        )?;
+        if self.lane_exited {
+            write!(f, " (lane joined, device closed)")?;
+        } else {
+            write!(f, " (the lane thread has NOT exited, so the device may stay open until this process exits: do not start another attempt before it has)")?;
+        }
+        if let Some((track, exited)) = self.torn_down {
+            if exited {
+                write!(f, "; the ready {track} lane was closed and has disconnected")?;
+            } else {
+                write!(f, "; the ready {track} lane has NOT exited within its release bound")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for L2DeviceStartFailure {}
 
 pub const DISCARD_OUTPUT_QUEUE_FULL: &str = "output_queue_full";
 /// Reserved for the PC renderer (M3): a not-yet-committed frame replaced by a
@@ -835,6 +951,8 @@ pub(crate) struct WaylandOutputDetail {
     timing: crate::l2_pc::PcTiming,
     t_commit_us: u64,
     presented: crate::l2_pc::Presented,
+    /// Time-derived refresh facts (v1.5).
+    presented_timing: crate::l2_pc::PresentedTiming,
     info: crate::l2_pc::FrameInfo,
 }
 
@@ -850,10 +968,13 @@ impl WaylandOutputDetail {
             "t_render_end_us": self.timing.t_render_end_us,
             "t_commit_us": self.t_commit_us,
             "refresh_us": p.refresh_us(),
-            "msc": p.seq,
+            "presentation_seq": p.seq,
+            "presented_delta_us": self.presented_timing.presented_delta_us,
+            "refresh_index": self.presented_timing.refresh_index,
             "flags": p.flags,
             "flag_names": crate::l2_pc::presentation_flag_names(p.flags),
             "sync_outputs": p.sync_outputs,
+            "sync_output": p.sync_output,
             "points": self.info.points,
             "covered_pixels": self.info.covered_pixels,
             "depth_scale": self.info.depth_scale,
@@ -870,10 +991,13 @@ impl WaylandOutputDetail {
             "t_render_end_us": "clock read right after the render",
             "t_commit_us": "clock read right before attach/damage/frame/feedback/commit were issued",
             "refresh_us": "presented.refresh as integer us (floor); 0 = unknown",
-            "msc": "presented seq_hi << 32 | seq_lo (refresh counter, not a time)",
+            "presentation_seq": "presented seq_hi << 32 | seq_lo exactly as the compositor reported it; its meaning is the compositor's and it is NOT read as a vblank counter (missed refreshes come from presented_delta_us / refresh_index)",
+            "presented_delta_us": "t_output_us minus the t_output_us of the previous output of this lane (arrival order); null for the first",
+            "refresh_index": "round_half_away((t_output_us - startup presentation time) * 1000 / presented.refresh in ns): the refresh period count since the startup frame, from presentation TIMES; null when refresh is 0",
             "flags": "presented.flags (wp_presentation_feedback.kind bits)",
             "flag_names": "decoded flags: vsync, hw_clock, hw_completion, zero_copy",
             "sync_outputs": "sync_output events received before presented",
+            "sync_output": "registry (global) name of the output of the first sync_output (meta wayland.startup.details.outputs names it); a frame presented on another output than meta wayland.startup.output is a PC device failure",
             "points": "points drawn",
             "covered_pixels": "canvas pixels at least one point covers",
             "depth_scale": "the tier's depth_scale from the tiers meta",
@@ -1094,7 +1218,7 @@ fn sink_contract(config: &L2Config, modality: L2Modality) -> serde_json::Value {
             "terminals": "output on wp_presentation_feedback.presented of the frame's commit (receipt strictly before close_deadline_us); explicit_discard before submit: output_queue_full (the bounded submission queue); explicit_discard after submit: superseded_before_commit (the pending frame was replaced before any commit), compositor_discarded (feedback discarded), payload_invalid (no payload, a tier the tiers meta does not know, records not drawable at the tier scale), decode_failed (the Draco decoder refused the payload), device_failure (a frame not yet committed when the PC device failed, or submitted after); a COMMITTED frame ends only through its feedback, otherwise it stays unresolved",
             "t_output_us": "presented tv_sec*1e6 + floor(tv_nsec/1000) on the wp_presentation clock, verified CLOCK_MONOTONIC before the meta row (registration 3-2: the time the compositor reports the content update turned into light; not a physical measurement)",
             "t_callback_us": "clock read when the presented event is handled",
-            "t_decode_start_us": "draco only, top-level on every after-submit terminal of a decoded frame: clock read right after the frame left the processing queue, immediately before the decoder call",
+            "t_decode_start_us": "draco only, top-level on every after-submit terminal of a decoded frame: clock read immediately before the decoder call (after the tier lookup and the pixel buffer preparation that follow the dequeue)",
             "t_decode_end_us": "draco only: clock read right after the 8-byte records exist (the same records the bin path renders)",
             "output_detail": WaylandOutputDetail::schema(),
         }),
@@ -1188,9 +1312,11 @@ fn wayland_meta(wayland: &WaylandSinkConfig, ready: &pc_lane::PcLaneReady) -> se
         "pending_policy": "one pending frame; a frame replaced there before it was committed is explicit_discard superseded_before_commit (after submit)",
         "buffer_policy": "a frame is written only into a wl_shm buffer the compositor does not hold (Held from its commit until wl_buffer.release); with none free the pending frame waits; wl_buffer.release and frame callbacks are never output evidence",
         "feedback_policy": "presented -> output; discarded -> explicit_discard compositor_discarded; a feedback or frame callback for an unknown or already resolved commit is a timed integrity failure at its receipt (wayland_unexpected_feedback / wayland_unexpected_frame_callback); a presented timestamp with tv_nsec >= 1e9 is wayland_bad_timestamp and the frame stays unresolved",
-        "failure_policy": "compositor connection loss or protocol error, xdg_toplevel.close, a configure that changes the size or drops fullscreen, an output mode change or removal after ready, and committed frames still without feedback at close are PC device failures: untimed (first_integrity_failure_us null, first_failure_time_determinable false), recorded in lanes.pc.device_failure with observation_interval_us [last_good_us, detected_us]; after one, nothing is committed any more and every frame not yet committed (pending or submitted later) gets explicit_discard device_failure after submit; committed frames keep waiting for their feedback",
-        "close_policy": "after finish starts the worker processes every submission of the producers, the commit thread commits the last pending frame and waits until every committed frame has its feedback or the close deadline, then disconnects",
-        "start_check": "wp_presentation.clock_id must be CLOCK_MONOTONIC before the meta row, otherwise the run is refused; the startup frame (commit 0, background, not a ledger row) must be presented",
+        "failure_policy": "compositor connection loss or protocol error, xdg_toplevel.close, a configure that changes the size or drops fullscreen, an output change after ready (output_policy), and committed frames still without feedback at close (including a feedback received at or after the close deadline, which is not accepted and leaves its commit outstanding) are PC device failures: untimed (first_integrity_failure_us null, first_failure_time_determinable false), recorded in lanes.pc.device_failure with observation_interval_us [last_good_us, detected_us]; after one, nothing is committed any more and every frame not yet committed (pending or submitted later) gets explicit_discard device_failure after submit; committed frames keep waiting for their feedback",
+        "close_policy": "after finish starts the worker processes every submission of the producers, the commit thread commits the last pending frame and waits until every committed frame has its feedback or the close deadline, then disconnects; a slow feedback is never declared missing before the deadline",
+        "start_check": "wp_presentation.clock_id must be CLOCK_MONOTONIC before the meta row, otherwise the run is refused; the startup frame (commit 0, background, not a ledger row) must be presented AND its frame callback must fire, and the surface must be on exactly one output (startup.output); every startup stage is bounded by the ready timeout and a failure is a typed device start failure (stage, timeout, lane exit)",
+        "presentation_time_policy": "output times are the presented timestamps as reported (never clamped or reordered); presentation_seq is kept raw and is not a vblank counter; refresh steps come from presented_delta_us and refresh_index",
+        "output_policy": "the surface stays on its single startup output: entering or leaving an output, an output scale or mode change, the output's removal, or a presentation synced to another output after ready is a PC device failure (wayland_reconfigured)",
     })
 }
 
@@ -1400,7 +1526,7 @@ impl L2Output {
                 .name("l2-sink-pc-wayland".into())
                 .spawn(move || pc_lane::wayland_lane_main(wayland, items_rx, rows, lane_shared, ready_tx, diagnostics))
                 .context("spawn L2 Wayland lane thread")?;
-            let (ready, lane, items_tx) = await_lane_ready("Wayland PC", ready_rx, lane, items_tx, timeout, release)?;
+            let (ready, lane, items_tx) = await_lane_ready("pc", "wayland", ready_rx, lane, items_tx, timeout, release)?;
             pc_ready = Some(ready);
             let lane_index = L2Modality::Pc.index();
             senders[lane_index] = Some(items_tx);
@@ -1419,23 +1545,18 @@ impl L2Output {
                 .name("l2-sink-haptic-alsa".into())
                 .spawn(move || alsa_lane_main(alsa, items_rx, rows, lane_shared, ready_tx, diagnostics))
                 .context("spawn L2 ALSA lane thread")?;
-            let (ready, lane, items_tx) = match await_lane_ready("ALSA haptic", ready_rx, lane, items_tx, timeout, release) {
+            let (ready, lane, items_tx) = match await_lane_ready("haptic", "alsa", ready_rx, lane, items_tx, timeout, release) {
                 Ok(ready) => ready,
-                Err(error) => {
+                Err(mut failure) => {
                     // Close the PC device lane that is already up before
                     // reporting: its queue goes, the lane disconnects.
                     let pc = L2Modality::Pc.index();
                     if let (Some(pc_tx), Some(pc_lane)) = (senders[pc].take(), lane_threads[pc].take()) {
                         drop(pc_tx);
                         let bound = config.wayland.as_ref().map_or(release, |w| micros(w.release_timeout_us));
-                        let note = if join_within(pc_lane, bound) {
-                            "the PC Wayland lane was closed and has disconnected"
-                        } else {
-                            "the PC Wayland lane has NOT exited within its release bound"
-                        };
-                        return Err(error.context(note));
+                        failure.torn_down = Some(("pc", join_within(pc_lane, bound)));
                     }
-                    return Err(error);
+                    return Err(failure.into());
                 }
             };
             alsa_ready = Some(ready);
@@ -1647,43 +1768,63 @@ fn micros(us: u64) -> Duration {
     Duration::from_micros(us)
 }
 
-/// Wait for a device lane's ready report. On an error report the lane is
-/// joined (it has closed its device). On a timeout (or a lane that exits
-/// without reporting) its queue is closed — a late ready send then fails and
-/// the lane stops and closes its stream; with the queue gone its loop exits —
-/// and the lane is joined within `release`, so the device is released before
-/// any next attempt; the error says whether that happened.
+/// Wait for a device lane's ready report, typed (Codex 112 P2-3). On an
+/// error report the lane is joined within `release` (it has closed its
+/// device). On the outer timeout (or a lane that exits without reporting)
+/// its queue is closed — a lane that becomes ready late then stops at once —
+/// and the lane is joined within `release`; the ready channel stays open
+/// meanwhile, so a cause the lane reports after the outer timeout (its own
+/// stage deadline is shorter) is not swallowed. The failure says whether
+/// the lane exited (device closed) or may still hold the device.
 fn await_lane_ready<T>(
-    label: &str,
-    ready_rx: Receiver<std::result::Result<T, String>>,
+    track: &'static str,
+    sink: &'static str,
+    ready_rx: Receiver<std::result::Result<T, LaneStartError>>,
     lane: JoinHandle<()>,
     items_tx: SyncSender<SinkMsg>,
     timeout: Duration,
     release: Duration,
-) -> Result<(T, JoinHandle<()>, SyncSender<SinkMsg>)> {
+) -> std::result::Result<(T, JoinHandle<()>, SyncSender<SinkMsg>), L2DeviceStartFailure> {
+    let failure = |stage, timed_out, ready_timeout_fired, lane_exited, detail| L2DeviceStartFailure {
+        track,
+        sink,
+        stage,
+        timed_out,
+        ready_timeout_fired,
+        lane_exited,
+        detail,
+        torn_down: None,
+        receiver_start_point: None,
+    };
     match ready_rx.recv_timeout(timeout) {
         Ok(Ok(ready)) => Ok((ready, lane, items_tx)),
         Ok(Err(error)) => {
             drop(items_tx);
-            let _ = lane.join();
-            bail!("L2 {label} sink failed to start: {error} (lane joined, device closed)");
+            let exited = join_within(lane, release);
+            Err(failure(error.stage, error.timed_out, false, exited, error.detail))
         }
         Err(timeout_or_gone) => {
             drop(items_tx);
-            drop(ready_rx);
-            let released = join_within(lane, release);
-            let what = match timeout_or_gone {
-                RecvTimeoutError::Timeout => format!("not ready within {} us", timeout.as_micros()),
-                RecvTimeoutError::Disconnected => "lane exited without reporting".to_string(),
+            let exited = join_within(lane, release);
+            // The lane's own report, if it came after the outer timeout.
+            let inner = match ready_rx.try_recv() {
+                Ok(Err(error)) => Some(error),
+                _ => None,
             };
-            if released {
-                bail!("L2 {label} sink {what}; the lane thread has exited and the device is closed");
-            }
-            bail!(
-                "L2 {label} sink {what}; the lane thread has NOT exited within a further {} us, so the \
-                 device may stay open until this process exits: do not start another attempt before it has",
-                release.as_micros()
-            );
+            let fired = matches!(timeout_or_gone, RecvTimeoutError::Timeout);
+            Err(match (inner, fired) {
+                (Some(error), _) => failure(error.stage, true, fired, exited, error.detail),
+                (None, true) => failure(
+                    "ready_timeout",
+                    true,
+                    true,
+                    exited,
+                    format!("not ready within {} us", timeout.as_micros()),
+                ),
+                (None, false) => {
+                    failure("lane_exited_without_report", false, false, exited, "lane exited without reporting".into())
+                }
+            })
         }
     }
 }
@@ -1852,28 +1993,28 @@ fn alsa_lane_main(
     items: Receiver<SinkMsg>,
     rows: SyncSender<Row>,
     shared: Arc<Shared>,
-    ready: mpsc::Sender<std::result::Result<LaneReady, String>>,
+    ready: mpsc::Sender<std::result::Result<LaneReady, LaneStartError>>,
     diagnostics: Option<DiagLog>,
 ) {
-    let fail = |message: String| {
-        let _ = ready.send(Err(message));
+    let fail = |stage: &'static str, message: String| {
+        let _ = ready.send(Err(LaneStartError::new(stage, false, message)));
     };
     let mut pcm = match open_haptic_pcm(&alsa) {
         Ok(pcm) => pcm,
-        Err(error) => return fail(error),
+        Err(error) => return fail("open", error),
     };
     let mut engine = match HapticPlacement::new(alsa.placement, pcm.params()) {
         Ok(engine) => engine,
-        Err(error) => return fail(error),
+        Err(error) => return fail("placement", error),
     };
     let mut clock = now_us;
     if let Err(error) = engine.prefill(pcm.as_mut(), &mut clock) {
-        return fail(format!("prefill: {error}"));
+        return fail("prefill", format!("prefill: {error}"));
     }
     let t_start_us = now_us();
     if let Err(error) = pcm.start(t_start_us) {
         let _ = pcm.stop();
-        return fail(format!("start: {error}"));
+        return fail("start", format!("start: {error}"));
     }
     let t0 = now_us();
     let first = pcm.status(t0);
@@ -1881,12 +2022,12 @@ fn alsa_lane_main(
         Ok(first) => first,
         Err(error) => {
             let _ = pcm.stop();
-            return fail(format!("first status: {error}"));
+            return fail("first_status", format!("first status: {error}"));
         }
     };
     if let Err(error) = engine.begin_epoch(t_start_us, first, t0) {
         let _ = pcm.stop();
-        return fail(error);
+        return fail("epoch", error);
     }
     let lane_ready = LaneReady {
         params: pcm.params().clone(),
@@ -3649,7 +3790,7 @@ mod tests {
         out.finish().unwrap();
         let rows = rows(&path);
         let meta = &rows[0];
-        assert_eq!(meta["l2_schema"], "event-pair-l2-v1.4");
+        assert_eq!(meta["l2_schema"], "event-pair-l2-v1.5");
         assert_eq!(meta["report_window_anchor"], "close");
         for key in ["object_rows", "sentinel_row", "receiver_fault", "t_callback_us", "file_order"] {
             assert!(meta["row_time_semantics"][key].is_string(), "{key}");
@@ -3789,7 +3930,7 @@ mod tests {
         let meta = &rows[0];
         assert_eq!(meta["role"], "meta");
         assert_eq!(meta["l2_schema"], L2_SCHEMA);
-        assert_eq!(meta["l2_schema"], "event-pair-l2-v1.4");
+        assert_eq!(meta["l2_schema"], "event-pair-l2-v1.5");
         assert_eq!(meta["sinks"], serde_json::json!({ "pc": "fake", "haptic": "null" }));
         assert_eq!(meta["device_output"], false);
         assert!(meta["device_output_rule"].as_str().unwrap().contains("EVERY track"));
@@ -4473,8 +4614,8 @@ mod tests {
     /// A stand-in lane for `await_lane_ready`: its behaviour is driven only
     /// by channels, so every branch is deterministic (no sleeps).
     fn stand_in_lane(
-        behaviour: impl FnOnce(mpsc::Sender<std::result::Result<u32, String>>, Receiver<SinkMsg>) + Send + 'static,
-    ) -> (Receiver<std::result::Result<u32, String>>, JoinHandle<()>, SyncSender<SinkMsg>) {
+        behaviour: impl FnOnce(mpsc::Sender<std::result::Result<u32, LaneStartError>>, Receiver<SinkMsg>) + Send + 'static,
+    ) -> (Receiver<std::result::Result<u32, LaneStartError>>, JoinHandle<()>, SyncSender<SinkMsg>) {
         let (ready_tx, ready_rx) = mpsc::channel();
         let (items_tx, items_rx) = mpsc::sync_channel::<SinkMsg>(4);
         let lane = std::thread::spawn(move || behaviour(ready_tx, items_rx));
@@ -4483,8 +4624,9 @@ mod tests {
 
     /// Ready timeout, deterministically: the stand-in lane never reports and
     /// only exits (closing its "device") once its queue disconnects — which
-    /// happens only when `await_lane_ready` gave up waiting. The error then
-    /// says the device is closed, and it IS closed before the return.
+    /// happens only when `await_lane_ready` gave up waiting. The typed
+    /// failure says `ready_timeout`, timed out, lane exited — and the device
+    /// IS closed before the return.
     #[test]
     fn a_ready_timeout_closes_the_queue_and_returns_after_the_lane_released_the_device() {
         use std::sync::atomic::AtomicBool;
@@ -4494,12 +4636,31 @@ mod tests {
             while items.recv().is_ok() {}
             flag.store(true, Ordering::SeqCst);
         });
-        let error = await_lane_ready("ALSA haptic", ready_rx, lane, items_tx, Duration::from_millis(1), Duration::from_secs(60))
+        let failure = await_lane_ready("haptic", "alsa", ready_rx, lane, items_tx, Duration::from_millis(1), Duration::from_secs(60))
             .err()
             .expect("not ready");
-        let error = format!("{error:#}");
-        assert!(error.contains("not ready within 1000 us") && error.contains("device is closed"), "{error}");
+        assert_eq!((failure.stage, failure.timed_out, failure.ready_timeout_fired, failure.lane_exited), ("ready_timeout", true, true, true));
+        assert!(failure.detail.contains("not ready within 1000 us"), "{failure}");
+        assert!(format!("{failure}").contains("device closed"), "{failure}");
         assert!(closed.load(Ordering::SeqCst), "closed before await_lane_ready returned");
+        let json = failure.to_json();
+        assert_eq!((json["status"].as_str(), json["device_may_still_be_held"].as_bool()), (Some("device_start_failure"), Some(false)));
+    }
+
+    /// Codex 112 P2-3: a cause the lane reports AFTER the outer timeout (its
+    /// own stage gave up a little later) is kept, not swallowed.
+    #[test]
+    fn a_cause_reported_after_the_outer_timeout_is_kept() {
+        let (ready_rx, lane, items_tx) = stand_in_lane(|ready, items| {
+            // Wait until the stage gave up (queue closed), then report.
+            while items.recv().is_ok() {}
+            ready.send(Err(LaneStartError::new("startup_present", true, "timed out"))).unwrap();
+        });
+        let failure = await_lane_ready("pc", "wayland", ready_rx, lane, items_tx, Duration::from_millis(1), Duration::from_secs(60))
+            .err()
+            .expect("not ready");
+        assert_eq!((failure.track, failure.sink, failure.stage), ("pc", "wayland", "startup_present"));
+        assert!(failure.timed_out && failure.ready_timeout_fired && failure.lane_exited);
     }
 
     /// A lane that cannot exit within the release bound (held on a gate the
@@ -4514,11 +4675,12 @@ mod tests {
             let _ = gate_rx.recv();
             flag.store(true, Ordering::SeqCst);
         });
-        let error = await_lane_ready("ALSA haptic", ready_rx, lane, items_tx, Duration::from_millis(1), Duration::from_millis(20))
+        let failure = await_lane_ready("haptic", "alsa", ready_rx, lane, items_tx, Duration::from_millis(1), Duration::from_millis(20))
             .err()
             .expect("not ready");
-        let error = format!("{error:#}");
-        assert!(error.contains("may stay open until this process exits"), "{error}");
+        assert!(!failure.lane_exited);
+        assert_eq!(failure.to_json()["device_may_still_be_held"], true);
+        assert!(format!("{failure}").contains("may stay open until this process exits"), "{failure}");
         assert!(!exited.load(Ordering::SeqCst), "still held on the gate");
         gate_tx.send(()).unwrap();
         while !exited.load(Ordering::SeqCst) {
@@ -4526,26 +4688,28 @@ mod tests {
         }
     }
 
-    /// The other branches: an error report (lane joined), a lane that exits
-    /// without reporting (joined, device closed), and a ready report.
+    /// The other branches: an error report (stage kept, lane joined), a lane
+    /// that exits without reporting (joined, device closed), and a ready
+    /// report.
     #[test]
     fn await_lane_ready_reports_errors_disconnects_and_ready() {
         let (ready_rx, lane, items_tx) = stand_in_lane(|ready, _items| {
-            ready.send(Err("snd_pcm_open: Device or resource busy".into())).unwrap();
+            ready.send(Err(LaneStartError::new("open", false, "snd_pcm_open: Device or resource busy"))).unwrap();
         });
-        let error = format!("{:#}", await_lane_ready("ALSA haptic", ready_rx, lane, items_tx, Duration::from_secs(60), Duration::from_secs(60)).err().unwrap());
-        assert!(error.contains("failed to start: snd_pcm_open: Device or resource busy (lane joined, device closed)"), "{error}");
+        let failure = await_lane_ready("haptic", "alsa", ready_rx, lane, items_tx, Duration::from_secs(60), Duration::from_secs(60)).err().unwrap();
+        assert_eq!((failure.stage, failure.timed_out, failure.ready_timeout_fired, failure.lane_exited), ("open", false, false, true));
+        assert!(format!("{failure}").contains("failed to start at stage open: snd_pcm_open: Device or resource busy (lane joined, device closed)"), "{failure}");
 
         let (ready_rx, lane, items_tx) = stand_in_lane(|ready, _items| drop(ready));
-        let error = format!("{:#}", await_lane_ready("ALSA haptic", ready_rx, lane, items_tx, Duration::from_secs(60), Duration::from_secs(60)).err().unwrap());
-        assert!(error.contains("lane exited without reporting") && error.contains("device is closed"), "{error}");
+        let failure = await_lane_ready("haptic", "alsa", ready_rx, lane, items_tx, Duration::from_secs(60), Duration::from_secs(60)).err().unwrap();
+        assert_eq!((failure.stage, failure.lane_exited), ("lane_exited_without_report", true));
 
         let (ready_rx, lane, items_tx) = stand_in_lane(|ready, items| {
             ready.send(Ok(42)).unwrap();
             while items.recv().is_ok() {}
         });
         let (ready, lane, items_tx) =
-            await_lane_ready("ALSA haptic", ready_rx, lane, items_tx, Duration::from_secs(60), Duration::from_secs(60)).unwrap();
+            await_lane_ready("haptic", "alsa", ready_rx, lane, items_tx, Duration::from_secs(60), Duration::from_secs(60)).unwrap();
         assert_eq!(ready, 42);
         drop(items_tx);
         lane.join().unwrap();
@@ -4738,6 +4902,11 @@ mod tests {
         (summary, rows, path)
     }
 
+    /// The refresh-index origin: the startup presentation time in meta.
+    fn alsa_free_origin(rows: &[serde_json::Value]) -> i64 {
+        rows[0]["wayland"]["startup"]["startup_presentation"]["t_presented_us"].as_i64().unwrap()
+    }
+
     /// Every submission has exactly one terminal (output or discard).
     fn terminals_by_key(rows: &[serde_json::Value]) -> HashMap<String, Vec<serde_json::Value>> {
         let mut map: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
@@ -4759,15 +4928,20 @@ mod tests {
         assert!(summary.integrity_ok(PC_WAYLAND_HAPTIC_NULL), "{summary:?}");
         assert_eq!((summary.submitted, summary.output), (8, 8));
         let meta = &rows[0];
-        assert_eq!(meta["l2_schema"], "event-pair-l2-v1.4");
+        assert_eq!(meta["l2_schema"], "event-pair-l2-v1.5");
         assert_eq!(meta["sinks"]["pc"], "wayland");
         assert_eq!(meta["device_output"], false, "a simulated compositor is never a device output");
         let contract = &meta["sink_contracts"]["pc"];
         assert_eq!((contract["kind"].as_str(), contract["backend"].as_str()), (Some("wayland"), Some("simulated")));
         assert_eq!((contract["device_output"].as_bool(), contract["resolves"].as_bool()), (Some(false), Some(true)));
-        for field in ["commit_id", "t_commit_us", "t_render_start_us", "refresh_us", "msc", "flags"] {
+        for field in [
+            "commit_id", "t_commit_us", "t_render_start_us", "refresh_us", "presentation_seq",
+            "presented_delta_us", "refresh_index", "sync_output", "flags",
+        ] {
             assert!(contract["output_detail"][field].is_string(), "schema of {field}");
         }
+        assert!(contract["output_detail"].get("msc").is_none(), "renamed in v1.5");
+        assert!(contract["output_detail"]["presentation_seq"].as_str().unwrap().contains("NOT read as a vblank counter"));
         let wayland = &meta["wayland"];
         assert_eq!(wayland["canvas_side_px"], 48);
         assert_eq!(wayland["startup"]["clock"], "CLOCK_MONOTONIC");
@@ -4795,6 +4969,14 @@ mod tests {
             assert!(v("t_output_us") <= v("t_callback_us") && v("t_callback_us") <= v("t_log_arrival_us"));
             assert_eq!(d["refresh_us"], 5_000);
             assert_eq!(d["flag_names"], serde_json::json!(["vsync", "hw_clock", "hw_completion"]));
+            // v1.5: the raw compositor seq, the time-derived refresh facts
+            // (the simulated vblanks are exact multiples of 5 ms from the
+            // startup presentation) and the presenting output.
+            assert!(d.get("msc").is_none());
+            assert!(d["presentation_seq"].as_u64().is_some());
+            let refresh_index = d["refresh_index"].as_i64().unwrap();
+            assert_eq!(v("t_output_us") as i64, alsa_free_origin(&rows) + refresh_index * 5_000);
+            assert_eq!(d["sync_output"], crate::l2_pc::SIM_OUTPUT);
             assert_eq!(d["points"], 1_500);
             assert_eq!(d["depth_scale"], 4);
         }
@@ -4803,6 +4985,9 @@ mod tests {
         let lane = &end["lanes"]["pc"];
         assert_eq!((lane["kind"].as_str(), lane["backend"].as_str()), (Some("wayland"), Some("simulated")));
         assert_eq!(lane["frames_rendered"], 8);
+        assert_eq!(lane["feedback_after_deadline"], 0);
+        assert_eq!(lane["compositor_log"]["backend"], "simulated");
+        assert_eq!(meta["wayland"]["startup"]["output"], crate::l2_pc::SIM_OUTPUT);
         assert_eq!(lane["engine"]["commits"], 8);
         assert_eq!(lane["engine"]["presented"], 8);
         assert_eq!(lane["committed_without_feedback_at_close"], 0);
@@ -5002,6 +5187,9 @@ mod tests {
         sim.clock_id = libc::CLOCK_MONOTONIC_RAW as u32;
         let path = tmp("pc-sim-clock");
         let error = L2Output::start(&path, wayland_config(sim, PcRepresentation::Bin)).err().expect("refused");
+        let failure = error.downcast_ref::<L2DeviceStartFailure>().expect("typed");
+        assert_eq!((failure.track, failure.sink, failure.stage), ("pc", "wayland", "clock"));
+        assert!(!failure.timed_out && !failure.ready_timeout_fired && failure.lane_exited);
         let error = format!("{error:#}");
         assert!(error.contains("not CLOCK_MONOTONIC") && error.contains("refuses to start"), "{error}");
         assert_eq!(std::fs::read(&path).unwrap(), b"", "no meta row");
@@ -5051,9 +5239,17 @@ mod tests {
         config.sinks = L2Sinks { pc: L2SinkKind::Wayland, haptic: L2SinkKind::Alsa };
         config.alsa = Some(sim_alsa(vec![SimFault::StartError]));
         let path = tmp("pc-sim-teardown");
-        let error = format!("{:#}", L2Output::start(&path, config).err().expect("refused"));
-        assert!(error.contains("ALSA haptic sink failed to start"), "{error}");
-        assert!(error.contains("the PC Wayland lane was closed and has disconnected"), "{error}");
+        let error = L2Output::start(&path, config).err().expect("refused");
+        // Typed (Codex 112 P2-3): the driver reads fields, not text.
+        let failure = error.downcast_ref::<L2DeviceStartFailure>().expect("a typed device start failure");
+        assert_eq!((failure.track, failure.sink, failure.stage), ("haptic", "alsa", "start"));
+        assert!(!failure.timed_out && failure.lane_exited);
+        assert_eq!(failure.torn_down, Some(("pc", true)), "the ready PC lane was closed and has exited");
+        let json = failure.to_json();
+        assert_eq!(json["torn_down"]["track"], "pc");
+        assert_eq!(json["torn_down"]["device_may_still_be_held"], false);
+        assert!(json["receiver_start_point"].is_null(), "set by the receiver only");
+        assert!(format!("{error:#}").contains("the ready pc lane was closed and has disconnected"), "{error:#}");
         assert!(observer.dropped.load(Ordering::SeqCst), "the compositor connection is gone");
         assert_eq!(std::fs::read(&path).unwrap(), b"", "no meta row");
         let _ = std::fs::remove_file(&path);
@@ -5067,8 +5263,10 @@ mod tests {
     /// consistent row passes. Values are written as given.
     #[test]
     fn a_pc_wayland_row_out_of_pipeline_order_is_an_integrity_failure() {
-        use crate::l2_pc::{FrameInfo, PcTiming, Presented};
-        let base = now_us();
+        use crate::l2_pc::{FrameInfo, PcTiming, Presented, PresentedTiming};
+        // Codex 112 P2-1: the synthetic timeline lies one second in the past,
+        // so the writer's own clock (t_log_arrival) is always after it.
+        let base = now_us() - 1_000_000;
         let presented = |t_us: u64| Presented {
             tv_sec: t_us / 1_000_000,
             tv_nsec: ((t_us % 1_000_000) * 1_000) as u32,
@@ -5076,6 +5274,7 @@ mod tests {
             seq: 7,
             flags: 0x7,
             sync_outputs: 1,
+            sync_output: Some(1),
         };
         // (name, decode, render start, render end, commit, output, violation?)
         let cases = [
@@ -5094,6 +5293,7 @@ mod tests {
                 timing: PcTiming { decode_us, t_render_start_us: render_start, t_render_end_us: render_end },
                 t_commit_us: t_commit,
                 presented: presented(t_output),
+                presented_timing: PresentedTiming { presented_delta_us: None, refresh_index: Some(3) },
                 info: FrameInfo { points: 1, covered_pixels: 1, depth_scale: 4 },
             };
             let path = tmp(name);
@@ -5125,6 +5325,57 @@ mod tests {
             }
             let _ = std::fs::remove_file(&path);
         }
+    }
+
+    /// M3b B: a compositor stall (one commit presented 20 refreshes late)
+    /// is recorded exactly as reported — commit->output of 100+ ms, the
+    /// refresh index jumping by 20+ — and is neither clamped nor declared
+    /// missing before the close deadline; the frames released meanwhile wait
+    /// or are superseded before commit, as the pending rule says.
+    #[test]
+    fn a_compositor_stall_is_recorded_as_is_and_never_called_missing_before_the_deadline() {
+        let mut sim = sim_display();
+        sim.faults.push(SimWaylandFault::Stall { commit_id: 2, extra_vblanks: 20 });
+        let (summary, rows, path) = run_pc(wayland_config(sim, PcRepresentation::Bin), 5, 15, "pc-sim-stall");
+        assert!(summary.integrity_ok(PC_WAYLAND_HAPTIC_NULL), "{summary:?}");
+        assert_eq!(summary.submitted_unresolved, 0);
+        let mut outputs: Vec<&serde_json::Value> = rows.iter().filter(|r| r["role"] == "output").collect();
+        outputs.sort_by_key(|o| o["output_detail"]["commit_id"].as_u64());
+        let stalled = outputs.iter().find(|o| o["output_detail"]["commit_id"] == 2).expect("the stalled commit");
+        let c2o = stalled["t_output_us"].as_i64().unwrap() - stalled["output_detail"]["t_commit_us"].as_i64().unwrap();
+        assert!(c2o >= 100_000, "recorded as reported: {c2o} us");
+        let first = outputs.iter().find(|o| o["output_detail"]["commit_id"] == 1).unwrap();
+        let step = stalled["output_detail"]["refresh_index"].as_i64().unwrap() - first["output_detail"]["refresh_index"].as_i64().unwrap();
+        assert!(step >= 20, "the refresh index shows the stall: {step}");
+        assert!(stalled["output_detail"]["presented_delta_us"].as_i64().unwrap() >= 100_000);
+        let lane = &sentinel(&rows)["lanes"]["pc"];
+        assert!(lane["device_failure"].is_null());
+        assert_eq!((lane["feedback_after_deadline"].as_u64(), lane["committed_without_feedback_at_close"].as_u64()), (Some(0), Some(0)));
+        assert!(lane["engine"]["max_commit_to_presented_us"].as_i64().unwrap() >= 100_000);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Codex 112 P2-4: the output a frame was presented on is recorded per
+    /// frame; a presentation on another output than the startup output keeps
+    /// its output row and is a PC device failure (later frames
+    /// `device_failure`).
+    #[test]
+    fn a_presentation_on_another_output_is_recorded_and_fails_the_pc_device() {
+        let mut sim = sim_display();
+        sim.faults.push(SimWaylandFault::PresentOnOtherOutput { commit_id: 2 });
+        let (summary, rows, path) = run_pc(wayland_config(sim, PcRepresentation::Bin), 5, 15, "pc-sim-other-output");
+        assert_eq!(summary.first_integrity_failure_reason.as_deref(), Some(FAIL_WAYLAND_RECONFIGURED));
+        assert!(!summary.first_failure_time_determinable);
+        let moved = rows
+            .iter()
+            .find(|r| r["role"] == "output" && r["output_detail"]["commit_id"] == 2)
+            .expect("the moved frame keeps its output row");
+        assert_eq!(moved["output_detail"]["sync_output"], crate::l2_pc::SIM_OTHER_OUTPUT);
+        let lane = &sentinel(&rows)["lanes"]["pc"];
+        assert_eq!(lane["engine"]["foreign_output_presentations"], 1);
+        assert!(lane["device_failure"]["detail"].as_str().unwrap().contains("not on the startup output"));
+        assert!(rows.iter().any(|r| r["reason"] == DISCARD_DEVICE_FAILURE));
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Both tracks on device sinks: the file is a device output only with
