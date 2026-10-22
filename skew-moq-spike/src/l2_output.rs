@@ -325,8 +325,11 @@ impl Shared {
     }
 
     /// The published close deadline, read AFTER the caller read its receipt
-    /// time. `CLOSE_PENDING` lasts only between `finish`'s marker and its
-    /// clock read, so the wait is bounded by that hand-off.
+    /// time. `CLOSE_PENDING` lasts from `finish`'s marker to its deadline
+    /// store; there is no wall-clock bound on that hand-off (a preempted
+    /// `finish` prolongs it), and the grace is anchored at `finish`'s clock
+    /// read, not at its entry. A receipt read before the marker is compared
+    /// with the deadline once it is published, so the verdict is unaffected.
     fn close_deadline(&self) -> Option<u64> {
         loop {
             match self.close_deadline_us.load(Ordering::SeqCst) {
@@ -363,7 +366,8 @@ pub struct L2Summary {
     pub sink_gone: u64,
     /// A terminal whose identity has no open submit.
     pub terminal_without_open_submit: u64,
-    /// A second release (submit or pre-submit discard) of one `(track, seq)`.
+    /// EXTRA releases (submit or pre-submit discard) of one `(track, seq)`:
+    /// `Σ_key max(N_key − 1, 0)`, not the number of duplicated keys.
     pub duplicate_logical_release: u64,
     pub tracking_overflow: u64,
     pub fake_pending_overflow: u64,
@@ -519,6 +523,25 @@ impl L2Submitter {
     }
 }
 
+/// A non-producer handle that only records receiver faults (earliest wins).
+/// Held by tasks that can store a fatal cause but never submit (drains); it
+/// does not count toward producer quiescence at `finish`.
+#[derive(Clone)]
+pub struct L2FaultStamp {
+    shared: Arc<Shared>,
+}
+
+impl L2FaultStamp {
+    /// Record a fatal receiver error at `t_us` (the moment it was stored).
+    pub fn receiver_fault(&self, t_us: u64, cause: &str) {
+        self.shared.note_receiver_fault(t_us, cause);
+    }
+
+    pub fn receiver_fault_noted(&self) -> bool {
+        self.shared.receiver_fault_noted()
+    }
+}
+
 /// The running output stage: meta row written, sink + writer threads alive.
 pub struct L2Output {
     config: L2Config,
@@ -604,6 +627,11 @@ impl L2Output {
                 "submit_conservation_violated": "undeterminable unless explained by a timed failure",
                 "undeterminable": "first_integrity_failure_us = null, first_failure_time_determinable = false",
             },
+            "counter_semantics": {
+                "duplicate_logical_release": "number of EXTRA releases of one (track, seq): sum over keys of max(N_key - 1, 0); not the number of duplicated keys",
+                "submitted_unresolved": "submits without a terminal at the sentinel",
+                "discarded_before_submit": "releases refused by the bounded submission queue (explicit_discard output_queue_full)",
+            },
             "fake_pc_offset_us": fake.map(|f| f.pc_offset_us),
             "fake_haptic_offset_us": fake.map(|f| f.haptic_offset_us),
             "fake_force_queue_full": fake.map(|f| f.force_queue_full),
@@ -660,6 +688,11 @@ impl L2Output {
 
     pub fn submitter(&self) -> L2Submitter {
         self.submitter.clone().expect("the stage handle lives until finish")
+    }
+
+    /// A fault-only handle (not a producer).
+    pub fn fault_stamp(&self) -> L2FaultStamp {
+        L2FaultStamp { shared: self.shared.clone() }
     }
 
     pub fn path(&self) -> &Path {
@@ -2153,8 +2186,50 @@ mod tests {
         ] {
             assert!(meta["failure_time_semantics"][key].is_string(), "{key}");
         }
+        assert!(meta["counter_semantics"]["duplicate_logical_release"]
+            .as_str()
+            .unwrap()
+            .contains("EXTRA releases"));
         let end = sentinel(&rows);
         assert_eq!(end["t_us"], end["t_log_arrival_us"]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Three releases of one key count TWO extra releases (Σ max(N − 1, 0)),
+    /// in every processing order; the failure time is the second earliest.
+    #[test]
+    fn duplicate_counter_counts_extra_releases_in_every_order() {
+        let identity = id(L2Modality::Pc, 3);
+        let times = [100u64, 200, 300];
+        let orders: [[usize; 3]; 6] = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
+        for (n, order) in orders.iter().enumerate() {
+            let mut input = Vec::new();
+            for &i in order {
+                let t = times[i];
+                let s = L2Submission { identity, t_release_us: t, t_submit_us: t };
+                input.push(Row::Submit(s));
+                input.push(output_row(s));
+            }
+            let path = tmp(&format!("dup3-{n}"));
+            let summary = replay(&path, L2SinkKind::Fake, input, None);
+            assert_eq!(summary.duplicate_logical_release, 2, "{order:?}");
+            assert_eq!(summary.first_integrity_failure_us, Some(200), "{order:?}");
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn a_fault_stamp_is_not_a_producer() {
+        let path = tmp("fault-stamp");
+        let mut cfg = config(L2SinkKind::Null, None, 8);
+        cfg.report_window_us = 20_000;
+        let out = L2Output::start(&path, cfg).unwrap();
+        let stamp = out.fault_stamp();
+        stamp.receiver_fault(42, "drain counter");
+        let summary = out.finish().unwrap();
+        assert!(!summary.producers_alive_at_finish, "a live fault stamp is not a producer");
+        assert_eq!(summary.receiver_fault, Some((42, "drain counter".to_string())));
+        drop(stamp);
         let _ = std::fs::remove_file(&path);
     }
 }

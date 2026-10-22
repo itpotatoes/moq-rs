@@ -1249,6 +1249,41 @@ fn ensure_l2_distinct_from_rx(rx: (u64, u64), l2: (u64, u64)) -> Result<()> {
     Ok(())
 }
 
+/// A static-path fatal condition stamped where it happens (drain tasks,
+/// drain joins). Inert without L2: no clock read, no allocation.
+fn stamp_static_fault(
+    stamp: &Option<skew_moq::l2_output::L2FaultStamp>,
+    cause: impl FnOnce() -> String,
+) {
+    if let Some(stamp) = stamp {
+        stamp.receiver_fault(now_us(), &cause());
+    }
+}
+
+/// Join the static drains in order. A panicking or failed join is a FAILED
+/// track end, stamped for L2 at the moment it is recorded — before the next
+/// drain's `.await`, so a later select arm cannot cancel it away.
+async fn join_rx_drains(
+    drains: &mut [tokio::task::JoinHandle<(&'static str, TrackEnd, String)>],
+    stamp: &Option<skew_moq::l2_output::L2FaultStamp>,
+) -> Vec<(&'static str, TrackEnd, String)> {
+    let mut ends: Vec<(&'static str, TrackEnd, String)> = Vec::new();
+    for d in drains.iter_mut() {
+        match d.await {
+            Ok(t) => ends.push(t),
+            Err(e) if e.is_panic() => {
+                stamp_static_fault(stamp, || format!("drain task panicked: {e}"));
+                ends.push(("?", TrackEnd::Failed, format!("drain task panicked: {e}")))
+            }
+            Err(e) => {
+                stamp_static_fault(stamp, || format!("drain task join error: {e}"));
+                ends.push(("?", TrackEnd::Failed, format!("drain task join error: {e}")))
+            }
+        }
+    }
+    ends
+}
+
 /// Report the receiver's first fatal error to the L2 log (registration §6-1
 /// needs its time). Inert unless L2 is enabled: no clock read, no allocation.
 fn note_l2_fault(l2: Option<&skew_moq::l2_output::L2Output>, cause: impl FnOnce() -> String) {
@@ -1260,47 +1295,94 @@ fn note_l2_fault(l2: Option<&skew_moq::l2_output::L2Output>, cause: impl FnOnce(
     }
 }
 
-/// When the S3 run's first fatal cause was stored (registration §6-1: the
-/// abort time). The receiver keeps its cause in a plain `outcome_error` slot;
-/// `observe` is called right after code that may fill it and BEFORE any
-/// `.await` or release dispatch that follows, so the stamp is the storing
-/// moment, not a later cleanup step. A cause recorded elsewhere with its own
-/// time (switch-target faults) is offered through `observe_at`; the earliest
-/// wins. Inert without L2: no clock read, no allocation.
-struct FirstCauseClock {
-    enabled: bool,
-    first: Option<(u64, String)>,
+tokio::task_local! {
+    /// L2 fault stamp of the S3 control task and of the drain tasks it spawns
+    /// (registration §6-1). In scope only when L2 is enabled, so with
+    /// `--l2-sink none` every stamp below is a failed task-local lookup: no
+    /// clock read, no allocation, no row.
+    static S3_L2_FAULT: skew_moq::l2_output::L2FaultStamp;
 }
 
-impl FirstCauseClock {
-    fn new(enabled: bool) -> Self {
-        Self { enabled, first: None }
+/// Stamp a fatal S3 cause AT THE MOMENT it is stored (Codex 106 H1). Called
+/// by every store into the S3 `outcome_error` slot (`keep_first_cause`,
+/// `set_cause`), by the switch-target fault store, and where the drains count
+/// a fatal condition. The earliest stamp wins in L2; the slot's own semantics
+/// (first- or last-writer-wins) are untouched.
+fn stamp_s3_fault(cause: impl FnOnce() -> String) {
+    let _ = S3_L2_FAULT.try_with(|stamp| stamp.receiver_fault(now_us(), &cause()));
+}
+
+/// `*slot = Some(error)` exactly as before — last writer wins where the code
+/// relied on it — plus the L2 stamp at the storing moment.
+fn set_cause(slot: &mut Option<anyhow::Error>, error: anyhow::Error) {
+    stamp_s3_fault(|| format!("{error:#}"));
+    *slot = Some(error);
+}
+
+/// A loop cutoff a TEST can force right after an event was dequeued, so the
+/// carried-event path (Codex 106 H2) is driven deterministically through the
+/// real control loop. Outside `cfg(test)` there is no seam: the function is a
+/// constant `None` and the loop's behaviour is exactly the production one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum S3TestCutoff {
+    MaxDuration,
+    RetirementError,
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn s3_test_cutoff(_run_id: &str, _dequeued: bool) -> Option<S3TestCutoff> {
+    None
+}
+
+#[cfg(test)]
+fn s3_test_cutoff(run_id: &str, dequeued: bool) -> Option<S3TestCutoff> {
+    s3_test_seam::take(run_id, dequeued)
+}
+
+/// Per-run test plans: fire `cutoff` once, right after the `after_dequeued`-th
+/// dequeued event of the run with this `run_id`.
+#[cfg(test)]
+mod s3_test_seam {
+    use super::S3TestCutoff;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    struct Plan {
+        after_dequeued: u64,
+        seen: u64,
+        cutoff: S3TestCutoff,
+        fired: bool,
     }
 
-    fn observe(&mut self, slot: &Option<anyhow::Error>) {
-        if self.enabled && self.first.is_none() {
-            if let Some(error) = slot {
-                self.first = Some((now_us(), format!("{error:#}")));
-            }
+    static PLANS: Mutex<Option<HashMap<String, Plan>>> = Mutex::new(None);
+
+    pub fn arm(run_id: &str, after_dequeued: u64, cutoff: S3TestCutoff) {
+        let mut plans = PLANS.lock().unwrap_or_else(|p| p.into_inner());
+        plans.get_or_insert_with(HashMap::new).insert(
+            run_id.to_string(),
+            Plan { after_dequeued, seen: 0, cutoff, fired: false },
+        );
+    }
+
+    pub fn fired(run_id: &str) -> bool {
+        let plans = PLANS.lock().unwrap_or_else(|p| p.into_inner());
+        plans.as_ref().and_then(|p| p.get(run_id)).is_some_and(|plan| plan.fired)
+    }
+
+    pub fn take(run_id: &str, dequeued: bool) -> Option<S3TestCutoff> {
+        let mut plans = PLANS.lock().unwrap_or_else(|p| p.into_inner());
+        let plan = plans.as_mut()?.get_mut(run_id)?;
+        if plan.fired || !dequeued {
+            return None;
         }
-    }
-
-    fn observe_at(&mut self, t_us: u64, cause: impl FnOnce() -> String) {
-        if self.enabled && self.first.as_ref().is_none_or(|(t, _)| t_us < *t) {
-            self.first = Some((t_us, cause()));
+        plan.seen += 1;
+        if plan.seen < plan.after_dequeued {
+            return None;
         }
-    }
-
-    #[cfg(test)]
-    fn first_us(&self) -> Option<u64> {
-        self.first.as_ref().map(|(t, _)| *t)
-    }
-
-    /// Hand the stamped cause to L2 unchanged (the stored time, not now).
-    fn report(&self, l2: Option<&skew_moq::l2_output::L2Output>) {
-        if let (Some(l2), Some((t_us, cause))) = (l2, &self.first) {
-            l2.receiver_fault(*t_us, cause);
-        }
+        plan.fired = true;
+        Some(plan.cutoff)
     }
 }
 
@@ -2865,10 +2947,12 @@ async fn drain_s3_track(
                 let t_recv = now_us();
                 let Some(header) = unpack_header(&bytes) else {
                     bad_headers.fetch_add(1, Ordering::Relaxed);
+                    stamp_s3_fault(|| format!("S3 malformed header on {}", route.name));
                     continue;
                 };
                 if header.version != VERSION || bytes.len() != HDR + header.payload_len as usize {
                     bad_headers.fetch_add(1, Ordering::Relaxed);
+                    stamp_s3_fault(|| format!("S3 malformed header on {}", route.name));
                     continue;
                 }
                 let routed = RoutedObject {
@@ -2882,6 +2966,7 @@ async fn drain_s3_track(
                 };
                 if validate_routed_object(&routed).is_err() {
                     bad_headers.fetch_add(1, Ordering::Relaxed);
+                    stamp_s3_fault(|| format!("S3 malformed header on {}", route.name));
                     continue;
                 }
                 if is_warmup_seq(header.seq) {
@@ -2901,6 +2986,7 @@ async fn drain_s3_track(
                         .is_err()
                     {
                         log_failed.fetch_add(1, Ordering::Relaxed);
+                        stamp_s3_fault(|| format!("S3 rx log write failed on {}", route.name));
                     }
                     continue;
                 }
@@ -2922,11 +3008,13 @@ async fn drain_s3_track(
                     .is_err()
                 {
                     log_failed.fetch_add(1, Ordering::Relaxed);
+                    stamp_s3_fault(|| format!("S3 rx log write failed on {}", route.name));
                 }
                 match events.try_send(S3WireEvent::Object(routed)) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(S3WireEvent::Object(routed))) => {
                         ingress_drops.fetch_add(1, Ordering::Relaxed);
+                        stamp_s3_fault(|| format!("S3 ingress queue full on {}", route.name));
                         let header = routed.object.header;
                         if logger
                             .lock()
@@ -2947,6 +3035,7 @@ async fn drain_s3_track(
                             .is_err()
                         {
                             log_failed.fetch_add(1, Ordering::Relaxed);
+                            stamp_s3_fault(|| format!("S3 rx log write failed on {}", route.name));
                         }
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
@@ -3063,7 +3152,7 @@ async fn open_s3_subscription<S: S3SubscribeSeam>(
             Ok(handle) => {
                 let t_ok = now_us();
                 let local_release = Arc::new(AtomicBool::new(false));
-                let drain = tokio::spawn(drain_s3_track(
+                let drain = drain_s3_track(
                     role,
                     route,
                     reader,
@@ -3073,7 +3162,13 @@ async fn open_s3_subscription<S: S3SubscribeSeam>(
                     ingress_drops,
                     log_failed,
                     local_release.clone(),
-                ));
+                );
+                // The drain inherits the L2 fault stamp scope (only present
+                // with L2), so its fatal counters are stamped when they count.
+                let drain = match S3_L2_FAULT.try_with(|stamp| stamp.clone()) {
+                    Ok(stamp) => tokio::spawn(S3_L2_FAULT.scope(stamp, drain)),
+                    Err(_) => tokio::spawn(drain),
+                };
                 return Ok((
                     S3LiveSubscription {
                         handle: Some(handle),
@@ -3793,6 +3888,7 @@ fn flush_s3_barrier_drops(
 /// log as its own row, but the shutdown `detail` is then the later one.
 fn keep_first_cause(outcome_error: &mut Option<anyhow::Error>, error: anyhow::Error) {
     if outcome_error.is_none() {
+        stamp_s3_fault(|| format!("{error:#}"));
         *outcome_error = Some(error);
     }
 }
@@ -3844,7 +3940,11 @@ fn note_s3_drain_join(
                 keep_first_cause(outcome_error, error);
             }
         }
-        DrainJoin::Unjoined => *drains_unjoined += 1,
+        DrainJoin::Unjoined => {
+            *drains_unjoined += 1;
+            // Fatal at the end (`failed`); recorded now.
+            stamp_s3_fault(|| "S3 drain task did not stop within the join bound".to_string());
+        }
     }
 }
 
@@ -4432,10 +4532,6 @@ struct S3SwitchTargetFaults {
     faulted: Vec<(TrackRole, Route)>,
     /// The first such terminal, kept as the run's failure cause.
     cause: Option<anyhow::Error>,
-    /// When the first fault was recorded (the event-handling `now` the
-    /// `s3_switch_target_terminal_fault` row also carries). Kept after
-    /// `take_cause`, so a promotion at any later point keeps its time.
-    first_recorded_us: Option<u64>,
 }
 
 impl S3SwitchTargetFaults {
@@ -4458,18 +4554,16 @@ impl S3SwitchTargetFaults {
     /// First-cause-wins inside the store as well: a second faulted target is
     /// still recorded as faulted (so the refusal rule sees it), but the cause
     /// text stays the first one.
-    fn record(&mut self, role: TrackRole, route: Route, error: anyhow::Error, at_us: u64) {
+    fn record(&mut self, role: TrackRole, route: Route, error: anyhow::Error) {
         if !self.faulted.contains(&(role, route)) {
             self.faulted.push((role, route));
         }
         if self.cause.is_none() {
+            // The cause is stored HERE (promoted into `outcome_error` later),
+            // so this is its L2 time, not the event's earlier `now`.
+            stamp_s3_fault(|| format!("{error:#}"));
             self.cause = Some(error);
         }
-        self.first_recorded_us.get_or_insert(at_us);
-    }
-
-    fn first_recorded_us(&self) -> Option<u64> {
-        self.first_recorded_us
     }
 
     /// Does THIS pending request have a faulted target? Routes carry their
@@ -4759,12 +4853,12 @@ fn handle_s3_wire_event<H>(
                                         .map_err(anyhow::Error::from)
                                 })
                             {
-                                *outcome_error = Some(error);
+                                set_cause(outcome_error, error);
                                 return EventFlow::SkipIteration;
                             }
                         }
                         None => {
-                            *outcome_error = Some(anyhow::anyhow!(
+                            set_cause(outcome_error, anyhow::anyhow!(
                                 "S3 window end overflow: gen_ts_us={} pts_us={} duration_us={duration_us}",
                                 header.gen_ts_us,
                                 header.pts_us
@@ -4777,8 +4871,7 @@ fn handle_s3_wire_event<H>(
             let ingress_events = match ingress.push(routed, now) {
                 Ok(events) => events,
                 Err(error) => {
-                    *outcome_error =
-                        Some(anyhow::anyhow!("S3 ingress validation failed: {error}"));
+                    set_cause(outcome_error, anyhow::anyhow!("S3 ingress validation failed: {error}"));
                     return EventFlow::SkipIteration;
                 }
             };
@@ -4816,14 +4909,14 @@ fn handle_s3_wire_event<H>(
                                         .map_err(anyhow::Error::from)
                                 })
                             {
-                                *outcome_error = Some(error);
+                                set_cause(outcome_error, error);
                                 break;
                             }
                             stats.dropped += 1;
                             continue;
                         }
                         if let Err(error) = tracker.note_received(&routed.object) {
-                            *outcome_error = Some(anyhow::anyhow!(error));
+                            set_cause(outcome_error, anyhow::anyhow!(error));
                             break;
                         }
                         let key = S3ObjectKey::from(&routed.object);
@@ -4831,8 +4924,7 @@ fn handle_s3_wire_event<H>(
                             .insert(key, (routed.role, routed.route))
                             .is_some()
                         {
-                            *outcome_error =
-                                Some(anyhow::anyhow!("duplicate S3 scheduler identity"));
+                            set_cause(outcome_error, anyhow::anyhow!("duplicate S3 scheduler identity"));
                             break;
                         }
                         scheduler_actions.extend(scheduler.push(routed.object, now));
@@ -4860,7 +4952,7 @@ fn handle_s3_wire_event<H>(
                                     .map_err(anyhow::Error::from)
                             })
                         {
-                            *outcome_error = Some(error);
+                            set_cause(outcome_error, error);
                             break;
                         }
                         stats.dropped += 1;
@@ -4882,7 +4974,7 @@ fn handle_s3_wire_event<H>(
                             object_routes,
                             tracker,
                         ) {
-                            *outcome_error = Some(anyhow::anyhow!(error));
+                            set_cause(outcome_error, anyhow::anyhow!(error));
                             break;
                         }
                         let log_result = logger
@@ -4894,7 +4986,7 @@ fn handle_s3_wire_event<H>(
                                 Ok::<(), anyhow::Error>(())
                             });
                         if let Err(error) = log_result {
-                            *outcome_error = Some(error);
+                            set_cause(outcome_error, error);
                             break;
                         }
                         for (role, route) in [
@@ -4915,7 +5007,7 @@ fn handle_s3_wire_event<H>(
                                         .map_err(anyhow::Error::from)
                                 })
                             {
-                                *outcome_error = Some(error);
+                                set_cause(outcome_error, error);
                                 break;
                             }
                             // Defer the wire UNSUBSCRIBE for one
@@ -4935,7 +5027,7 @@ fn handle_s3_wire_event<H>(
                             ) {
                                 Ok(()) => {}
                                 Err(RetireError::Missing) => {
-                                    *outcome_error = Some(anyhow::anyhow!(
+                                    set_cause(outcome_error, anyhow::anyhow!(
                                         "missing old S3 subscription {} generation {}",
                                         route.name,
                                         route.generation
@@ -4946,7 +5038,7 @@ fn handle_s3_wire_event<H>(
                                     let drain = old.release_handle();
                                     drain.abort();
                                     retired_drains.push(drain);
-                                    *outcome_error = Some(anyhow::anyhow!(
+                                    set_cause(outcome_error, anyhow::anyhow!(
                                         "duplicate retiring S3 route {} generation {}",
                                         route.name,
                                         route.generation
@@ -5036,7 +5128,7 @@ fn handle_s3_route_ended<H>(
             logger,
             retired_drains,
         ) {
-            *outcome_error = Some(error);
+            set_cause(outcome_error, error);
         }
     }
     // A target route of a switch that never applied, ending with
@@ -5085,7 +5177,6 @@ fn handle_s3_route_ended<H>(
                         .unwrap_or_else(|| "none".to_string()),
                     detail
                 ),
-                now,
             );
         }
         if !pending {
@@ -5149,14 +5240,14 @@ fn handle_s3_route_ended<H>(
             Ok(()) => {
                 recompute_s3_normal_end(ingress, current_finished, normal_end);
             }
-            Err(error) => *outcome_error = Some(error),
+            Err(error) => set_cause(outcome_error, error),
         }
         return EventFlow::Continue;
     }
     let current = ingress.gate().active_routes().for_role(role);
     if current == route {
         if end != TrackEnd::Fin {
-            *outcome_error = Some(anyhow::anyhow!(
+            set_cause(outcome_error, anyhow::anyhow!(
                 "current S3 route {} generation {} ended {:?}: {}",
                 route.name,
                 route.generation,
@@ -5233,15 +5324,19 @@ fn drain_s3_events_at_exit<H>(
     outcome_error: &mut Option<anyhow::Error>,
     // A release emitted while draining at exit is a real release.
     l2: Option<&skew_moq::l2_output::L2Submitter>,
-    // Stamps a cause stored here BEFORE the releases dispatched after it.
-    cause_clock: &mut FirstCauseClock,
+    // An event the control loop dequeued in the iteration that ended it
+    // (Codex 106 H2): processed FIRST, exactly once, before the queue.
+    mut carried: Option<S3WireEvent>,
 ) -> ExitDrain {
     let mut drained = 0u64;
     let disconnected = loop {
-        let event = match event_rx.try_recv() {
-            Ok(event) => event,
-            Err(mpsc::error::TryRecvError::Empty) => break false,
-            Err(mpsc::error::TryRecvError::Disconnected) => break true,
+        let event = match carried.take() {
+            Some(event) => event,
+            None => match event_rx.try_recv() {
+                Ok(event) => event,
+                Err(mpsc::error::TryRecvError::Empty) => break false,
+                Err(mpsc::error::TryRecvError::Disconnected) => break true,
+            },
         };
         drained += 1;
         let now = now_us();
@@ -5272,8 +5367,6 @@ fn drain_s3_events_at_exit<H>(
             faults,
             &mut failure,
         );
-        cause_clock.observe(outcome_error);
-        cause_clock.observe(&failure);
         // Same terminal accounting as the shutdown flush that follows: no
         // bridge, no render, no audio — this path is teardown, not playback.
         let dispatched = dispatch_s3_playout_actions(
@@ -5289,12 +5382,11 @@ fn drain_s3_events_at_exit<H>(
             &|action| scheduler.action_due_us(action),
             l2,
         );
+        // `failure` was stamped where it was stored; a dispatch error is
+        // stored (and stamped) here. Same first-writer-wins merge as before.
         for error in [failure, dispatched.err()].into_iter().flatten() {
-            if outcome_error.is_none() {
-                *outcome_error = Some(error);
-            }
+            keep_first_cause(outcome_error, error);
         }
-        cause_clock.observe(outcome_error);
     };
     ExitDrain {
         drained,
@@ -6432,8 +6524,51 @@ async fn run_s3_control<S, T>(
     runtime: S3RuntimeConfig,
     logger: Arc<Mutex<JsonlLogger>>,
     namespace: TrackNamespace,
+    subscriber: S,
+    session_run: tokio::task::JoinHandle<T>,
+) -> Result<()>
+where
+    S: S3SubscribeSeam,
+    T: std::fmt::Debug + S3SessionOutcome,
+{
+    // L2 output stage (1-D M1); `None` with `--l2-sink none`. With L2 the
+    // whole control task (and every drain it spawns) runs inside the L2 fault
+    // stamp scope, so a fatal cause is stamped where it is stored. Without L2
+    // there is no scope and no stamp.
+    let l2_output = start_l2_output(args, &logger)?;
+    match l2_output.as_ref().map(|output| output.fault_stamp()) {
+        Some(stamp) => {
+            S3_L2_FAULT
+                .scope(
+                    stamp,
+                    run_s3_control_body(
+                        args, playout, runtime, logger, namespace, subscriber, session_run,
+                        l2_output,
+                    ),
+                )
+                .await
+        }
+        None => {
+            run_s3_control_body(
+                args, playout, runtime, logger, namespace, subscriber, session_run, None,
+            )
+            .await
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_s3_control_body<S, T>(
+    args: &Args,
+    playout: PlayoutConfig,
+    runtime: S3RuntimeConfig,
+    logger: Arc<Mutex<JsonlLogger>>,
+    namespace: TrackNamespace,
     mut subscriber: S,
     mut session_run: tokio::task::JoinHandle<T>,
+    // An early `?` return below leaves the L2 file without its sentinel
+    // (fail closed).
+    mut l2_output: Option<skew_moq::l2_output::L2Output>,
 ) -> Result<()>
 where
     S: S3SubscribeSeam,
@@ -6443,11 +6578,7 @@ where
     // site.
     T: std::fmt::Debug + S3SessionOutcome,
 {
-    // L2 output stage (1-D M1); `None` with `--l2-sink none`. An early `?`
-    // return below leaves the L2 file without its sentinel (fail closed).
-    let mut l2_output = start_l2_output(args, &logger)?;
     let l2_submitter = l2_output.as_ref().map(|output| output.submitter());
-    let mut cause_clock = FirstCauseClock::new(l2_output.is_some());
     let mut controller = S3Controller::new(runtime.controller).map_err(anyhow::Error::msg)?;
     let gate = S3SwitchGate::new(runtime.switch)
         .map_err(|error| anyhow::anyhow!("create S3 switch gate: {error:?}"))?;
@@ -6632,6 +6763,8 @@ where
             )?;
     }
 
+    // An event dequeued in the iteration that ends the loop (Codex 106 H2).
+    let mut carried_event: Option<S3WireEvent> = None;
     while !normal_end && outcome_error.is_none() {
         let now = now_us();
         let pending_at_start = ingress.gate().pending_request().is_some();
@@ -6672,20 +6805,24 @@ where
             }
             _ = tokio::time::sleep(wait) => None,
         };
-        // L2 (registration §6-1): a session end stored by the select arm.
-        cause_clock.observe(&outcome_error);
         let now = now_us();
+        let test_cutoff = s3_test_cutoff(&args.run_id, event.is_some());
         // First-cause-wins from here to the end of the iteration: the session
         // arm above, the max-duration check and the retirement releases can
         // all fire in the SAME iteration, and the cause that ended the run
         // must not be replaced by a consequence of it. (The loop condition
         // guarantees `outcome_error` was `None` at the top of the iteration,
         // so this only orders causes WITHIN one iteration.)
-        if now >= max_end_us {
+        if now >= max_end_us || test_cutoff == Some(S3TestCutoff::MaxDuration) {
             keep_first_cause(
                 &mut outcome_error,
                 anyhow::anyhow!("S3 receiver max-duration reached"),
             );
+            // Codex 106 H2 (user decision 가): the event dequeued above is
+            // out of the channel and not in `object_routes`; dropping it here
+            // left its rx row without a terminal. It goes to exit drain pass 1
+            // as its first item, exactly once.
+            carried_event = event;
             break;
         }
 
@@ -6703,7 +6840,15 @@ where
                 keep_first_cause(&mut outcome_error, error);
             }
         }
+        if test_cutoff == Some(S3TestCutoff::RetirementError) {
+            keep_first_cause(
+                &mut outcome_error,
+                anyhow::anyhow!("test-only: forced S3 retirement release failure"),
+            );
+        }
         if outcome_error.is_some() {
+            // Same as the max-duration break: hand the dequeued event over.
+            carried_event = event;
             continue;
         }
 
@@ -6736,15 +6881,12 @@ where
                 EventFlow::SkipIteration => continue,
             }
         }
-        // L2: a cause stored by the event (e.g. a current route ended
-        // `Failed`) is stamped BEFORE the releases dispatched below.
-        cause_clock.observe(&outcome_error);
 
         scheduler_actions.extend(scheduler.advance(now));
         // Same common-timeline epoch row as S1/M1/S2/S3R: S3 uses the same
         // scheduler, so its `t_due` is verifiable the same way.
         if let Err(error) = log_common_epochs(&mut scheduler, &logger, playout) {
-            outcome_error = Some(error);
+            set_cause(&mut outcome_error, error);
             continue;
         }
         if let Err(error) = dispatch_s3_playout_actions(
@@ -6760,16 +6902,16 @@ where
             &|action| scheduler.action_due_us(action),
             l2_submitter.as_ref(),
         ) {
-            outcome_error = Some(error);
+            set_cause(&mut outcome_error, error);
             continue;
         }
         if scheduler.is_started() && !controller.is_active() {
             if let Err(error) = controller.activate(now) {
-                outcome_error = Some(anyhow::anyhow!(error));
+                set_cause(&mut outcome_error, anyhow::anyhow!(error));
                 continue;
             }
             if let Err(error) = tracker.activate() {
-                outcome_error = Some(anyhow::anyhow!(error));
+                set_cause(&mut outcome_error, anyhow::anyhow!(error));
                 continue;
             }
             controller_active_at_us = Some(now);
@@ -6803,7 +6945,7 @@ where
                 }) {
                     Ok(update) => final_update = Some(update),
                     Err(error) => {
-                        outcome_error = Some(anyhow::anyhow!(error));
+                        set_cause(&mut outcome_error, anyhow::anyhow!(error));
                         break;
                     }
                 }
@@ -6820,7 +6962,7 @@ where
                             .map_err(anyhow::Error::from)
                     })
                 {
-                    outcome_error = Some(error);
+                    set_cause(&mut outcome_error, error);
                     continue;
                 }
                 if let Some(update) = final_update {
@@ -6865,17 +7007,13 @@ where
                             }
                         }
                         Err(error) => {
-                            outcome_error = Some(error);
+                            set_cause(&mut outcome_error, error);
                             continue;
                         }
                     }
                 }
             }
         }
-        // L2 checkpoint before the switch request below, an `.await` that is
-        // not guarded by `outcome_error.is_none()` (the forced-miss request
-        // above is) and can follow an error recorded in this iteration.
-        cause_clock.observe(&outcome_error);
         let observations = match advance_tracker_checked(&mut tracker, &scheduler, now) {
             Ok(observations) => observations,
             Err(error) => {
@@ -6903,12 +7041,11 @@ where
                                 .map_err(anyhow::Error::from)
                         })
                     {
-                        outcome_error =
-                            Some(log_error.context(format!("S3 tracker bound: {message}")));
+                        set_cause(&mut outcome_error, log_error.context(format!("S3 tracker bound: {message}")));
                         continue;
                     }
                 }
-                outcome_error = Some(anyhow::anyhow!(error.message()));
+                set_cause(&mut outcome_error, anyhow::anyhow!(error.message()));
                 continue;
             }
         };
@@ -6926,7 +7063,7 @@ where
                             .map_err(anyhow::Error::from)
                     })
                 {
-                    outcome_error = Some(error);
+                    set_cause(&mut outcome_error, error);
                 }
             }
         } else {
@@ -6934,7 +7071,7 @@ where
                 let update = match controller.observe(observation) {
                     Ok(update) => update,
                     Err(error) => {
-                        outcome_error = Some(anyhow::anyhow!(error));
+                        set_cause(&mut outcome_error, anyhow::anyhow!(error));
                         break;
                     }
                 };
@@ -6981,17 +7118,13 @@ where
                         }
                     }
                     Err(error) => {
-                        outcome_error = Some(error);
+                        set_cause(&mut outcome_error, error);
                         break;
                     }
                 }
             }
         }
     }
-
-    // L2 checkpoint (registration §6-1): an error recorded inside the loop
-    // ended it at the loop condition, with no `.await` in between.
-    cause_clock.observe(&outcome_error);
 
     // Drain-at-exit, pass 1 — BEFORE `finish_pending`, on the normal end and
     // on every error exit alike. Anything still queued (typically the objects
@@ -7028,7 +7161,7 @@ where
         &mut switch_faults,
         &mut outcome_error,
         l2_submitter.as_ref(),
-        &mut cause_clock,
+        carried_event.take(),
     );
     s3_events_drained_at_exit += pass_one.drained;
 
@@ -7038,7 +7171,6 @@ where
     if let Err(error) = flush_s3_barrier_drops(&mut ingress, &logger, &mut stats) {
         keep_first_cause(&mut outcome_error, error);
     }
-    cause_clock.observe(&outcome_error);
 
     // Stop every subscription before joining/aborting its drain, then stop the
     // session. No detached reader is allowed to write after shutdown logging.
@@ -7065,14 +7197,10 @@ where
     for (_role, _route, subscription) in retiring.drain_all() {
         let join = discard_s3_subscription(subscription).await;
         note_s3_drain_join(join, &logger, &mut drains_unjoined, &mut outcome_error);
-        // Before the next join's `.await` (Codex 105 G3).
-        cause_clock.observe(&outcome_error);
     }
     for (_, subscription) in live.drain() {
         let join = discard_s3_subscription(subscription).await;
         note_s3_drain_join(join, &logger, &mut drains_unjoined, &mut outcome_error);
-        // Before the next join's `.await` (Codex 105 G3).
-        cause_clock.observe(&outcome_error);
     }
     for drain in retired_drains.drain(..) {
         if !drain.is_finished() {
@@ -7080,8 +7208,6 @@ where
         }
         let join = join_s3_drain(drain).await;
         note_s3_drain_join(join, &logger, &mut drains_unjoined, &mut outcome_error);
-        // Before the next join's `.await` (Codex 105 G3).
-        cause_clock.observe(&outcome_error);
     }
     // Only a handle the select never consumed may be polled here; re-polling
     // a completed one panics and would skip everything below, including the
@@ -7095,7 +7221,6 @@ where
         // timeout branch are documented there.
         join_s3_session_at_shutdown(&mut session_run, &logger, &mut outcome_error).await;
     }
-    cause_clock.observe(&outcome_error);
     // Every drain task has now been joined — or, for the `drains_unjoined`
     // ones that missed the bound, is still alive and still holds an
     // `S3WireEvent` sender clone, which is why pass 2 below then reports
@@ -7131,10 +7256,14 @@ where
         &mut switch_faults,
         &mut outcome_error,
         l2_submitter.as_ref(),
-        &mut cause_clock,
+        None,
     );
     s3_events_drained_at_exit += pass_two.drained;
     let event_queue_closed = pass_two.disconnected;
+    if !event_queue_closed {
+        // A fatal residue condition (`failed` below), recorded now.
+        stamp_s3_fault(|| "S3 event queue not closed after exit drain pass 2".to_string());
+    }
     // `finish_pending` empties the exact-pair barrier but does NOT clear the
     // gate's pending request, so on an ERROR exit that still had a switch
     // pending, an object drained in pass 2 can be classified
@@ -7153,7 +7282,6 @@ where
     if let Some(cause) = switch_faults.take_cause() {
         keep_first_cause(&mut outcome_error, cause);
     }
-    cause_clock.observe(&outcome_error);
     drop(bridge_tx);
     if let Some(mut child) = bridge_child {
         let _ = child.start_kill();
@@ -7216,9 +7344,6 @@ where
         }
     }
 
-    // L2 checkpoint after the shutdown flush.
-    cause_clock.observe(&outcome_error);
-
     let n_pc = recv_pc.load(Ordering::Relaxed);
     let n_haptic = recv_haptic.load(Ordering::Relaxed);
     let n_bad = bad_headers.load(Ordering::Relaxed);
@@ -7251,14 +7376,6 @@ where
     // failure without an earlier recorded cause is first recorded here. Close
     // the L2 stage before the shutdown rows so no `?` below can skip it; its
     // integrity is judged from the L2 file, not the rx log or exit status.
-    // A switch-target fault keeps the time it was recorded at, wherever it
-    // was later promoted into `outcome_error`; the earliest cause wins.
-    if let Some(at_us) = switch_faults.first_recorded_us() {
-        cause_clock.observe_at(at_us, || {
-            "S3 switch target terminal fault (rx s3_switch_target_terminal_fault, t_ended)".to_string()
-        });
-    }
-    cause_clock.report(l2_output.as_ref());
     if failed {
         note_l2_fault(l2_output.as_ref(), || {
             format!(
@@ -7955,9 +8072,11 @@ async fn main() -> Result<()> {
         let ingress_log_failed = ingress_log_failed.clone();
         let wire_stats_out = wire_stats.clone();
         let l2_b1 = if args.arm == Arm::B1 { l2_submitter.clone() } else { None };
-        // Every L2-enabled drain reports a FAILED track end at the moment it
-        // happens (registration §6-1). `None` without L2.
-        let l2_fault = l2_submitter.clone();
+        // Every L2-enabled drain stamps its fatal conditions (FAILED track
+        // end, malformed header, rx/drop log failure, closed scheduler) at
+        // the moment they happen (registration §6-1). A fault stamp is not a
+        // producer. `None` without L2.
+        let l2_fault = l2_output.as_ref().map(|output| output.fault_stamp());
         // Logical slots this drain owns: its own for pc/haptic, both for mixed.
         let owned_slots: Vec<usize> = if name == SHARED_FIFO_TRACK {
             vec![0, 1]
@@ -8017,11 +8136,13 @@ async fn main() -> Result<()> {
                     let Some(h) = unpack_header(&obj) else {
                         eprintln!("[rx] {name}: object shorter than the {HDR}B header ({}B)", obj.len());
                         bad.fetch_add(1, Ordering::Relaxed);
+                        stamp_static_fault(&l2_fault, || format!("malformed header on {name}"));
                         continue;
                     };
                     if h.version != VERSION {
                         eprintln!("[rx] {name}: header version {} != {VERSION}", h.version);
                         bad.fetch_add(1, Ordering::Relaxed);
+                        stamp_static_fault(&l2_fault, || format!("malformed header on {name}"));
                         continue;
                     }
                     let Some(track) = demux_track(name, h.track_id) else {
@@ -8030,6 +8151,7 @@ async fn main() -> Result<()> {
                             track_name(h.track_id)
                         );
                         bad.fetch_add(1, Ordering::Relaxed);
+                        stamp_static_fault(&l2_fault, || format!("malformed header on {name}"));
                         continue;
                     };
                     let slot = track_slot(track);
@@ -8040,6 +8162,7 @@ async fn main() -> Result<()> {
                             obj.len(), h.payload_len
                         );
                         bad.fetch_add(1, Ordering::Relaxed);
+                        stamp_static_fault(&l2_fault, || format!("malformed header on {name}"));
                         continue;
                     }
                     let warmup = is_warmup_seq(h.seq);
@@ -8054,6 +8177,7 @@ async fn main() -> Result<()> {
                             Err(e) => {
                                 eprintln!("[rx] {name}: invalid equal-chunk object: {e:#}");
                                 bad.fetch_add(1, Ordering::Relaxed);
+                                stamp_static_fault(&l2_fault, || format!("malformed equal-chunk object on {name}"));
                                 continue;
                             }
                         };
@@ -8082,6 +8206,7 @@ async fn main() -> Result<()> {
                             h.payload_len, h.gen_ts_us, t,
                         ).is_err() {
                             ingress_log_failed.fetch_add(1, Ordering::Relaxed);
+                            stamp_static_fault(&l2_fault, || format!("warm-up rx log write failed on {name}"));
                         }
                         continue;
                     }
@@ -8130,6 +8255,7 @@ async fn main() -> Result<()> {
                                 );
                                 if logged.is_err() {
                                     ingress_log_failed.fetch_add(1, Ordering::Relaxed);
+                                    stamp_static_fault(&l2_fault, || format!("ingress drop log write failed on {name}"));
                                 }
                             }
                             Err(mpsc::error::TrySendError::Closed(scheduled)) => {
@@ -8148,6 +8274,7 @@ async fn main() -> Result<()> {
                                     None,
                                 );
                                 ingress_log_failed.fetch_add(1, Ordering::Relaxed);
+                                stamp_static_fault(&l2_fault, || format!("scheduler closed while {name} was receiving"));
                             }
                         }
                     } else {
@@ -8187,10 +8314,8 @@ async fn main() -> Result<()> {
                 Err(DrainFail::Serve(e)) => (name, classify_track_end(&e), format!("{e}")),
                 Err(DrainFail::NonSubgroup) => (name, TrackEnd::Failed, "non-subgroup delivery".into()),
             };
-            if let Some(l2) = &l2_fault {
-                if ended.1 == TrackEnd::Failed && !l2.receiver_fault_noted() {
-                    l2.receiver_fault(now_us(), &format!("track {name} ended Failed: {}", ended.2));
-                }
+            if ended.1 == TrackEnd::Failed {
+                stamp_static_fault(&l2_fault, || format!("track {name} ended Failed: {}", ended.2));
             }
             ended
         }));
@@ -8204,19 +8329,8 @@ async fn main() -> Result<()> {
     // Errors here used to be discarded, so the receiver exited 0 no matter what
     // happened and a batch runner's "abort on non-zero exit" never fired on the
     // rx side. Each outcome is now classified and reported.
-    let all_drains = async {
-        let mut ends: Vec<(&'static str, TrackEnd, String)> = Vec::new();
-        for d in &mut drains {
-            match d.await {
-                Ok(t) => ends.push(t),
-                Err(e) if e.is_panic() => {
-                    ends.push(("?", TrackEnd::Failed, format!("drain task panicked: {e}")))
-                }
-                Err(e) => ends.push(("?", TrackEnd::Failed, format!("drain task join error: {e}"))),
-            }
-        }
-        ends
-    };
+    let drain_fault = l2_output.as_ref().map(|output| output.fault_stamp());
+    let all_drains = join_rx_drains(&mut drains, &drain_fault);
     let drained = tokio::select! {
         ends = all_drains => Drained::Ends(ends),
         r = &mut session_run => {
@@ -11941,18 +12055,15 @@ mod s3_switch_subscribe_tests {
             TrackRole::Haptic,
             target.haptic,
             anyhow::anyhow!("first cause"),
-            1_000,
         );
         assert!(faults.request_has_fault(request));
-        // First-cause-wins inside the store as well, and so does its time.
-        faults.record(TrackRole::Pc, target.pc, anyhow::anyhow!("second cause"), 2_000);
+        // First-cause-wins inside the store as well.
+        faults.record(TrackRole::Pc, target.pc, anyhow::anyhow!("second cause"));
         assert_eq!(
             format!("{:#}", faults.take_cause().expect("a cause was recorded")),
             "first cause"
         );
         assert!(faults.take_cause().is_none());
-        // The first record time outlives the promotion (Codex 105 G3).
-        assert_eq!(faults.first_recorded_us(), Some(1_000));
         // Still faulted for the rule even after the cause was promoted.
         assert!(faults.request_has_fault(request));
 
@@ -11966,12 +12077,11 @@ mod s3_switch_subscribe_tests {
                 generation: 2,
             },
             anyhow::anyhow!("older generation"),
-            0,
         );
         assert!(!other.request_has_fault(request));
         // Neither is the same route under the other role.
         let mut swapped = S3SwitchTargetFaults::default();
-        swapped.record(TrackRole::Pc, target.haptic, anyhow::anyhow!("wrong role"), 0);
+        swapped.record(TrackRole::Pc, target.haptic, anyhow::anyhow!("wrong role"));
         assert!(!swapped.request_has_fault(request));
 
         // A torn-down target stays watched until its terminal arrives.
@@ -12982,8 +13092,24 @@ mod s3_control_loop_tests {
         session: SessionEnding,
         extra: &[String],
     ) -> CaseOutcome {
+        run_case_core(name, "loop-test", duration_s, force_ms, script, delayed, session, extra).await
+    }
+
+    /// `run_case_inner_with` under a caller-chosen run id (the per-run test
+    /// cutoff seam is keyed by it).
+    #[allow(clippy::too_many_arguments)]
+    async fn run_case_core(
+        name: &str,
+        run_id: &str,
+        duration_s: Option<&str>,
+        force_ms: &str,
+        script: Vec<Call>,
+        delayed: Vec<(u64, Vec<Step>)>,
+        session: SessionEnding,
+        extra: &[String],
+    ) -> CaseOutcome {
         let out = test_log_path(name);
-        let args = s3_args_with(&out, "loop-test", duration_s, force_ms, extra);
+        let args = s3_args_with(&out, run_id, duration_s, force_ms, extra);
         let playout = playout_config(&args)
             .expect("playout config")
             .expect("S3 uses the common scheduler");
@@ -13658,7 +13784,6 @@ mod s3_control_loop_tests {
         )
         .unwrap();
         let submitter = output.submitter();
-        let mut clock = FirstCauseClock::new(true);
         let object = |role: TrackRole, tier: u16, seq: u32, pts_us: u64, event_id: u32| {
             let (track_id, route) = match role {
                 TrackRole::Pc => (TRACK_PC, routes.pc),
@@ -13689,7 +13814,7 @@ mod s3_control_loop_tests {
             &mut tracker, &mut object_routes, &mut live, &mut retiring, &mut retired_drains,
             &mut current_finished, &mut normal_end, &recv_pc, &recv_haptic, &logger,
             &mut stats, &mut refused, &mut faults, &mut outcome_error, Some(&submitter),
-            &mut clock,
+            None,
         );
         assert_eq!((pass_one.drained, pass_one.disconnected), (4, false));
         let releases = |path: &std::path::Path| -> Vec<serde_json::Value> {
@@ -13720,7 +13845,7 @@ mod s3_control_loop_tests {
             &mut tracker, &mut object_routes, &mut live, &mut retiring, &mut retired_drains,
             &mut current_finished, &mut normal_end, &recv_pc, &recv_haptic, &logger,
             &mut stats, &mut refused, &mut faults, &mut outcome_error, Some(&submitter),
-            &mut clock,
+            None,
         );
         assert_eq!((pass_two.drained, pass_two.disconnected), (2, true));
         assert!(outcome_error.is_none(), "{outcome_error:?}");
@@ -13756,6 +13881,107 @@ mod s3_control_loop_tests {
         for p in [&rx_path, &l2_path] {
             std::fs::remove_file(p).ok();
         }
+    }
+
+    /// Codex 106 H2 (user decision 가), driven through the REAL control loop:
+    /// the loop is cut right after its 3rd dequeue (test seam keyed by run id;
+    /// no seam outside `cfg(test)`). The dequeued event must reach exit drain
+    /// pass 1 first and exactly once, so every rx route copy has exactly one
+    /// terminal and every release has submit + terminal in L2. The pair 100 ms
+    /// older than the anchors is due at the epoch, so it is released in pass 1
+    /// itself (production late tolerance), the anchors in the shutdown flush.
+    async fn h2_cutoff_case(name: &str, run_id: &str, cutoff: S3TestCutoff, cause: &str) {
+        s3_test_seam::arm(run_id, 3, cutoff);
+        let l2_path = test_log_path(&format!("{name}-l2"));
+        let extra: Vec<String> = [
+            "--l2-sink", "fake", "--l2-log", &l2_path.display().to_string(),
+            "--l2-fake-pc-offset-us", "1500", "--l2-fake-haptic-offset-us", "400",
+            "--l2-report-window-ms", "300",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let script = vec![
+            Call { track: PC_NORMAL, before: Vec::new(), answer: Answer::Accept(Vec::new()) },
+            Call {
+                track: HAPTIC_FULL,
+                before: Vec::new(),
+                answer: Answer::Accept(vec![
+                    Step::Publish(PC_NORMAL, vec![(2, 30, 1_000_000, 31), (2, 27, 900_000, 28)]),
+                    Step::Publish(HAPTIC_FULL, vec![(0, 90, 1_000_000, 31), (0, 81, 900_000, 28)]),
+                ]),
+            },
+        ];
+        let outcome = run_case_core(
+            name, run_id, Some("30"), "600000", script, Vec::new(), SessionEnding::Never, &extra,
+        )
+        .await;
+        assert!(s3_test_seam::fired(run_id), "the cutoff fired right after a dequeue");
+        let error = format!("{:#}", outcome.result.as_ref().expect_err("the cutoff ends the run"));
+        assert!(error.contains(cause), "{error}");
+        // Exactly once: one terminal per rx route copy, no duplicate drop.
+        outcome.assert_every_rx_object_is_terminated();
+        assert_eq!(outcome.keys("rx").len(), 4, "all four objects were received");
+        assert!(outcome.rows.iter().all(|r| r["drop_reason"] != DROP_DUPLICATE_IDENTITY));
+        let shutdown = outcome.shutdown();
+        assert_eq!(shutdown["s3_event_queue_closed"], true);
+        assert!(shutdown["s3_events_drained_at_exit"].as_u64().unwrap() >= 2, "{shutdown}");
+
+        let l2: Vec<serde_json::Value> = std::fs::read_to_string(&l2_path)
+            .expect("L2 log written")
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        std::fs::remove_file(&l2_path).ok();
+        let last = l2.last().unwrap();
+        assert_eq!(last["role"], "instrumentation_end");
+        assert_eq!(last["integrity_ok"], true, "{last}");
+        let fault = l2.iter().find(|r| r["role"] == "receiver_fault").expect("abort stamped");
+        assert!(fault["cause"].as_str().unwrap().contains(cause), "{fault}");
+        let fault_us = fault["t_us"].as_u64().unwrap();
+        let key = |r: &serde_json::Value| {
+            format!(
+                "{}/{}/{}/{}/{}/{}/{}",
+                r["track"], r["wire_track"], r["route_generation"], r["tier"], r["seq"],
+                r["pts_us"], r["event_id"]
+            )
+        };
+        let releases: Vec<&serde_json::Value> =
+            outcome.rows.iter().filter(|r| r["role"] == "release").collect();
+        assert_eq!(releases.len(), 4, "{releases:?}");
+        for release in &releases {
+            let k = key(release);
+            assert_eq!(l2.iter().filter(|r| r["role"] == "submit" && key(r) == k).count(), 1, "{k}");
+            assert_eq!(l2.iter().filter(|r| r["role"] == "output" && key(r) == k).count(), 1, "{k}");
+            assert!(release["t_release"].as_u64().unwrap() > fault_us, "released after the abort");
+        }
+        // Pass-1 releases (the older pair) precede the flush releases.
+        let t = |pts: u64| -> Vec<u64> {
+            releases
+                .iter()
+                .filter(|r| r["pts_us"] == pts)
+                .map(|r| r["t_release"].as_u64().unwrap())
+                .collect()
+        };
+        let (older, anchors) = (t(900_000), t(1_000_000));
+        assert_eq!((older.len(), anchors.len()), (2, 2));
+        assert!(older.iter().max() < anchors.iter().min(), "older pair released in pass 1");
+    }
+
+    #[tokio::test]
+    async fn h2_max_duration_cutoff_hands_the_dequeued_event_to_exit_drain() {
+        h2_cutoff_case("h2-max", "h2-max-duration", S3TestCutoff::MaxDuration, "max-duration").await;
+    }
+
+    #[tokio::test]
+    async fn h2_retirement_error_cutoff_hands_the_dequeued_event_to_exit_drain() {
+        h2_cutoff_case(
+            "h2-retire",
+            "h2-retirement-error",
+            S3TestCutoff::RetirementError,
+            "forced S3 retirement release failure",
+        )
+        .await;
     }
 
     /// (b) A transition whose request instant falls at/after the window end is
@@ -15799,103 +16025,288 @@ mod l2_hook_tests {
         }
     }
 
-    /// F4: `--l2-sink none` reports nothing (no clock read, no call); with L2
-    /// one fault row is written, the earliest.
-    #[test]
-    fn receiver_faults_are_inert_without_l2_and_earliest_with_it() {
-        let mut called = false;
-        note_l2_fault(None, || {
-            called = true;
-            String::new()
-        });
-        assert!(!called, "the cause is not even formatted without L2");
-        let mut inert = FirstCauseClock::new(false);
-        inert.observe(&Some(anyhow::anyhow!("x")));
-        inert.observe_at(5, || panic!("not even formatted"));
-        assert!(inert.first.is_none(), "no stamp without L2");
-        let path = tmp("faults");
-        let output = fake_output(&path, 0, 0);
-        let mut clock = FirstCauseClock::new(true);
-        clock.observe(&None);
-        assert!(clock.first.is_none());
-        clock.observe(&Some(anyhow::anyhow!("first")));
-        let stamped = clock.first_us().unwrap();
-        clock.observe(&Some(anyhow::anyhow!("later")));
-        assert_eq!(clock.first_us(), Some(stamped), "observe never re-stamps");
-        clock.report(Some(&output));
-        note_l2_fault(Some(&output), || "second".to_string());
-        output.finish().unwrap();
-        let l2 = rows(&path);
-        let faults: Vec<_> = l2.iter().filter(|r| r["role"] == "receiver_fault").collect();
-        assert_eq!(faults.len(), 1);
-        assert_eq!(faults[0]["cause"], "first");
-        assert_eq!(faults[0]["t_us"].as_u64(), Some(stamped));
-        let _ = std::fs::remove_file(&path);
+    /// An L2 fake stage whose terminals never come back: a submission is an
+    /// unresolved integrity failure OCCURRING at its own `t_submit_us`.
+    fn unresolved_stage(path: &std::path::Path) -> L2Output {
+        let mut fake = FakeSinkConfig::offsets(0, 0);
+        fake.drop_terminals = true;
+        L2Output::start(
+            path,
+            L2Config {
+                run_id: "l2-hook".into(),
+                method: "s3".into(),
+                sink: L2SinkKind::Fake,
+                fake: Some(fake),
+                queue_capacity: 64,
+                row_capacity: 1024,
+                report_window_us: 50_000,
+                max_tracked_objects: 1024,
+            },
+        )
+        .unwrap()
     }
 
-    /// Codex 105 G3: the first drain panic is stamped when it is STORED; a
-    /// slow next join does not move the time, and the L2 row carries exactly
-    /// the stored value. Same helper sequence as the S3 exit path
-    /// (`join_s3_drain` -> `note_s3_drain_join` -> `observe`), helper-level for
-    /// the same reason as `a_panicking_drain_join_fails_the_run...`: a real
-    /// drain has no reachable panic without a production injection point.
-    #[tokio::test]
-    async fn a_drain_panic_is_timed_where_it_is_stored_not_after_the_next_join() {
-        let rx_path = tmp("g3-rx");
-        let logger = rx_logger(&rx_path);
-        let l2_path = tmp("g3-l2");
-        let output = fake_output(&l2_path, 0, 0);
-        let mut clock = FirstCauseClock::new(true);
-        let mut drains_unjoined = 0u64;
-        let mut outcome_error: Option<anyhow::Error> = None;
-        let before_panic = now_us();
-        let panicking = tokio::spawn(async { panic!("scripted drain panic") });
-        let join = join_s3_drain(panicking).await;
-        note_s3_drain_join(join, &logger, &mut drains_unjoined, &mut outcome_error);
-        clock.observe(&outcome_error);
-        let stored = clock.first_us().expect("stamped at the store");
-        assert!(stored >= before_panic);
-        // The next join is slow (a drain that takes 40 ms to stop).
-        let slow = tokio::spawn(async {
-            tokio::time::sleep(Duration::from_millis(40)).await;
+    /// Hold the rx logger from another thread; `pause` into the hold, make
+    /// one L2 submission (an integrity failure DURING the hold), release.
+    /// Returns the holder (yielding the failure's `t_submit_us`) once the lock
+    /// is held.
+    fn hold_logger_and_fail(
+        logger: &Arc<Mutex<JsonlLogger>>,
+        submitter: skew_moq::l2_output::L2Submitter,
+        pause: Duration,
+    ) -> std::thread::JoinHandle<u64> {
+        let logger = logger.clone();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let guard = logger.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(pause);
+            let t = now_us();
+            let identity = skew_moq::l2_output::L2Identity {
+                modality: skew_moq::l2_output::L2Modality::Pc,
+                tier: 2,
+                seq: 1,
+                pts_us: 33_333,
+                event_id: 2,
+                route: None,
+            };
+            submitter.submit(identity, t);
+            drop(submitter);
+            drop(guard);
+            t
         });
-        let join = join_s3_drain(slow).await;
-        note_s3_drain_join(join, &logger, &mut drains_unjoined, &mut outcome_error);
-        clock.observe(&outcome_error);
-        let after_slow_join = now_us();
-        assert!(after_slow_join >= stored + 40_000);
-        clock.report(Some(&output));
-        output.finish().unwrap();
-        let l2 = rows(&l2_path);
-        let fault = l2.iter().find(|r| r["role"] == "receiver_fault").unwrap();
-        assert_eq!(fault["t_us"].as_u64(), Some(stored), "exactly the stored value");
-        assert!(fault["cause"].as_str().unwrap().contains("S3 drain task panicked"));
+        locked_rx.recv().unwrap();
+        holder
+    }
+
+    /// The common verdict: the fault was stamped where the cause was stored,
+    /// so it precedes the failure injected while the next step was blocked.
+    fn assert_fault_precedes_failure(l2_path: &std::path::Path, failure_submit_us: u64, cause: &str) {
+        let l2 = rows(l2_path);
         let end = l2.last().unwrap();
         assert_eq!(end["role"], "instrumentation_end");
-        assert_eq!(end["receiver_fault_us"].as_u64(), Some(stored));
+        assert_eq!(end["first_integrity_failure_reason"], "submitted_unresolved");
+        let failure_us = end["first_integrity_failure_us"].as_u64().unwrap();
+        assert!(failure_us >= failure_submit_us);
+        let fault = l2.iter().find(|r| r["role"] == "receiver_fault").expect("fault row");
+        let fault_us = fault["t_us"].as_u64().unwrap();
+        assert!(
+            fault_us < failure_us,
+            "receiver_fault {fault_us} must precede the failure at {failure_us}"
+        );
+        assert!(fault["cause"].as_str().unwrap().contains(cause), "{fault}");
+        assert_eq!(end["receiver_fault_us"].as_u64(), Some(fault_us));
+    }
+
+    const HOLD: Duration = Duration::from_millis(50);
+
+    /// `--l2-sink none`: no task-local scope, no stamp, the cause closure is
+    /// never even evaluated; the slot semantics are unchanged.
+    #[test]
+    fn stamps_are_inert_without_l2() {
+        stamp_s3_fault(|| panic!("not evaluated without the L2 scope"));
+        stamp_static_fault(&None, || panic!("not evaluated without L2"));
+        let mut slot = None;
+        keep_first_cause(&mut slot, anyhow::anyhow!("first"));
+        keep_first_cause(&mut slot, anyhow::anyhow!("second"));
+        assert_eq!(format!("{:#}", slot.as_ref().unwrap()), "first");
+        set_cause(&mut slot, anyhow::anyhow!("overwrite"));
+        assert_eq!(format!("{:#}", slot.unwrap()), "overwrite", "last writer wins as before");
+    }
+
+    /// H1 class: S3 drain-join panic (`note_s3_drain_join` stores, then logs).
+    #[tokio::test]
+    async fn h1_s3_drain_panic_is_stamped_before_its_exit_note() {
+        let rx_path = tmp("h1-panic-rx");
+        let logger = rx_logger(&rx_path);
+        let l2_path = tmp("h1-panic-l2");
+        let output = unresolved_stage(&l2_path);
+        let join = join_s3_drain(tokio::spawn(async { panic!("scripted drain panic") })).await;
+        let holder = hold_logger_and_fail(&logger, output.submitter(), HOLD);
+        let mut outcome_error = None;
+        let mut unjoined = 0u64;
+        S3_L2_FAULT
+            .scope(output.fault_stamp(), async {
+                note_s3_drain_join(join, &logger, &mut unjoined, &mut outcome_error);
+            })
+            .await;
+        let failure_submit_us = holder.join().unwrap();
+        assert!(outcome_error.is_some());
+        output.finish().unwrap();
+        assert_fault_precedes_failure(&l2_path, failure_submit_us, "S3 drain task panicked");
         for p in [&rx_path, &l2_path] {
             let _ = std::fs::remove_file(p);
         }
     }
 
-    /// Codex 105 G3: a switch-target fault promoted later keeps the time it
-    /// was recorded at, and an earlier cause stays first.
-    #[test]
-    fn a_switch_target_fault_keeps_its_record_time_through_promotion() {
-        let mut faults = S3SwitchTargetFaults::default();
-        let route = Route { name: "pc-d6", generation: 1 };
-        faults.record(TrackRole::Pc, route, anyhow::anyhow!("target ended Failed"), 1_000);
-        let mut clock = FirstCauseClock::new(true);
-        // Something else is stored (and stamped now) before the promotion.
-        clock.observe(&Some(anyhow::anyhow!("a later error stored first")));
+    /// H1 class: S3 session failure found at the shutdown join.
+    #[tokio::test]
+    async fn h1_s3_session_shutdown_fault_is_stamped_before_its_exit_note() {
+        let rx_path = tmp("h1-session-rx");
+        let logger = rx_logger(&rx_path);
+        let l2_path = tmp("h1-session-l2");
+        let output = unresolved_stage(&l2_path);
+        let mut session_run: tokio::task::JoinHandle<std::result::Result<(), SessionError>> =
+            tokio::spawn(async { panic!("scripted session panic") });
+        while !session_run.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let holder = hold_logger_and_fail(&logger, output.submitter(), HOLD);
         let mut outcome_error = None;
-        keep_first_cause(&mut outcome_error, faults.take_cause().unwrap());
-        clock.observe_at(faults.first_recorded_us().unwrap(), || "switch target fault".into());
-        assert_eq!(clock.first_us(), Some(1_000), "the earlier record time wins");
-        // A record time later than the stamped cause does not replace it.
-        let mut clock = FirstCauseClock::new(true);
-        clock.observe_at(500, || "early".into());
-        clock.observe_at(1_000, || panic!("not formatted when later"));
-        assert_eq!(clock.first_us(), Some(500));
+        S3_L2_FAULT
+            .scope(output.fault_stamp(), async {
+                join_s3_session_at_shutdown(&mut session_run, &logger, &mut outcome_error).await;
+            })
+            .await;
+        let failure_submit_us = holder.join().unwrap();
+        assert!(outcome_error.is_some());
+        output.finish().unwrap();
+        assert_fault_precedes_failure(&l2_path, failure_submit_us, "S3 session task panicked");
+        for p in [&rx_path, &l2_path] {
+            let _ = std::fs::remove_file(p);
+        }
     }
+
+    /// H1 class: the direct stores of the route loop (cancel / retirement
+    /// `Missing`/`Duplicate`, and every other `set_cause` site) followed by
+    /// more logging in the same handler; also: the slot keeps its
+    /// last-writer-wins value while L2 keeps the first stored cause.
+    #[tokio::test]
+    async fn h1_route_loop_direct_store_is_stamped_before_the_following_logs() {
+        let rx_path = tmp("h1-route-rx");
+        let logger = rx_logger(&rx_path);
+        let l2_path = tmp("h1-route-l2");
+        let output = unresolved_stage(&l2_path);
+        let holder = hold_logger_and_fail(&logger, output.submitter(), HOLD);
+        let mut outcome_error = None;
+        S3_L2_FAULT
+            .scope(output.fault_stamp(), async {
+                set_cause(
+                    &mut outcome_error,
+                    anyhow::anyhow!("missing old S3 subscription pc generation 0"),
+                );
+                // The handler's next drop/cancel row waits for the logger.
+                let _ = log_s3_exit_note(&logger, "\"event\":\"probe_after_store\"");
+                set_cause(&mut outcome_error, anyhow::anyhow!("a later overwrite"));
+            })
+            .await;
+        let failure_submit_us = holder.join().unwrap();
+        assert_eq!(format!("{:#}", outcome_error.unwrap()), "a later overwrite");
+        output.finish().unwrap();
+        assert_fault_precedes_failure(&l2_path, failure_submit_us, "missing old S3 subscription");
+        for p in [&rx_path, &l2_path] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    /// H1 class: a switch-target fault is timed where it is STORED, not at
+    /// the earlier event `now` (retirement work and rows sit in between): an
+    /// integrity failure that happened in between therefore precedes it.
+    #[tokio::test]
+    async fn h1_switch_target_fault_is_timed_at_its_store_not_at_the_event() {
+        let l2_path = tmp("h1-switch-l2");
+        let output = unresolved_stage(&l2_path);
+        let event_now = now_us();
+        // Work between the event's `now` and the store, during which an L2
+        // failure occurs.
+        let submitter = output.submitter();
+        std::thread::sleep(Duration::from_millis(5));
+        let failure_submit_us = now_us();
+        submitter.submit(
+            skew_moq::l2_output::L2Identity {
+                modality: skew_moq::l2_output::L2Modality::Pc,
+                tier: 2,
+                seq: 1,
+                pts_us: 33_333,
+                event_id: 2,
+                route: None,
+            },
+            failure_submit_us,
+        );
+        drop(submitter);
+        std::thread::sleep(Duration::from_millis(5));
+        let mut faults = S3SwitchTargetFaults::default();
+        S3_L2_FAULT
+            .scope(output.fault_stamp(), async {
+                faults.record(
+                    TrackRole::Pc,
+                    Route { name: "pc-d6", generation: 1 },
+                    anyhow::anyhow!("S3 switch target pc-d6 generation 1 ended Failed"),
+                );
+            })
+            .await;
+        output.finish().unwrap();
+        let l2 = rows(&l2_path);
+        let fault_us = l2.iter().find(|r| r["role"] == "receiver_fault").unwrap()["t_us"]
+            .as_u64()
+            .unwrap();
+        assert!(fault_us > failure_submit_us, "stored after the failure: {fault_us}");
+        assert!(fault_us > event_now + 10_000, "not the event's earlier `now`");
+        assert!(faults.take_cause().is_some(), "the cause is still promoted later");
+        let _ = std::fs::remove_file(&l2_path);
+    }
+
+    /// H1 class: a static drain-join panic is stamped when it is recorded,
+    /// before the next (slow) drain is awaited.
+    #[tokio::test]
+    async fn h1_static_drain_join_panic_is_stamped_before_the_next_join() {
+        let l2_path = tmp("h1-static-join-l2");
+        let output = unresolved_stage(&l2_path);
+        let submitter = output.submitter();
+        let injector = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            let t = now_us();
+            submitter.submit(
+                skew_moq::l2_output::L2Identity {
+                    modality: skew_moq::l2_output::L2Modality::Haptic,
+                    tier: 0,
+                    seq: 3,
+                    pts_us: 33_333,
+                    event_id: 2,
+                    route: None,
+                },
+                t,
+            );
+            t
+        });
+        let mut drains: Vec<tokio::task::JoinHandle<(&'static str, TrackEnd, String)>> = vec![
+            tokio::spawn(async { panic!("scripted static drain panic") }),
+            tokio::spawn(async {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                ("haptic", TrackEnd::Fin, String::new())
+            }),
+        ];
+        let stamp = Some(output.fault_stamp());
+        let ends = join_rx_drains(&mut drains, &stamp).await;
+        let failure_submit_us = injector.join().unwrap();
+        assert_eq!(ends.len(), 2);
+        assert_eq!(ends[0].1, TrackEnd::Failed);
+        output.finish().unwrap();
+        assert_fault_precedes_failure(&l2_path, failure_submit_us, "drain task panicked");
+        let _ = std::fs::remove_file(&l2_path);
+    }
+
+    /// H1 class: a static ingress-log failure (or closed scheduler) is
+    /// stamped where the drain counts it, before its next rx row.
+    #[tokio::test]
+    async fn h1_static_ingress_log_failure_is_stamped_where_it_is_counted() {
+        let rx_path = tmp("h1-ingress-rx");
+        let logger = rx_logger(&rx_path);
+        let l2_path = tmp("h1-ingress-l2");
+        let output = unresolved_stage(&l2_path);
+        let holder = hold_logger_and_fail(&logger, output.submitter(), HOLD);
+        let stamp = Some(output.fault_stamp());
+        let ingress_log_failed = AtomicU64::new(0);
+        // The drain's sequence: count + stamp, then the next object's rx row.
+        ingress_log_failed.fetch_add(1, Ordering::Relaxed);
+        stamp_static_fault(&stamp, || "ingress drop log write failed on pc".to_string());
+        logger.lock().unwrap().log_rx("pc", 2, 2, 66_666, 3, 4, now_us(), now_us(), now_us());
+        let failure_submit_us = holder.join().unwrap();
+        output.finish().unwrap();
+        assert_fault_precedes_failure(&l2_path, failure_submit_us, "ingress drop log write failed");
+        for p in [&rx_path, &l2_path] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
 }
