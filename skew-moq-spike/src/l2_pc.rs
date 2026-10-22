@@ -203,11 +203,14 @@ impl PcRepresentation {
 }
 
 /// The decoder of a representation for the L2 meta (null for `.bin`).
-/// v1.6 (registration 3-2, Codex 115 gap 2): `compiler_command` (the full
-/// command the Draco build validated: program, then every argument with the
-/// crate directory written `<crate>`; cc appends `-o <obj> -c <src>` per
-/// file) and `compiler_resolved` (that program after the PATH lookup and
-/// symlink resolution, or `unresolved`) are required fields.
+/// v1.6 (registration 3-2, Codex 115 gap 2): `compiler_command` (the
+/// command the Draco build validated, PROGRAM AND ARGUMENTS ONLY: program,
+/// then every argument with the crate directory written `<crate>`; cc
+/// appends `-o <obj> -c <src>` per file. The build check also required the
+/// command's environment overrides to be exactly cc's `LC_ALL=C`; that rule
+/// is enforced when the binary is built and is NOT carried here) and
+/// `compiler_resolved` (that program after the PATH lookup and symlink
+/// resolution, or the string `unresolved`) are required fields.
 pub fn decoder_meta(representation: PcRepresentation) -> serde_json::Value {
     match representation {
         PcRepresentation::Bin => serde_json::Value::Null,

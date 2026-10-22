@@ -174,14 +174,17 @@ mod pc_lane;
 /// start is reported as a typed [`L2DeviceStartFailure`] (stage, timeout,
 /// lane exit) instead of a bare string. (e69c310 added the untimed PC device
 /// failure `wayland_frame_callback_missing` under this tag.)
-/// v1.6 (Codex 115; registration 3-2, 3-3b, 3-5): a rendered frame still
-/// pending at close is classified three ways (`pc_lane`): (i) the frame
-/// callback of the last commit missing -> `wayland_frame_callback_missing`;
-/// (ii) the callback fired but the compositor holds every buffer -> the new
-/// untimed PC device failure `wayland_buffer_release_missing` (the 6th entry
-/// of the closed list `l2_pc::WAYLAND_DEVICE_FAILURE_REASONS`), its block in
-/// the sentinel's `lanes.pc.buffer_release_missing_at_close`; (iii) neither
-/// -> a timed unresolved submit counted in `lanes.pc.committable_pending_at_close`;
+/// v1.6 (Codex 115; registration 3-2, 3-3b, 3-5): the PC lane starts no
+/// commit at or after the close deadline; a rendered frame still pending at
+/// close is classified three ways by the engine state at the close deadline
+/// (`pc_lane`; a frame callback or buffer release received at or after the
+/// deadline does not change the branch): (i) the frame callback of the last
+/// commit missing -> `wayland_frame_callback_missing`; (ii) the callback
+/// fired but the compositor holds every buffer -> the new untimed PC device
+/// failure `wayland_buffer_release_missing` (the 6th entry of the closed list
+/// `l2_pc::WAYLAND_DEVICE_FAILURE_REASONS`), its block in the sentinel's
+/// `lanes.pc.buffer_release_missing_at_close`; (iii) neither -> a timed
+/// unresolved submit counted in `lanes.pc.committable_pending_at_close`;
 /// meta `wayland.decoder` (draco) gains the required `compiler_command` and
 /// `compiler_resolved`. Still µs-only time fields: no `*_ns` field (no
 /// `refresh_ns`, registration 11-11).
@@ -1330,10 +1333,10 @@ fn wayland_meta(wayland: &WaylandSinkConfig, ready: &pc_lane::PcLaneReady) -> se
         "thread_layout": "render worker thread: takes released frames from the bounded submission queue in release order, decodes (draco) and renders them, puts each into a one-frame pending slot; commit thread: owns the compositor connection and commits the pending frame at each commit opportunity (neither thread has a real-time priority, registration 11-10)",
         "commit_policy": "a commit opportunity exists when the frame callback requested with the previous commit has fired (or nothing was committed since startup) and no PC device failure occurred; one frame per commit; wp_presentation.feedback is requested immediately before every commit and maps its commit_id to the frame immutably",
         "pending_policy": "one pending frame; a frame replaced there before it was committed is explicit_discard superseded_before_commit (after submit)",
-        "buffer_policy": "a frame is written only into a wl_shm buffer the compositor does not hold (Held from its commit until wl_buffer.release); with none free the pending frame waits (still waiting at close: close_policy (ii)); wl_buffer.release and frame callbacks are never output evidence",
+        "buffer_policy": "a frame is written only into a wl_shm buffer the compositor does not hold (Held from its commit until wl_buffer.release); with none free the pending frame waits (still waiting at the close deadline: close_policy (ii)); wl_buffer.release and frame callbacks are never output evidence",
         "feedback_policy": "presented -> output; discarded -> explicit_discard compositor_discarded; a feedback or frame callback for an unknown or already resolved commit is a timed integrity failure at its receipt (wayland_unexpected_feedback / wayland_unexpected_frame_callback); a presented timestamp with tv_nsec >= 1e9 is wayland_bad_timestamp and the frame stays unresolved",
-        "failure_policy": "compositor connection loss or protocol error, xdg_toplevel.close, a configure that changes the size or drops fullscreen, an output change after ready (output_policy), committed frames still without feedback at close (including a feedback received at or after the close deadline, which is not accepted and leaves its commit outstanding), a frame callback still missing at close while a rendered frame waits for its commit (wayland_frame_callback_missing), and every buffer still held by the compositor at close while a rendered frame waits for its commit after the frame callback fired (wayland_buffer_release_missing) are PC device failures (with nothing waiting, neither a last frame presented without its callback nor buffers still held is a failure): untimed (first_integrity_failure_us null, first_failure_time_determinable false), recorded in lanes.pc.device_failure with observation_interval_us [last_good_us, detected_us]; after one, nothing is committed any more and every frame not yet committed (pending or submitted later) gets explicit_discard device_failure after submit; committed frames keep waiting for their feedback",
-        "close_policy": "after finish starts the worker processes every submission of the producers, the commit thread commits the last pending frame and waits until every committed frame has its feedback or the close deadline, then disconnects; a slow feedback is never declared missing before the deadline; a rendered frame still pending when the close deadline ended the commit loop keeps no terminal (submitted_unresolved) and is classified by what kept it from its commit (registration 3-3b): (i) the frame callback of the last commit missing -> wayland_frame_callback_missing (lanes.pc.frame_callback_missing_at_close = that commit id), (ii) the callback fired but the compositor holds every buffer -> wayland_buffer_release_missing (lanes.pc.buffer_release_missing_at_close = {pending_seq, buffers, buffers_held, holding_commit_ids by buffer index, 0 = startup commit}), both untimed PC device failures; (iii) the callback fired and a buffer is free (the frame reached the pending slot after the commit loop stopped at the deadline) -> no device failure, the submit stays a timed submitted_unresolved (lanes.pc.committable_pending_at_close = 1)",
+        "failure_policy": "compositor connection loss or protocol error, xdg_toplevel.close, a configure that changes the size or drops fullscreen, an output change after ready (output_policy), committed frames still without feedback at close (including a feedback received at or after the close deadline, which is not accepted and leaves its commit outstanding), a frame callback still missing at the close deadline while a rendered frame waits for its commit (wayland_frame_callback_missing), and every buffer still held by the compositor at the close deadline while a rendered frame waits for its commit after the frame callback fired (wayland_buffer_release_missing) are PC device failures (close_policy; with nothing waiting, neither a last frame presented without its callback nor buffers still held is a failure): untimed (first_integrity_failure_us null, first_failure_time_determinable false), recorded in lanes.pc.device_failure with observation_interval_us [last_good_us, detected_us]; after one, nothing is committed any more and every frame not yet committed (pending or submitted later) gets explicit_discard device_failure after submit; committed frames keep waiting for their feedback",
+        "close_policy": "after finish starts the worker processes every submission of the producers, the commit thread commits the last pending frame and waits until every committed frame has its feedback or the close deadline, then disconnects; a slow feedback is never declared missing before the deadline; no commit is started at or after the close deadline: the commit thread reads its clock immediately before it takes the pending frame and takes it only while that read is < close_deadline_us; a rendered frame still pending when the close deadline ended the commit loop keeps no terminal (submitted_unresolved) and is classified by the engine state at the close deadline, i.e. what kept it from its commit (registration 3-3b; a frame callback or buffer release received at or after the deadline is still counted in lanes.pc.engine but does not change the classification): (i) the frame callback of the last commit missing -> wayland_frame_callback_missing (lanes.pc.frame_callback_missing_at_close = that commit id), (ii) the callback fired but the compositor holds every buffer -> wayland_buffer_release_missing (lanes.pc.buffer_release_missing_at_close = {pending_seq, buffers, buffers_held, holding_commit_ids by buffer index, 0 = startup commit}), both untimed PC device failures; (iii) the callback fired and a buffer is free: the frame reached the pending slot after the commit loop's deadline exit or too shortly before the deadline for a commit to start -> no device failure, the submit stays a timed submitted_unresolved at its t_submit_us, like not_rendered_after_deadline (lanes.pc.committable_pending_at_close = 1)",
         "start_check": "wp_presentation.clock_id must be CLOCK_MONOTONIC before the meta row, otherwise the run is refused; the startup frame (commit 0, background, not a ledger row) must be presented AND its frame callback must fire, and the surface must be on exactly one output (startup.output); a failure is a typed device start failure (stage, timeout, lane exit) the receiver writes as one L2_DEVICE_START_FAILURE line on STDERR before exiting 10",
         "start_bounds": "every wait for the compositor during startup (registry and clock round trips, configure, startup presentation and frame callback, surface output) shares the lane's deadline (80 % of the ready timeout); connect_to_env (a local socket connect) and the synchronous buffer preparation (memfd, mmap, fill) have no internal deadline; the stage's outer ready timeout bounds the caller's wait and its later join of the lane, it does not by itself guarantee that the compositor or the device was released",
         "presentation_time_policy": "output times are the presented timestamps as reported (never clamped or reordered); presentation_seq is kept raw and is not a vblank counter; refresh steps come from presented_delta_us and refresh_index",
@@ -4981,6 +4984,19 @@ mod tests {
         assert_eq!(wayland["startup"]["clock"], "CLOCK_MONOTONIC");
         assert_eq!(wayland["representation"], "bin");
         assert!(wayland["decoder"].is_null(), "no decoder for bin (no compiler fields either)");
+        // v1.6: the close rules the checker copies (registration 3-3b).
+        let close_policy = wayland["close_policy"].as_str().unwrap();
+        for phrase in [
+            "no commit is started at or after the close deadline",
+            "takes it only while that read is < close_deadline_us",
+            "classified by the engine state at the close deadline",
+            "does not change the classification",
+            "wayland_buffer_release_missing",
+            "lanes.pc.committable_pending_at_close = 1",
+        ] {
+            assert!(close_policy.contains(phrase), "close_policy: {phrase}");
+        }
+        assert!(wayland["failure_policy"].as_str().unwrap().contains("wayland_buffer_release_missing"));
         assert_eq!(wayland["tiers_meta"]["tiers_by_header_tier"]["2"]["depth_scale"], 4);
         assert_no_raw_ns(&rows);
         let terminals = terminals_by_key(&rows);

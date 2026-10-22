@@ -19,17 +19,20 @@
 //! the deadline passed, records committed frames still without feedback as
 //! the device failure `wayland_feedback_missing` (they stay unresolved: a
 //! committed frame ends only through its feedback), sends its counters
-//! (`lanes.pc`) and disconnects. A rendered frame still pending at close
-//! (only possible when the close deadline ended the commit loop) keeps no
-//! terminal and is classified by what kept it from its commit (registration
-//! 3-3b, v1.6): (i) the frame callback of the last commit is missing ->
-//! `wayland_frame_callback_missing`; (ii) the callback fired but the
-//! compositor holds every buffer -> `wayland_buffer_release_missing`
-//! (`buffer_release_missing_at_close`) — both untimed PC device failures —;
-//! (iii) neither: the frame reached the slot after the commit loop stopped
-//! at the deadline -> a timed unresolved submit, counted in
-//! `committable_pending_at_close`. A stage dropped without `finish`
-//! abandons: no counters, no sentinel (fail closed).
+//! (`lanes.pc`) and disconnects. No commit is started at or after the close
+//! deadline (v1.6). A rendered frame still pending at close (only possible
+//! when the close deadline ended the commit loop) keeps no terminal and is
+//! classified by what kept it from its commit at the close deadline
+//! (registration 3-3b, v1.6; a frame callback or buffer release received
+//! at or after the deadline does not change the branch): (i) the frame
+//! callback of the last commit is missing -> `wayland_frame_callback_missing`;
+//! (ii) the callback fired but the compositor holds every buffer ->
+//! `wayland_buffer_release_missing` (`buffer_release_missing_at_close`) —
+//! both untimed PC device failures —; (iii) neither: the frame reached the
+//! slot too late for a commit to start before the deadline -> a timed
+//! unresolved submit, counted in `committable_pending_at_close`. A stage
+//! dropped without `finish` abandons: no counters, no sentinel (fail
+//! closed).
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -373,8 +376,9 @@ enum Exit {
 
 /// Registration 3-3b (v1.6) close branch (ii): the state that kept the
 /// pending frame from its commit — the frame callback had fired, but the
-/// compositor held every buffer. Sentinel `lanes.pc.buffer_release_missing_at_close`
-/// (null when branch (ii) did not happen):
+/// compositor held every buffer at the close deadline. Sentinel
+/// `lanes.pc.buffer_release_missing_at_close` (null when branch (ii) did not
+/// happen):
 /// `{"pending_seq": u32, "buffers": n, "buffers_held": n,
 ///   "holding_commit_ids": [commit id holding buffer 0, .., buffer n-1]}`
 /// (`buffers_held == buffers`; commit id 0 = the startup commit).
@@ -384,7 +388,7 @@ struct BufferReleaseMissing {
     pending_seq: u32,
     /// The wl_shm pool size.
     buffers: usize,
-    /// Buffers the compositor held at close.
+    /// Buffers the compositor held at the close deadline.
     buffers_held: usize,
     /// Index = buffer: the commit that holds it.
     holding_commit_ids: Vec<u64>,
@@ -398,6 +402,26 @@ impl BufferReleaseMissing {
             "buffers_held": self.buffers_held,
             "holding_commit_ids": self.holding_commit_ids,
         })
+    }
+}
+
+/// v1.6: what the close classification of a pending frame reads — the
+/// engine's outstanding frame callback and buffer states AT THE CLOSE
+/// DEADLINE. Taken just before the first compositor event received at or
+/// after the deadline is applied, so that a late frame callback or buffer
+/// release (still applied and counted in `lanes.pc.engine`) cannot turn
+/// branch (i) or (ii) into (iii). No snapshot = no event was applied after
+/// the deadline; since no commit is started then either, the engine state at
+/// `finish` IS the state at the deadline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeadlineState {
+    outstanding_frame_callback: Option<u64>,
+    buffers: Vec<BufferState>,
+}
+
+impl DeadlineState {
+    fn of(engine: &PresentEngine) -> Self {
+        Self { outstanding_frame_callback: engine.outstanding_frame_callback(), buffers: engine.buffer_states().to_vec() }
     }
 }
 
@@ -421,14 +445,19 @@ struct CommitLane {
     committed_without_feedback_at_close: u64,
     pending_at_close: bool,
     /// The commit whose missing frame callback kept the pending frame from
-    /// being committed before close (registration 3-3b, Codex 114; branch (i)).
+    /// being committed before the close deadline (registration 3-3b, Codex
+    /// 114; branch (i)).
     frame_callback_missing_at_close: Option<u64>,
-    /// Branch (ii) (v1.6): every buffer held by the compositor at close.
+    /// Branch (ii) (v1.6): every buffer held by the compositor at the close
+    /// deadline.
     buffer_release_missing_at_close: Option<BufferReleaseMissing>,
-    /// Branch (iii) (v1.6): a pending frame that was committable at close
-    /// (callback fired, a buffer free) — it reached the slot after the
-    /// commit loop stopped at the close deadline. 0 or 1.
+    /// Branch (iii) (v1.6): a pending frame that was committable at the
+    /// close deadline (callback fired, a buffer free) — it reached the slot
+    /// after the commit loop's deadline exit, or too shortly before the
+    /// deadline for a commit to start. 0 or 1.
     committable_pending_at_close: u64,
+    /// The close classification's input at the deadline ([`DeadlineState`]).
+    at_deadline: Option<DeadlineState>,
     diagnostics: Option<PcDiagLog>,
 }
 
@@ -445,6 +474,15 @@ impl CommitLane {
             return;
         };
         self.waiting_for_buffer = false;
+        // v1.6: no commit is STARTED at or after the close deadline (the
+        // same boundary as the terminal acceptance `< close_deadline_us`):
+        // its feedback could never be accepted, and the commit would turn a
+        // frame the deadline cut off (iii) or a stall (i)/(ii) into a
+        // spurious wayland_feedback_missing. Read immediately before the
+        // pending frame is taken; the frame then stays pending for `finish`.
+        if self.out.shared.close_deadline().is_some_and(|deadline| now_us() >= deadline) {
+            return;
+        }
         let Some(frame) = self.link.pending.take() else { return };
         let t_write_us = now_us();
         if let Err(error) = self.backend.write_frame(buffer, self.side, &frame.pixels) {
@@ -486,6 +524,12 @@ impl CommitLane {
 
     fn apply(&mut self, event: BackendEvent, t_callback_us: u64) {
         let deadline = self.out.shared.close_deadline();
+        // v1.6: freeze the close classification's input before the first
+        // event received at or after the deadline changes the engine (the
+        // event itself is still applied and counted below).
+        if self.at_deadline.is_none() && deadline.is_some_and(|d| t_callback_us >= d) {
+            self.at_deadline = Some(DeadlineState::of(&self.engine));
+        }
         // Codex 112 P1: a feedback received at or after the close deadline is
         // not accepted AND its commit must stay outstanding, so that the
         // close check records it as the PC device failure
@@ -604,8 +648,10 @@ impl CommitLane {
             // can only be left here when the close deadline ended `run`:
             // its other exit needs an empty slot or a device failure, which
             // empties the slot. Registration 3-3b (v1.6), by the engine
-            // state that kept the frame from its commit (never by
-            // `commit_opportunity()`, which a feedback-missing failure
+            // state AT THE CLOSE DEADLINE that kept the frame from its
+            // commit ([`DeadlineState`]: a frame callback or buffer release
+            // received at or after the deadline does not change the branch;
+            // never `commit_opportunity()`, which a feedback-missing failure
             // recorded above already turned false):
             // (i)   the frame callback of the last commit is still missing:
             //       untimed PC device failure wayland_frame_callback_missing
@@ -615,26 +661,28 @@ impl CommitLane {
             //       wayland_buffer_release_missing, the block recorded in
             //       buffer_release_missing_at_close;
             // (iii) the callback fired and a buffer is free: the frame reached
-            //       the slot when the commit loop had already stopped at the
-            //       deadline (the worker checks the deadline BEFORE it decodes
-            //       and renders, and offers afterwards) — deliberately a timed
-            //       unresolved submit at its t_submit_us, like a frame not
-            //       rendered before the deadline; counted in
-            //       committable_pending_at_close.
+            //       the slot after the commit loop's deadline exit (the worker
+            //       checks the deadline BEFORE it decodes and renders, and
+            //       offers afterwards) or too shortly before the deadline for
+            //       a commit to start (`try_commit` starts none at or after
+            //       it) — deliberately a timed unresolved submit at its
+            //       t_submit_us, like a frame not rendered before the
+            //       deadline; counted in committable_pending_at_close.
             // With no pending frame neither (i) nor (ii) is a failure: a last
             // frame presented without its callback, or buffers still held
             // with nothing waiting, are not.
             self.pending_at_close = true;
             let seq = frame.submission.identity.seq;
-            if let Some(blocking) = self.engine.outstanding_frame_callback() {
+            let at_deadline = self.at_deadline.take().unwrap_or_else(|| DeadlineState::of(&self.engine));
+            if let Some(blocking) = at_deadline.outstanding_frame_callback {
                 self.frame_callback_missing_at_close = Some(blocking);
                 let detail = format!(
-                    "the frame callback of commit {blocking} was still missing at close, so the rendered frame seq {seq} was never committed"
+                    "the frame callback of commit {blocking} was still missing at the close deadline, so the rendered frame seq {seq} was never committed"
                 );
                 self.device_failure(FAIL_WAYLAND_FRAME_CALLBACK_MISSING, now_us(), detail);
-            } else if self.engine.free_buffer().is_none() {
-                let states = self.engine.buffer_states();
-                let holding_commit_ids: Vec<u64> = states
+            } else if !at_deadline.buffers.contains(&BufferState::Free) {
+                let holding_commit_ids: Vec<u64> = at_deadline
+                    .buffers
                     .iter()
                     .filter_map(|state| match state {
                         BufferState::Held { commit_id } => Some(*commit_id),
@@ -643,12 +691,12 @@ impl CommitLane {
                     .collect();
                 let blocked = BufferReleaseMissing {
                     pending_seq: seq,
-                    buffers: states.len(),
+                    buffers: at_deadline.buffers.len(),
                     buffers_held: holding_commit_ids.len(),
                     holding_commit_ids,
                 };
                 let detail = format!(
-                    "the frame callback had fired but the compositor still held all {} buffers at close (held by commits {:?}, no wl_buffer.release), so the rendered frame seq {seq} was never committed",
+                    "the frame callback had fired but the compositor still held all {} buffers at the close deadline (held by commits {:?}, no wl_buffer.release), so the rendered frame seq {seq} was never committed",
                     blocked.buffers, blocked.holding_commit_ids
                 );
                 self.buffer_release_missing_at_close = Some(blocked);
@@ -786,6 +834,7 @@ pub(crate) fn wayland_lane_main(
         frame_callback_missing_at_close: None,
         buffer_release_missing_at_close: None,
         committable_pending_at_close: 0,
+        at_deadline: None,
         diagnostics,
     };
     let exit = lane.run();
@@ -873,6 +922,7 @@ mod tests {
             frame_callback_missing_at_close: None,
             buffer_release_missing_at_close: None,
             committable_pending_at_close: 0,
+            at_deadline: None,
             diagnostics,
         }
     }
@@ -1236,6 +1286,149 @@ mod tests {
         assert_eq!(pc_lane["committable_pending_at_close"], 1);
         assert!(pc_lane["frame_callback_missing_at_close"].is_null());
         assert!(pc_lane["buffer_release_missing_at_close"].is_null());
+    }
+
+    /// The LAST wait of a close that ran into its deadline: `wait` returns
+    /// its scripted events only once the deadline it is given has passed,
+    /// so `run` applies them with a receipt time at or after the deadline.
+    struct LateBackend {
+        startup: StartupInfo,
+        late: Vec<BackendEvent>,
+    }
+
+    impl PresentBackend for LateBackend {
+        fn startup(&self) -> &StartupInfo {
+            &self.startup
+        }
+        fn write_frame(&mut self, _: usize, _: u32, _: &[u32]) -> Result<(), crate::l2_pc::BackendError> {
+            Ok(())
+        }
+        fn commit(&mut self, _: usize, _: u64) -> Result<(), crate::l2_pc::BackendError> {
+            Ok(())
+        }
+        fn wait(&mut self, until_us: Option<u64>, _: &Waker) -> Result<Vec<BackendEvent>, crate::l2_pc::BackendError> {
+            let until = until_us.expect("the close deadline is published before the last wait");
+            while now_us() < until {
+                std::thread::sleep(std::time::Duration::from_micros(100));
+            }
+            Ok(std::mem::take(&mut self.late))
+        }
+    }
+
+    /// v1.6 (coordinator decision on the e23ae17 report), through the real
+    /// commit loop: the close runs into its deadline with a rendered frame B
+    /// (submit 210) waiting, and the last wait returns, at or after the
+    /// deadline, the event that would have unblocked B — (i) A's late frame
+    /// callback, or (ii) a late wl_buffer.release with both buffers held.
+    /// No commit is started (`engine.commits` stays 1, no
+    /// wayland_feedback_missing), the late event IS applied and counted, and
+    /// the branch is the one of the engine state AT THE DEADLINE: (i) or (ii),
+    /// untimed, never (iii) (which an abort could excuse). Before v1.6 B was
+    /// committed after the deadline and closed as wayland_feedback_missing.
+    #[test]
+    fn v1_6_a_late_callback_or_release_in_the_last_wait_neither_commits_nor_changes_the_branch() {
+        for late_release in [false, true] {
+            let case = if late_release { "(ii) + late wl_buffer.release" } else { "(i) + late frame callback" };
+            let (rows_tx, rows_rx) = mpsc::sync_channel(64);
+            let shared = Arc::new(Shared::default());
+            let mut lane = lane(rows_tx.clone(), shared.clone(), None);
+            if late_release {
+                // Two buffers; the startup frame (commit 0) holds buffer 0.
+                lane.engine = PresentEngine::new(2, &[(0, 0)]);
+            }
+            let a = pc_submission(1, 150);
+            rows_tx.send(Row::Submit(a)).unwrap();
+            let buffer = lane.engine.free_buffer().unwrap();
+            let (commit_a, _) = lane.engine.commit(rendered(a), buffer, 160);
+            lane.apply(BackendEvent::Presented { commit_id: commit_a, presented: presented(170) }, 180);
+            if late_release {
+                lane.apply(BackendEvent::FrameDone { commit_id: commit_a }, 190);
+            }
+            let b = pc_submission(2, 210);
+            rows_tx.send(Row::Submit(b)).unwrap();
+            assert!(matches!(lane.link.pending.offer(rendered(b)), Offer::Accepted { superseded: None }));
+            let late = if late_release {
+                BackendEvent::BufferReleased { buffer: 0 }
+            } else {
+                BackendEvent::FrameDone { commit_id: commit_a }
+            };
+            lane.backend = Box::new(LateBackend { startup: startup(), late: vec![late] });
+            // A deadline 100 ms ahead: `run` reaches its wait well before it.
+            let t_finish = now_us();
+            shared.finish_start_us.store(t_finish, Ordering::SeqCst);
+            shared.close_deadline_us.store(t_finish + 100_000, Ordering::SeqCst);
+            assert_eq!(lane.run(), Exit::Closed, "{case}");
+            assert!(now_us() >= t_finish + 100_000, "{case}: the loop ended at the deadline");
+            assert_eq!(lane.engine.stats().commits, 1, "{case}: no commit at or after the deadline");
+            assert!(lane.link.pending.has_frame(), "{case}: B still waits");
+            // The late event was applied: B became committable — after the deadline.
+            assert!(lane.engine.commit_opportunity() && lane.engine.free_buffer().is_some(), "{case}: late event applied");
+            assert!(lane.at_deadline.is_some(), "{case}: the deadline state was frozen before it");
+            lane.finish(&startup(), "bin", WorkerStats::default());
+            drop(rows_tx);
+            let (summary, rows) = ledger(rows_rx, shared, "v16-late-event");
+            let pc_lane = &rows.last().unwrap()["lanes"]["pc"];
+            let reason = if late_release { FAIL_WAYLAND_BUFFER_RELEASE_MISSING } else { FAIL_WAYLAND_FRAME_CALLBACK_MISSING };
+            assert_eq!(rows.iter().filter(|r| r["role"] == "output").count(), 1, "{case}: A keeps its output");
+            assert_eq!(summary.submitted_unresolved, 1, "{case}: B has no terminal");
+            assert_eq!(summary.first_integrity_failure_reason.as_deref(), Some(reason), "{case}");
+            assert_eq!(summary.first_integrity_failure_us, None, "{case}");
+            assert!(!summary.first_failure_time_determinable, "{case}");
+            assert_eq!(pc_lane["device_failure"]["reason"], reason, "{case}: not wayland_feedback_missing");
+            assert_eq!(pc_lane["committed_without_feedback_at_close"], 0, "{case}");
+            assert_eq!(pc_lane["committable_pending_at_close"], 0, "{case}: not (iii)");
+            assert_eq!(pc_lane["pending_at_close"], true, "{case}");
+            assert_eq!(pc_lane["engine"]["commits"], 1, "{case}");
+            assert_eq!(pc_lane["engine"]["frame_callbacks"], 1, "{case}: the late callback is counted");
+            assert_eq!(pc_lane["engine"]["buffer_releases"], u64::from(late_release), "{case}: the late release is counted");
+            if late_release {
+                assert!(pc_lane["frame_callback_missing_at_close"].is_null(), "{case}");
+                assert_eq!(
+                    pc_lane["buffer_release_missing_at_close"],
+                    serde_json::json!({ "pending_seq": 2, "buffers": 2, "buffers_held": 2, "holding_commit_ids": [0, commit_a] }),
+                    "{case}: the buffers as they were at the deadline"
+                );
+            } else {
+                assert_eq!(pc_lane["frame_callback_missing_at_close"], commit_a, "{case}");
+                assert!(pc_lane["buffer_release_missing_at_close"].is_null(), "{case}");
+            }
+        }
+    }
+
+    /// v1.6 guard, deterministic and without sleeping: `try_commit` starts a
+    /// commit with no deadline published or strictly before the deadline
+    /// (no change inside the window), and none at the deadline (the clock
+    /// read at the deadline value itself; the boundary of the terminal
+    /// acceptance `< close_deadline_us`) or after it — the frame then stays
+    /// pending.
+    #[test]
+    fn v1_6_no_commit_is_started_at_or_after_the_close_deadline() {
+        for (case, deadline, committed) in [
+            ("no deadline", None, true),
+            ("strictly before", Some(now_us() + 60_000_000), true),
+            ("at", Some(0), false), // replaced by a clock read just before `try_commit`
+            ("after", Some(1_000), false),
+        ] {
+            let (rows_tx, _rows_rx) = mpsc::sync_channel(64);
+            let shared = Arc::new(Shared::default());
+            let mut lane = lane(rows_tx, shared.clone(), None);
+            assert!(matches!(lane.link.pending.offer(rendered(pc_submission(2, 210))), Offer::Accepted { superseded: None }));
+            assert!(lane.engine.commit_opportunity() && lane.engine.free_buffer().is_some());
+            if let Some(deadline) = deadline {
+                let deadline = if case == "at" { now_us() } else { deadline };
+                shared.close_deadline_us.store(deadline, Ordering::SeqCst);
+            }
+            lane.try_commit();
+            assert_eq!(lane.engine.stats().commits, u64::from(committed), "{case}");
+            assert_eq!(lane.link.pending.has_frame(), !committed, "{case}");
+            if committed {
+                let commit = lane.engine.unresolved()[0];
+                assert_eq!(commit.submission.identity.seq, 2, "{case}");
+                if let Some(deadline) = deadline {
+                    assert!(commit.t_commit_us < deadline, "{case}");
+                }
+            }
+        }
     }
 
     /// Codex 112 P2-5: an anomaly's L2 detail carries the reason and the
