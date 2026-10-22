@@ -163,10 +163,6 @@ fn main() {
     let mut build = cc::Build::new();
     build
         .cpp(true)
-        // libstdc++ is linked below with `as-needed`, so that binaries of a
-        // dependent package that never call the decoder (e.g. the sender) do
-        // not get a NEEDED libstdc++.so.6.
-        .cpp_link_stdlib(None)
         .no_default_flags(true)
         .warnings(false)
         .extra_warnings(false)
@@ -197,8 +193,12 @@ fn main() {
         .and_then(|out| String::from_utf8(out.stdout).ok())
         .and_then(|text| text.lines().next().map(str::to_string))
         .unwrap_or_else(|| "unknown".into());
+    // cc links libstdc++ (dynamic). Every binary of a dependent package
+    // then has libstdc++.so.6 as NEEDED, including ones that never decode:
+    // their link pulls Draco objects through shared codegen units, and the
+    // exception tables that survive --gc-sections reference the C++
+    // personality (a link-modifier `as-needed` is nightly-only).
     build.compile("skew_draco");
-    println!("cargo:rustc-link-lib=dylib=stdc++");
 
     let (digest, files) = source_digest(&root);
     // The include paths are absolute (machine-specific); record them
