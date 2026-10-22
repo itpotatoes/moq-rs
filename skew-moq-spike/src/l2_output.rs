@@ -14,8 +14,8 @@
 //!  L2Submitter::submit() --try_send(Item)--> [bounded submission queue] --> Submit row ─┐
 //!     │ (Full)                                     NullSink: nothing more              │
 //!     └─try_send(Discard before submit)─────────────────────────────────────────────>  [bounded row queue] --> L2 JSONL
-//!  receiver_fault() (first fatal receiver error) ──────────────────────────────────>  │
 //!                                                  FakeSink: Output (t_callback_us) ──┘
+//!  receiver_fault(t, cause): earliest kept in shared state, written before the sentinel
 //! ```
 //!
 //! * The release side only ever calls `try_send` (no file I/O, no JSON, no
@@ -25,23 +25,33 @@
 //! * Every object row carries the ORIGINAL identity of the released object
 //!   (run_id, track, tier, seq, pts_us, event_id and, for S3, wire_track +
 //!   route_generation). Nothing is rewritten from a ledger.
-//! * The writer stamps `t_log_arrival_us` (and `t_us`) immediately before it
-//!   writes each row and measures the write lag (`max_write_lag_us`, contract
-//!   §9). The sink's own receipt time of a terminal callback is kept apart as
-//!   `t_callback_us`.
-//! * Integrity is checked by construction and recorded in the sentinel:
-//!   duplicate logical releases (same `(track, seq)`, any route), terminals
-//!   without an open submit, conservation `submitted == output +
-//!   discarded_after_submit + submitted_unresolved`, unresolved submits
-//!   (non-null sinks), bounded-tracking overflow, row-queue overflow,
-//!   submissions after close, producers still alive at finish. The first
-//!   failure's time and reason are kept (`first_integrity_failure_*`).
+//! * Row times (also stated in the meta row, `row_time_semantics`): on object
+//!   rows and the sentinel `t_us == t_log_arrival_us` = writer clock
+//!   immediately before the write; on the `receiver_fault` row `t_us` = the
+//!   moment the receiver recorded its first fatal error and
+//!   `t_log_arrival_us` = write time. `t_callback_us` = the sink's receipt of
+//!   the terminal callback. `t_us` is therefore NOT monotonic in file order;
+//!   use `t_log_arrival_us` for write order.
+//! * Integrity failures carry their OCCURRENCE time (registration §6-1;
+//!   `failure_time_semantics` in meta): duplicate release -> the second
+//!   release's `t_release_us`; queue/row/tracking overflow -> the offending
+//!   attempt; unresolved -> the earliest `t_submit_us` among unresolved
+//!   submits; orphan terminal -> its own receipt time; sink gone / producers
+//!   alive at finish / submit after close -> when detected (= when attempted).
+//!   A failure whose time cannot be determined makes
+//!   `first_failure_time_determinable` false and `first_integrity_failure_us`
+//!   null.
+//! * The close grace (`report_window_us`, meta `report_window_anchor:
+//!   "close"`) starts when `finish` begins; the deadline is published in
+//!   shared state BEFORE anything else in `finish`, so a terminal is accepted
+//!   only if its receipt time is strictly before it in every sink phase. It is
+//!   NOT the registration's H-anchored `G_report` (§3-6).
 //! * `instrumentation_end` is written only by [`L2Output::finish`]: after the
-//!   submission side is closed, every producer handle is gone (channel
-//!   disconnected; otherwise `producers_alive_at_finish`), the close grace has
-//!   run, and the sink thread has been joined. It is the last row because the
-//!   writer exits right after writing it. A run that ends without `finish`
-//!   has no sentinel — fail closed.
+//!   submission side is closed, every producer handle is gone (otherwise
+//!   `producers_alive_at_finish`), the close grace has run and the sink thread
+//!   has been joined. It is the last row because the writer exits right after
+//!   writing it. A run that ends without `finish` has no sentinel — fail
+//!   closed.
 //! * All times are integer microseconds of `CLOCK_MONOTONIC` ([`crate::now_us`]).
 //!
 //! `NullSink` accepts submissions and never emits a terminal: it exists only
@@ -51,20 +61,15 @@
 //! `t_output_us = t_submit_us + offset(modality)`; it handles the deferred
 //! output at a real clock read `t_callback_us >= t_output_us`. Neither is a
 //! device output (meta `device_output: false`).
-//!
-//! The close grace (`report_window_us`, meta `report_window_anchor: "close"`)
-//! starts when `finish` begins. It is NOT the registration's H-anchored
-//! `G_report` (§3-6); during the grace a terminal is accepted only if its real
-//! receipt time `t_callback_us` is strictly before the grace deadline.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -73,10 +78,14 @@ use anyhow::{bail, Context, Result};
 
 use crate::now_us;
 
-/// L2 JSONL schema tag written into the meta row. v1 (Codex 104 fixes):
-/// `t_log_arrival_us` is the writer's pre-write clock, `t_callback_us` is new,
-/// the sentinel carries the conservation/duplicate/failure-time fields.
-pub const L2_SCHEMA: &str = "event-pair-l2-v1";
+/// L2 JSONL schema tag written into the meta row.
+/// v1 (Codex 104): writer-side `t_log_arrival_us`, `t_callback_us`,
+/// conservation/duplicate/failure fields. v1.1 (Codex 105):
+/// `first_integrity_failure_us` is the OCCURRENCE time (plus
+/// `_detected_us` and `first_failure_time_determinable`), the close deadline
+/// binds every sink phase, the earliest `receiver_fault` is kept, and the
+/// meta row states the row/failure time semantics.
+pub const L2_SCHEMA: &str = "event-pair-l2-v1.1";
 pub const L2_CLOCK: &str = "CLOCK_MONOTONIC";
 /// The M1 grace is anchored at `finish`, not at the registration's H.
 pub const REPORT_WINDOW_ANCHOR: &str = "close";
@@ -99,6 +108,11 @@ pub const FAIL_FAKE_PENDING_OVERFLOW: &str = "fake_pending_overflow";
 pub const FAIL_PRODUCERS_ALIVE_AT_FINISH: &str = "producers_alive_at_finish";
 pub const FAIL_SUBMITTED_UNRESOLVED: &str = "submitted_unresolved";
 pub const FAIL_CONSERVATION: &str = "submit_conservation_violated";
+
+/// `close_deadline_us` states besides a real deadline.
+const CLOSE_OPEN: u64 = 0;
+/// `finish` has started but has not read its clock yet.
+const CLOSE_PENDING: u64 = u64::MAX;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum L2SinkKind {
@@ -214,7 +228,7 @@ pub struct L2Config {
     /// Close grace: after `finish` starts, how long producers may take to
     /// disappear and the sink may still receive terminals (anchor: close).
     pub report_window_us: u64,
-    /// Bound of every per-object tracking structure (logical-event set, open
+    /// Bound of every per-object tracking structure (logical-event map, open
     /// submits, fake pending outputs). Exceeding it is an integrity failure.
     pub max_tracked_objects: usize,
 }
@@ -248,6 +262,17 @@ pub enum L2SubmitOutcome {
     SinkGone,
 }
 
+/// Integrity failures with their occurrence and detection times.
+#[derive(Debug, Default, Clone, Copy)]
+struct FailureLog {
+    /// Earliest failure whose occurrence time is known:
+    /// `(occurred_us, detected_us, reason)`.
+    timed: Option<(u64, u64, &'static str)>,
+    /// First-detected failure whose occurrence time is unknown:
+    /// `(detected_us, reason)`.
+    untimed: Option<(u64, &'static str)>,
+}
+
 /// State shared by every handle and both threads.
 #[derive(Debug, Default)]
 struct Shared {
@@ -256,31 +281,73 @@ struct Shared {
     /// the stage keeps a non-producer control sender on the same channel.
     producers: AtomicUsize,
     closed: AtomicBool,
+    /// `CLOSE_OPEN`, `CLOSE_PENDING`, or the published close deadline. Set by
+    /// `finish` before anything else, independent of the message queue.
+    close_deadline_us: AtomicU64,
     queue_full: AtomicU64,
     row_overflow: AtomicU64,
     submit_after_close: AtomicU64,
     sink_gone: AtomicU64,
     fake_pending_overflow: AtomicU64,
     producers_alive_at_finish: AtomicBool,
-    receiver_fault_noted: AtomicBool,
-    /// Earliest integrity failure `(t_us, reason)`.
-    first_failure: Mutex<Option<(u64, &'static str)>>,
+    failures: Mutex<FailureLog>,
+    /// Earliest receiver fault `(t_us, cause)`; written before the sentinel.
+    receiver_fault: Mutex<Option<(u64, String)>>,
 }
 
 impl Shared {
+    /// A failure detected at the moment it happens (release side, finish).
     fn fail(&self, reason: &'static str) {
-        self.fail_at(now_us(), reason);
+        let now = now_us();
+        self.fail_occurred(now, reason);
     }
 
-    fn fail_at(&self, t_us: u64, reason: &'static str) {
-        let mut first = self.first_failure.lock().unwrap_or_else(|p| p.into_inner());
-        if first.is_none_or(|(t, _)| t_us < t) {
-            *first = Some((t_us, reason));
+    /// A failure whose occurrence time is known; detection time is now.
+    fn fail_occurred(&self, occurred_us: u64, reason: &'static str) {
+        let detected_us = now_us();
+        let mut log = self.failures.lock().unwrap_or_else(|p| p.into_inner());
+        if log.timed.is_none_or(|(t, _, _)| occurred_us < t) {
+            log.timed = Some((occurred_us, detected_us, reason));
         }
     }
 
-    fn first_failure(&self) -> Option<(u64, &'static str)> {
-        *self.first_failure.lock().unwrap_or_else(|p| p.into_inner())
+    /// A failure whose occurrence time cannot be determined.
+    fn fail_untimed(&self, reason: &'static str) {
+        let detected_us = now_us();
+        let mut log = self.failures.lock().unwrap_or_else(|p| p.into_inner());
+        if log.untimed.is_none() {
+            log.untimed = Some((detected_us, reason));
+        }
+    }
+
+    fn failures(&self) -> FailureLog {
+        *self.failures.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The published close deadline, read AFTER the caller read its receipt
+    /// time. `CLOSE_PENDING` lasts only between `finish`'s marker and its
+    /// clock read, so the wait is bounded by that hand-off.
+    fn close_deadline(&self) -> Option<u64> {
+        loop {
+            match self.close_deadline_us.load(Ordering::SeqCst) {
+                CLOSE_OPEN => return None,
+                CLOSE_PENDING => std::thread::yield_now(),
+                deadline => return Some(deadline),
+            }
+        }
+    }
+
+    /// Earliest fault wins (a cause recorded earlier elsewhere may be
+    /// reported later with its own time).
+    fn note_receiver_fault(&self, t_us: u64, cause: &str) {
+        let mut fault = self.receiver_fault.lock().unwrap_or_else(|p| p.into_inner());
+        if fault.as_ref().is_none_or(|(t, _)| t_us < *t) {
+            *fault = Some((t_us, cause.to_string()));
+        }
+    }
+
+    fn receiver_fault_noted(&self) -> bool {
+        self.receiver_fault.lock().unwrap_or_else(|p| p.into_inner()).is_some()
     }
 }
 
@@ -307,8 +374,15 @@ pub struct L2Summary {
     pub max_write_lag_us: u64,
     /// Max of (`t_log_arrival_us` − `t_callback_us`) over terminal callbacks.
     pub max_callback_to_log_us: u64,
-    pub first_integrity_failure: Option<(u64, String)>,
-    /// The first fatal receiver error, if the receiver reported one.
+    /// Occurrence time of the first integrity failure; `None` if there is
+    /// none OR its time cannot be determined (see the flag below).
+    pub first_integrity_failure_us: Option<u64>,
+    pub first_integrity_failure_reason: Option<String>,
+    pub first_integrity_failure_detected_us: Option<u64>,
+    /// `false` when some failure's occurrence time is unknown (registration
+    /// §6-1: undecidable).
+    pub first_failure_time_determinable: bool,
+    /// The earliest fatal receiver error, if the receiver reported one.
     pub receiver_fault: Option<(u64, String)>,
 }
 
@@ -316,7 +390,7 @@ impl L2Summary {
     /// Instrumentation-level integrity (registration §3-5, §6). `NullSink`
     /// runs are never L2 evidence; their unresolved submissions are expected.
     pub fn integrity_ok(&self, sink: L2SinkKind) -> bool {
-        self.first_integrity_failure.is_none()
+        self.first_integrity_failure_reason.is_none()
             && self.conservation_ok
             && self.row_overflow == 0
             && self.submit_after_close == 0
@@ -335,9 +409,8 @@ enum SinkMsg {
     /// The last producer handle was dropped (prompt wake-up only; the sink
     /// always re-reads the producer count).
     Wake,
-    /// `finish` started: producers must be gone and terminals must be
-    /// received strictly before `deadline_us`.
-    Closing { deadline_us: u64 },
+    /// `finish` started (wake-up; the deadline itself is in shared state).
+    Closing,
 }
 
 enum Row {
@@ -356,20 +429,7 @@ enum Row {
         t_discard_us: u64,
         reason: &'static str,
     },
-    /// The receiver's first fatal error (registration §6-1 needs its time).
-    ReceiverFault { t_us: u64, cause: String },
     End,
-}
-
-fn note_receiver_fault(rows: &SyncSender<Row>, shared: &Shared, t_us: u64, cause: &str) {
-    if shared.receiver_fault_noted.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    let row = Row::ReceiverFault { t_us, cause: cause.to_string() };
-    if rows.try_send(row).is_err() {
-        shared.row_overflow.fetch_add(1, Ordering::Relaxed);
-        shared.fail(FAIL_ROW_QUEUE_OVERFLOW);
-    }
 }
 
 /// Cloneable, non-blocking submission handle held at the release points.
@@ -433,28 +493,29 @@ impl L2Submitter {
             return L2SubmitOutcome::SinkGone;
         }
         self.shared.queue_full.fetch_add(1, Ordering::Relaxed);
+        let t_discard_us = now_us().max(t_release_us);
         let row = Row::Discard {
             identity,
             t_release_us,
             t_submit_us: None,
-            t_discard_us: now_us().max(t_release_us),
+            t_discard_us,
             reason: DISCARD_OUTPUT_QUEUE_FULL,
         };
         if self.rows.try_send(row).is_err() {
             self.shared.row_overflow.fetch_add(1, Ordering::Relaxed);
-            self.shared.fail(FAIL_ROW_QUEUE_OVERFLOW);
+            self.shared.fail_occurred(t_discard_us, FAIL_ROW_QUEUE_OVERFLOW);
         }
         L2SubmitOutcome::QueueFull
     }
 
-    /// Record the receiver's FIRST fatal error at `t_us` (the moment the
-    /// receiver recorded it). Later calls are ignored. Non-blocking.
+    /// Record a fatal receiver error at `t_us` (the moment the receiver
+    /// recorded it). The earliest is kept. Non-blocking, no row queue.
     pub fn receiver_fault(&self, t_us: u64, cause: &str) {
-        note_receiver_fault(&self.rows, &self.shared, t_us, cause);
+        self.shared.note_receiver_fault(t_us, cause);
     }
 
     pub fn receiver_fault_noted(&self) -> bool {
-        self.shared.receiver_fault_noted.load(Ordering::Acquire)
+        self.shared.receiver_fault_noted()
     }
 }
 
@@ -466,9 +527,9 @@ pub struct L2Output {
     /// The stage's own producer handle; dropped by `finish` before it waits
     /// for every other producer to disappear.
     submitter: Option<L2Submitter>,
-    /// The stage's own row handle (`End`, receiver faults). Not a producer.
+    /// The stage's own row handle (`End`). Not a producer.
     rows: SyncSender<Row>,
-    /// Non-producer sender used only to deliver `Closing`.
+    /// Non-producer sender used only to wake the sink with `Closing`.
     control: SyncSender<SinkMsg>,
     shared: Arc<Shared>,
     sink: Option<JoinHandle<()>>,
@@ -522,7 +583,27 @@ impl L2Output {
             "max_tracked_objects": config.max_tracked_objects,
             "report_window_us": config.report_window_us,
             "report_window_anchor": REPORT_WINDOW_ANCHOR,
-            "t_log_arrival": "writer_clock_immediately_before_row_write",
+            "report_window_rule": "terminal accepted iff t_callback_us < finish_start + report_window_us; not the H-anchored G_report",
+            "row_time_semantics": {
+                "object_rows": "t_us == t_log_arrival_us == writer clock immediately before the row write",
+                "sentinel_row": "t_us == end_us == t_log_arrival_us == writer clock before the sentinel write",
+                "receiver_fault": "t_us = moment the receiver recorded its first fatal error (earliest kept); t_log_arrival_us = write time",
+                "t_callback_us": "sink receipt time of the terminal callback",
+                "file_order": "t_us is not monotonic in file order; t_log_arrival_us is",
+            },
+            "failure_time_semantics": {
+                "duplicate_logical_release": "t_release_us of the second release (two earliest kept per (track, seq))",
+                "row_queue_overflow": "t_discard_us of the discard whose row could not be queued",
+                "tracking_capacity_exceeded": "t_submit_us (submit) or t_discard_us (pre-submit discard) of the offending release",
+                "fake_pending_overflow": "t_submit_us of the offending submission",
+                "terminal_without_open_submit": "t_callback_us (output) or t_discard_us (post-submit discard) of the orphan terminal",
+                "submitted_unresolved": "earliest t_submit_us among unresolved submits",
+                "submit_after_close": "detection = the attempt",
+                "sink_gone": "detection (the failed send)",
+                "producers_alive_at_finish": "detection (the close deadline)",
+                "submit_conservation_violated": "undeterminable unless explained by a timed failure",
+                "undeterminable": "first_integrity_failure_us = null, first_failure_time_determinable = false",
+            },
             "fake_pc_offset_us": fake.map(|f| f.pc_offset_us),
             "fake_haptic_offset_us": fake.map(|f| f.haptic_offset_us),
             "fake_force_queue_full": fake.map(|f| f.force_queue_full),
@@ -593,29 +674,37 @@ impl L2Output {
         self.config.sink
     }
 
-    /// Record the receiver's FIRST fatal error at `t_us`; later calls are
-    /// ignored. Non-blocking. Not a producer handle.
+    /// Record a fatal receiver error at `t_us`; the earliest is kept and
+    /// written as the `receiver_fault` row before the sentinel. Non-blocking.
     pub fn receiver_fault(&self, t_us: u64, cause: &str) {
-        note_receiver_fault(&self.rows, &self.shared, t_us, cause);
+        self.shared.note_receiver_fault(t_us, cause);
     }
 
     pub fn receiver_fault_noted(&self) -> bool {
-        self.shared.receiver_fault_noted.load(Ordering::Acquire)
+        self.shared.receiver_fault_noted()
     }
 
-    /// Registration §3-5 order: stop submissions -> every producer handle
-    /// gone (bounded by the close grace) -> terminals received before the
-    /// grace deadline -> sink joined -> `instrumentation_end` -> flush/close.
+    /// Registration §3-5 order: publish the close deadline -> stop
+    /// submissions -> every producer handle gone (bounded by the grace) ->
+    /// terminals received strictly before the deadline -> sink joined ->
+    /// `receiver_fault` row (if any) -> `instrumentation_end` -> flush/close.
     /// Blocking; call from `spawn_blocking` in async code.
     pub fn finish(mut self) -> Result<L2Summary> {
+        // The deadline goes first and is independent of the message queue, so
+        // a callback the sink handles before it sees `Closing` is still held
+        // to it. `CLOSE_PENDING` covers the instant before the clock read.
+        self.shared.close_deadline_us.store(CLOSE_PENDING, Ordering::SeqCst);
+        let deadline_us = now_us()
+            .saturating_add(self.config.report_window_us)
+            .clamp(1, CLOSE_PENDING - 1);
+        self.shared.close_deadline_us.store(deadline_us, Ordering::SeqCst);
         self.shared.closed.store(true, Ordering::Release);
-        let deadline_us = now_us().saturating_add(self.config.report_window_us);
-        // Our own producer handle goes first, so the count the sink checks
-        // can reach zero; then the deadline is delivered on the non-producer
-        // control sender. Blocking send: the sink is consuming, so space
-        // appears; a dead sink makes this fail immediately instead of hanging.
+        // Our own producer handle goes next, so the count the sink checks can
+        // reach zero; then the non-producer control sender wakes the sink.
+        // Blocking send: the sink is consuming, so space appears; a dead sink
+        // makes this fail immediately instead of hanging.
         drop(self.submitter.take().expect("finish runs once"));
-        if self.control.send(SinkMsg::Closing { deadline_us }).is_err() {
+        if self.control.send(SinkMsg::Closing).is_err() {
             self.shared.sink_gone.fetch_add(1, Ordering::Relaxed);
             self.shared.fail(FAIL_SINK_GONE);
         }
@@ -665,14 +754,18 @@ impl FakePending {
     }
 
     /// Emit every output whose instant has passed. The callback receipt time
-    /// is a real clock read; with `deadline` set (close grace) a callback is
-    /// accepted only if that receipt time is strictly before the deadline —
-    /// the synthetic `t_output_us` is never what is compared. Returns `false`
-    /// once the writer is gone.
-    fn emit_due(&mut self, rows: &SyncSender<Row>, deadline: Option<u64>) -> bool {
+    /// is a real clock read, and it is compared with the published close
+    /// deadline read AFTER it: once `finish` has started, a callback is
+    /// accepted only if its receipt time is strictly before the deadline, in
+    /// whatever phase the sink is. The synthetic `t_output_us` is never what
+    /// is compared. Returns `false` once the writer is gone.
+    fn emit_due(&mut self, rows: &SyncSender<Row>, shared: &Shared) -> bool {
         while let Some(Reverse((t_output_us, key))) = self.heap.peek().copied() {
             let t_callback_us = now_us();
-            if t_output_us > t_callback_us || deadline.is_some_and(|d| t_callback_us >= d) {
+            if t_output_us > t_callback_us {
+                break;
+            }
+            if shared.close_deadline().is_some_and(|deadline| t_callback_us >= deadline) {
                 break;
             }
             self.heap.pop();
@@ -683,6 +776,15 @@ impl FakePending {
             }
         }
         true
+    }
+
+    /// The next instant worth waking for: nothing once the deadline passed.
+    fn next_wake(&self, shared: &Shared) -> Option<u64> {
+        let due = self.next_due()?;
+        match shared.close_deadline() {
+            Some(deadline) if due >= deadline || now_us() >= deadline => None,
+            _ => Some(due),
+        }
     }
 }
 
@@ -717,7 +819,7 @@ fn sink_loop(
                 .unwrap_or(0);
             if !pending.push(submission, submission.t_submit_us.saturating_add(offset)) {
                 shared.fake_pending_overflow.fetch_add(1, Ordering::Relaxed);
-                shared.fail(FAIL_FAKE_PENDING_OVERFLOW);
+                shared.fail_occurred(submission.t_submit_us, FAIL_FAKE_PENDING_OVERFLOW);
             }
         }
         true
@@ -739,9 +841,10 @@ fn sink_loop(
 
     // Phase 1: submissions open, until `finish` sends `Closing`. A disconnect
     // means the stage was dropped without `finish`: abandon (the writer then
-    // ends without a sentinel — fail closed).
-    let deadline_us = loop {
-        let msg = match pending.next_due() {
+    // ends without a sentinel — fail closed). The published deadline binds
+    // every callback here as well.
+    loop {
+        let msg = match pending.next_wake(&shared) {
             Some(due) => match items.recv_timeout(micros(due.saturating_sub(now_us()))) {
                 Ok(msg) => Some(msg),
                 Err(RecvTimeoutError::Timeout) => None,
@@ -758,13 +861,16 @@ fn sink_loop(
                     return;
                 }
             }
-            Some(SinkMsg::Closing { deadline_us }) => break deadline_us,
+            Some(SinkMsg::Closing) => break,
             Some(SinkMsg::Wake) | None => {}
         }
-        if !pending.emit_due(&rows, None) {
+        if !pending.emit_due(&rows, &shared) {
             return;
         }
-    };
+    }
+    let deadline_us = shared
+        .close_deadline()
+        .expect("finish publishes the deadline before sending Closing");
 
     // Phase 2: closing. Every producer handle must be dropped and every
     // terminal received strictly before the deadline.
@@ -774,7 +880,7 @@ fn sink_loop(
             producers_gone = true;
         }
         // After reading zero, this drain sees every submission ever sent.
-        if !drain_queue(&mut pending) || !pending.emit_due(&rows, Some(deadline_us)) {
+        if !drain_queue(&mut pending) || !pending.emit_due(&rows, &shared) {
             return;
         }
         let now = now_us();
@@ -791,14 +897,13 @@ fn sink_loop(
             }
         } else {
             let until = next.map_or(deadline_us, |due| due.min(deadline_us));
-            match items.recv_timeout(micros(until.saturating_sub(now))) {
-                Ok(SinkMsg::Item(submission)) => {
-                    // Raced the close on the release side: still recorded.
-                    if !accept(&mut pending, submission) {
-                        return;
-                    }
+            if let Ok(SinkMsg::Item(submission)) =
+                items.recv_timeout(micros(until.saturating_sub(now)))
+            {
+                // Raced the close on the release side: still recorded.
+                if !accept(&mut pending, submission) {
+                    return;
                 }
-                Ok(_) | Err(_) => {}
             }
         }
     }
@@ -829,54 +934,86 @@ fn identity_json(run_id: &str, id: &L2Identity) -> serde_json::Map<String, serde
 
 /// Per-object bookkeeping of the writer, bounded by `cap`.
 struct Tracking {
-    /// Logical events ever released (submitted or discarded before submit).
-    seen: HashSet<(L2Modality, u32)>,
-    /// Open submits per identity (a count, so duplicates cannot hide).
-    open: HashMap<L2Identity, u32>,
+    /// Logical events ever released (submitted or discarded before submit)
+    /// with their two earliest `t_release_us`; the second one is when a
+    /// duplicate occurred, whatever order the two paths delivered them in.
+    seen: HashMap<(L2Modality, u32), (u64, Option<u64>)>,
+    /// Open submits per identity, as their `t_submit_us` (a list, so a
+    /// duplicate can neither hide nor lose its time).
+    open: HashMap<L2Identity, Vec<u64>>,
+    open_stored: usize,
     open_total: u64,
     cap: usize,
 }
 
 impl Tracking {
-    fn release(&mut self, identity: &L2Identity, summary: &mut L2Summary, shared: &Shared) {
+    fn new(cap: usize) -> Self {
+        Self { seen: HashMap::new(), open: HashMap::new(), open_stored: 0, open_total: 0, cap }
+    }
+
+    /// One release of `identity` at `t_release_us`; `attempt_us` is the
+    /// submission/discard attempt time used if the bound is exceeded.
+    fn release(
+        &mut self,
+        identity: &L2Identity,
+        t_release_us: u64,
+        attempt_us: u64,
+        summary: &mut L2Summary,
+        shared: &Shared,
+    ) {
         let key = identity.logical();
-        if self.seen.contains(&key) {
+        if let Some((first, second)) = self.seen.get_mut(&key) {
             summary.duplicate_logical_release += 1;
-            shared.fail(FAIL_DUPLICATE_LOGICAL_RELEASE);
+            if t_release_us < *first {
+                *second = Some(*first);
+                *first = t_release_us;
+            } else if second.is_none_or(|s| t_release_us < s) {
+                *second = Some(t_release_us);
+            }
+            let occurred = second.expect("two releases are known");
+            shared.fail_occurred(occurred, FAIL_DUPLICATE_LOGICAL_RELEASE);
         } else if self.seen.len() >= self.cap {
             summary.tracking_overflow += 1;
-            shared.fail(FAIL_TRACKING_CAPACITY);
+            shared.fail_occurred(attempt_us, FAIL_TRACKING_CAPACITY);
         } else {
-            self.seen.insert(key);
+            self.seen.insert(key, (t_release_us, None));
         }
     }
 
-    fn open(&mut self, identity: L2Identity, summary: &mut L2Summary, shared: &Shared) {
+    fn open(&mut self, s: &L2Submission, summary: &mut L2Summary, shared: &Shared) {
         self.open_total += 1;
-        if let Some(count) = self.open.get_mut(&identity) {
-            *count += 1;
-        } else if self.open.len() >= self.cap {
+        if self.open_stored >= self.cap {
             summary.tracking_overflow += 1;
-            shared.fail(FAIL_TRACKING_CAPACITY);
-        } else {
-            self.open.insert(identity, 1);
+            shared.fail_occurred(s.t_submit_us, FAIL_TRACKING_CAPACITY);
+            return;
         }
+        self.open.entry(s.identity).or_default().push(s.t_submit_us);
+        self.open_stored += 1;
     }
 
-    fn close(&mut self, identity: &L2Identity, summary: &mut L2Summary, shared: &Shared) {
-        match self.open.get_mut(identity) {
-            Some(count) => {
-                *count -= 1;
-                if *count == 0 {
-                    self.open.remove(identity);
-                }
-                self.open_total -= 1;
-            }
-            None => {
-                summary.terminal_without_open_submit += 1;
-                shared.fail(FAIL_TERMINAL_WITHOUT_OPEN_SUBMIT);
-            }
+    /// A terminal for `identity`, received at `terminal_us`.
+    fn close(&mut self, identity: &L2Identity, terminal_us: u64, summary: &mut L2Summary, shared: &Shared) {
+        let Some(times) = self.open.get_mut(identity) else {
+            summary.terminal_without_open_submit += 1;
+            shared.fail_occurred(terminal_us, FAIL_TERMINAL_WITHOUT_OPEN_SUBMIT);
+            return;
+        };
+        let earliest = times
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, t)| **t)
+            .map(|(i, _)| i)
+            .expect("stored lists are never empty");
+        times.swap_remove(earliest);
+        if times.is_empty() {
+            self.open.remove(identity);
         }
+        self.open_stored -= 1;
+        self.open_total -= 1;
+    }
+
+    fn earliest_unresolved_submit(&self) -> Option<u64> {
+        self.open.values().flatten().min().copied()
     }
 }
 
@@ -908,14 +1045,14 @@ fn writer_loop(
     cap: usize,
 ) -> std::io::Result<L2Summary> {
     let mut summary = L2Summary::default();
-    let mut tracking = Tracking { seen: HashSet::new(), open: HashMap::new(), open_total: 0, cap };
+    let mut tracking = Tracking::new(cap);
     let mut ended = false;
     let mut handle = |row: Row, w: &mut BufWriter<File>, summary: &mut L2Summary| -> std::io::Result<()> {
         match row {
             Row::Submit(s) => {
                 summary.submitted += 1;
-                tracking.release(&s.identity, summary, &shared);
-                tracking.open(s.identity, summary, &shared);
+                tracking.release(&s.identity, s.t_release_us, s.t_submit_us, summary, &shared);
+                tracking.open(&s, summary, &shared);
                 let mut m = identity_json(&run_id, &s.identity);
                 m.insert("role".into(), "submit".into());
                 m.insert("t_release_us".into(), s.t_release_us.into());
@@ -924,7 +1061,7 @@ fn writer_loop(
             }
             Row::Output { submission: s, t_output_us, t_callback_us, device } => {
                 summary.output += 1;
-                tracking.close(&s.identity, summary, &shared);
+                tracking.close(&s.identity, t_callback_us, summary, &shared);
                 let mut m = identity_json(&run_id, &s.identity);
                 m.insert("role".into(), "output".into());
                 m.insert("t_release_us".into(), s.t_release_us.into());
@@ -945,11 +1082,11 @@ fn writer_loop(
                 match t_submit_us {
                     None => {
                         summary.discarded_before_submit += 1;
-                        tracking.release(&identity, summary, &shared);
+                        tracking.release(&identity, t_release_us, t_discard_us, summary, &shared);
                     }
                     Some(_) => {
                         summary.discarded_after_submit += 1;
-                        tracking.close(&identity, summary, &shared);
+                        tracking.close(&identity, t_discard_us, summary, &shared);
                     }
                 }
                 let mut m = identity_json(&run_id, &identity);
@@ -963,14 +1100,6 @@ fn writer_loop(
                 m.insert("t_submit_us".into(), t_submit_us.into());
                 m.insert("t_discard_us".into(), t_discard_us.into());
                 write_row(w, m, None, summary)?;
-            }
-            Row::ReceiverFault { t_us, cause } => {
-                let mut m = serde_json::Map::new();
-                m.insert("role".into(), "receiver_fault".into());
-                m.insert("run_id".into(), run_id.clone().into());
-                m.insert("cause".into(), cause.clone().into());
-                write_row(w, m, Some(t_us), summary)?;
-                summary.receiver_fault.get_or_insert((t_us, cause));
             }
             Row::End => unreachable!("End is handled by the loop"),
         }
@@ -1000,23 +1129,50 @@ fn writer_loop(
     summary.conservation_ok = summary.submitted
         == summary.output + summary.discarded_after_submit + summary.submitted_unresolved;
     if sink != L2SinkKind::Null && summary.submitted_unresolved > 0 {
-        shared.fail(FAIL_SUBMITTED_UNRESOLVED);
+        match tracking.earliest_unresolved_submit() {
+            Some(t_submit_us) => shared.fail_occurred(t_submit_us, FAIL_SUBMITTED_UNRESOLVED),
+            // Every unresolved submit was beyond the tracking bound.
+            None => shared.fail_untimed(FAIL_SUBMITTED_UNRESOLVED),
+        }
     }
-    if !summary.conservation_ok {
-        shared.fail(FAIL_CONSERVATION);
+    if !summary.conservation_ok
+        && summary.terminal_without_open_submit == 0
+        && summary.tracking_overflow == 0
+    {
+        // Not explained by any timed failure.
+        shared.fail_untimed(FAIL_CONSERVATION);
     }
     summary.row_overflow = shared.row_overflow.load(Ordering::Relaxed);
     summary.submit_after_close = shared.submit_after_close.load(Ordering::Relaxed);
     summary.sink_gone = shared.sink_gone.load(Ordering::Relaxed);
     summary.fake_pending_overflow = shared.fake_pending_overflow.load(Ordering::Relaxed);
     summary.producers_alive_at_finish = shared.producers_alive_at_finish.load(Ordering::Acquire);
-    summary.first_integrity_failure = shared.first_failure().map(|(t, r)| (t, r.to_string()));
+    let failures = shared.failures();
+    match (failures.untimed, failures.timed) {
+        (Some((detected, reason)), _) => {
+            summary.first_integrity_failure_us = None;
+            summary.first_integrity_failure_reason = Some(reason.to_string());
+            summary.first_integrity_failure_detected_us = Some(detected);
+            summary.first_failure_time_determinable = false;
+        }
+        (None, Some((occurred, detected, reason))) => {
+            summary.first_integrity_failure_us = Some(occurred);
+            summary.first_integrity_failure_reason = Some(reason.to_string());
+            summary.first_integrity_failure_detected_us = Some(detected);
+            summary.first_failure_time_determinable = true;
+        }
+        (None, None) => summary.first_failure_time_determinable = true,
+    }
+    summary.receiver_fault = shared.receiver_fault.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    if let Some((t_us, cause)) = &summary.receiver_fault {
+        let mut m = serde_json::Map::new();
+        m.insert("role".into(), "receiver_fault".into());
+        m.insert("run_id".into(), run_id.clone().into());
+        m.insert("cause".into(), cause.clone().into());
+        write_row(&mut w, m, Some(*t_us), &mut summary)?;
+    }
     let integrity_ok = summary.integrity_ok(sink);
     let t_end = now_us();
-    let (failure_us, failure_reason) = match &summary.first_integrity_failure {
-        Some((t, r)) => (serde_json::json!(t), serde_json::json!(r)),
-        None => (serde_json::Value::Null, serde_json::Value::Null),
-    };
     let (fault_us, fault_cause) = match &summary.receiver_fault {
         Some((t, c)) => (serde_json::json!(t), serde_json::json!(c)),
         None => (serde_json::Value::Null, serde_json::Value::Null),
@@ -1027,6 +1183,7 @@ fn writer_loop(
         "sink": sink.as_str(),
         "t_us": t_end,
         "end_us": t_end,
+        "t_log_arrival_us": t_end,
         "submitted": summary.submitted,
         "output": summary.output,
         "discarded_before_submit": summary.discarded_before_submit,
@@ -1044,8 +1201,10 @@ fn writer_loop(
         "max_write_lag_us": summary.max_write_lag_us,
         "max_callback_to_log_us": summary.max_callback_to_log_us,
         "report_window_anchor": REPORT_WINDOW_ANCHOR,
-        "first_integrity_failure_us": failure_us,
-        "first_integrity_failure_reason": failure_reason,
+        "first_integrity_failure_us": summary.first_integrity_failure_us,
+        "first_integrity_failure_reason": summary.first_integrity_failure_reason,
+        "first_integrity_failure_detected_us": summary.first_integrity_failure_detected_us,
+        "first_failure_time_determinable": summary.first_failure_time_determinable,
         "receiver_fault_us": fault_us,
         "receiver_fault_cause": fault_cause,
         "integrity_ok": integrity_ok,
@@ -1109,7 +1268,18 @@ mod tests {
 
     /// Replay rows straight through the writer (Codex 104 harness shape).
     fn replay(path: &Path, sink: L2SinkKind, input: Vec<Row>, writer_delay: Option<Duration>) -> L2Summary {
-        let (tx, rx) = mpsc::sync_channel(64);
+        replay_with(path, sink, input, writer_delay, Arc::new(Shared::default()))
+    }
+
+    fn replay_with(
+        path: &Path,
+        sink: L2SinkKind,
+        input: Vec<Row>,
+        writer_delay: Option<Duration>,
+        shared: Arc<Shared>,
+    ) -> L2Summary {
+        // Room for every row plus `End`: the writer runs after the sends.
+        let (tx, rx) = mpsc::sync_channel(input.len() + 1);
         for row in input {
             tx.send(row).unwrap();
         }
@@ -1119,7 +1289,7 @@ mod tests {
             std::thread::sleep(delay);
         }
         let file = OpenOptions::new().write(true).create_new(true).open(path).unwrap();
-        writer_loop(BufWriter::new(file), rx, "l2-test".into(), sink, Arc::new(Shared::default()), 64).unwrap()
+        writer_loop(BufWriter::new(file), rx, "l2-test".into(), sink, shared, 64).unwrap()
     }
 
     fn submission(identity: L2Identity) -> L2Submission {
@@ -1564,16 +1734,18 @@ mod tests {
     #[test]
     fn a_callback_received_after_the_deadline_is_not_accepted() {
         let (tx, rx) = mpsc::sync_channel(4);
+        let shared = Shared::default();
         let s = submission(id(L2Modality::Pc, 1));
-        let deadline = now_us();
+        shared.close_deadline_us.store(now_us(), Ordering::SeqCst);
         let mut pending = FakePending::new(8);
         assert!(pending.push(s, s.t_submit_us));
         std::thread::sleep(Duration::from_millis(2));
-        assert!(pending.emit_due(&tx, Some(deadline)));
+        assert!(pending.emit_due(&tx, &shared));
         assert!(rx.try_recv().is_err(), "late receipt must not become an output");
         assert_eq!(pending.next_due(), Some(s.t_submit_us), "it stays pending -> unresolved");
         // Without a deadline (submissions open) it is emitted, receipt >= t_output.
-        assert!(pending.emit_due(&tx, None));
+        shared.close_deadline_us.store(CLOSE_OPEN, Ordering::SeqCst);
+        assert!(pending.emit_due(&tx, &shared));
         match rx.try_recv().unwrap() {
             Row::Output { t_output_us, t_callback_us, .. } => assert!(t_callback_us >= t_output_us),
             _ => panic!("expected an output"),
@@ -1610,10 +1782,12 @@ mod tests {
     #[test]
     fn the_first_integrity_failure_time_and_reason_are_recorded() {
         let shared = Shared::default();
-        shared.fail_at(200, FAIL_SINK_GONE);
-        shared.fail_at(100, FAIL_DUPLICATE_LOGICAL_RELEASE);
-        shared.fail_at(300, FAIL_CONSERVATION);
-        assert_eq!(shared.first_failure(), Some((100, FAIL_DUPLICATE_LOGICAL_RELEASE)));
+        shared.fail_occurred(200, FAIL_SINK_GONE);
+        shared.fail_occurred(100, FAIL_DUPLICATE_LOGICAL_RELEASE);
+        shared.fail_occurred(300, FAIL_CONSERVATION);
+        let timed = shared.failures().timed.unwrap();
+        assert_eq!((timed.0, timed.2), (100, FAIL_DUPLICATE_LOGICAL_RELEASE));
+        assert!(timed.1 >= 100, "the detection time is kept apart");
     }
 
     // ---- F6: producer quiescence ---------------------------------------------
@@ -1712,7 +1886,8 @@ mod tests {
         drop(out);
         std::thread::sleep(Duration::from_millis(50));
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(!text.contains("instrumentation_end"));
+        assert!(!text.contains("\"role\":\"instrumentation_end\""));
+        assert!(!text.contains("instrumentation_end"), "not even as a meta key");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1737,6 +1912,249 @@ mod tests {
         let s = submission(id(L2Modality::Pc, 1));
         assert!(pending.push(s, 1) && pending.push(s, 2));
         assert!(!pending.push(s, 3), "a full pending set refuses instead of growing");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- Codex 105 G1: the close deadline binds every sink phase ------------
+
+    /// Codex 105 #1: an item queued before `Closing`, handled by a delayed
+    /// sink after the deadline, must not become an accepted output.
+    #[test]
+    fn codex105_a_callback_after_the_deadline_is_refused_even_before_closing_is_read() {
+        let path = tmp("c105-late-before-closing");
+        let gate = Arc::new(Barrier::new(2));
+        let mut cfg = config(L2SinkKind::Fake, Some(FakeSinkConfig::offsets(0, 0)), 8);
+        cfg.report_window_us = 1_000;
+        cfg.fake.as_mut().unwrap().start_gate = Some(gate.clone());
+        let out = L2Output::start(&path, cfg).unwrap();
+        let shared = out.shared.clone();
+        let s = out.submitter();
+        let t_release = now_us();
+        assert_eq!(s.submit(id(L2Modality::Pc, 0), t_release), L2SubmitOutcome::Submitted);
+        drop(s);
+        let finisher = std::thread::spawn(move || out.finish().unwrap());
+        // The count reaches zero only after `finish` published its deadline.
+        while shared.producers.load(Ordering::Acquire) != 0 {
+            std::thread::yield_now();
+        }
+        let deadline = shared.close_deadline().expect("published before the producer drop");
+        std::thread::sleep(Duration::from_millis(20));
+        gate.wait();
+        let summary = finisher.join().unwrap();
+        assert!(now_us() > deadline);
+        assert_eq!((summary.submitted, summary.output, summary.submitted_unresolved), (1, 0, 1));
+        assert!(!summary.integrity_ok(L2SinkKind::Fake));
+        assert_eq!(summary.first_integrity_failure_reason.as_deref(), Some(FAIL_SUBMITTED_UNRESOLVED));
+        let rows = rows(&path);
+        let submit = rows.iter().find(|r| r["role"] == "submit").unwrap();
+        // Occurrence = the unresolved submit's own t_submit_us (§6-1).
+        assert_eq!(summary.first_integrity_failure_us, submit["t_submit_us"].as_u64());
+        assert!(rows.iter().all(|r| r["role"] != "output"));
+        assert_eq!(sentinel(&rows)["integrity_ok"], false);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn emit_due_compares_the_receipt_time_with_the_published_deadline() {
+        let (tx, rx) = mpsc::sync_channel(4);
+        let shared = Shared::default();
+        let s = submission(id(L2Modality::Pc, 1));
+        let mut pending = FakePending::new(8);
+        assert!(pending.push(s, s.t_submit_us));
+        // A deadline already in the past: nothing is accepted, it stays pending.
+        shared.close_deadline_us.store(now_us(), Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(1));
+        assert!(pending.emit_due(&tx, &shared));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(pending.next_wake(&shared), None, "no wake-up for an unreceivable output");
+        // A deadline in the future: accepted, with receipt >= t_output.
+        shared.close_deadline_us.store(now_us() + 10_000_000, Ordering::SeqCst);
+        assert!(pending.emit_due(&tx, &shared));
+        match rx.try_recv().unwrap() {
+            Row::Output { t_output_us, t_callback_us, .. } => assert!(t_callback_us >= t_output_us),
+            _ => panic!("expected an output"),
+        }
+    }
+
+    // ---- Codex 105 G2: failure OCCURRENCE times ------------------------------
+
+    /// Codex 105 #2: a duplicate that happened BEFORE a receiver fault but was
+    /// detected after it (delayed writer) keeps its occurrence time.
+    #[test]
+    fn codex105_a_duplicate_before_a_fault_is_timed_before_the_fault() {
+        let path = tmp("c105-delayed-failure");
+        let shared = Arc::new(Shared::default());
+        let identity = id(L2Modality::Pc, 0);
+        let first = submission(identity);
+        let duplicate_us = now_us();
+        let second = L2Submission { identity, t_release_us: duplicate_us, t_submit_us: duplicate_us };
+        std::thread::sleep(Duration::from_millis(2));
+        let fault_us = now_us();
+        shared.note_receiver_fault(fault_us, "later receiver failure");
+        let summary = replay_with(
+            &path,
+            L2SinkKind::Fake,
+            vec![Row::Submit(first), output_row(first), Row::Submit(second), output_row(second)],
+            Some(Duration::from_millis(5)),
+            shared,
+        );
+        assert_eq!(summary.first_integrity_failure_us, Some(duplicate_us));
+        assert!(summary.first_integrity_failure_us.unwrap() < fault_us);
+        assert!(summary.first_integrity_failure_detected_us.unwrap() > fault_us, "detected later");
+        assert!(summary.first_failure_time_determinable);
+        let rows = rows(&path);
+        let fault = rows.iter().find(|r| r["role"] == "receiver_fault").unwrap();
+        assert_eq!(fault["t_us"].as_u64(), Some(fault_us));
+        let end = sentinel(&rows);
+        assert_eq!(end["first_integrity_failure_us"].as_u64(), Some(duplicate_us));
+        assert_eq!(end["receiver_fault_us"].as_u64(), Some(fault_us));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The submit path and the pre-submit discard path can reach the writer
+    /// in either order; the duplicate occurred at the LATER release.
+    #[test]
+    fn a_duplicate_is_timed_at_the_later_release_in_either_processing_order() {
+        let identity = id(L2Modality::Haptic, 9);
+        let early = 1_000_000u64;
+        let late = 1_000_500u64;
+        let discard = |t: u64| Row::Discard {
+            identity,
+            t_release_us: t,
+            t_submit_us: None,
+            t_discard_us: t,
+            reason: DISCARD_OUTPUT_QUEUE_FULL,
+        };
+        // A submit and its output, so nothing is left unresolved.
+        let submit = |t: u64| {
+            let s = L2Submission { identity, t_release_us: t, t_submit_us: t };
+            vec![Row::Submit(s), output_row(s)]
+        };
+        let then = |mut a: Vec<Row>, b: Vec<Row>| {
+            a.extend(b);
+            a
+        };
+        for (name, input) in [
+            ("inv-a", then(vec![discard(late)], submit(early))),
+            ("inv-b", then(submit(early), vec![discard(late)])),
+            ("inv-c", then(submit(late), vec![discard(early)])),
+        ] {
+            let path = tmp(name);
+            let summary = replay(&path, L2SinkKind::Fake, input, None);
+            assert_eq!(summary.duplicate_logical_release, 1, "{name}");
+            assert_eq!(
+                summary.first_integrity_failure_reason.as_deref(),
+                Some(FAIL_DUPLICATE_LOGICAL_RELEASE),
+                "{name}"
+            );
+            assert_eq!(summary.first_integrity_failure_us, Some(late), "{name}");
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn unresolved_is_timed_at_the_earliest_unresolved_submit() {
+        let path = tmp("unresolved-earliest");
+        let a = L2Submission { identity: id(L2Modality::Pc, 1), t_release_us: 2_000, t_submit_us: 2_000 };
+        let b = L2Submission { identity: id(L2Modality::Pc, 2), t_release_us: 900, t_submit_us: 900 };
+        let c = L2Submission { identity: id(L2Modality::Pc, 3), t_release_us: 100, t_submit_us: 100 };
+        // c is resolved; a and b are not, and arrive in the "wrong" order.
+        let summary = replay(
+            &path,
+            L2SinkKind::Fake,
+            vec![Row::Submit(a), Row::Submit(b), Row::Submit(c), output_row(c)],
+            None,
+        );
+        assert_eq!(summary.submitted_unresolved, 2);
+        assert_eq!(summary.first_integrity_failure_reason.as_deref(), Some(FAIL_SUBMITTED_UNRESOLVED));
+        assert_eq!(summary.first_integrity_failure_us, Some(900));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_orphan_terminal_is_timed_at_its_receipt_and_overflow_at_the_attempt() {
+        let path = tmp("orphan-time");
+        let s = submission(id(L2Modality::Pc, 1));
+        let receipt = s.t_submit_us + 7;
+        let summary = replay(
+            &path,
+            L2SinkKind::Fake,
+            vec![Row::Output { submission: s, t_output_us: s.t_submit_us, t_callback_us: receipt, device: "fake" }],
+            None,
+        );
+        assert_eq!(summary.first_integrity_failure_us, Some(receipt));
+        assert_eq!(
+            summary.first_integrity_failure_reason.as_deref(),
+            Some(FAIL_TERMINAL_WITHOUT_OPEN_SUBMIT)
+        );
+        let _ = std::fs::remove_file(&path);
+
+        // Tracking bound 64 (replay): the 65th distinct release overflows at
+        // its own submission time.
+        let path = tmp("overflow-time");
+        let mut input = Vec::new();
+        for seq in 0..65u32 {
+            let t = 10_000 + seq as u64;
+            let s = L2Submission { identity: id(L2Modality::Haptic, seq), t_release_us: t, t_submit_us: t };
+            input.push(Row::Submit(s));
+            input.push(output_row(s));
+        }
+        let summary = replay(&path, L2SinkKind::Fake, input, None);
+        assert!(summary.tracking_overflow >= 1);
+        assert_eq!(summary.first_integrity_failure_reason.as_deref(), Some(FAIL_TRACKING_CAPACITY));
+        assert_eq!(summary.first_integrity_failure_us, Some(10_064));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_undeterminable_failure_time_is_null_and_flagged() {
+        let path = tmp("untimed");
+        let shared = Arc::new(Shared::default());
+        shared.fail_occurred(5, FAIL_SINK_GONE);
+        shared.fail_untimed(FAIL_CONSERVATION);
+        let summary = replay_with(&path, L2SinkKind::Fake, Vec::new(), None, shared);
+        assert_eq!(summary.first_integrity_failure_us, None);
+        assert_eq!(summary.first_integrity_failure_reason.as_deref(), Some(FAIL_CONSERVATION));
+        assert!(!summary.first_failure_time_determinable);
+        assert!(!summary.integrity_ok(L2SinkKind::Fake));
+        let rows = rows(&path);
+        let end = sentinel(&rows);
+        assert!(end["first_integrity_failure_us"].is_null());
+        assert_eq!(end["first_failure_time_determinable"], false);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_earliest_receiver_fault_wins_whatever_the_reporting_order() {
+        let shared = Shared::default();
+        shared.note_receiver_fault(300, "reported first, happened later");
+        shared.note_receiver_fault(100, "switch target fault, promoted later");
+        shared.note_receiver_fault(200, "another");
+        let fault = shared.receiver_fault.lock().unwrap().clone().unwrap();
+        assert_eq!(fault, (100, "switch target fault, promoted later".to_string()));
+    }
+
+    #[test]
+    fn the_meta_row_states_the_row_and_failure_time_semantics() {
+        let path = tmp("meta-semantics");
+        let out = L2Output::start(&path, config(L2SinkKind::Null, None, 8)).unwrap();
+        out.finish().unwrap();
+        let rows = rows(&path);
+        let meta = &rows[0];
+        assert_eq!(meta["l2_schema"], "event-pair-l2-v1.1");
+        assert_eq!(meta["report_window_anchor"], "close");
+        for key in ["object_rows", "sentinel_row", "receiver_fault", "t_callback_us", "file_order"] {
+            assert!(meta["row_time_semantics"][key].is_string(), "{key}");
+        }
+        for key in [
+            FAIL_DUPLICATE_LOGICAL_RELEASE, FAIL_ROW_QUEUE_OVERFLOW, FAIL_TRACKING_CAPACITY,
+            FAIL_FAKE_PENDING_OVERFLOW, FAIL_TERMINAL_WITHOUT_OPEN_SUBMIT, FAIL_SUBMITTED_UNRESOLVED,
+            FAIL_SUBMIT_AFTER_CLOSE, FAIL_SINK_GONE, FAIL_PRODUCERS_ALIVE_AT_FINISH, FAIL_CONSERVATION,
+        ] {
+            assert!(meta["failure_time_semantics"][key].is_string(), "{key}");
+        }
+        let end = sentinel(&rows);
+        assert_eq!(end["t_us"], end["t_log_arrival_us"]);
         let _ = std::fs::remove_file(&path);
     }
 }

@@ -221,8 +221,9 @@ struct Args {
     /// release points of b1/s1/s2/s3/s3r submit.
     #[arg(long, value_enum, default_value = "none")]
     l2_sink: L2SinkArg,
-    /// Separate L2 JSONL (`event-pair-l2-v0`). Required iff `--l2-sink` is not
-    /// `none`; must differ from `--out`.
+    /// Separate L2 JSONL (schema `skew_moq::l2_output::L2_SCHEMA`, v1.1).
+    /// Required iff `--l2-sink` is not `none`; must not exist yet and must
+    /// not be the rx log.
     #[arg(long)]
     l2_log: Option<PathBuf>,
     /// Fake sink: `t_output_us = t_submit_us + offset` for PC objects.
@@ -234,7 +235,10 @@ struct Args {
     /// Bound of the non-blocking release -> sink submission queue.
     #[arg(long)]
     l2_queue_capacity: Option<usize>,
-    /// Report window after submissions close, in ms.
+    /// Close grace in ms, anchored at the start of the L2 close (meta
+    /// `report_window_anchor: "close"`): a terminal is accepted only if the
+    /// sink receives it strictly before close + this. NOT the registration's
+    /// H-anchored `G_report`.
     #[arg(long)]
     l2_report_window_ms: Option<u64>,
     #[arg(long)]
@@ -1256,16 +1260,47 @@ fn note_l2_fault(l2: Option<&skew_moq::l2_output::L2Output>, cause: impl FnOnce(
     }
 }
 
-/// `note_l2_fault` for the S3 `outcome_error` slot: called at checkpoints
-/// that follow every place the slot can first be filled. Inside the control
-/// loop no `.await` separates the recording from the checkpoint after the
-/// loop; on the exit path each checkpoint follows one exit step.
-fn note_l2_outcome_fault(
-    l2: Option<&skew_moq::l2_output::L2Output>,
-    outcome_error: &Option<anyhow::Error>,
-) {
-    if let Some(error) = outcome_error {
-        note_l2_fault(l2, || format!("{error:#}"));
+/// When the S3 run's first fatal cause was stored (registration §6-1: the
+/// abort time). The receiver keeps its cause in a plain `outcome_error` slot;
+/// `observe` is called right after code that may fill it and BEFORE any
+/// `.await` or release dispatch that follows, so the stamp is the storing
+/// moment, not a later cleanup step. A cause recorded elsewhere with its own
+/// time (switch-target faults) is offered through `observe_at`; the earliest
+/// wins. Inert without L2: no clock read, no allocation.
+struct FirstCauseClock {
+    enabled: bool,
+    first: Option<(u64, String)>,
+}
+
+impl FirstCauseClock {
+    fn new(enabled: bool) -> Self {
+        Self { enabled, first: None }
+    }
+
+    fn observe(&mut self, slot: &Option<anyhow::Error>) {
+        if self.enabled && self.first.is_none() {
+            if let Some(error) = slot {
+                self.first = Some((now_us(), format!("{error:#}")));
+            }
+        }
+    }
+
+    fn observe_at(&mut self, t_us: u64, cause: impl FnOnce() -> String) {
+        if self.enabled && self.first.as_ref().is_none_or(|(t, _)| t_us < *t) {
+            self.first = Some((t_us, cause()));
+        }
+    }
+
+    #[cfg(test)]
+    fn first_us(&self) -> Option<u64> {
+        self.first.as_ref().map(|(t, _)| *t)
+    }
+
+    /// Hand the stamped cause to L2 unchanged (the stored time, not now).
+    fn report(&self, l2: Option<&skew_moq::l2_output::L2Output>) {
+        if let (Some(l2), Some((t_us, cause))) = (l2, &self.first) {
+            l2.receiver_fault(*t_us, cause);
+        }
     }
 }
 
@@ -4397,6 +4432,10 @@ struct S3SwitchTargetFaults {
     faulted: Vec<(TrackRole, Route)>,
     /// The first such terminal, kept as the run's failure cause.
     cause: Option<anyhow::Error>,
+    /// When the first fault was recorded (the event-handling `now` the
+    /// `s3_switch_target_terminal_fault` row also carries). Kept after
+    /// `take_cause`, so a promotion at any later point keeps its time.
+    first_recorded_us: Option<u64>,
 }
 
 impl S3SwitchTargetFaults {
@@ -4419,13 +4458,18 @@ impl S3SwitchTargetFaults {
     /// First-cause-wins inside the store as well: a second faulted target is
     /// still recorded as faulted (so the refusal rule sees it), but the cause
     /// text stays the first one.
-    fn record(&mut self, role: TrackRole, route: Route, error: anyhow::Error) {
+    fn record(&mut self, role: TrackRole, route: Route, error: anyhow::Error, at_us: u64) {
         if !self.faulted.contains(&(role, route)) {
             self.faulted.push((role, route));
         }
         if self.cause.is_none() {
             self.cause = Some(error);
         }
+        self.first_recorded_us.get_or_insert(at_us);
+    }
+
+    fn first_recorded_us(&self) -> Option<u64> {
+        self.first_recorded_us
     }
 
     /// Does THIS pending request have a faulted target? Routes carry their
@@ -5041,6 +5085,7 @@ fn handle_s3_route_ended<H>(
                         .unwrap_or_else(|| "none".to_string()),
                     detail
                 ),
+                now,
             );
         }
         if !pending {
@@ -5188,6 +5233,8 @@ fn drain_s3_events_at_exit<H>(
     outcome_error: &mut Option<anyhow::Error>,
     // A release emitted while draining at exit is a real release.
     l2: Option<&skew_moq::l2_output::L2Submitter>,
+    // Stamps a cause stored here BEFORE the releases dispatched after it.
+    cause_clock: &mut FirstCauseClock,
 ) -> ExitDrain {
     let mut drained = 0u64;
     let disconnected = loop {
@@ -5225,6 +5272,8 @@ fn drain_s3_events_at_exit<H>(
             faults,
             &mut failure,
         );
+        cause_clock.observe(outcome_error);
+        cause_clock.observe(&failure);
         // Same terminal accounting as the shutdown flush that follows: no
         // bridge, no render, no audio — this path is teardown, not playback.
         let dispatched = dispatch_s3_playout_actions(
@@ -5245,6 +5294,7 @@ fn drain_s3_events_at_exit<H>(
                 *outcome_error = Some(error);
             }
         }
+        cause_clock.observe(outcome_error);
     };
     ExitDrain {
         drained,
@@ -6397,6 +6447,7 @@ where
     // return below leaves the L2 file without its sentinel (fail closed).
     let mut l2_output = start_l2_output(args, &logger)?;
     let l2_submitter = l2_output.as_ref().map(|output| output.submitter());
+    let mut cause_clock = FirstCauseClock::new(l2_output.is_some());
     let mut controller = S3Controller::new(runtime.controller).map_err(anyhow::Error::msg)?;
     let gate = S3SwitchGate::new(runtime.switch)
         .map_err(|error| anyhow::anyhow!("create S3 switch gate: {error:?}"))?;
@@ -6621,6 +6672,8 @@ where
             }
             _ = tokio::time::sleep(wait) => None,
         };
+        // L2 (registration §6-1): a session end stored by the select arm.
+        cause_clock.observe(&outcome_error);
         let now = now_us();
         // First-cause-wins from here to the end of the iteration: the session
         // arm above, the max-duration check and the retirement releases can
@@ -6683,6 +6736,9 @@ where
                 EventFlow::SkipIteration => continue,
             }
         }
+        // L2: a cause stored by the event (e.g. a current route ended
+        // `Failed`) is stamped BEFORE the releases dispatched below.
+        cause_clock.observe(&outcome_error);
 
         scheduler_actions.extend(scheduler.advance(now));
         // Same common-timeline epoch row as S1/M1/S2/S3R: S3 uses the same
@@ -6819,7 +6875,7 @@ where
         // L2 checkpoint before the switch request below, an `.await` that is
         // not guarded by `outcome_error.is_none()` (the forced-miss request
         // above is) and can follow an error recorded in this iteration.
-        note_l2_outcome_fault(l2_output.as_ref(), &outcome_error);
+        cause_clock.observe(&outcome_error);
         let observations = match advance_tracker_checked(&mut tracker, &scheduler, now) {
             Ok(observations) => observations,
             Err(error) => {
@@ -6935,7 +6991,7 @@ where
 
     // L2 checkpoint (registration §6-1): an error recorded inside the loop
     // ended it at the loop condition, with no `.await` in between.
-    note_l2_outcome_fault(l2_output.as_ref(), &outcome_error);
+    cause_clock.observe(&outcome_error);
 
     // Drain-at-exit, pass 1 — BEFORE `finish_pending`, on the normal end and
     // on every error exit alike. Anything still queued (typically the objects
@@ -6972,6 +7028,7 @@ where
         &mut switch_faults,
         &mut outcome_error,
         l2_submitter.as_ref(),
+        &mut cause_clock,
     );
     s3_events_drained_at_exit += pass_one.drained;
 
@@ -6981,7 +7038,7 @@ where
     if let Err(error) = flush_s3_barrier_drops(&mut ingress, &logger, &mut stats) {
         keep_first_cause(&mut outcome_error, error);
     }
-    note_l2_outcome_fault(l2_output.as_ref(), &outcome_error);
+    cause_clock.observe(&outcome_error);
 
     // Stop every subscription before joining/aborting its drain, then stop the
     // session. No detached reader is allowed to write after shutdown logging.
@@ -7008,10 +7065,14 @@ where
     for (_role, _route, subscription) in retiring.drain_all() {
         let join = discard_s3_subscription(subscription).await;
         note_s3_drain_join(join, &logger, &mut drains_unjoined, &mut outcome_error);
+        // Before the next join's `.await` (Codex 105 G3).
+        cause_clock.observe(&outcome_error);
     }
     for (_, subscription) in live.drain() {
         let join = discard_s3_subscription(subscription).await;
         note_s3_drain_join(join, &logger, &mut drains_unjoined, &mut outcome_error);
+        // Before the next join's `.await` (Codex 105 G3).
+        cause_clock.observe(&outcome_error);
     }
     for drain in retired_drains.drain(..) {
         if !drain.is_finished() {
@@ -7019,6 +7080,8 @@ where
         }
         let join = join_s3_drain(drain).await;
         note_s3_drain_join(join, &logger, &mut drains_unjoined, &mut outcome_error);
+        // Before the next join's `.await` (Codex 105 G3).
+        cause_clock.observe(&outcome_error);
     }
     // Only a handle the select never consumed may be polled here; re-polling
     // a completed one panics and would skip everything below, including the
@@ -7032,7 +7095,7 @@ where
         // timeout branch are documented there.
         join_s3_session_at_shutdown(&mut session_run, &logger, &mut outcome_error).await;
     }
-    note_l2_outcome_fault(l2_output.as_ref(), &outcome_error);
+    cause_clock.observe(&outcome_error);
     // Every drain task has now been joined — or, for the `drains_unjoined`
     // ones that missed the bound, is still alive and still holds an
     // `S3WireEvent` sender clone, which is why pass 2 below then reports
@@ -7068,6 +7131,7 @@ where
         &mut switch_faults,
         &mut outcome_error,
         l2_submitter.as_ref(),
+        &mut cause_clock,
     );
     s3_events_drained_at_exit += pass_two.drained;
     let event_queue_closed = pass_two.disconnected;
@@ -7089,7 +7153,7 @@ where
     if let Some(cause) = switch_faults.take_cause() {
         keep_first_cause(&mut outcome_error, cause);
     }
-    note_l2_outcome_fault(l2_output.as_ref(), &outcome_error);
+    cause_clock.observe(&outcome_error);
     drop(bridge_tx);
     if let Some(mut child) = bridge_child {
         let _ = child.start_kill();
@@ -7153,7 +7217,7 @@ where
     }
 
     // L2 checkpoint after the shutdown flush.
-    note_l2_outcome_fault(l2_output.as_ref(), &outcome_error);
+    cause_clock.observe(&outcome_error);
 
     let n_pc = recv_pc.load(Ordering::Relaxed);
     let n_haptic = recv_haptic.load(Ordering::Relaxed);
@@ -7187,6 +7251,14 @@ where
     // failure without an earlier recorded cause is first recorded here. Close
     // the L2 stage before the shutdown rows so no `?` below can skip it; its
     // integrity is judged from the L2 file, not the rx log or exit status.
+    // A switch-target fault keeps the time it was recorded at, wherever it
+    // was later promoted into `outcome_error`; the earliest cause wins.
+    if let Some(at_us) = switch_faults.first_recorded_us() {
+        cause_clock.observe_at(at_us, || {
+            "S3 switch target terminal fault (rx s3_switch_target_terminal_fault, t_ended)".to_string()
+        });
+    }
+    cause_clock.report(l2_output.as_ref());
     if failed {
         note_l2_fault(l2_output.as_ref(), || {
             format!(
@@ -11869,15 +11941,18 @@ mod s3_switch_subscribe_tests {
             TrackRole::Haptic,
             target.haptic,
             anyhow::anyhow!("first cause"),
+            1_000,
         );
         assert!(faults.request_has_fault(request));
-        // First-cause-wins inside the store as well.
-        faults.record(TrackRole::Pc, target.pc, anyhow::anyhow!("second cause"));
+        // First-cause-wins inside the store as well, and so does its time.
+        faults.record(TrackRole::Pc, target.pc, anyhow::anyhow!("second cause"), 2_000);
         assert_eq!(
             format!("{:#}", faults.take_cause().expect("a cause was recorded")),
             "first cause"
         );
         assert!(faults.take_cause().is_none());
+        // The first record time outlives the promotion (Codex 105 G3).
+        assert_eq!(faults.first_recorded_us(), Some(1_000));
         // Still faulted for the rule even after the cause was promoted.
         assert!(faults.request_has_fault(request));
 
@@ -11891,11 +11966,12 @@ mod s3_switch_subscribe_tests {
                 generation: 2,
             },
             anyhow::anyhow!("older generation"),
+            0,
         );
         assert!(!other.request_has_fault(request));
         // Neither is the same route under the other role.
         let mut swapped = S3SwitchTargetFaults::default();
-        swapped.record(TrackRole::Pc, target.haptic, anyhow::anyhow!("wrong role"));
+        swapped.record(TrackRole::Pc, target.haptic, anyhow::anyhow!("wrong role"), 0);
         assert!(!swapped.request_has_fault(request));
 
         // A torn-down target stays watched until its terminal arrives.
@@ -13524,6 +13600,162 @@ mod s3_control_loop_tests {
             .rows
             .iter()
             .all(|r| !(r["role"] == "rx" && r["track"] == "pc" && r["seq"] == 3)));
+    }
+
+    /// Codex 105 G4: objects released ONLY in exit-drain pass 1 and ONLY in
+    /// exit-drain pass 2. The production `drain_s3_events_at_exit` is called
+    /// twice exactly as the S3 exit path does (pass 1 with the producers
+    /// still connected, pass 2 after the queue closed); each release must be
+    /// submitted to L2 with exactly one terminal, and the sentinel is last.
+    #[tokio::test]
+    async fn exit_drain_pass_one_and_pass_two_releases_are_submitted() {
+        use skew_moq::l2_output::{FakeSinkConfig, L2Config, L2Output, L2SinkKind};
+        let rx_path = test_log_path("g4-rx");
+        let l2_path = test_log_path("g4-l2");
+        let args = s3_args_with(&rx_path, "g4", Some("30"), "600000", &[]);
+        let mut playout = playout_config(&args).unwrap().unwrap();
+        // The fixture needs releases at push time; a wide late tolerance
+        // keeps them releases under test-machine scheduling noise.
+        playout.late_tolerance_us = 5_000_000;
+        let runtime = s3_runtime_config(&args).unwrap().unwrap();
+        let logger = Arc::new(Mutex::new(
+            JsonlLogger::new(
+                &rx_path, "g4", "moq", "rx", None, 0.0, 0.0, 0.0, 1, 30, 90, 1, None, None,
+                Some("both"), Some(TERM_PROTOCOL_V), None, None, None,
+            )
+            .unwrap(),
+        ));
+        let gate = S3SwitchGate::new(runtime.switch).unwrap();
+        let routes = gate.active_routes();
+        let mut ingress = S3ReceiverIngress::new(gate, playout.max_objects_per_track).unwrap();
+        let mut scheduler = PlayoutScheduler::new(playout).unwrap();
+        let mut tracker = S3DeadlineTracker::new(runtime.deadline_max_anchors).unwrap();
+        let mut object_routes: HashMap<S3ObjectKey, (TrackRole, Route)> = HashMap::new();
+        let mut live: HashMap<(TrackRole, u64), S3LiveSubscription<&'static str>> = HashMap::new();
+        let mut retiring: S3RetirementQueue<S3LiveSubscription<&'static str>> =
+            S3RetirementQueue::new(67_000).unwrap();
+        let mut retired_drains = Vec::new();
+        let mut current_finished = [false, false];
+        let mut normal_end = false;
+        let (recv_pc, recv_haptic) = (AtomicU64::new(0), AtomicU64::new(0));
+        let mut stats = PlayoutStats::default();
+        let mut refused = 0u64;
+        let mut faults = S3SwitchTargetFaults::default();
+        let mut outcome_error: Option<anyhow::Error> = None;
+        let mut window_end_us = None;
+        let output = L2Output::start(
+            &l2_path,
+            L2Config {
+                run_id: "g4".into(),
+                method: "s3".into(),
+                sink: L2SinkKind::Fake,
+                fake: Some(FakeSinkConfig::offsets(800, 300)),
+                queue_capacity: 64,
+                row_capacity: 1024,
+                report_window_us: 300_000,
+                max_tracked_objects: 1024,
+            },
+        )
+        .unwrap();
+        let submitter = output.submitter();
+        let mut clock = FirstCauseClock::new(true);
+        let object = |role: TrackRole, tier: u16, seq: u32, pts_us: u64, event_id: u32| {
+            let (track_id, route) = match role {
+                TrackRole::Pc => (TRACK_PC, routes.pc),
+                TrackRole::Haptic => (TRACK_HAPTIC, routes.haptic),
+            };
+            let t = now_us();
+            let header =
+                unpack_header(&pack_header(track_id, tier, seq, pts_us, event_id, t, 4)).unwrap();
+            S3WireEvent::Object(RoutedObject {
+                role,
+                route,
+                object: PlayoutObject { header, t_recv: t, bytes: Bytes::from(vec![0u8; HDR + 4]) },
+            })
+        };
+        let (tx, mut event_rx) = mpsc::channel::<S3WireEvent>(64);
+        // Pass 1: the exact anchor pair (pts 1 s) arms the epoch; the pair
+        // 100 ms older is due at the epoch itself, so it is released at push.
+        for event in [
+            object(TrackRole::Pc, 2, 30, 1_000_000, 31),
+            object(TrackRole::Haptic, 0, 90, 1_000_000, 31),
+            object(TrackRole::Pc, 2, 27, 900_000, 28),
+            object(TrackRole::Haptic, 0, 81, 900_000, 28),
+        ] {
+            tx.send(event).await.unwrap();
+        }
+        let pass_one = drain_s3_events_at_exit(
+            &mut event_rx, None, &mut window_end_us, &mut ingress, &mut scheduler,
+            &mut tracker, &mut object_routes, &mut live, &mut retiring, &mut retired_drains,
+            &mut current_finished, &mut normal_end, &recv_pc, &recv_haptic, &logger,
+            &mut stats, &mut refused, &mut faults, &mut outcome_error, Some(&submitter),
+            &mut clock,
+        );
+        assert_eq!((pass_one.drained, pass_one.disconnected), (4, false));
+        let releases = |path: &std::path::Path| -> Vec<serde_json::Value> {
+            std::fs::read_to_string(path)
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+                .filter(|r| r["role"] == "release")
+                .collect()
+        };
+        let after_one = releases(&rx_path);
+        let pts_of = |rows: &[serde_json::Value]| -> Vec<u64> {
+            let mut v: Vec<u64> = rows.iter().map(|r| r["pts_us"].as_u64().unwrap()).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(pts_of(&after_one), vec![900_000, 900_000], "pass 1 released exactly its pair");
+        // Pass 2: events that arrive after pass 1; then the queue closes.
+        for event in [
+            object(TrackRole::Pc, 2, 24, 800_000, 25),
+            object(TrackRole::Haptic, 0, 72, 800_000, 25),
+        ] {
+            tx.send(event).await.unwrap();
+        }
+        drop(tx);
+        let pass_two = drain_s3_events_at_exit(
+            &mut event_rx, None, &mut window_end_us, &mut ingress, &mut scheduler,
+            &mut tracker, &mut object_routes, &mut live, &mut retiring, &mut retired_drains,
+            &mut current_finished, &mut normal_end, &recv_pc, &recv_haptic, &logger,
+            &mut stats, &mut refused, &mut faults, &mut outcome_error, Some(&submitter),
+            &mut clock,
+        );
+        assert_eq!((pass_two.drained, pass_two.disconnected), (2, true));
+        assert!(outcome_error.is_none(), "{outcome_error:?}");
+        let all = releases(&rx_path);
+        assert_eq!(pts_of(&all), vec![800_000, 800_000, 900_000, 900_000], "pass 2 released its pair");
+        drop(submitter);
+        let summary = tokio::task::spawn_blocking(move || output.finish()).await.unwrap().unwrap();
+        assert!(summary.integrity_ok(L2SinkKind::Fake), "{summary:?}");
+        assert_eq!((summary.submitted, summary.output), (4, 4));
+        let l2: Vec<serde_json::Value> = std::fs::read_to_string(&l2_path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let key = |r: &serde_json::Value| {
+            format!(
+                "{}/{}/{}/{}/{}/{}/{}",
+                r["track"], r["wire_track"], r["route_generation"], r["tier"], r["seq"],
+                r["pts_us"], r["event_id"]
+            )
+        };
+        for release in &all {
+            let k = key(release);
+            assert_eq!(l2.iter().filter(|r| r["role"] == "submit" && key(r) == k).count(), 1, "{k}");
+            assert_eq!(l2.iter().filter(|r| r["role"] == "output" && key(r) == k).count(), 1, "{k}");
+            let s = l2.iter().find(|r| r["role"] == "submit" && key(r) == k).unwrap();
+            assert_eq!(s["t_release_us"], release["t_release"], "{k}");
+        }
+        assert_eq!(l2.last().unwrap()["role"], "instrumentation_end");
+        // The two anchors are still buffered (due epoch + 100 ms): never
+        // released here, so never submitted.
+        assert!(l2.iter().all(|r| r["pts_us"] != 1_000_000));
+        for p in [&rx_path, &l2_path] {
+            std::fs::remove_file(p).ok();
+        }
     }
 
     /// (b) A transition whose request instant falls at/after the window end is
@@ -15568,27 +15800,102 @@ mod l2_hook_tests {
     }
 
     /// F4: `--l2-sink none` reports nothing (no clock read, no call); with L2
-    /// only the first fault is written.
+    /// one fault row is written, the earliest.
     #[test]
-    fn receiver_faults_are_inert_without_l2_and_first_only_with_it() {
+    fn receiver_faults_are_inert_without_l2_and_earliest_with_it() {
         let mut called = false;
         note_l2_fault(None, || {
             called = true;
             String::new()
         });
         assert!(!called, "the cause is not even formatted without L2");
-        note_l2_outcome_fault(None, &Some(anyhow::anyhow!("x")));
+        let mut inert = FirstCauseClock::new(false);
+        inert.observe(&Some(anyhow::anyhow!("x")));
+        inert.observe_at(5, || panic!("not even formatted"));
+        assert!(inert.first.is_none(), "no stamp without L2");
         let path = tmp("faults");
         let output = fake_output(&path, 0, 0);
-        note_l2_outcome_fault(Some(&output), &None);
-        assert!(!output.receiver_fault_noted());
-        note_l2_outcome_fault(Some(&output), &Some(anyhow::anyhow!("first")));
+        let mut clock = FirstCauseClock::new(true);
+        clock.observe(&None);
+        assert!(clock.first.is_none());
+        clock.observe(&Some(anyhow::anyhow!("first")));
+        let stamped = clock.first_us().unwrap();
+        clock.observe(&Some(anyhow::anyhow!("later")));
+        assert_eq!(clock.first_us(), Some(stamped), "observe never re-stamps");
+        clock.report(Some(&output));
         note_l2_fault(Some(&output), || "second".to_string());
         output.finish().unwrap();
         let l2 = rows(&path);
         let faults: Vec<_> = l2.iter().filter(|r| r["role"] == "receiver_fault").collect();
         assert_eq!(faults.len(), 1);
         assert_eq!(faults[0]["cause"], "first");
+        assert_eq!(faults[0]["t_us"].as_u64(), Some(stamped));
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Codex 105 G3: the first drain panic is stamped when it is STORED; a
+    /// slow next join does not move the time, and the L2 row carries exactly
+    /// the stored value. Same helper sequence as the S3 exit path
+    /// (`join_s3_drain` -> `note_s3_drain_join` -> `observe`), helper-level for
+    /// the same reason as `a_panicking_drain_join_fails_the_run...`: a real
+    /// drain has no reachable panic without a production injection point.
+    #[tokio::test]
+    async fn a_drain_panic_is_timed_where_it_is_stored_not_after_the_next_join() {
+        let rx_path = tmp("g3-rx");
+        let logger = rx_logger(&rx_path);
+        let l2_path = tmp("g3-l2");
+        let output = fake_output(&l2_path, 0, 0);
+        let mut clock = FirstCauseClock::new(true);
+        let mut drains_unjoined = 0u64;
+        let mut outcome_error: Option<anyhow::Error> = None;
+        let before_panic = now_us();
+        let panicking = tokio::spawn(async { panic!("scripted drain panic") });
+        let join = join_s3_drain(panicking).await;
+        note_s3_drain_join(join, &logger, &mut drains_unjoined, &mut outcome_error);
+        clock.observe(&outcome_error);
+        let stored = clock.first_us().expect("stamped at the store");
+        assert!(stored >= before_panic);
+        // The next join is slow (a drain that takes 40 ms to stop).
+        let slow = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        });
+        let join = join_s3_drain(slow).await;
+        note_s3_drain_join(join, &logger, &mut drains_unjoined, &mut outcome_error);
+        clock.observe(&outcome_error);
+        let after_slow_join = now_us();
+        assert!(after_slow_join >= stored + 40_000);
+        clock.report(Some(&output));
+        output.finish().unwrap();
+        let l2 = rows(&l2_path);
+        let fault = l2.iter().find(|r| r["role"] == "receiver_fault").unwrap();
+        assert_eq!(fault["t_us"].as_u64(), Some(stored), "exactly the stored value");
+        assert!(fault["cause"].as_str().unwrap().contains("S3 drain task panicked"));
+        let end = l2.last().unwrap();
+        assert_eq!(end["role"], "instrumentation_end");
+        assert_eq!(end["receiver_fault_us"].as_u64(), Some(stored));
+        for p in [&rx_path, &l2_path] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    /// Codex 105 G3: a switch-target fault promoted later keeps the time it
+    /// was recorded at, and an earlier cause stays first.
+    #[test]
+    fn a_switch_target_fault_keeps_its_record_time_through_promotion() {
+        let mut faults = S3SwitchTargetFaults::default();
+        let route = Route { name: "pc-d6", generation: 1 };
+        faults.record(TrackRole::Pc, route, anyhow::anyhow!("target ended Failed"), 1_000);
+        let mut clock = FirstCauseClock::new(true);
+        // Something else is stored (and stamped now) before the promotion.
+        clock.observe(&Some(anyhow::anyhow!("a later error stored first")));
+        let mut outcome_error = None;
+        keep_first_cause(&mut outcome_error, faults.take_cause().unwrap());
+        clock.observe_at(faults.first_recorded_us().unwrap(), || "switch target fault".into());
+        assert_eq!(clock.first_us(), Some(1_000), "the earlier record time wins");
+        // A record time later than the stamped cause does not replace it.
+        let mut clock = FirstCauseClock::new(true);
+        clock.observe_at(500, || "early".into());
+        clock.observe_at(1_000, || panic!("not formatted when later"));
+        assert_eq!(clock.first_us(), Some(500));
     }
 }
