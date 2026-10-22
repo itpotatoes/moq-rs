@@ -93,6 +93,10 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
+use crate::l2_haptic::{
+    Admission, AlsaOutputDetail, DeviceFailure, EpochStart, HapticPcm, HapticPlacement, PcmParams,
+    PlacementConfig, SimPcm, SimPcmConfig, FAIL_HAPTIC_PAYLOAD_INVALID,
+};
 use crate::now_us;
 
 /// L2 JSONL schema tag written into the meta row.
@@ -119,6 +123,12 @@ pub const DISCARD_OUTPUT_QUEUE_FULL: &str = "output_queue_full";
 pub const DISCARD_SUPERSEDED_BEFORE_COMMIT: &str = "superseded_before_commit";
 /// Reserved for the PC renderer (M3): `wp_presentation_feedback.discarded`.
 pub const DISCARD_COMPOSITOR_DISCARDED: &str = "compositor_discarded";
+/// Haptic ALSA lane, after submit: the device failed (XRUN, suspend, epoch
+/// reset, error) — every submission it can no longer output. The failure
+/// itself is the integrity failure; these rows keep the ledger complete.
+pub const DISCARD_DEVICE_FAILURE: &str = "device_failure";
+/// Haptic ALSA lane, after submit: the payload is not a playable PCM tick.
+pub const DISCARD_PAYLOAD_INVALID: &str = "payload_invalid";
 
 /// `first_integrity_failure_reason` values.
 pub const FAIL_ROW_QUEUE_OVERFLOW: &str = "row_queue_overflow";
@@ -147,6 +157,9 @@ const CLOSE_PENDING: u64 = u64::MAX;
 pub enum L2SinkKind {
     Null,
     Fake,
+    /// Haptic only: PCM playback with ALSA-reported output times
+    /// (registration §3-3, §3-3a; `l2_haptic`).
+    Alsa,
 }
 
 impl L2SinkKind {
@@ -154,6 +167,7 @@ impl L2SinkKind {
         match self {
             Self::Null => "null",
             Self::Fake => "fake",
+            Self::Alsa => "alsa",
         }
     }
 
@@ -286,6 +300,57 @@ impl FakeSinkConfig {
     }
 }
 
+/// Where the haptic ALSA lane plays.
+#[derive(Debug, Clone)]
+pub enum AlsaBackend {
+    /// The deterministic simulated stream (`l2_haptic::SimPcm`) driven by
+    /// the real clock: tests only, never a device output.
+    Simulated(SimPcmConfig),
+}
+
+impl AlsaBackend {
+    pub fn is_device(&self) -> bool {
+        match self {
+            Self::Simulated(_) => false,
+        }
+    }
+}
+
+/// The haptic ALSA sink (registration §3-3, §3-3a). Every number here is a
+/// provisional SINK parameter recorded in meta, fixed in the freeze after
+/// the M2 device measurement; none is an experimental parameter of a method.
+#[derive(Debug, Clone)]
+pub struct AlsaSinkConfig {
+    pub backend: AlsaBackend,
+    pub placement: PlacementConfig,
+    /// Status snapshot cadence; the lane also wakes on every arrival.
+    pub status_interval_us: u64,
+    /// Bound on opening, configuring, prefilling and starting the stream.
+    pub ready_timeout_us: u64,
+}
+
+impl AlsaSinkConfig {
+    pub fn validate(&self) -> Result<()> {
+        self.placement.validate().map_err(anyhow::Error::msg)?;
+        if self.status_interval_us == 0 || self.status_interval_us > 100_000 {
+            bail!("ALSA status interval must be in 1..=100000 us");
+        }
+        if self.ready_timeout_us == 0 {
+            bail!("ALSA ready timeout must be positive");
+        }
+        match &self.backend {
+            AlsaBackend::Simulated(sim) => {
+                if (sim.period_frames, sim.buffer_frames)
+                    != (self.placement.period_frames, self.placement.buffer_frames)
+                {
+                    bail!("simulated stream sizes differ from the placement sizes");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct L2Config {
     pub run_id: String,
@@ -296,6 +361,8 @@ pub struct L2Config {
     /// Required iff some modality's sink is `fake`, refused otherwise. Its
     /// negative-test switches apply to the fake lanes only.
     pub fake: Option<FakeSinkConfig>,
+    /// Required iff the haptic sink is `alsa`, refused otherwise.
+    pub alsa: Option<AlsaSinkConfig>,
     /// Bound of EACH modality's release -> sink submission queue (one lane
     /// per modality since v1.2; meta `queue_capacity_per_track`).
     pub queue_capacity: usize,
@@ -324,14 +391,24 @@ impl L2Config {
         if !any_fake && self.fake.is_some() {
             bail!("fake-sink options apply only when some modality uses the fake L2 sink");
         }
+        if self.sinks.pc == L2SinkKind::Alsa {
+            bail!("the ALSA sink is a haptic sink");
+        }
+        match (self.sinks.haptic == L2SinkKind::Alsa, &self.alsa) {
+            (true, Some(alsa)) => alsa.validate()?,
+            (true, None) => bail!("the ALSA haptic sink requires its configuration"),
+            (false, Some(_)) => bail!("ALSA options apply only to the ALSA haptic sink"),
+            (false, None) => {}
+        }
         Ok(())
     }
 
     /// Whether this modality's sink is a real output device. No null/fake
-    /// sink is; M2 adds the ALSA device sink (haptic), M3 Wayland (PC).
+    /// sink is, nor a simulated ALSA stream; M3 adds Wayland (PC).
     pub fn device_output_of(&self, modality: L2Modality) -> bool {
         match self.sinks.of(modality) {
             L2SinkKind::Null | L2SinkKind::Fake => false,
+            L2SinkKind::Alsa => self.alsa.as_ref().is_some_and(|a| a.backend.is_device()),
         }
     }
 
@@ -401,7 +478,11 @@ impl Shared {
 
     /// A failure whose occurrence time is known; detection time is now.
     fn fail_occurred(&self, occurred_us: u64, reason: &'static str) {
-        let detected_us = now_us();
+        self.fail_detected(occurred_us, now_us(), reason);
+    }
+
+    /// A failure with both its occurrence and its detection time.
+    fn fail_detected(&self, occurred_us: u64, detected_us: u64, reason: &'static str) {
         let mut log = self.failures.lock().unwrap_or_else(|p| p.into_inner());
         if log.timed.is_none_or(|(t, _, _)| occurred_us < t) {
             log.timed = Some((occurred_us, detected_us, reason));
@@ -539,12 +620,15 @@ enum SinkMsg {
 enum OutputDetail {
     /// `{"device": "fake", "modality": <track>}` (unchanged from v1.1).
     Fake,
+    /// The status snapshot that showed `hw_pos > n_k` (haptic ALSA lane).
+    Alsa(Box<AlsaOutputDetail>),
 }
 
 impl OutputDetail {
     fn to_json(&self, modality: L2Modality) -> serde_json::Value {
         match self {
             Self::Fake => serde_json::json!({ "device": "fake", "modality": modality.as_str() }),
+            Self::Alsa(detail) => detail.to_json(),
         }
     }
 }
@@ -565,6 +649,9 @@ enum Row {
         t_discard_us: u64,
         reason: &'static str,
     },
+    /// A device lane's counters, sent once before its thread exits; written
+    /// into the sentinel (`lanes.<track>`), never as a row of its own.
+    LaneStats { modality: L2Modality, stats: serde_json::Value },
     End,
 }
 
@@ -737,11 +824,78 @@ fn sink_contract(config: &L2Config, modality: L2Modality) -> serde_json::Value {
                 "modality": "track name (pc | haptic)",
             },
         }),
+        L2SinkKind::Alsa => serde_json::json!({
+            "kind": "alsa",
+            "backend": config.alsa.as_ref().map(|a| alsa_backend_name(&a.backend)),
+            "device_output": device_output,
+            "resolves": true,
+            "terminals": "output once a status snapshot shows hw_pos > n_k (receipt strictly before close_deadline_us); explicit_discard before submit: output_queue_full (write queue would exceed queue_limit_frames); explicit_discard after submit: payload_invalid, device_failure",
+            "t_output_us": "htstamp_us + round_half_away((n_k - hw_pos) * 1e6 / 48000), signed integer arithmetic, from the ONE snapshot that shows hw_pos > n_k (registration 3-3: PCM frame time back-computed from the ALSA-reported position and timestamp; not a physical DAC measurement)",
+            "t_callback_us": "clock read immediately after that snd_pcm_status call",
+            "output_detail": AlsaOutputDetail::schema(),
+        }),
     }
 }
 
+fn alsa_backend_name(backend: &AlsaBackend) -> &'static str {
+    match backend {
+        AlsaBackend::Simulated(_) => "simulated",
+    }
+}
+
+/// The meta `alsa` section: the negotiated, verified stream and the
+/// registered-later placement policy as implemented.
+fn alsa_meta(alsa: &AlsaSinkConfig, ready: &LaneReady) -> serde_json::Value {
+    let p = &ready.params;
+    let c = &alsa.placement;
+    let first = &ready.epoch.first_status;
+    serde_json::json!({
+        "backend": alsa_backend_name(&alsa.backend),
+        "device": p.device,
+        "library": p.library,
+        "open_mode": "SND_PCM_NONBLOCK",
+        "access": p.access,
+        "format": p.format,
+        "channels": p.channels,
+        "rate_hz": p.rate_hz,
+        "period_frames": p.period_frames,
+        "buffer_frames": p.buffer_frames,
+        "tstamp_mode": p.tstamp_mode,
+        "tstamp_type": p.tstamp_type,
+        "audio_tstamp_type_requested": crate::l2_haptic::audio_tstamp_type_name(p.audio_tstamp_type_requested),
+        "target_fill_frames": c.target_fill_frames,
+        "prefill_frames": c.prefill_frames,
+        "queue_limit_frames": c.queue_limit_frames,
+        "status_interval_us": alsa.status_interval_us,
+        "parameter_status": "provisional sink parameters, not registered experimental parameters; fixed in the freeze after the M2 device measurement (registration 3-3a)",
+        "stream_epoch": {
+            "prefill_frames": ready.prefill_frames,
+            "t_start_us": ready.epoch.t_start_us,
+            "trigger_htstamp_ns": ready.epoch.trigger_htstamp_ns,
+            "first_status_htstamp_ns": first.htstamp_ns,
+            "first_status_delay_frames": first.delay,
+            "first_status_avail_frames": first.avail,
+            "first_status_audio_tstamp_type_actual": crate::l2_haptic::audio_tstamp_type_name(first.audio_tstamp.actual_type),
+            "first_status_audio_tstamp_report_valid": first.audio_tstamp.valid,
+        },
+        "frame_numbering": "n = cumulative 48 kHz frames written since the stream was prepared (prefill included); the lane is the only writer, so n equals the kernel appl_ptr of the hw device",
+        "upsample": "each 8 kHz S16_LE mono sample repeated 6 times (88/89 samples -> 528/534 frames, never a fixed length)",
+        "channel_map": "mono duplicated to L and R",
+        "placement_policy": "released ticks are appended in release order at the current write position (n_k = w), written only whole (avail >= frames); while a tick waits nothing else is written; never aligned to a planned slot",
+        "silence_policy": "with an empty write queue, one period of silence when buffer_frames - avail < target_fill_frames; silence frames are never the output of any tick",
+        "queue_policy": "a tick that would make the unwritten write queue exceed queue_limit_frames is explicit_discard output_queue_full before submit",
+        "hw_pos_definition": "from ONE snd_pcm_status snapshot: hw_pos = appl_pos - delay, appl_pos = frames written by this lane at that call; hw_ptr_pos = appl_pos - (buffer_frames - avail) is the DMA pointer (must never decrease); driver_delay_frames = delay - (buffer_frames - avail) is recorded",
+        "output_rule": "an output row only when hw_pos > n_k in that snapshot (strict); t_output_us = htstamp_us + round_half_away((n_k - hw_pos) * 1e6 / 48000); htstamp_us = sec*1e6 + floor(nsec/1000)",
+        "htstamp_semantics": "inferred from the kernel source, to be confirmed on the device: with an audio timestamp of actual type LINK the status htstamp is the system time read next to the position read in that same status call; with DEFAULT it is the time the current position value was first observed",
+        "audio_tstamp_policy": "the LINK audio timestamp is requested before every status call and recorded per output row (link_audio_tstamp_ns, its type and accuracy) for comparison only; it is not the registered formula",
+        "link_audio_tstamp_domain": "HDA link wall clock since the stream started, ns; NOT CLOCK_MONOTONIC",
+        "failure_policy": "XRUN, SUSPENDED, DISCONNECTED, an unexpected state, a moved trigger timestamp or a decreasing DMA pointer (epoch reset), an inconsistent snapshot, or a status/write error is an integrity failure; the stream is stopped, never recovered, and every submission that can no longer be output gets explicit_discard device_failure (after submit, receipt before close_deadline_us)",
+        "close_policy": "after finish starts the lane keeps writing (silence) and observing until every written tick passed hw_pos or the close deadline, then drops the stream",
+    })
+}
+
 /// The v1.2 meta row (written once, synchronously, before any other row).
-fn meta_row(config: &L2Config) -> serde_json::Value {
+fn meta_row(config: &L2Config, alsa_ready: Option<&LaneReady>) -> serde_json::Value {
     let fake = config.fake.as_ref();
     let sinks = serde_json::json!({
         "pc": config.sinks.pc.as_str(),
@@ -750,6 +904,47 @@ fn meta_row(config: &L2Config) -> serde_json::Value {
     let contracts = serde_json::json!({
         "pc": sink_contract(config, L2Modality::Pc),
         "haptic": sink_contract(config, L2Modality::Haptic),
+    });
+    let row_time_semantics = serde_json::json!({
+        "object_rows": "t_us == t_log_arrival_us == writer clock immediately before the row write",
+        "sentinel_row": "t_us == end_us == t_log_arrival_us == writer clock before the sentinel write",
+        "receiver_fault": "t_us = moment the receiver recorded its first fatal error (earliest kept); t_log_arrival_us = write time",
+        "t_callback_us": "sink receipt time of the terminal callback",
+        "t_output_us": "per sink kind: sink_contracts.<track>.t_output_us",
+        "file_order": "t_us is not monotonic in file order; t_log_arrival_us is",
+    });
+    let failure_time_semantics = serde_json::json!({
+        "duplicate_logical_release": "t_release_us of the second release (two earliest kept per (track, seq))",
+        "row_queue_overflow": "t_discard_us of the discard whose row could not be queued; from a device lane the event time of the row (t_submit_us of a submit, t_callback_us of an output, t_discard_us of a discard)",
+        "alsa_xrun": "the kernel trigger timestamp of the stop when it moved (status trigger_htstamp), otherwise the end of the last good status snapshot (lower bound); first_integrity_failure_detected_us is the detection",
+        "alsa_suspended": "as alsa_xrun",
+        "alsa_epoch_reset": "the moved trigger timestamp (restart), or for a DMA pointer that went back the end of the last good status snapshot (lower bound)",
+        "alsa_disconnected": "end of the last good status snapshot (lower bound)",
+        "alsa_state_unexpected": "end of the last good status snapshot (lower bound)",
+        "alsa_status_inconsistent": "end of the last good status snapshot (lower bound)",
+        "alsa_status_error": "end of the last good status snapshot (lower bound)",
+        "alsa_write_error": "the kernel trigger timestamp if a status taken right after the error shows a moved trigger, otherwise the end of the last good status snapshot (lower bound)",
+        "haptic_payload_invalid": "t_submit_us of the submission",
+        "tracking_capacity_exceeded": "t_submit_us (submit) or t_discard_us (pre-submit discard) of the offending release",
+        "fake_pending_overflow": "t_submit_us of the offending submission",
+        "terminal_without_open_submit": "t_callback_us (output) or t_discard_us (post-submit discard) of the orphan terminal",
+        "submitted_unresolved": "earliest t_submit_us among unresolved submits of tracks whose sink resolves",
+        "submit_after_close": "detection = the attempt",
+        "sink_gone": "detection (the failed send)",
+        "producers_alive_at_finish": "detection (the close deadline)",
+        "submit_conservation_violated": "undeterminable unless explained by a timed failure",
+        "output_order_violation": "t_callback_us of the offending output row",
+        "terminal_at_or_after_deadline": "the receipt time of the offending terminal",
+        "undeterminable": "first_integrity_failure_us = null, first_failure_time_determinable = false",
+    });
+    let counter_semantics = serde_json::json!({
+        "duplicate_logical_release": "number of EXTRA releases of one (track, seq): sum over keys of max(N_key - 1, 0); not the number of duplicated keys",
+        "submitted_unresolved": "submits without a terminal at the sentinel (all tracks); submitted_unresolved_by_track splits it",
+        "discarded_before_submit": "releases refused before submit (explicit_discard with discard_phase before_submit; the bounded submission queue: output_queue_full)",
+        "discarded_after_submit": "submits terminated by an explicit_discard (discard_phase after_submit)",
+        "output_order_violation": "output rows violating order_rule",
+        "terminal_at_or_after_deadline": "terminals whose receipt time is not < close_deadline_us",
+        "lanes": "sentinel lanes.<track>: counters of a device lane (null for null/fake lanes); see sink_contracts",
     });
     serde_json::json!({
         "role": "meta",
@@ -770,43 +965,16 @@ fn meta_row(config: &L2Config) -> serde_json::Value {
         "report_window_anchor": REPORT_WINDOW_ANCHOR,
         "report_window_rule": "a terminal is accepted iff its receipt time (t_callback_us of an output, t_discard_us of an after-submit discard) < close_deadline_us = finish_start_us + report_window_us (both in the sentinel); equality is rejected; not the H-anchored G_report",
         "order_rule": "every output row satisfies t_release_us <= t_submit_us <= t_output_us <= t_callback_us <= t_log_arrival_us; the writer checks it after writing the row (values are never clamped) and a violation is the integrity failure output_order_violation",
-        "row_time_semantics": {
-            "object_rows": "t_us == t_log_arrival_us == writer clock immediately before the row write",
-            "sentinel_row": "t_us == end_us == t_log_arrival_us == writer clock before the sentinel write",
-            "receiver_fault": "t_us = moment the receiver recorded its first fatal error (earliest kept); t_log_arrival_us = write time",
-            "t_callback_us": "sink receipt time of the terminal callback",
-            "t_output_us": "per sink kind: sink_contracts.<track>.t_output_us",
-            "file_order": "t_us is not monotonic in file order; t_log_arrival_us is",
-        },
-        "failure_time_semantics": {
-            "duplicate_logical_release": "t_release_us of the second release (two earliest kept per (track, seq))",
-            "row_queue_overflow": "t_discard_us of the discard whose row could not be queued",
-            "tracking_capacity_exceeded": "t_submit_us (submit) or t_discard_us (pre-submit discard) of the offending release",
-            "fake_pending_overflow": "t_submit_us of the offending submission",
-            "terminal_without_open_submit": "t_callback_us (output) or t_discard_us (post-submit discard) of the orphan terminal",
-            "submitted_unresolved": "earliest t_submit_us among unresolved submits of tracks whose sink resolves",
-            "submit_after_close": "detection = the attempt",
-            "sink_gone": "detection (the failed send)",
-            "producers_alive_at_finish": "detection (the close deadline)",
-            "submit_conservation_violated": "undeterminable unless explained by a timed failure",
-            "output_order_violation": "t_callback_us of the offending output row",
-            "terminal_at_or_after_deadline": "the receipt time of the offending terminal",
-            "undeterminable": "first_integrity_failure_us = null, first_failure_time_determinable = false",
-        },
-        "counter_semantics": {
-            "duplicate_logical_release": "number of EXTRA releases of one (track, seq): sum over keys of max(N_key - 1, 0); not the number of duplicated keys",
-            "submitted_unresolved": "submits without a terminal at the sentinel (all tracks); submitted_unresolved_by_track splits it",
-            "discarded_before_submit": "releases refused before submit (explicit_discard with discard_phase before_submit; the bounded submission queue: output_queue_full)",
-            "discarded_after_submit": "submits terminated by an explicit_discard (discard_phase after_submit)",
-            "output_order_violation": "output rows violating order_rule",
-            "terminal_at_or_after_deadline": "terminals whose receipt time is not < close_deadline_us",
-        },
+        "row_time_semantics": row_time_semantics,
+        "failure_time_semantics": failure_time_semantics,
+        "counter_semantics": counter_semantics,
         "fake": fake.map(|f| serde_json::json!({
             "pc_offset_us": f.pc_offset_us,
             "haptic_offset_us": f.haptic_offset_us,
             "force_queue_full": f.force_queue_full,
             "drop_terminals": f.drop_terminals,
         })),
+        "alsa": config.alsa.as_ref().zip(alsa_ready).map(|(alsa, ready)| alsa_meta(alsa, ready)),
     })
 }
 
@@ -842,11 +1010,44 @@ impl L2Output {
             bail!("L2 log {} is the same file as an open log", path.display());
         }
         let mut w = BufWriter::new(file);
-        writeln!(w, "{}", meta_row(&config))?;
-        w.flush()?;
-
         let (rows_tx, rows_rx) = mpsc::sync_channel::<Row>(config.row_capacity);
         let shared = Arc::new(Shared::default());
+        let mut senders: [Option<SyncSender<SinkMsg>>; 2] = [None, None];
+        let mut lane_threads: [Option<JoinHandle<()>>; 2] = [None, None];
+
+        // A device lane goes first: it opens, configures, prefills and starts
+        // its stream (registration 3-3a: before the run's warm-up) and hands
+        // back what it negotiated, which the meta row records. If it cannot,
+        // `start` fails here and the receiver refuses to run; the file then
+        // holds no meta row, so it can never pass as a run's ledger.
+        let mut alsa_ready = None;
+        if let (L2SinkKind::Alsa, Some(alsa)) = (config.sinks.haptic, config.alsa.clone()) {
+            let (items_tx, items_rx) = mpsc::sync_channel::<SinkMsg>(config.queue_capacity);
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let rows = rows_tx.clone();
+            let lane_shared = shared.clone();
+            let timeout = micros(alsa.ready_timeout_us);
+            let lane = std::thread::Builder::new()
+                .name("l2-sink-haptic-alsa".into())
+                .spawn(move || alsa_lane_main(alsa, items_rx, rows, lane_shared, ready_tx))
+                .context("spawn L2 ALSA lane thread")?;
+            match ready_rx.recv_timeout(timeout) {
+                Ok(Ok(ready)) => alsa_ready = Some(ready),
+                Ok(Err(error)) => {
+                    drop(items_tx);
+                    let _ = lane.join();
+                    bail!("L2 ALSA haptic sink failed to start: {error}");
+                }
+                // The lane stops its stream by itself once `items_tx` is gone.
+                Err(_) => bail!("L2 ALSA haptic sink not ready within {} us", timeout.as_micros()),
+            }
+            let lane_index = L2Modality::Haptic.index();
+            senders[lane_index] = Some(items_tx);
+            lane_threads[lane_index] = Some(lane);
+        }
+
+        writeln!(w, "{}", meta_row(&config, alsa_ready.as_ref()))?;
+        w.flush()?;
         let writer = {
             let run_id = config.run_id.clone();
             let sinks = config.sinks;
@@ -858,9 +1059,10 @@ impl L2Output {
                 .spawn(move || writer_loop(w, rows_rx, run_id, sinks, device_output, shared, cap))
                 .context("spawn L2 writer thread")?
         };
-        let mut senders = Vec::with_capacity(2);
-        let mut lanes = Vec::with_capacity(2);
         for modality in L2Modality::ALL {
+            if senders[modality.index()].is_some() {
+                continue; // the device lane above
+            }
             let (items_tx, items_rx) = mpsc::sync_channel::<SinkMsg>(config.queue_capacity);
             let rows = rows_tx.clone();
             let kind = config.sinks.of(modality);
@@ -871,9 +1073,11 @@ impl L2Output {
                 .name(format!("l2-sink-{}", modality.as_str()))
                 .spawn(move || sink_loop(kind, fake, items_rx, rows, shared, cap))
                 .context("spawn L2 sink thread")?;
-            senders.push(items_tx);
-            lanes.push(lane);
+            senders[modality.index()] = Some(items_tx);
+            lane_threads[modality.index()] = Some(lane);
         }
+        let senders = senders.map(|s| s.expect("every lane has a queue"));
+        let lanes: Vec<JoinHandle<()>> = lane_threads.into_iter().flatten().collect();
         let controls: [SyncSender<SinkMsg>; 2] = [senders[0].clone(), senders[1].clone()];
         let force_queue_full = L2Modality::ALL
             .map(|m| config.fake_lane(m).is_some_and(|f| f.force_queue_full));
@@ -1170,6 +1374,385 @@ fn sink_loop(
     }
 }
 
+/// What the haptic device lane reports once its stream epoch has started.
+struct LaneReady {
+    params: PcmParams,
+    epoch: EpochStart,
+    prefill_frames: u64,
+}
+
+/// Open the configured stream INSIDE the lane thread: a device handle never
+/// crosses threads.
+fn open_haptic_pcm(alsa: &AlsaSinkConfig) -> std::result::Result<Box<dyn HapticPcm>, String> {
+    match &alsa.backend {
+        AlsaBackend::Simulated(sim) => Ok(Box::new(SimPcm::new(sim.clone()))),
+    }
+}
+
+/// The haptic ALSA lane thread: open -> prefill -> start -> first snapshot
+/// (the epoch) -> ready -> loop. Any failure before ready is reported to
+/// `start`, which then refuses to run.
+fn alsa_lane_main(
+    alsa: AlsaSinkConfig,
+    items: Receiver<SinkMsg>,
+    rows: SyncSender<Row>,
+    shared: Arc<Shared>,
+    ready: mpsc::Sender<std::result::Result<LaneReady, String>>,
+) {
+    let fail = |message: String| {
+        let _ = ready.send(Err(message));
+    };
+    let mut pcm = match open_haptic_pcm(&alsa) {
+        Ok(pcm) => pcm,
+        Err(error) => return fail(error),
+    };
+    let mut engine = match HapticPlacement::new(alsa.placement, pcm.params()) {
+        Ok(engine) => engine,
+        Err(error) => return fail(error),
+    };
+    let mut clock = now_us;
+    if let Err(error) = engine.prefill(pcm.as_mut(), &mut clock) {
+        return fail(format!("prefill: {error}"));
+    }
+    let t_start_us = now_us();
+    if let Err(error) = pcm.start(t_start_us) {
+        let _ = pcm.stop();
+        return fail(format!("start: {error}"));
+    }
+    let t0 = now_us();
+    let first = pcm.status(t0);
+    let t1 = now_us();
+    let first = match first {
+        Ok(first) => first,
+        Err(error) => {
+            let _ = pcm.stop();
+            return fail(format!("first status: {error}"));
+        }
+    };
+    if let Err(error) = engine.begin_epoch(t_start_us, first, t1) {
+        let _ = pcm.stop();
+        return fail(error);
+    }
+    let lane_ready = LaneReady {
+        params: pcm.params().clone(),
+        epoch: *engine.epoch().expect("the epoch has begun"),
+        prefill_frames: engine.stats().prefill_frames,
+    };
+    if ready.send(Ok(lane_ready)).is_err() {
+        // `start` gave up waiting.
+        let _ = pcm.stop();
+        return;
+    }
+    AlsaLane::new(pcm, engine, rows, shared).run(items, alsa.status_interval_us);
+}
+
+/// The running haptic ALSA lane: the device, the placement engine and the
+/// row hand-off. Rows go to the writer with `try_send`: a logging stall must
+/// never become a PCM underrun (a full row queue is `row_queue_overflow`).
+struct AlsaLane {
+    pcm: Box<dyn HapticPcm>,
+    engine: HapticPlacement,
+    rows: SyncSender<Row>,
+    shared: Arc<Shared>,
+    /// `avail` of this iteration's good snapshot (consumed by `fill`).
+    avail: Option<u64>,
+    failed: Option<DeviceFailure>,
+    stopped: bool,
+    stop_error: Option<String>,
+    outputs_after_deadline: u64,
+    discards_not_emitted_after_deadline: u64,
+    device_failure_discards: u64,
+    payload_invalid_discards: u64,
+    queue_full_discards: u64,
+    row_overflow: u64,
+    writer_gone: bool,
+}
+
+impl AlsaLane {
+    fn new(pcm: Box<dyn HapticPcm>, engine: HapticPlacement, rows: SyncSender<Row>, shared: Arc<Shared>) -> Self {
+        Self {
+            pcm,
+            engine,
+            rows,
+            shared,
+            avail: None,
+            failed: None,
+            stopped: false,
+            stop_error: None,
+            outputs_after_deadline: 0,
+            discards_not_emitted_after_deadline: 0,
+            device_failure_discards: 0,
+            payload_invalid_discards: 0,
+            queue_full_discards: 0,
+            row_overflow: 0,
+            writer_gone: false,
+        }
+    }
+
+    fn row(&mut self, row: Row, event_us: u64) {
+        match self.rows.try_send(row) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                self.row_overflow += 1;
+                self.shared.row_overflow.fetch_add(1, Ordering::Relaxed);
+                self.shared.fail_occurred(event_us, FAIL_ROW_QUEUE_OVERFLOW);
+            }
+            Err(TrySendError::Disconnected(_)) => self.writer_gone = true,
+        }
+    }
+
+    /// An after-submit discard, emitted only strictly before the close
+    /// deadline (otherwise the submission stays unresolved).
+    fn discard_after(&mut self, s: L2Submission, reason: &'static str) {
+        let t_discard_us = now_us().max(s.t_submit_us);
+        if self.shared.close_deadline().is_some_and(|deadline| t_discard_us >= deadline) {
+            self.discards_not_emitted_after_deadline += 1;
+            return;
+        }
+        let row = Row::Discard {
+            identity: s.identity,
+            t_release_us: s.t_release_us,
+            t_submit_us: Some(s.t_submit_us),
+            t_discard_us,
+            reason,
+        };
+        self.row(row, t_discard_us);
+    }
+
+    fn accept(&mut self, s: L2Submission, payload: Option<bytes::Bytes>) {
+        if self.failed.is_some() {
+            // The device is gone: still a submission, terminated at once.
+            self.row(Row::Submit(s), s.t_submit_us);
+            self.device_failure_discards += 1;
+            self.discard_after(s, DISCARD_DEVICE_FAILURE);
+            return;
+        }
+        match self.engine.admit(s, payload.as_deref()) {
+            Admission::Queued => self.row(Row::Submit(s), s.t_submit_us),
+            Admission::QueueFull => {
+                let t_discard_us = now_us().max(s.t_release_us);
+                self.queue_full_discards += 1;
+                let row = Row::Discard {
+                    identity: s.identity,
+                    t_release_us: s.t_release_us,
+                    t_submit_us: None,
+                    t_discard_us,
+                    reason: DISCARD_OUTPUT_QUEUE_FULL,
+                };
+                self.row(row, t_discard_us);
+            }
+            Admission::PayloadInvalid => {
+                self.row(Row::Submit(s), s.t_submit_us);
+                self.shared.fail_occurred(s.t_submit_us, FAIL_HAPTIC_PAYLOAD_INVALID);
+                self.payload_invalid_discards += 1;
+                self.discard_after(s, DISCARD_PAYLOAD_INVALID);
+            }
+        }
+    }
+
+    fn handle(&mut self, msg: SinkMsg, closing: &mut bool) {
+        match msg {
+            SinkMsg::Item(s, payload) => self.accept(s, payload),
+            SinkMsg::Closing => *closing = true,
+            SinkMsg::Wake => {}
+        }
+    }
+
+    /// Take everything queued right now; `false` once the stage is gone.
+    fn drain(&mut self, items: &Receiver<SinkMsg>, closing: &mut bool) -> bool {
+        loop {
+            match items.try_recv() {
+                Ok(msg) => self.handle(msg, closing),
+                Err(mpsc::TryRecvError::Empty) => return true,
+                Err(mpsc::TryRecvError::Disconnected) => return false,
+            }
+        }
+    }
+
+    /// One status snapshot: validate it and emit every output it shows,
+    /// each only if received strictly before the close deadline.
+    fn poll(&mut self) {
+        self.avail = None;
+        if self.failed.is_some() {
+            return;
+        }
+        let t0 = now_us();
+        let status = self.pcm.status(t0);
+        let t1 = now_us();
+        let snapshot = match status {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let failure = self.engine.failure_from_error(&error, None, t1, "status");
+                return self.fail(failure);
+            }
+        };
+        match self.engine.observe(&snapshot, t0, t1) {
+            Err(failure) => self.fail(failure),
+            Ok(placed) => {
+                let deadline = self.shared.close_deadline();
+                for p in placed {
+                    if deadline.is_some_and(|deadline| p.t_callback_us >= deadline) {
+                        // Not accepted: it stays unresolved.
+                        self.outputs_after_deadline += 1;
+                        continue;
+                    }
+                    let t = p.t_callback_us;
+                    let row = Row::Output {
+                        submission: p.submission,
+                        t_output_us: p.t_output_us,
+                        t_callback_us: p.t_callback_us,
+                        detail: OutputDetail::Alsa(Box::new(p.detail)),
+                    };
+                    self.row(row, t);
+                }
+                self.avail = Some(snapshot.avail);
+            }
+        }
+    }
+
+    /// Write what this iteration's snapshot allows.
+    fn fill(&mut self) {
+        let Some(avail) = self.avail.take() else { return };
+        if self.failed.is_some() {
+            return;
+        }
+        let mut clock = now_us;
+        if let Err(error) = self.engine.fill(self.pcm.as_mut(), avail, &mut clock) {
+            let detected = now_us();
+            // The kernel's view right after the error (an XRUN's trigger time).
+            let after = self.pcm.status(detected).ok();
+            let failure = self.engine.failure_from_error(&error, after.as_ref(), detected, "writei");
+            self.fail(failure);
+        }
+    }
+
+    /// A device failure: recorded with its occurrence and detection times,
+    /// the stream stopped (never recovered), and every submission that can
+    /// no longer be output terminated as `device_failure`.
+    fn fail(&mut self, failure: DeviceFailure) {
+        if self.failed.is_some() {
+            return;
+        }
+        self.shared.fail_detected(failure.occurred_us, failure.detected_us, failure.reason);
+        self.stop_stream();
+        for s in self.engine.abandon() {
+            self.device_failure_discards += 1;
+            self.discard_after(s, DISCARD_DEVICE_FAILURE);
+        }
+        self.failed = Some(failure);
+    }
+
+    fn stop_stream(&mut self) {
+        if !self.stopped {
+            self.stopped = true;
+            if let Err(error) = self.pcm.stop() {
+                self.stop_error = Some(error.to_string());
+            }
+        }
+    }
+
+    fn stats(&self) -> serde_json::Value {
+        let mut stats = self.engine.stats().to_json();
+        let map = stats.as_object_mut().expect("lane stats are an object");
+        map.insert("kind".into(), "alsa".into());
+        map.insert("backend".into(), self.pcm.params().backend.into());
+        map.insert("outputs_after_deadline".into(), self.outputs_after_deadline.into());
+        map.insert(
+            "discards_not_emitted_after_deadline".into(),
+            self.discards_not_emitted_after_deadline.into(),
+        );
+        map.insert("device_failure_discards".into(), self.device_failure_discards.into());
+        map.insert("payload_invalid_discards".into(), self.payload_invalid_discards.into());
+        map.insert("queue_full_discards".into(), self.queue_full_discards.into());
+        map.insert("row_overflow".into(), self.row_overflow.into());
+        map.insert(
+            "device_failure".into(),
+            self.failed.as_ref().map_or(serde_json::Value::Null, |f| {
+                serde_json::json!({
+                    "reason": f.reason,
+                    "occurred_us": f.occurred_us,
+                    "occurred_basis": f.occurred_basis,
+                    "detected_us": f.detected_us,
+                    "detail": f.detail,
+                })
+            }),
+        );
+        map.insert("stop_error".into(), self.stop_error.clone().into());
+        stats
+    }
+
+    /// The lane loop. Each iteration: status -> observe/emit -> accept
+    /// everything queued -> fill (ticks, silence) -> close checks -> wait for
+    /// the next status time or an arrival. A tick written in one iteration
+    /// is first observable in the next snapshot. Close protocol as the
+    /// null/fake lanes: after `Closing`, every producer must go and every
+    /// terminal be received strictly before the deadline; the stream keeps
+    /// being fed (silence) meanwhile, then is dropped.
+    fn run(mut self, items: Receiver<SinkMsg>, interval_us: u64) {
+        let mut closing = false;
+        let mut producers_gone = false;
+        let mut next_poll = now_us();
+        loop {
+            self.poll();
+            if !self.drain(&items, &mut closing) || self.writer_gone {
+                // Dropped without `finish` (or the writer died): fail closed,
+                // the writer ends without a sentinel.
+                self.stop_stream();
+                return;
+            }
+            self.fill();
+            let now = now_us();
+            let mut deadline = None;
+            if closing {
+                let deadline_us = self
+                    .shared
+                    .close_deadline()
+                    .expect("finish publishes the deadline before Closing");
+                deadline = Some(deadline_us);
+                if !producers_gone && self.shared.producers.load(Ordering::Acquire) == 0 {
+                    producers_gone = true;
+                    // After reading zero, this drain sees every submission ever sent.
+                    if !self.drain(&items, &mut closing) {
+                        self.stop_stream();
+                        return;
+                    }
+                }
+                if now >= deadline_us {
+                    break;
+                }
+                if producers_gone && (self.failed.is_some() || self.engine.idle()) {
+                    break;
+                }
+            }
+            if now >= next_poll {
+                next_poll = now.saturating_add(interval_us);
+            }
+            let until = deadline.map_or(next_poll, |d| next_poll.min(d));
+            match items.recv_timeout(micros(until.saturating_sub(now_us()))) {
+                Ok(msg) => self.handle(msg, &mut closing),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.stop_stream();
+                    return;
+                }
+            }
+        }
+        if !producers_gone {
+            if self.shared.producers.load(Ordering::Acquire) > 0 {
+                self.shared.producers_alive_at_finish.store(true, Ordering::Release);
+                self.shared.fail(FAIL_PRODUCERS_ALIVE_AT_FINISH);
+            }
+            // Whatever is still queued gets its submit row (and stays unresolved).
+            let mut closing = true;
+            let _ = self.drain(&items, &mut closing);
+        }
+        self.stop_stream();
+        // The stream is stopped: a blocking hand-off of the counters is fine.
+        let stats = self.stats();
+        let _ = self.rows.send(Row::LaneStats { modality: L2Modality::Haptic, stats });
+    }
+}
+
 fn identity_json(run_id: &str, id: &L2Identity) -> serde_json::Map<String, serde_json::Value> {
     let mut m = serde_json::Map::new();
     m.insert("run_id".into(), run_id.into());
@@ -1319,6 +1902,8 @@ fn writer_loop(
     let mut summary = L2Summary::default();
     let mut tracking = Tracking::new(cap);
     let mut ended = false;
+    // Device lanes' counters, for the sentinel (`lanes.<track>`).
+    let mut lane_stats: [Option<serde_json::Value>; 2] = [None, None];
     let mut handle = |row: Row, w: &mut BufWriter<File>, summary: &mut L2Summary| -> std::io::Result<()> {
         match row {
             Row::Submit(s) => {
@@ -1381,6 +1966,7 @@ fn writer_loop(
                 m.insert("t_discard_us".into(), t_discard_us.into());
                 write_row(w, m, None, summary)?;
             }
+            Row::LaneStats { modality, stats } => lane_stats[modality.index()] = Some(stats),
             Row::End => unreachable!("End is handled by the loop"),
         }
         Ok(())
@@ -1505,6 +2091,10 @@ fn writer_loop(
         "report_window_anchor": REPORT_WINDOW_ANCHOR,
         "finish_start_us": summary.finish_start_us,
         "close_deadline_us": summary.close_deadline_us,
+        "lanes": {
+            "pc": lane_stats[L2Modality::Pc.index()].take(),
+            "haptic": lane_stats[L2Modality::Haptic.index()].take(),
+        },
         "first_integrity_failure_us": summary.first_integrity_failure_us,
         "first_integrity_failure_reason": summary.first_integrity_failure_reason,
         "first_integrity_failure_detected_us": summary.first_integrity_failure_detected_us,
@@ -1537,6 +2127,7 @@ mod tests {
             method: "s1".into(),
             sinks,
             fake,
+            alsa: None,
             queue_capacity: capacity,
             row_capacity: 4096,
             report_window_us: 500_000,
@@ -2755,5 +3346,327 @@ mod tests {
         assert_eq!((summary.submitted, summary.output), (2, 1));
         assert!(summary.integrity_ok(sinks), "{summary:?}");
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- M2: the haptic ALSA lane on the simulated stream -------------------
+
+    use crate::l2_haptic::{
+        frames_to_us_round_half_away, SimFault, FAIL_ALSA_XRUN, OCCURRED_KERNEL_TRIGGER, PCM_RATE_HZ,
+    };
+
+    /// Generous sizes so that a starved test thread cannot manufacture a
+    /// simulated XRUN: F = 100 ms of frames, buffer ~341 ms.
+    fn sim_placement() -> PlacementConfig {
+        PlacementConfig {
+            period_frames: 512,
+            buffer_frames: 16_384,
+            target_fill_frames: 4_800,
+            prefill_frames: 4_800,
+            queue_limit_frames: 48_000,
+        }
+    }
+
+    fn sim_alsa(faults: Vec<SimFault>) -> AlsaSinkConfig {
+        let mut sim = SimPcmConfig::new(512, 16_384);
+        sim.faults = faults;
+        AlsaSinkConfig {
+            backend: AlsaBackend::Simulated(sim),
+            placement: sim_placement(),
+            status_interval_us: 1_000,
+            ready_timeout_us: 5_000_000,
+        }
+    }
+
+    const PC_FAKE_HAPTIC_ALSA: L2Sinks = L2Sinks { pc: L2SinkKind::Fake, haptic: L2SinkKind::Alsa };
+
+    fn alsa_config(faults: Vec<SimFault>) -> L2Config {
+        let mut c = config_sinks(PC_FAKE_HAPTIC_ALSA, Some(FakeSinkConfig::offsets(1_000, 0)), 64);
+        c.alsa = Some(sim_alsa(faults));
+        c.report_window_us = 2_000_000;
+        c
+    }
+
+    fn haptic(seq: u32) -> L2Identity {
+        L2Identity {
+            modality: L2Modality::Haptic,
+            tier: 0,
+            seq,
+            pts_us: seq as u64 * 1_000_000 / 90,
+            event_id: if seq % 3 == 0 { seq / 3 + 1 } else { 0 },
+            route: None,
+        }
+    }
+
+    /// The registered PCM split of tick `seq` (88/89 samples at 8 kHz / 90 Hz).
+    fn tick_payload(seq: u32) -> bytes::Bytes {
+        let (start, end) = crate::pcm_sample_bounds(seq as u64, 8_000, 90);
+        let samples: Vec<u8> = (start..end).flat_map(|i| ((i % 2_000) as i16 - 1_000).to_le_bytes()).collect();
+        bytes::Bytes::from(samples)
+    }
+
+    fn submits_with_outputs(rows: &[serde_json::Value], track: &str) -> Vec<(serde_json::Value, serde_json::Value)> {
+        rows.iter()
+            .filter(|r| r["role"] == "submit" && r["track"] == track)
+            .map(|s| {
+                let k = key(s);
+                let outputs: Vec<_> = rows.iter().filter(|r| r["role"] == "output" && key(r) == k).collect();
+                assert_eq!(outputs.len(), 1, "{k}: exactly one output");
+                (s.clone(), outputs[0].clone())
+            })
+            .collect()
+    }
+
+    /// Every released tick: one submit, one output, the snapshot evidence
+    /// of the registered formula, release-order back-to-back placement,
+    /// and the order rule; v1.2 meta and sentinel for an ALSA lane.
+    #[test]
+    fn the_alsa_lane_outputs_each_tick_once_with_its_status_evidence() {
+        let path = tmp("alsa-sim-happy");
+        let out = L2Output::start(&path, alsa_config(Vec::new())).unwrap();
+        let s = out.submitter();
+        let t_begin = now_us();
+        for seq in 0..18u32 {
+            let due = t_begin + seq as u64 * 11_111;
+            while now_us() < due {
+                std::thread::sleep(Duration::from_micros(200));
+            }
+            assert_eq!(s.submit_payload(haptic(seq), now_us(), Some(tick_payload(seq))), L2SubmitOutcome::Submitted);
+            if seq % 3 == 0 {
+                assert_eq!(s.submit(id(L2Modality::Pc, seq / 3), now_us()), L2SubmitOutcome::Submitted);
+            }
+        }
+        drop(s);
+        let summary = out.finish().unwrap();
+        assert!(summary.integrity_ok(PC_FAKE_HAPTIC_ALSA), "{summary:?}");
+        assert_eq!((summary.submitted, summary.output), (24, 24));
+        let rows = rows(&path);
+        let meta = &rows[0];
+        assert_eq!(meta["sinks"], serde_json::json!({ "pc": "fake", "haptic": "alsa" }));
+        assert_eq!(meta["device_output"], false, "a simulated stream is never a device output");
+        let contract = &meta["sink_contracts"]["haptic"];
+        assert_eq!((contract["kind"].as_str(), contract["backend"].as_str()), (Some("alsa"), Some("simulated")));
+        assert_eq!((contract["device_output"].as_bool(), contract["resolves"].as_bool()), (Some(false), Some(true)));
+        for field in ["n_k", "hw_pos", "appl_pos", "delay_frames", "htstamp_ns", "link_audio_tstamp_ns", "offset_us"] {
+            assert!(contract["output_detail"][field].is_string(), "schema of {field}");
+        }
+        let alsa = &meta["alsa"];
+        assert_eq!(alsa["backend"], "simulated");
+        assert_eq!((alsa["period_frames"].as_u64(), alsa["buffer_frames"].as_u64()), (Some(512), Some(16_384)));
+        assert_eq!((alsa["tstamp_mode"].as_str(), alsa["tstamp_type"].as_str()), (Some("ENABLE"), Some("MONOTONIC")));
+        assert_eq!(alsa["audio_tstamp_type_requested"], "LINK");
+        assert!(alsa["parameter_status"].as_str().unwrap().contains("provisional"));
+        let t_start = alsa["stream_epoch"]["t_start_us"].as_u64().unwrap();
+        assert!(t_start > 0 && alsa["stream_epoch"]["trigger_htstamp_ns"].as_u64().unwrap() == t_start * 1_000);
+        assert_eq!(alsa["stream_epoch"]["prefill_frames"], 4_800);
+
+        let pairs = submits_with_outputs(&rows, "haptic");
+        assert_eq!(pairs.len(), 18);
+        let mut previous_end = 0u64;
+        for (submit, output) in &pairs {
+            let d = &output["output_detail"];
+            assert_eq!((d["device"].as_str(), d["backend"].as_str()), (Some("alsa"), Some("simulated")));
+            let seq = submit["seq"].as_u64().unwrap();
+            let (start, end) = crate::pcm_sample_bounds(seq, 8_000, 90);
+            assert_eq!(d["samples_8k"].as_u64(), Some(end - start));
+            assert_eq!(d["frames"].as_u64(), Some(6 * (end - start)));
+            assert!(matches!(d["frames"].as_u64(), Some(528) | Some(534)));
+            let (n_k, hw_pos) = (d["n_k"].as_u64().unwrap(), d["hw_pos"].as_i64().unwrap());
+            assert!(hw_pos > n_k as i64, "strictly passed");
+            assert_eq!(hw_pos, d["appl_pos"].as_i64().unwrap() - d["delay_frames"].as_i64().unwrap());
+            let offset = frames_to_us_round_half_away(n_k as i64 - hw_pos, PCM_RATE_HZ);
+            assert_eq!(d["offset_us"].as_i64(), Some(offset));
+            assert_eq!(output["t_output_us"].as_i64(), Some(d["htstamp_us"].as_i64().unwrap() + offset));
+            assert!(n_k >= previous_end, "release order, never overlapping");
+            previous_end = n_k + d["frames"].as_u64().unwrap();
+            let t = |k: &str| output[k].as_u64().unwrap();
+            assert!(t("t_release_us") <= t("t_submit_us") && t("t_submit_us") <= t("t_output_us"));
+            assert!(t("t_output_us") <= t("t_callback_us") && t("t_callback_us") <= t("t_log_arrival_us"));
+            // The snapshot's timestamp lies within its status call.
+            let status_t0 = d["status_t0_us"].as_u64().unwrap();
+            let htstamp_us = d["htstamp_us"].as_u64().unwrap();
+            assert!(status_t0 <= htstamp_us && htstamp_us <= t("t_callback_us"));
+        }
+        let end = sentinel(&rows);
+        assert_eq!(end["integrity_ok"], true);
+        assert_eq!(end["device_output"], false);
+        assert!(end["lanes"]["pc"].is_null(), "no device lane on PC");
+        let lane = &end["lanes"]["haptic"];
+        assert_eq!((lane["kind"].as_str(), lane["backend"].as_str()), (Some("alsa"), Some("simulated")));
+        assert_eq!(lane["ticks_output"], 18);
+        assert_eq!(lane["ticks_written"], 18);
+        assert!(lane["silence_frames_written"].as_u64().unwrap() > 4_800, "low-water silence was written");
+        assert!(lane["status_calls"].as_u64().unwrap() > 18);
+        assert!(lane["device_failure"].is_null());
+        assert_eq!(lane["outputs_after_deadline"], 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An XRUN mid-run: the integrity failure is timed at the kernel trigger
+    /// (stream start + 60 ms here), every submission still has exactly one
+    /// terminal (an after-submit `device_failure` discard), nothing is left
+    /// unresolved to mask the failure time, and the order/close checks hold.
+    #[test]
+    fn an_alsa_xrun_fails_integrity_at_its_trigger_time_and_terminates_every_submission() {
+        let path = tmp("alsa-sim-xrun");
+        let out = L2Output::start(&path, alsa_config(vec![SimFault::Xrun { after_start_us: 60_000 }])).unwrap();
+        let s = out.submitter();
+        for seq in 0..12u32 {
+            s.submit_payload(haptic(seq), now_us(), Some(tick_payload(seq)));
+            std::thread::sleep(Duration::from_millis(11));
+        }
+        drop(s);
+        let summary = out.finish().unwrap();
+        assert!(!summary.integrity_ok(PC_FAKE_HAPTIC_ALSA));
+        assert_eq!(summary.first_integrity_failure_reason.as_deref(), Some(FAIL_ALSA_XRUN));
+        let rows = rows(&path);
+        let t_start = rows[0]["alsa"]["stream_epoch"]["t_start_us"].as_u64().unwrap();
+        assert_eq!(summary.first_integrity_failure_us, Some(t_start + 60_000), "the kernel trigger time");
+        assert!(summary.first_integrity_failure_detected_us.unwrap() >= t_start + 60_000);
+        assert!(summary.conservation_ok);
+        assert_eq!(summary.submitted_unresolved, 0, "nothing unresolved masks the failure time");
+        assert_eq!(summary.output_order_violation + summary.terminal_at_or_after_deadline, 0);
+        for submit in rows.iter().filter(|r| r["role"] == "submit") {
+            let k = key(submit);
+            let terminals: Vec<_> = rows
+                .iter()
+                .filter(|r| (r["role"] == "output" || r["role"] == "explicit_discard") && key(r) == k)
+                .collect();
+            assert_eq!(terminals.len(), 1, "{k}");
+        }
+        let discards: Vec<_> = rows.iter().filter(|r| r["role"] == "explicit_discard").collect();
+        assert!(!discards.is_empty());
+        for d in discards {
+            assert_eq!((d["reason"].as_str(), d["discard_phase"].as_str()), (Some(DISCARD_DEVICE_FAILURE), Some("after_submit")));
+            assert!(d["t_discard_us"].as_u64() >= d["t_submit_us"].as_u64());
+        }
+        let end = sentinel(&rows);
+        assert_eq!(end["integrity_ok"], false);
+        let failure = &end["lanes"]["haptic"]["device_failure"];
+        assert_eq!(failure["reason"], FAIL_ALSA_XRUN);
+        assert_eq!(failure["occurred_basis"], OCCURRED_KERNEL_TRIGGER);
+        assert_eq!(failure["occurred_us"].as_u64(), Some(t_start + 60_000));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A haptic submission without a playable payload: submit row, an
+    /// after-submit `payload_invalid` discard, and the integrity failure at
+    /// its `t_submit_us`.
+    #[test]
+    fn an_unplayable_haptic_payload_is_submit_discard_and_an_integrity_failure() {
+        let path = tmp("alsa-sim-payload");
+        let out = L2Output::start(&path, alsa_config(Vec::new())).unwrap();
+        let s = out.submitter();
+        assert_eq!(s.submit(haptic(1), now_us()), L2SubmitOutcome::Submitted);
+        std::thread::sleep(Duration::from_millis(2));
+        s.submit_payload(haptic(2), now_us(), Some(bytes::Bytes::from(vec![1u8, 2, 3])));
+        drop(s);
+        let summary = out.finish().unwrap();
+        assert!(!summary.integrity_ok(PC_FAKE_HAPTIC_ALSA));
+        assert_eq!(summary.first_integrity_failure_reason.as_deref(), Some(FAIL_HAPTIC_PAYLOAD_INVALID));
+        let rows = rows(&path);
+        let first_submit = rows.iter().find(|r| r["role"] == "submit").unwrap();
+        assert_eq!(summary.first_integrity_failure_us, first_submit["t_submit_us"].as_u64());
+        let discards: Vec<_> = rows.iter().filter(|r| r["role"] == "explicit_discard").collect();
+        assert_eq!(discards.len(), 2);
+        assert!(discards.iter().all(|d| d["reason"] == DISCARD_PAYLOAD_INVALID && d["discard_phase"] == "after_submit"));
+        assert!(rows.iter().all(|r| r["role"] != "output"));
+        assert!(summary.conservation_ok && summary.submitted_unresolved == 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A stream that cannot start (the device is held): `start` fails, the
+    /// run is refused, and the file never gets a meta row.
+    #[test]
+    fn an_alsa_stream_that_cannot_start_refuses_the_run_and_leaves_no_meta() {
+        let path = tmp("alsa-sim-start-error");
+        let error = L2Output::start(&path, alsa_config(vec![SimFault::StartError])).err().expect("refused");
+        assert!(format!("{error:#}").contains("failed to start"), "{error:#}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"", "no meta row, so never a valid ledger");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The close deadline binds the device lane too: ticks whose first
+    /// frame cannot reach hw_pos before it stay unresolved (no terminal is
+    /// accepted at or after the deadline), which fails integrity.
+    #[test]
+    fn alsa_outputs_after_the_close_deadline_are_not_accepted() {
+        let path = tmp("alsa-sim-deadline");
+        let mut c = alsa_config(Vec::new());
+        c.report_window_us = 5_000; // far shorter than the 100 ms fill
+        let out = L2Output::start(&path, c).unwrap();
+        let s = out.submitter();
+        for seq in 0..3u32 {
+            s.submit_payload(haptic(seq), now_us(), Some(tick_payload(seq)));
+        }
+        drop(s);
+        let summary = out.finish().unwrap();
+        assert_eq!(summary.submitted_unresolved_by_track[L2Modality::Haptic.index()], 3);
+        assert_eq!(summary.first_integrity_failure_reason.as_deref(), Some(FAIL_SUBMITTED_UNRESOLVED));
+        assert_eq!(summary.terminal_at_or_after_deadline, 0, "the lane never emits one");
+        let rows = rows(&path);
+        assert!(rows.iter().all(|r| r["role"] != "output"));
+        let end = sentinel(&rows);
+        assert_eq!(end["close_deadline_us"].as_u64().unwrap() - end["finish_start_us"].as_u64().unwrap(), 5_000);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The lane's row hand-off, driven directly and deterministically:
+    /// queued -> submit; write queue over Q -> before-submit
+    /// `output_queue_full`; no payload -> submit + `payload_invalid`; after
+    /// a device failure every abandoned and every later submission ->
+    /// `device_failure` after submit.
+    #[test]
+    fn the_alsa_lane_turns_admissions_into_ledger_rows() {
+        let (rows_tx, rows_rx) = mpsc::sync_channel(64);
+        let shared = Arc::new(Shared::default());
+        let placement = PlacementConfig { queue_limit_frames: 2 * 534, ..sim_placement() };
+        let mut pcm = SimPcm::new(SimPcmConfig::new(512, 16_384));
+        let mut engine = HapticPlacement::new(placement, pcm.params()).unwrap();
+        let mut clock = now_us;
+        engine.prefill(&mut pcm, &mut clock).unwrap();
+        let t0 = now_us();
+        pcm.start(t0).unwrap();
+        let first = pcm.status(t0).unwrap();
+        engine.begin_epoch(t0, first, t0).unwrap();
+        let mut lane = AlsaLane::new(Box::new(pcm), engine, rows_tx, shared.clone());
+        let sub = |seq: u32| {
+            let t = now_us();
+            L2Submission { identity: haptic(seq), t_release_us: t, t_submit_us: t }
+        };
+        lane.accept(sub(0), Some(tick_payload(1))); // 89 samples
+        lane.accept(sub(1), Some(tick_payload(1)));
+        lane.accept(sub(2), Some(tick_payload(0))); // over Q
+        lane.accept(sub(3), None); // not playable
+        let failure = DeviceFailure {
+            reason: FAIL_ALSA_XRUN,
+            occurred_us: t0,
+            occurred_basis: OCCURRED_KERNEL_TRIGGER,
+            detected_us: now_us(),
+            detail: "test".into(),
+        };
+        lane.fail(failure);
+        lane.accept(sub(4), Some(tick_payload(4)));
+        drop(lane);
+        let got: Vec<String> = rows_rx
+            .try_iter()
+            .map(|row| match row {
+                Row::Submit(s) => format!("submit {}", s.identity.seq),
+                Row::Discard { identity, t_submit_us, reason, .. } => {
+                    format!("discard {} {} {reason}", identity.seq, if t_submit_us.is_some() { "after" } else { "before" })
+                }
+                Row::Output { .. } => "output".into(),
+                Row::LaneStats { .. } | Row::End => "other".into(),
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                "submit 0", "submit 1", "discard 2 before output_queue_full", "submit 3",
+                "discard 3 after payload_invalid", "discard 0 after device_failure",
+                "discard 1 after device_failure", "submit 4", "discard 4 after device_failure",
+            ]
+        );
+        let timed = shared.failures().timed.unwrap();
+        assert_eq!(timed.2, FAIL_ALSA_XRUN, "the device failure occurred first (at t0)");
     }
 }
