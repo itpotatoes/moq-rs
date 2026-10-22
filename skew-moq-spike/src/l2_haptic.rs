@@ -249,6 +249,9 @@ pub struct PcmParams {
     pub audio_tstamp_type_requested: u32,
     /// The library actually loaded (device backend).
     pub library: Option<String>,
+    /// Backend-specific installed settings (device: sw thresholds, batch
+    /// flag, open mode, status struct size); `null` for the simulation.
+    pub details: serde_json::Value,
 }
 
 /// A PCM playback stream. Every method takes the caller's clock read so the
@@ -656,10 +659,23 @@ impl HapticPlacement {
     }
 
     /// Record the epoch right after `start`: the first snapshot's trigger
-    /// timestamp is the epoch's identity from now on.
+    /// timestamp is the epoch's identity from now on. The first snapshot is
+    /// also the ABI witness of the audio-timestamp bitfields: a non-COMPAT
+    /// request (LINK) that reached the driver makes the report `valid`, and
+    /// an `actual_type` outside the known range means the report was
+    /// decoded with a wrong layout — both refuse the run.
     pub fn begin_epoch(&mut self, t_start_us: u64, first_status: PcmStatus, t_status_end_us: u64) -> Result<(), String> {
         if first_status.state != PcmState::Running {
             return Err(format!("stream not RUNNING after start: {}", first_status.state.as_str()));
+        }
+        let report = first_status.audio_tstamp;
+        if !report.valid || report.actual_type > AUDIO_TSTAMP_TYPE_LINK_SYNCHRONIZED {
+            return Err(format!(
+                "audio timestamp report not usable (valid {}, actual_type {}): the {} request did not reach the driver as decoded",
+                report.valid,
+                report.actual_type,
+                audio_tstamp_type_name(self.audio_tstamp_type_requested)
+            ));
         }
         self.epoch = Some(EpochStart {
             t_start_us,
@@ -1063,6 +1079,7 @@ impl SimPcm {
             tstamp_type: "MONOTONIC",
             audio_tstamp_type_requested: AUDIO_TSTAMP_TYPE_LINK,
             library: None,
+            details: serde_json::Value::Null,
         };
         Self { cfg, params, appl: 0, start_us: None, stopped: None, trigger_us: 0, rewound_frames: 0, dropped: false }
     }

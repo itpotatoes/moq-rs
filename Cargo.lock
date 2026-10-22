@@ -2447,6 +2447,7 @@ dependencies = [
  "bytes",
  "clap",
  "libc",
+ "libloading",
  "moq-native-ietf",
  "moq-transport",
  "serde",

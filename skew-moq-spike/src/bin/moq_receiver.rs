@@ -100,13 +100,15 @@ enum L2SinkArg {
 
 /// Parse `--l2-sink`: `none`; `null` or `fake` for both tracks; or per track
 /// `pc=<kind>,haptic=<kind>` (both keys, once each, any order). PC kinds:
-/// `null`, `fake` (`wayland` is milestone M3); haptic kinds: `null`, `fake`.
+/// `null`, `fake` (`wayland` is milestone M3); haptic kinds: `null`, `fake`,
+/// `alsa` (the PCM device; `--l2-alsa-*`).
 fn parse_l2_sink(value: &str) -> std::result::Result<L2SinkArg, String> {
     use skew_moq::l2_output::{L2SinkKind, L2Sinks};
     let kind_of = |track: &str, kind: &str| -> std::result::Result<L2SinkKind, String> {
         match (track, kind) {
             (_, "null") => Ok(L2SinkKind::Null),
             (_, "fake") => Ok(L2SinkKind::Fake),
+            ("haptic", "alsa") => Ok(L2SinkKind::Alsa),
             ("pc", "wayland") => Err("the PC Wayland sink is milestone M3 and not available yet".into()),
             ("pc", "alsa") => Err("alsa is a haptic sink; use pc=<null|fake>,haptic=<kind>".into()),
             _ => Err(format!("unknown {track} sink kind {kind:?}")),
@@ -116,6 +118,7 @@ fn parse_l2_sink(value: &str) -> std::result::Result<L2SinkArg, String> {
         "none" => return Ok(L2SinkArg::None),
         "null" => return Ok(L2SinkArg::Sinks(L2Sinks::both(L2SinkKind::Null))),
         "fake" => return Ok(L2SinkArg::Sinks(L2Sinks::both(L2SinkKind::Fake))),
+        "alsa" => return Err("alsa is a haptic sink; use pc=<null|fake>,haptic=alsa".into()),
         _ => {}
     }
     let (mut pc, mut haptic) = (None, None);
@@ -255,13 +258,16 @@ struct Args {
     #[arg(long, default_value_t = 4096)]
     receive_trace_capacity: usize,
     /// L2 output stage (experiment 1-D). `none` (the default) constructs
-    /// nothing: no thread, no file, no row, no device, no clock read, and the
-    /// rx log is byte-identical to a build without this option. Otherwise the
-    /// sink of each track: `null` or `fake` for both, or per track
-    /// `pc=<kind>,haptic=<kind>` (e.g. `pc=fake,haptic=null`). `null`
-    /// accepts releases and never resolves them (overhead measurement only);
-    /// `fake` emits a synthetic `output` at `t_submit + offset`. Only the
-    /// ACTUAL release points of b1/s1/s2/s3/s3r submit.
+    /// nothing: no thread, no file, no row, no device, no library load, no
+    /// clock read, and the rx log is byte-identical to a build without this
+    /// option. Otherwise the sink of each track: `null` or `fake` for both,
+    /// or per track `pc=<kind>,haptic=<kind>` (e.g. `pc=fake,haptic=alsa`).
+    /// `null` accepts releases and never resolves them (overhead measurement
+    /// only); `fake` emits a synthetic `output` at `t_submit + offset`;
+    /// haptic `alsa` plays the released PCM on the device (`--l2-alsa-*`) and
+    /// reports ALSA-derived output times (only an all-device file has
+    /// `device_output: true`; PC `wayland` is milestone M3). Only the ACTUAL
+    /// release points of b1/s1/s2/s3/s3r submit.
     #[arg(long, default_value = "none", value_parser = parse_l2_sink)]
     l2_sink: L2SinkArg,
     /// Separate L2 JSONL (schema `skew_moq::l2_output::L2_SCHEMA`, v1.2).
@@ -284,6 +290,35 @@ struct Args {
     /// H-anchored `G_report`.
     #[arg(long)]
     l2_report_window_ms: Option<u64>,
+    /// Haptic ALSA sink (`--l2-sink pc=<kind>,haptic=alsa`): the PCM device,
+    /// opened `SND_PCM_NONBLOCK` before the run starts (default `hw:1,0`).
+    /// The card must be released by PipeWire first (the 1-D driver holds
+    /// `pw-reserve -n Audio1 -r`); a busy device refuses the run. Every
+    /// `--l2-alsa-*` value below is a provisional SINK parameter recorded in
+    /// the L2 meta row, fixed in the freeze after the M2 device measurement.
+    #[arg(long)]
+    l2_alsa_device: Option<String>,
+    /// ALSA period in 48 kHz frames (HDA: a multiple of 32; default 256).
+    #[arg(long)]
+    l2_alsa_period_frames: Option<u64>,
+    /// ALSA buffer in frames (default 2048).
+    #[arg(long)]
+    l2_alsa_buffer_frames: Option<u64>,
+    /// Target fill F: with no tick waiting, one period of silence is written
+    /// whenever fewer frames than this are queued (default 512).
+    #[arg(long)]
+    l2_alsa_target_fill_frames: Option<u64>,
+    /// Silence written before the stream starts (default 512).
+    #[arg(long)]
+    l2_alsa_prefill_frames: Option<u64>,
+    /// Write-queue bound Q in frames: a tick that would exceed it is
+    /// `explicit_discard(output_queue_full)` before submit (default 48000).
+    #[arg(long)]
+    l2_alsa_queue_frames: Option<u64>,
+    /// Status snapshot cadence in µs (the lane also wakes on arrivals;
+    /// default 1000).
+    #[arg(long)]
+    l2_alsa_status_interval_us: Option<u64>,
     #[arg(long)]
     s_bytes: u64,
     #[arg(long)]
@@ -1195,21 +1230,60 @@ const L2_MAX_TRACKED_OBJECTS: usize = 65_536;
 /// Validate the L2 output-stage options before any log is opened. `Ok(None)`
 /// for `--l2-sink none`, which must also carry no other L2 option.
 fn l2_output_config(args: &Args) -> Result<Option<(PathBuf, skew_moq::l2_output::L2Config)>> {
-    use skew_moq::l2_output::{FakeSinkConfig, L2Config, L2Modality, L2SinkKind};
+    use skew_moq::l2_haptic::PlacementConfig;
+    use skew_moq::l2_output::{
+        AlsaBackend, AlsaSinkConfig, FakeSinkConfig, L2Config, L2Modality, L2SinkKind,
+        ALSA_DEFAULT_BUFFER_FRAMES, ALSA_DEFAULT_DEVICE, ALSA_DEFAULT_PERIOD_FRAMES,
+        ALSA_DEFAULT_PREFILL_FRAMES, ALSA_DEFAULT_QUEUE_FRAMES, ALSA_DEFAULT_STATUS_INTERVAL_US,
+        ALSA_DEFAULT_TARGET_FILL_FRAMES, ALSA_READY_TIMEOUT_US,
+    };
     let fake_given =
         args.l2_fake_pc_offset_us.is_some() || args.l2_fake_haptic_offset_us.is_some();
+    let alsa_given = args.l2_alsa_device.is_some()
+        || args.l2_alsa_period_frames.is_some()
+        || args.l2_alsa_buffer_frames.is_some()
+        || args.l2_alsa_target_fill_frames.is_some()
+        || args.l2_alsa_prefill_frames.is_some()
+        || args.l2_alsa_queue_frames.is_some()
+        || args.l2_alsa_status_interval_us.is_some();
     let sinks = match args.l2_sink {
         L2SinkArg::None => {
             if args.l2_log.is_some()
                 || fake_given
+                || alsa_given
                 || args.l2_queue_capacity.is_some()
                 || args.l2_report_window_ms.is_some()
             {
-                bail!("--l2-log/--l2-fake-*/--l2-queue-capacity/--l2-report-window-ms require an --l2-sink other than none");
+                bail!("--l2-log/--l2-fake-*/--l2-alsa-*/--l2-queue-capacity/--l2-report-window-ms require an --l2-sink other than none");
             }
             return Ok(None);
         }
         L2SinkArg::Sinks(sinks) => sinks,
+    };
+    let alsa = if sinks.haptic == L2SinkKind::Alsa {
+        Some(AlsaSinkConfig {
+            backend: AlsaBackend::Device {
+                name: args.l2_alsa_device.clone().unwrap_or_else(|| ALSA_DEFAULT_DEVICE.to_string()),
+            },
+            placement: PlacementConfig {
+                period_frames: args.l2_alsa_period_frames.unwrap_or(ALSA_DEFAULT_PERIOD_FRAMES),
+                buffer_frames: args.l2_alsa_buffer_frames.unwrap_or(ALSA_DEFAULT_BUFFER_FRAMES),
+                target_fill_frames: args
+                    .l2_alsa_target_fill_frames
+                    .unwrap_or(ALSA_DEFAULT_TARGET_FILL_FRAMES),
+                prefill_frames: args.l2_alsa_prefill_frames.unwrap_or(ALSA_DEFAULT_PREFILL_FRAMES),
+                queue_limit_frames: args.l2_alsa_queue_frames.unwrap_or(ALSA_DEFAULT_QUEUE_FRAMES),
+            },
+            status_interval_us: args
+                .l2_alsa_status_interval_us
+                .unwrap_or(ALSA_DEFAULT_STATUS_INTERVAL_US),
+            ready_timeout_us: ALSA_READY_TIMEOUT_US,
+        })
+    } else {
+        if alsa_given {
+            bail!("--l2-alsa-* options require --l2-sink pc=<kind>,haptic=alsa");
+        }
+        None
     };
     let any_fake = L2Modality::ALL.iter().any(|m| sinks.of(*m) == L2SinkKind::Fake);
     // The registered 1-D ladder (B1, S1, S2, S3, S3R). M1/S2Eq share the S1
@@ -1253,7 +1327,7 @@ fn l2_output_config(args: &Args) -> Result<Option<(PathBuf, skew_moq::l2_output:
         method: args.arm.as_str().to_string(),
         sinks,
         fake,
-        alsa: None,
+        alsa,
         queue_capacity: args.l2_queue_capacity.unwrap_or(L2_DEFAULT_QUEUE_CAPACITY),
         row_capacity: L2_ROW_CAPACITY,
         report_window_us: ms_to_us(
@@ -9187,6 +9261,13 @@ mod rx_ending_tests {
             l2_fake_haptic_offset_us: None,
             l2_queue_capacity: None,
             l2_report_window_ms: None,
+            l2_alsa_device: None,
+            l2_alsa_period_frames: None,
+            l2_alsa_buffer_frames: None,
+            l2_alsa_target_fill_frames: None,
+            l2_alsa_prefill_frames: None,
+            l2_alsa_queue_frames: None,
+            l2_alsa_status_interval_us: None,
             s_bytes: 1,
             c_mbps: None,
             rtt_ms: 0.0,
@@ -9482,6 +9563,13 @@ mod rx_ending_tests {
             l2_fake_haptic_offset_us: None,
             l2_queue_capacity: None,
             l2_report_window_ms: None,
+            l2_alsa_device: None,
+            l2_alsa_period_frames: None,
+            l2_alsa_buffer_frames: None,
+            l2_alsa_target_fill_frames: None,
+            l2_alsa_prefill_frames: None,
+            l2_alsa_queue_frames: None,
+            l2_alsa_status_interval_us: None,
             s_bytes: 1,
             c_mbps: None,
             rtt_ms: 0.0,
@@ -9588,6 +9676,13 @@ mod rx_ending_tests {
             l2_fake_haptic_offset_us: None,
             l2_queue_capacity: None,
             l2_report_window_ms: None,
+            l2_alsa_device: None,
+            l2_alsa_period_frames: None,
+            l2_alsa_buffer_frames: None,
+            l2_alsa_target_fill_frames: None,
+            l2_alsa_prefill_frames: None,
+            l2_alsa_queue_frames: None,
+            l2_alsa_status_interval_us: None,
             s_bytes: 1,
             c_mbps: None,
             rtt_ms: 0.0,
@@ -16565,6 +16660,8 @@ mod l2_hook_tests {
         // A fake track without its offsets is refused.
         let args = b1_cli(&["--l2-sink", "pc=fake,haptic=null", "--l2-log", &fresh_s]).unwrap();
         assert!(l2_output_config(&args).is_err());
+        // Bare `alsa` is not a both-tracks kind.
+        assert!(b1_cli(&["--l2-sink", "alsa", "--l2-log", &fresh_s]).is_err());
         // Malformed specs never parse.
         for spec in [
             "pc=fake", "haptic=fake", "pc=fake,haptic=null,pc=null", "pc=alsa,haptic=null",
@@ -16573,6 +16670,67 @@ mod l2_hook_tests {
         ] {
             assert!(b1_cli(&["--l2-sink", spec, "--l2-log", &fresh_s]).is_err(), "{spec:?}");
         }
+        assert!(!fresh.exists(), "validation never creates the L2 log");
+    }
+
+    /// M2: `haptic=alsa` builds the device sink configuration (defaults
+    /// recorded, provisional) WITHOUT opening anything — this test never
+    /// starts the stage, so no device or library is touched. Every
+    /// `--l2-alsa-*` option is refused unless the haptic sink is alsa.
+    #[test]
+    fn haptic_alsa_config_is_built_and_alsa_options_are_refused_elsewhere() {
+        use skew_moq::l2_output::{AlsaBackend, L2Modality, L2Sinks};
+        let fresh = tmp("cli-alsa");
+        let fresh_s = fresh.display().to_string();
+        let args = b1_cli(&[
+            "--l2-sink", "pc=fake,haptic=alsa", "--l2-log", &fresh_s,
+            "--l2-fake-pc-offset-us", "1000", "--l2-fake-haptic-offset-us", "200",
+        ])
+        .unwrap();
+        let (_, config) = l2_output_config(&args).unwrap().unwrap();
+        assert_eq!(config.sinks, L2Sinks { pc: L2SinkKind::Fake, haptic: L2SinkKind::Alsa });
+        let alsa = config.alsa.as_ref().expect("the ALSA sink configuration");
+        match &alsa.backend {
+            AlsaBackend::Device { name } => assert_eq!(name, "hw:1,0"),
+            other => panic!("{other:?}"),
+        }
+        let p = alsa.placement;
+        assert_eq!(
+            (p.period_frames, p.buffer_frames, p.target_fill_frames, p.prefill_frames, p.queue_limit_frames),
+            (256, 2_048, 512, 512, 48_000)
+        );
+        assert_eq!(alsa.status_interval_us, 1_000);
+        assert!(config.device_output_of(L2Modality::Haptic));
+        assert!(!config.device_output(), "PC is fake: the file is test-only");
+        // Explicit values are taken as given; null PC needs no fake offsets.
+        let args = b1_cli(&[
+            "--l2-sink", "haptic=alsa,pc=null", "--l2-log", &fresh_s, "--l2-alsa-device", "hw:2,0",
+            "--l2-alsa-period-frames", "512", "--l2-alsa-buffer-frames", "4096",
+            "--l2-alsa-target-fill-frames", "1024", "--l2-alsa-prefill-frames", "1024",
+            "--l2-alsa-queue-frames", "9600", "--l2-alsa-status-interval-us", "500",
+        ])
+        .unwrap();
+        let (_, config) = l2_output_config(&args).unwrap().unwrap();
+        let alsa = config.alsa.unwrap();
+        assert!(matches!(&alsa.backend, AlsaBackend::Device { name } if name == "hw:2,0"));
+        assert_eq!((alsa.placement.period_frames, alsa.placement.buffer_frames), (512, 4_096));
+        assert_eq!((alsa.placement.queue_limit_frames, alsa.status_interval_us), (9_600, 500));
+        assert!(config.fake.is_none());
+        // Refused: ALSA options without the ALSA sink (also with none), an
+        // unsafe placement, and alsa on the PC track.
+        for extra in [
+            &["--l2-alsa-device", "hw:1,0"][..],
+            &["--l2-sink", "pc=null,haptic=null", "--l2-log", &fresh_s, "--l2-alsa-device", "hw:1,0"][..],
+            &["--l2-sink", "fake", "--l2-log", &fresh_s, "--l2-fake-pc-offset-us", "1",
+              "--l2-fake-haptic-offset-us", "1", "--l2-alsa-queue-frames", "100"][..],
+            &["--l2-sink", "pc=null,haptic=alsa", "--l2-log", &fresh_s, "--l2-alsa-buffer-frames", "600"][..],
+            &["--l2-sink", "pc=null,haptic=alsa", "--l2-log", &fresh_s, "--l2-alsa-status-interval-us", "0"][..],
+            &["--l2-sink", "pc=null,haptic=alsa", "--l2-log", &fresh_s, "--l2-alsa-device", ""][..],
+        ] {
+            let args = b1_cli(extra).unwrap();
+            assert!(l2_output_config(&args).is_err(), "{extra:?}");
+        }
+        assert!(b1_cli(&["--l2-sink", "pc=alsa,haptic=alsa", "--l2-log", &fresh_s]).is_err());
         assert!(!fresh.exists(), "validation never creates the L2 log");
     }
 

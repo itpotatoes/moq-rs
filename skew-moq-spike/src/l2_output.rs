@@ -75,9 +75,18 @@
 //! integrity failure FOR THAT MODALITY. `fake` emits a deterministic synthetic
 //! `output` with `t_output_us = t_submit_us + offset(modality)`; it handles
 //! the deferred output at a real clock read `t_callback_us >= t_output_us`.
-//! Neither is a device output. The file-level `device_output` is true only if
-//! EVERY modality's sink is a device sink, so a file mixing a device sink
-//! with a null/fake one is test-only and fails `--require-device-output`.
+//! Neither is a device output. `alsa` (haptic only) plays the released PCM
+//! on the device (`l2_alsa`, `hw:1,0` by default) or on the simulated stream
+//! (`l2_haptic::SimPcm`, tests only, never a device output) through the
+//! placement engine (`l2_haptic`); its lane thread owns the stream, opens,
+//! prefills and starts it BEFORE the meta row is written (which records what
+//! was negotiated), emits an `output` only when a status snapshot shows the
+//! hardware passed the tick's first frame, terminates everything it can no
+//! longer output after a device failure as `explicit_discard(device_failure)`
+//! and reports its counters in the sentinel (`lanes.haptic`). The file-level
+//! `device_output` is true only if EVERY modality's sink is a device sink, so
+//! a file mixing a device sink with a null/fake one is test-only and fails
+//! `--require-device-output`.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -300,9 +309,27 @@ impl FakeSinkConfig {
     }
 }
 
+/// Defaults of the haptic ALSA sink (receiver `--l2-alsa-*`, probe). All
+/// PROVISIONAL sink parameters (registration 3-3a: fixed in the freeze after
+/// the M2 device measurement), never experimental parameters of a method.
+/// HDA constrains period/buffer bytes to multiples of 128, i.e. multiples of
+/// 32 frames at S16_LE stereo.
+pub const ALSA_DEFAULT_DEVICE: &str = "hw:1,0";
+pub const ALSA_DEFAULT_PERIOD_FRAMES: u64 = 256;
+pub const ALSA_DEFAULT_BUFFER_FRAMES: u64 = 2_048;
+pub const ALSA_DEFAULT_TARGET_FILL_FRAMES: u64 = 512;
+pub const ALSA_DEFAULT_PREFILL_FRAMES: u64 = 512;
+pub const ALSA_DEFAULT_QUEUE_FRAMES: u64 = 48_000;
+pub const ALSA_DEFAULT_STATUS_INTERVAL_US: u64 = 1_000;
+/// Bound on opening, configuring, prefilling and starting the stream.
+pub const ALSA_READY_TIMEOUT_US: u64 = 5_000_000;
+
 /// Where the haptic ALSA lane plays.
 #[derive(Debug, Clone)]
 pub enum AlsaBackend {
+    /// The real device through libasound (`l2_alsa`), e.g. `hw:1,0`. Opened
+    /// inside the lane thread when the stage starts.
+    Device { name: String },
     /// The deterministic simulated stream (`l2_haptic::SimPcm`) driven by
     /// the real clock: tests only, never a device output.
     Simulated(SimPcmConfig),
@@ -311,6 +338,7 @@ pub enum AlsaBackend {
 impl AlsaBackend {
     pub fn is_device(&self) -> bool {
         match self {
+            Self::Device { .. } => true,
             Self::Simulated(_) => false,
         }
     }
@@ -339,6 +367,11 @@ impl AlsaSinkConfig {
             bail!("ALSA ready timeout must be positive");
         }
         match &self.backend {
+            AlsaBackend::Device { name } => {
+                if name.is_empty() || name.contains('\0') {
+                    bail!("ALSA device name must be a non-empty C string");
+                }
+            }
             AlsaBackend::Simulated(sim) => {
                 if (sim.period_frames, sim.buffer_frames)
                     != (self.placement.period_frames, self.placement.buffer_frames)
@@ -839,6 +872,7 @@ fn sink_contract(config: &L2Config, modality: L2Modality) -> serde_json::Value {
 
 fn alsa_backend_name(backend: &AlsaBackend) -> &'static str {
     match backend {
+        AlsaBackend::Device { .. } => "device",
         AlsaBackend::Simulated(_) => "simulated",
     }
 }
@@ -862,6 +896,7 @@ fn alsa_meta(alsa: &AlsaSinkConfig, ready: &LaneReady) -> serde_json::Value {
         "buffer_frames": p.buffer_frames,
         "tstamp_mode": p.tstamp_mode,
         "tstamp_type": p.tstamp_type,
+        "device_details": p.details,
         "audio_tstamp_type_requested": crate::l2_haptic::audio_tstamp_type_name(p.audio_tstamp_type_requested),
         "target_fill_frames": c.target_fill_frames,
         "prefill_frames": c.prefill_frames,
@@ -1385,6 +1420,8 @@ struct LaneReady {
 /// crosses threads.
 fn open_haptic_pcm(alsa: &AlsaSinkConfig) -> std::result::Result<Box<dyn HapticPcm>, String> {
     match &alsa.backend {
+        AlsaBackend::Device { name } => crate::l2_alsa::AlsaPcm::open(name, &alsa.placement)
+            .map(|pcm| Box::new(pcm) as Box<dyn HapticPcm>),
         AlsaBackend::Simulated(sim) => Ok(Box::new(SimPcm::new(sim.clone()))),
     }
 }
