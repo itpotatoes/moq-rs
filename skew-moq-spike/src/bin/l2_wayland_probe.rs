@@ -5,7 +5,8 @@
 //! sink the receiver uses (`skew_moq::l2_output`: PC lane `wayland` on the
 //! display backend, haptic lane `null`), once per representation given —
 //! `.bin` frames as sent and/or Draco frames decoded by the vendored Draco
-//! 1.5.7 — writes one schema v1.4 L2 JSONL per representation and prints ONE
+//! 1.5.7 — writes one L2 JSONL (schema tag `skew_moq::l2_output::L2_SCHEMA`)
+//! per representation and prints ONE
 //! JSON report: presentation flags, refresh, refresh steps between
 //! consecutive outputs from the presentation TIMES (`refresh_index`; the
 //! compositor's `presentation_seq` is reported raw, never as vblanks),

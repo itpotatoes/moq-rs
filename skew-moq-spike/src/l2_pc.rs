@@ -75,17 +75,26 @@ pub const FAIL_WAYLAND_CONNECTION_LOST: &str = "wayland_connection_lost";
 pub const FAIL_WAYLAND_WINDOW_CLOSED: &str = "wayland_window_closed";
 pub const FAIL_WAYLAND_RECONFIGURED: &str = "wayland_reconfigured";
 pub const FAIL_WAYLAND_FEEDBACK_MISSING: &str = "wayland_feedback_missing";
-/// Registration 3-3b (Codex 114): the frame callback of the last commit is
-/// still missing at close AND a rendered frame could therefore not be
-/// committed. (A last frame that got its `presented` but no callback, with
-/// nothing waiting, is not a failure.)
+/// Registration 3-3b (Codex 114), close branch (i): the frame callback of
+/// the last commit is still missing at close AND a rendered frame could
+/// therefore not be committed. (A last frame that got its `presented` but no
+/// callback, with nothing waiting, is not a failure.)
 pub const FAIL_WAYLAND_FRAME_CALLBACK_MISSING: &str = "wayland_frame_callback_missing";
-pub const WAYLAND_DEVICE_FAILURE_REASONS: [&str; 5] = [
+/// Registration 3-3b (v1.6), close branch (ii): the frame callback of the
+/// last commit has fired, but the compositor still holds EVERY wl_shm buffer
+/// at close (no `wl_buffer.release`), so a rendered frame could not be
+/// committed. Same principle as (i): the compositor stopped making progress.
+/// (Nothing waiting at close is not a failure, whatever the buffers.)
+pub const FAIL_WAYLAND_BUFFER_RELEASE_MISSING: &str = "wayland_buffer_release_missing";
+/// The closed list of PC device-failure reasons (all untimed). The meta's
+/// `failure_time_semantics` lists exactly these.
+pub const WAYLAND_DEVICE_FAILURE_REASONS: [&str; 6] = [
     FAIL_WAYLAND_CONNECTION_LOST,
     FAIL_WAYLAND_WINDOW_CLOSED,
     FAIL_WAYLAND_RECONFIGURED,
     FAIL_WAYLAND_FEEDBACK_MISSING,
     FAIL_WAYLAND_FRAME_CALLBACK_MISSING,
+    FAIL_WAYLAND_BUFFER_RELEASE_MISSING,
 ];
 
 pub fn presentation_flag_names(flags: u32) -> Vec<&'static str> {
@@ -194,6 +203,11 @@ impl PcRepresentation {
 }
 
 /// The decoder of a representation for the L2 meta (null for `.bin`).
+/// v1.6 (registration 3-2, Codex 115 gap 2): `compiler_command` (the full
+/// command the Draco build validated: program, then every argument with the
+/// crate directory written `<crate>`; cc appends `-o <obj> -c <src>` per
+/// file) and `compiler_resolved` (that program after the PATH lookup and
+/// symlink resolution, or `unresolved`) are required fields.
 pub fn decoder_meta(representation: PcRepresentation) -> serde_json::Value {
     match representation {
         PcRepresentation::Bin => serde_json::Value::Null,
@@ -208,6 +222,8 @@ pub fn decoder_meta(representation: PcRepresentation) -> serde_json::Value {
                 "vendored_files": info.vendored_files,
                 "compiled_sources": info.compiled_sources,
                 "compiler": info.compiler,
+                "compiler_command": info.compiler_command,
+                "compiler_resolved": info.compiler_resolved,
                 "compiler_version": info.compiler_version,
                 "fixed_flags": info.fixed_flags,
                 "compiler_args": info.compiler_args,
@@ -1416,6 +1432,21 @@ mod tests {
             t += 7;
             t
         }
+    }
+
+    /// v1.6 (registration 3-2): the Draco decoder meta carries the validated
+    /// compiler command and the resolved compiler (as the build recorded
+    /// them); `.bin` has no decoder at all.
+    #[test]
+    fn the_decoder_meta_names_the_validated_compiler_command_and_the_resolved_compiler() {
+        assert!(decoder_meta(PcRepresentation::Bin).is_null());
+        let meta = decoder_meta(PcRepresentation::Draco);
+        let info = skew_draco_sys::decoder_info();
+        assert_eq!(meta["compiler_command"], info.compiler_command);
+        assert_eq!(meta["compiler_resolved"], info.compiler_resolved);
+        assert_eq!(meta["compiler_command"], format!("{} {}", info.compiler, info.compiler_args));
+        assert!(meta["compiler_args"].as_str().unwrap().ends_with(info.fixed_flags));
+        assert!(!info.compiler_resolved.is_empty() && !info.compiler_resolved.contains("ccache"));
     }
 
     /// Decode times exist only for Draco; bin and Draco of the same content

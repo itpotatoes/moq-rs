@@ -1,5 +1,6 @@
 //! L2 output stage: milestone M1 (device-free ledger), M2 (per-modality
-//! sinks, schema v1.2; haptic ALSA) and M3 (PC Wayland sink, schema v1.4).
+//! sinks, schema v1.2; haptic ALSA) and M3 (PC Wayland sink, schema v1.4;
+//! current tag [`L2_SCHEMA`]).
 //!
 //! Governing documents: `md/20261022_실험1D_L2사다리_사전등록_문안.md` §3-1,
 //! §3-3, §3-3a, §3-5, §3-6, §6, §6-1, §11-7; `md/20261022_L2_계측_설계초안.md`
@@ -171,8 +172,20 @@ mod pc_lane;
 /// changes); meta `wayland.startup.details` lists every configure before
 /// ready and the decoder meta names the C++ runtime. A device that cannot
 /// start is reported as a typed [`L2DeviceStartFailure`] (stage, timeout,
-/// lane exit) instead of a bare string.
-pub const L2_SCHEMA: &str = "event-pair-l2-v1.5";
+/// lane exit) instead of a bare string. (e69c310 added the untimed PC device
+/// failure `wayland_frame_callback_missing` under this tag.)
+/// v1.6 (Codex 115; registration 3-2, 3-3b, 3-5): a rendered frame still
+/// pending at close is classified three ways (`pc_lane`): (i) the frame
+/// callback of the last commit missing -> `wayland_frame_callback_missing`;
+/// (ii) the callback fired but the compositor holds every buffer -> the new
+/// untimed PC device failure `wayland_buffer_release_missing` (the 6th entry
+/// of the closed list `l2_pc::WAYLAND_DEVICE_FAILURE_REASONS`), its block in
+/// the sentinel's `lanes.pc.buffer_release_missing_at_close`; (iii) neither
+/// -> a timed unresolved submit counted in `lanes.pc.committable_pending_at_close`;
+/// meta `wayland.decoder` (draco) gains the required `compiler_command` and
+/// `compiler_resolved`. Still µs-only time fields: no `*_ns` field (no
+/// `refresh_ns`, registration 11-11).
+pub const L2_SCHEMA: &str = "event-pair-l2-v1.6";
 pub const L2_CLOCK: &str = "CLOCK_MONOTONIC";
 /// The M1 grace is anchored at `finish`, not at the registration's H.
 pub const REPORT_WINDOW_ANCHOR: &str = "close";
@@ -1317,10 +1330,10 @@ fn wayland_meta(wayland: &WaylandSinkConfig, ready: &pc_lane::PcLaneReady) -> se
         "thread_layout": "render worker thread: takes released frames from the bounded submission queue in release order, decodes (draco) and renders them, puts each into a one-frame pending slot; commit thread: owns the compositor connection and commits the pending frame at each commit opportunity (neither thread has a real-time priority, registration 11-10)",
         "commit_policy": "a commit opportunity exists when the frame callback requested with the previous commit has fired (or nothing was committed since startup) and no PC device failure occurred; one frame per commit; wp_presentation.feedback is requested immediately before every commit and maps its commit_id to the frame immutably",
         "pending_policy": "one pending frame; a frame replaced there before it was committed is explicit_discard superseded_before_commit (after submit)",
-        "buffer_policy": "a frame is written only into a wl_shm buffer the compositor does not hold (Held from its commit until wl_buffer.release); with none free the pending frame waits; wl_buffer.release and frame callbacks are never output evidence",
+        "buffer_policy": "a frame is written only into a wl_shm buffer the compositor does not hold (Held from its commit until wl_buffer.release); with none free the pending frame waits (still waiting at close: close_policy (ii)); wl_buffer.release and frame callbacks are never output evidence",
         "feedback_policy": "presented -> output; discarded -> explicit_discard compositor_discarded; a feedback or frame callback for an unknown or already resolved commit is a timed integrity failure at its receipt (wayland_unexpected_feedback / wayland_unexpected_frame_callback); a presented timestamp with tv_nsec >= 1e9 is wayland_bad_timestamp and the frame stays unresolved",
-        "failure_policy": "compositor connection loss or protocol error, xdg_toplevel.close, a configure that changes the size or drops fullscreen, an output change after ready (output_policy), committed frames still without feedback at close (including a feedback received at or after the close deadline, which is not accepted and leaves its commit outstanding), and a frame callback still missing at close while a rendered frame waits for its commit (wayland_frame_callback_missing; a last frame presented without its callback and with nothing waiting is no failure) are PC device failures: untimed (first_integrity_failure_us null, first_failure_time_determinable false), recorded in lanes.pc.device_failure with observation_interval_us [last_good_us, detected_us]; after one, nothing is committed any more and every frame not yet committed (pending or submitted later) gets explicit_discard device_failure after submit; committed frames keep waiting for their feedback",
-        "close_policy": "after finish starts the worker processes every submission of the producers, the commit thread commits the last pending frame and waits until every committed frame has its feedback or the close deadline, then disconnects; a slow feedback is never declared missing before the deadline",
+        "failure_policy": "compositor connection loss or protocol error, xdg_toplevel.close, a configure that changes the size or drops fullscreen, an output change after ready (output_policy), committed frames still without feedback at close (including a feedback received at or after the close deadline, which is not accepted and leaves its commit outstanding), a frame callback still missing at close while a rendered frame waits for its commit (wayland_frame_callback_missing), and every buffer still held by the compositor at close while a rendered frame waits for its commit after the frame callback fired (wayland_buffer_release_missing) are PC device failures (with nothing waiting, neither a last frame presented without its callback nor buffers still held is a failure): untimed (first_integrity_failure_us null, first_failure_time_determinable false), recorded in lanes.pc.device_failure with observation_interval_us [last_good_us, detected_us]; after one, nothing is committed any more and every frame not yet committed (pending or submitted later) gets explicit_discard device_failure after submit; committed frames keep waiting for their feedback",
+        "close_policy": "after finish starts the worker processes every submission of the producers, the commit thread commits the last pending frame and waits until every committed frame has its feedback or the close deadline, then disconnects; a slow feedback is never declared missing before the deadline; a rendered frame still pending when the close deadline ended the commit loop keeps no terminal (submitted_unresolved) and is classified by what kept it from its commit (registration 3-3b): (i) the frame callback of the last commit missing -> wayland_frame_callback_missing (lanes.pc.frame_callback_missing_at_close = that commit id), (ii) the callback fired but the compositor holds every buffer -> wayland_buffer_release_missing (lanes.pc.buffer_release_missing_at_close = {pending_seq, buffers, buffers_held, holding_commit_ids by buffer index, 0 = startup commit}), both untimed PC device failures; (iii) the callback fired and a buffer is free (the frame reached the pending slot after the commit loop stopped at the deadline) -> no device failure, the submit stays a timed submitted_unresolved (lanes.pc.committable_pending_at_close = 1)",
         "start_check": "wp_presentation.clock_id must be CLOCK_MONOTONIC before the meta row, otherwise the run is refused; the startup frame (commit 0, background, not a ledger row) must be presented AND its frame callback must fire, and the surface must be on exactly one output (startup.output); a failure is a typed device start failure (stage, timeout, lane exit) the receiver writes as one L2_DEVICE_START_FAILURE line on STDERR before exiting 10",
         "start_bounds": "every wait for the compositor during startup (registry and clock round trips, configure, startup presentation and frame callback, surface output) shares the lane's deadline (80 % of the ready timeout); connect_to_env (a local socket connect) and the synchronous buffer preparation (memfd, mmap, fill) have no internal deadline; the stage's outer ready timeout bounds the caller's wait and its later join of the lane, it does not by itself guarantee that the compositor or the device was released",
         "presentation_time_policy": "output times are the presented timestamps as reported (never clamped or reordered); presentation_seq is kept raw and is not a vblank counter; refresh steps come from presented_delta_us and refresh_index",
@@ -3798,7 +3811,7 @@ mod tests {
         out.finish().unwrap();
         let rows = rows(&path);
         let meta = &rows[0];
-        assert_eq!(meta["l2_schema"], "event-pair-l2-v1.5");
+        assert_eq!(meta["l2_schema"], "event-pair-l2-v1.6");
         assert_eq!(meta["report_window_anchor"], "close");
         for key in ["object_rows", "sentinel_row", "receiver_fault", "t_callback_us", "file_order"] {
             assert!(meta["row_time_semantics"][key].is_string(), "{key}");
@@ -3810,6 +3823,19 @@ mod tests {
         ] {
             assert!(meta["failure_time_semantics"][key].is_string(), "{key}");
         }
+        // v1.6: the closed list of PC device-failure reasons has 6 entries,
+        // the 6th the buffer-release block at close (registration 3-3b);
+        // every one is declared untimed in meta.
+        let pc_reasons = crate::l2_pc::WAYLAND_DEVICE_FAILURE_REASONS;
+        assert_eq!(pc_reasons.len(), 6);
+        assert_eq!(pc_reasons[5], crate::l2_pc::FAIL_WAYLAND_BUFFER_RELEASE_MISSING);
+        assert_eq!(crate::l2_pc::FAIL_WAYLAND_BUFFER_RELEASE_MISSING, "wayland_buffer_release_missing");
+        assert_eq!(pc_reasons.iter().collect::<std::collections::HashSet<_>>().len(), 6, "distinct");
+        for reason in pc_reasons {
+            let semantics = meta["failure_time_semantics"][reason].as_str().unwrap_or_else(|| panic!("{reason}"));
+            assert!(semantics.starts_with("UNDETERMINABLE (PC device failure)"), "{reason}: {semantics}");
+        }
+        assert!(meta["failure_time_semantics"]["wayland_buffer_release_missing"].is_string());
         assert!(meta["counter_semantics"]["duplicate_logical_release"]
             .as_str()
             .unwrap()
@@ -3938,7 +3964,7 @@ mod tests {
         let meta = &rows[0];
         assert_eq!(meta["role"], "meta");
         assert_eq!(meta["l2_schema"], L2_SCHEMA);
-        assert_eq!(meta["l2_schema"], "event-pair-l2-v1.5");
+        assert_eq!(meta["l2_schema"], "event-pair-l2-v1.6");
         assert_eq!(meta["sinks"], serde_json::json!({ "pc": "fake", "haptic": "null" }));
         assert_eq!(meta["device_output"], false);
         assert!(meta["device_output_rule"].as_str().unwrap().contains("EVERY track"));
@@ -4936,7 +4962,7 @@ mod tests {
         assert!(summary.integrity_ok(PC_WAYLAND_HAPTIC_NULL), "{summary:?}");
         assert_eq!((summary.submitted, summary.output), (8, 8));
         let meta = &rows[0];
-        assert_eq!(meta["l2_schema"], "event-pair-l2-v1.5");
+        assert_eq!(meta["l2_schema"], "event-pair-l2-v1.6");
         assert_eq!(meta["sinks"]["pc"], "wayland");
         assert_eq!(meta["device_output"], false, "a simulated compositor is never a device output");
         let contract = &meta["sink_contracts"]["pc"];
@@ -4954,7 +4980,7 @@ mod tests {
         assert_eq!(wayland["canvas_side_px"], 48);
         assert_eq!(wayland["startup"]["clock"], "CLOCK_MONOTONIC");
         assert_eq!(wayland["representation"], "bin");
-        assert!(wayland["decoder"].is_null(), "no decoder for bin");
+        assert!(wayland["decoder"].is_null(), "no decoder for bin (no compiler fields either)");
         assert_eq!(wayland["tiers_meta"]["tiers_by_header_tier"]["2"]["depth_scale"], 4);
         assert_no_raw_ns(&rows);
         let terminals = terminals_by_key(&rows);
@@ -4999,6 +5025,11 @@ mod tests {
         assert_eq!(lane["engine"]["commits"], 8);
         assert_eq!(lane["engine"]["presented"], 8);
         assert_eq!(lane["committed_without_feedback_at_close"], 0);
+        // v1.6: the normal close committed every frame first.
+        assert_eq!(lane["pending_at_close"], false);
+        assert!(lane["frame_callback_missing_at_close"].is_null());
+        assert!(lane["buffer_release_missing_at_close"].is_null());
+        assert_eq!(lane["committable_pending_at_close"], 0);
         assert!(lane["device_failure"].is_null());
         assert_eq!(observer.writes_into_held_buffers.load(Ordering::SeqCst), 0);
         assert!(observer.dropped.load(Ordering::SeqCst), "disconnected at close");
@@ -5056,6 +5087,17 @@ mod tests {
         let meta = &rows[0];
         assert_eq!(meta["wayland"]["decoder"]["version"], "1.5.7");
         assert_eq!(meta["wayland"]["decoder"]["threads"], 1);
+        // v1.6 (registration 3-2): the validated compiler command and the
+        // resolved compiler are required decoder fields, exactly the
+        // values the Draco build recorded.
+        let decoder = &meta["wayland"]["decoder"];
+        let info = skew_draco_sys::decoder_info();
+        assert_eq!(decoder["compiler_command"], info.compiler_command);
+        assert_eq!(decoder["compiler_resolved"], info.compiler_resolved);
+        let command = decoder["compiler_command"].as_str().unwrap();
+        assert_eq!(command, format!("{} {}", decoder["compiler"].as_str().unwrap(), decoder["compiler_args"].as_str().unwrap()));
+        assert!(command.ends_with("-std=c++17 -O3 -DNDEBUG -fPIC -ffp-contract=off"), "{command}");
+        assert!(!decoder["compiler_resolved"].as_str().unwrap().is_empty());
         let lane = &sentinel(&rows)["lanes"]["pc"];
         assert_eq!(lane["superseded_before_commit"], superseded);
         assert!(lane["decode_us_max"].as_u64().is_some());
@@ -5166,7 +5208,13 @@ mod tests {
 
     /// The compositor never releases a buffer: after the free ones are used
     /// the pending frame waits — a held buffer is never written — and stays
-    /// unresolved at close.
+    /// unresolved at close. v1.6 (registration 3-3b close branch (ii), real
+    /// lane threads on the simulated compositor): frame 0 is commit 1 in
+    /// buffer 1, its frame callback fires at the next vblank, frame 1 waits
+    /// for a buffer and is superseded by frame 2, which is still waiting at
+    /// close with both buffers held (startup commit 0, commit 1) — the
+    /// untimed PC device failure `wayland_buffer_release_missing`, never a
+    /// timed unresolved submit.
     #[test]
     fn held_buffers_are_never_written_and_the_frame_waits() {
         let mut sim = sim_display();
@@ -5181,9 +5229,23 @@ mod tests {
         assert_eq!(summary.output, 1);
         let lane = &sentinel(&rows)["lanes"]["pc"];
         assert!(lane["engine"]["commit_waits_for_buffer"].as_u64().unwrap() >= 1);
+        assert_eq!(lane["engine"]["frame_callbacks"], 1, "commit 1's frame callback fired");
         assert_eq!(lane["pending_at_close"], true);
         assert_eq!(summary.submitted_unresolved, 1, "the pending frame");
         assert_eq!(rows.iter().filter(|r| r["reason"] == DISCARD_SUPERSEDED_BEFORE_COMMIT).count(), 1);
+        assert!(!summary.integrity_ok(PC_WAYLAND_HAPTIC_NULL));
+        assert_eq!(summary.first_integrity_failure_reason.as_deref(), Some(crate::l2_pc::FAIL_WAYLAND_BUFFER_RELEASE_MISSING));
+        assert_eq!(summary.first_integrity_failure_us, None, "untimed");
+        assert!(!summary.first_failure_time_determinable);
+        assert_eq!(lane["device_failure"]["reason"], crate::l2_pc::FAIL_WAYLAND_BUFFER_RELEASE_MISSING);
+        assert_eq!(lane["device_failure"]["occurrence_time_determinable"], false);
+        assert_eq!(
+            lane["buffer_release_missing_at_close"],
+            serde_json::json!({ "pending_seq": 2, "buffers": 2, "buffers_held": 2, "holding_commit_ids": [0, 1] })
+        );
+        assert!(lane["frame_callback_missing_at_close"].is_null());
+        assert_eq!(lane["committable_pending_at_close"], 0);
+        assert!(rows.iter().all(|r| !(r["seq"] == 2 && (r["role"] == "output" || r["role"] == "explicit_discard"))), "no terminal");
         let _ = std::fs::remove_file(&path);
     }
 

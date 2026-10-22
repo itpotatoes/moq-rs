@@ -3,7 +3,8 @@
 //!
 //! Plays a deterministic tick pattern through the SAME haptic ALSA sink the
 //! receiver uses (`skew_moq::l2_output`: haptic lane `alsa`, PC lane `null`),
-//! writes a schema v1.2 L2 JSONL and prints ONE JSON report: the measured
+//! writes an L2 JSONL (schema tag `skew_moq::l2_output::L2_SCHEMA`) and
+//! prints ONE JSON report: the measured
 //! status cadence, the writer's max write lag, and the `report_lag =
 //! t_log_arrival_us - t_output_us` distribution that §3-6 needs to fix
 //! `G_report` (and §3-3a its F/Q/period/buffer values). It reports no
