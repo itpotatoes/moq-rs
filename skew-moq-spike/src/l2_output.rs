@@ -1,5 +1,5 @@
-//! L2 output stage: milestone M1 (device-free ledger) and M2 (per-modality
-//! sinks, schema v1.2).
+//! L2 output stage: milestone M1 (device-free ledger), M2 (per-modality
+//! sinks, schema v1.2; haptic ALSA) and M3 (PC Wayland sink, schema v1.4).
 //!
 //! Governing documents: `md/20261022_실험1D_L2사다리_사전등록_문안.md` §3-1,
 //! §3-3, §3-3a, §3-5, §3-6, §6, §6-1, §11-7; `md/20261022_L2_계측_설계초안.md`
@@ -19,7 +19,8 @@
 //!                        --try_send(Item)--> [bounded queue: haptic] --> sink(haptic) ─┤ Submit / Output / Discard
 //!     │ (Full)                                                                         │
 //!     └─try_send(Discard before submit)───────────────────────────────────────────>  [bounded row queue] --> L2 JSONL
-//!  sink kinds: null (submit only), fake (synthetic output), alsa (haptic, real PCM device; see `l2_haptic`)
+//!  sink kinds: null (submit only), fake (synthetic output), alsa (haptic, real PCM device; see `l2_haptic`),
+//!              wayland (PC: render worker + commit thread, wp_presentation feedback; see `l2_pc`, `pc_lane`)
 //!  receiver_fault(t, cause): earliest kept in shared state, written before the sentinel
 //! ```
 //!
@@ -86,7 +87,14 @@
 //! was negotiated), emits an `output` only when a status snapshot shows the
 //! hardware passed the tick's first frame, terminates everything it can no
 //! longer output after a device failure as `explicit_discard(device_failure)`
-//! and reports its counters in the sentinel (`lanes.haptic`). The file-level
+//! and reports its counters in the sentinel (`lanes.haptic`). `wayland` (PC
+//! only, M3) renders every released frame (Draco decoded first) in a
+//! worker thread into a one-frame pending slot and commits it from the
+//! compositor thread at the next commit opportunity; the
+//! `wp_presentation_feedback` of that commit is the frame's terminal
+//! (`presented` -> `output`, `discarded` -> `compositor_discarded`); a
+//! pending frame replaced before its commit is `superseded_before_commit`;
+//! its counters go to `lanes.pc` (module `pc_lane`). The file-level
 //! `device_output` is true only if EVERY modality's sink is a device sink, so
 //! a file mixing a device sink with a null/fake one is test-only and fails
 //! `--require-device-output`.
@@ -111,6 +119,9 @@ use crate::l2_haptic::{
 };
 use crate::now_us;
 
+/// The PC Wayland lane (render worker + commit thread), M3.
+mod pc_lane;
+
 /// L2 JSONL schema tag written into the meta row.
 /// v1 (Codex 104): writer-side `t_log_arrival_us`, `t_callback_us`,
 /// conservation/duplicate/failure fields. v1.1 (Codex 105):
@@ -134,7 +145,20 @@ use crate::now_us;
 /// for the END of the last tick, and meta `alsa.audio_tstamp_type` records
 /// requested vs actual. Files written under an older tag are never
 /// re-labelled.
-pub const L2_SCHEMA: &str = "event-pair-l2-v1.3";
+/// v1.4 (M3, registration 3-2, 3-3b, 11-8): the PC sink kind `wayland`
+/// (contract `device_output` true for the display backend), meta `wayland`
+/// (startup presentation, clock id, surface/canvas, buffers, tiers meta
+/// digest and scales, the Draco decoder identity, the renderer), PC output
+/// rows with `output_detail` {commit_id, buffer, render/commit times, MSC,
+/// flags, refresh_us} and, for Draco frames only, top-level
+/// `t_decode_start_us`/`t_decode_end_us` on every after-submit terminal row,
+/// the extended order rule for PC rows (submit <= decode <= render <= commit
+/// <= output), the discard reasons `superseded_before_commit`,
+/// `compositor_discarded`, `decode_failed`, PC integrity failures
+/// (`pc_*` timed, `wayland_*` device failures untimed in `lanes.pc`) and
+/// the sentinel's `lanes.pc`. µs-only time fields as before (raw ns only in
+/// the probe's diagnostics file).
+pub const L2_SCHEMA: &str = "event-pair-l2-v1.4";
 pub const L2_CLOCK: &str = "CLOCK_MONOTONIC";
 /// The M1 grace is anchored at `finish`, not at the registration's H.
 pub const REPORT_WINDOW_ANCHOR: &str = "close";
@@ -149,8 +173,11 @@ pub const DISCARD_COMPOSITOR_DISCARDED: &str = "compositor_discarded";
 /// reset, error) — every submission it can no longer output. The failure
 /// itself is the integrity failure; these rows keep the ledger complete.
 pub const DISCARD_DEVICE_FAILURE: &str = "device_failure";
-/// Haptic ALSA lane, after submit: the payload is not a playable PCM tick.
+/// After submit: the payload is not a playable PCM tick (haptic ALSA lane)
+/// or not a drawable PC frame of a known tier (PC Wayland lane).
 pub const DISCARD_PAYLOAD_INVALID: &str = "payload_invalid";
+/// PC Wayland lane, after submit: the Draco decoder refused the payload.
+pub use crate::l2_pc::DISCARD_DECODE_FAILED;
 
 /// `first_integrity_failure_reason` values.
 pub const FAIL_ROW_QUEUE_OVERFLOW: &str = "row_queue_overflow";
@@ -182,6 +209,9 @@ pub enum L2SinkKind {
     /// Haptic only: PCM playback with ALSA-reported output times
     /// (registration §3-3, §3-3a; `l2_haptic`).
     Alsa,
+    /// PC only: rendered frames presented through Wayland with
+    /// `wp_presentation` output times (registration §3-2, §3-3b; `l2_pc`).
+    Wayland,
 }
 
 impl L2SinkKind {
@@ -190,6 +220,7 @@ impl L2SinkKind {
             Self::Null => "null",
             Self::Fake => "fake",
             Self::Alsa => "alsa",
+            Self::Wayland => "wayland",
         }
     }
 
@@ -409,6 +440,81 @@ impl AlsaSinkConfig {
     }
 }
 
+/// Defaults of the PC Wayland sink (receiver `--l2-wayland-*`, probe):
+/// provisional SINK parameters recorded in meta, never experimental
+/// parameters of a method.
+pub const WAYLAND_DEFAULT_BUFFERS: usize = 4;
+/// Bound on connecting, configuring and presenting the startup frame.
+pub const WAYLAND_READY_TIMEOUT_US: u64 = 5_000_000;
+/// After a failed start: bound on waiting for the lane to exit (and so to
+/// disconnect) before `start` returns its error.
+pub const WAYLAND_RELEASE_TIMEOUT_US: u64 = 5_000_000;
+/// Schema tag of the probe-only Wayland diagnostics file.
+pub const L2_WAYLAND_DIAGNOSTICS_SCHEMA: &str = "event-pair-l2-wayland-diagnostics-v1";
+
+/// Where the PC Wayland lane presents.
+#[derive(Debug, Clone)]
+pub enum WaylandBackendKind {
+    /// The user's Wayland display (`WAYLAND_DISPLAY`): a device output.
+    /// Connected inside the lane thread when the stage starts.
+    Display,
+    /// The simulated compositor (`l2_pc::SimCompositor`) on the real clock:
+    /// tests only, never a device output.
+    Simulated(crate::l2_pc::SimCompositorConfig),
+}
+
+impl WaylandBackendKind {
+    pub fn is_device(&self) -> bool {
+        matches!(self, Self::Display)
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Display => "wayland",
+            Self::Simulated(_) => "simulated",
+        }
+    }
+}
+
+/// The PC Wayland sink (registration §3-2, §3-3b).
+#[derive(Debug, Clone)]
+pub struct WaylandSinkConfig {
+    pub backend: WaylandBackendKind,
+    /// What the PC payload is (`--representation`): `.bin` records as sent,
+    /// or a Draco bitstream decoded in the render worker.
+    pub representation: crate::l2_pc::PcRepresentation,
+    /// Header tier -> point scale, from the tiers meta file.
+    pub tiers: crate::l2_pc::TierScales,
+    /// `wl_shm` buffers (>= 2; a buffer the compositor holds is never written).
+    pub buffers: usize,
+    pub ready_timeout_us: u64,
+    pub release_timeout_us: u64,
+    /// PROBE ONLY: a separate diagnostics JSONL (create_new) for the raw
+    /// presentation values (ns) the L2 JSONL must not carry. The receiver
+    /// never sets it.
+    pub diagnostics: Option<PathBuf>,
+}
+
+impl WaylandSinkConfig {
+    pub fn validate(&self) -> Result<()> {
+        if !(2..=16).contains(&self.buffers) {
+            bail!("the Wayland sink needs 2..=16 wl_shm buffers");
+        }
+        if self.ready_timeout_us == 0 || self.release_timeout_us == 0 {
+            bail!("Wayland ready and release timeouts must be positive");
+        }
+        if self.tiers.scales.is_empty() {
+            bail!("the Wayland sink needs the tiers meta depth scales");
+        }
+        if let WaylandBackendKind::Simulated(sim) = &self.backend {
+            if sim.buffers != self.buffers {
+                bail!("simulated compositor buffers differ from the sink's");
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct L2Config {
     pub run_id: String,
@@ -421,6 +527,8 @@ pub struct L2Config {
     pub fake: Option<FakeSinkConfig>,
     /// Required iff the haptic sink is `alsa`, refused otherwise.
     pub alsa: Option<AlsaSinkConfig>,
+    /// Required iff the PC sink is `wayland`, refused otherwise (v1.4).
+    pub wayland: Option<WaylandSinkConfig>,
     /// Bound of EACH modality's release -> sink submission queue (one lane
     /// per modality since v1.2; meta `queue_capacity_per_track`).
     pub queue_capacity: usize,
@@ -452,6 +560,15 @@ impl L2Config {
         if self.sinks.pc == L2SinkKind::Alsa {
             bail!("the ALSA sink is a haptic sink");
         }
+        if self.sinks.haptic == L2SinkKind::Wayland {
+            bail!("the Wayland sink is a PC sink");
+        }
+        match (self.sinks.pc == L2SinkKind::Wayland, &self.wayland) {
+            (true, Some(wayland)) => wayland.validate()?,
+            (true, None) => bail!("the Wayland PC sink requires its configuration"),
+            (false, Some(_)) => bail!("Wayland options apply only to the Wayland PC sink"),
+            (false, None) => {}
+        }
         match (self.sinks.haptic == L2SinkKind::Alsa, &self.alsa) {
             (true, Some(alsa)) => alsa.validate()?,
             (true, None) => bail!("the ALSA haptic sink requires its configuration"),
@@ -462,11 +579,12 @@ impl L2Config {
     }
 
     /// Whether this modality's sink is a real output device. No null/fake
-    /// sink is, nor a simulated ALSA stream; M3 adds Wayland (PC).
+    /// sink is, nor a simulated ALSA stream or compositor.
     pub fn device_output_of(&self, modality: L2Modality) -> bool {
         match self.sinks.of(modality) {
             L2SinkKind::Null | L2SinkKind::Fake => false,
             L2SinkKind::Alsa => self.alsa.as_ref().is_some_and(|a| a.backend.is_device()),
+            L2SinkKind::Wayland => self.wayland.as_ref().is_some_and(|w| w.backend.is_device()),
         }
     }
 
@@ -685,6 +803,8 @@ enum OutputDetail {
     Fake,
     /// The status snapshot that showed `hw_pos > n_k` (haptic ALSA lane).
     Alsa(Box<AlsaOutputDetail>),
+    /// The commit and its `presented` feedback (PC Wayland lane, v1.4).
+    Wayland(Box<WaylandOutputDetail>),
 }
 
 impl OutputDetail {
@@ -692,7 +812,72 @@ impl OutputDetail {
         match self {
             Self::Fake => serde_json::json!({ "device": "fake", "modality": modality.as_str() }),
             Self::Alsa(detail) => detail.to_json(),
+            Self::Wayland(detail) => detail.to_json(),
         }
+    }
+
+    /// Draco decode times of a PC frame (top-level row fields, v1.4).
+    fn decode_us(&self) -> Option<(u64, u64)> {
+        match self {
+            Self::Wayland(detail) => detail.timing.decode_us,
+            _ => None,
+        }
+    }
+}
+
+/// The evidence of one PC Wayland `output` (integer µs CLOCK_MONOTONIC
+/// times only; the raw presentation ns live in the probe diagnostics file).
+#[derive(Debug, Clone)]
+pub(crate) struct WaylandOutputDetail {
+    backend: &'static str,
+    commit_id: u64,
+    buffer: usize,
+    timing: crate::l2_pc::PcTiming,
+    t_commit_us: u64,
+    presented: crate::l2_pc::Presented,
+    info: crate::l2_pc::FrameInfo,
+}
+
+impl WaylandOutputDetail {
+    fn to_json(&self) -> serde_json::Value {
+        let p = &self.presented;
+        serde_json::json!({
+            "device": "wayland",
+            "backend": self.backend,
+            "commit_id": self.commit_id,
+            "buffer": self.buffer,
+            "t_render_start_us": self.timing.t_render_start_us,
+            "t_render_end_us": self.timing.t_render_end_us,
+            "t_commit_us": self.t_commit_us,
+            "refresh_us": p.refresh_us(),
+            "msc": p.seq,
+            "flags": p.flags,
+            "flag_names": crate::l2_pc::presentation_flag_names(p.flags),
+            "sync_outputs": p.sync_outputs,
+            "points": self.info.points,
+            "covered_pixels": self.info.covered_pixels,
+            "depth_scale": self.info.depth_scale,
+        })
+    }
+
+    fn schema() -> serde_json::Value {
+        serde_json::json!({
+            "device": "the string \"wayland\"",
+            "backend": "wayland (the display) | simulated (tests, never a device output)",
+            "commit_id": "the commit whose wp_presentation_feedback this row is (immutable commit_id -> run/track/tier/seq/pts/event_id/route mapping made at the commit)",
+            "buffer": "wl_shm buffer index the frame was committed in",
+            "t_render_start_us": "clock read right before the render (after the Draco decode for draco)",
+            "t_render_end_us": "clock read right after the render",
+            "t_commit_us": "clock read right before attach/damage/frame/feedback/commit were issued",
+            "refresh_us": "presented.refresh as integer us (floor); 0 = unknown",
+            "msc": "presented seq_hi << 32 | seq_lo (refresh counter, not a time)",
+            "flags": "presented.flags (wp_presentation_feedback.kind bits)",
+            "flag_names": "decoded flags: vsync, hw_clock, hw_completion, zero_copy",
+            "sync_outputs": "sync_output events received before presented",
+            "points": "points drawn",
+            "covered_pixels": "canvas pixels at least one point covers",
+            "depth_scale": "the tier's depth_scale from the tiers meta",
+        })
     }
 }
 
@@ -711,6 +896,8 @@ enum Row {
         t_submit_us: Option<u64>,
         t_discard_us: u64,
         reason: &'static str,
+        /// Draco decode times of a PC frame that was decoded (v1.4).
+        decode_us: Option<(u64, u64)>,
     },
     /// A device lane's counters, sent once before its thread exits; written
     /// into the sentinel (`lanes.<track>`), never as a row of its own.
@@ -805,6 +992,7 @@ impl L2Submitter {
             t_submit_us: None,
             t_discard_us,
             reason: DISCARD_OUTPUT_QUEUE_FULL,
+            decode_us: None,
         };
         if self.rows.try_send(row).is_err() {
             self.shared.row_overflow.fetch_add(1, Ordering::Relaxed);
@@ -897,6 +1085,19 @@ fn sink_contract(config: &L2Config, modality: L2Modality) -> serde_json::Value {
             "t_callback_us": "clock read immediately after that snd_pcm_status call",
             "output_detail": AlsaOutputDetail::schema(),
         }),
+        L2SinkKind::Wayland => serde_json::json!({
+            "kind": "wayland",
+            "backend": config.wayland.as_ref().map(|w| w.backend.name()),
+            "representation": config.wayland.as_ref().map(|w| w.representation.as_str()),
+            "device_output": device_output,
+            "resolves": true,
+            "terminals": "output on wp_presentation_feedback.presented of the frame's commit (receipt strictly before close_deadline_us); explicit_discard before submit: output_queue_full (the bounded submission queue); explicit_discard after submit: superseded_before_commit (the pending frame was replaced before any commit), compositor_discarded (feedback discarded), payload_invalid (no payload, a tier the tiers meta does not know, records not drawable at the tier scale), decode_failed (the Draco decoder refused the payload), device_failure (a frame not yet committed when the PC device failed, or submitted after); a COMMITTED frame ends only through its feedback, otherwise it stays unresolved",
+            "t_output_us": "presented tv_sec*1e6 + floor(tv_nsec/1000) on the wp_presentation clock, verified CLOCK_MONOTONIC before the meta row (registration 3-2: the time the compositor reports the content update turned into light; not a physical measurement)",
+            "t_callback_us": "clock read when the presented event is handled",
+            "t_decode_start_us": "draco only, top-level on every after-submit terminal of a decoded frame: clock read right after the frame left the processing queue, immediately before the decoder call",
+            "t_decode_end_us": "draco only: clock read right after the 8-byte records exist (the same records the bin path renders)",
+            "output_detail": WaylandOutputDetail::schema(),
+        }),
     }
 }
 
@@ -969,8 +1170,32 @@ fn alsa_meta(alsa: &AlsaSinkConfig, ready: &LaneReady) -> serde_json::Value {
     })
 }
 
+/// The meta `wayland` section: what the PC lane negotiated and how it works.
+fn wayland_meta(wayland: &WaylandSinkConfig, ready: &pc_lane::PcLaneReady) -> serde_json::Value {
+    serde_json::json!({
+        "backend": wayland.backend.name(),
+        "startup": ready.startup.to_json(),
+        "canvas_side_px": ready.side,
+        "buffers": wayland.buffers,
+        "representation": wayland.representation.as_str(),
+        "tiers_meta": wayland.tiers.to_json(),
+        "decoder": crate::l2_pc::decoder_meta(wayland.representation),
+        "renderer": crate::l2_pc::renderer_meta(ready.side),
+        "diagnostics_file": wayland.diagnostics.as_ref().map(|path| path.display().to_string()),
+        "parameter_status": "provisional sink parameters (buffers, ready timeout), not registered experimental parameters; fixed in the freeze after the M3 display measurement",
+        "thread_layout": "render worker thread: takes released frames from the bounded submission queue in release order, decodes (draco) and renders them, puts each into a one-frame pending slot; commit thread: owns the compositor connection and commits the pending frame at each commit opportunity (neither thread has a real-time priority, registration 11-10)",
+        "commit_policy": "a commit opportunity exists when the frame callback requested with the previous commit has fired (or nothing was committed since startup) and no PC device failure occurred; one frame per commit; wp_presentation.feedback is requested immediately before every commit and maps its commit_id to the frame immutably",
+        "pending_policy": "one pending frame; a frame replaced there before it was committed is explicit_discard superseded_before_commit (after submit)",
+        "buffer_policy": "a frame is written only into a wl_shm buffer the compositor does not hold (Held from its commit until wl_buffer.release); with none free the pending frame waits; wl_buffer.release and frame callbacks are never output evidence",
+        "feedback_policy": "presented -> output; discarded -> explicit_discard compositor_discarded; a feedback or frame callback for an unknown or already resolved commit is a timed integrity failure at its receipt (wayland_unexpected_feedback / wayland_unexpected_frame_callback); a presented timestamp with tv_nsec >= 1e9 is wayland_bad_timestamp and the frame stays unresolved",
+        "failure_policy": "compositor connection loss or protocol error, xdg_toplevel.close, a configure that changes the size or drops fullscreen, an output mode change or removal after ready, and committed frames still without feedback at close are PC device failures: untimed (first_integrity_failure_us null, first_failure_time_determinable false), recorded in lanes.pc.device_failure with observation_interval_us [last_good_us, detected_us]; after one, nothing is committed any more and every frame not yet committed (pending or submitted later) gets explicit_discard device_failure after submit; committed frames keep waiting for their feedback",
+        "close_policy": "after finish starts the worker processes every submission of the producers, the commit thread commits the last pending frame and waits until every committed frame has its feedback or the close deadline, then disconnects",
+        "start_check": "wp_presentation.clock_id must be CLOCK_MONOTONIC before the meta row, otherwise the run is refused; the startup frame (commit 0, background, not a ledger row) must be presented",
+    })
+}
+
 /// The meta row (written once, synchronously, before any other row).
-fn meta_row(config: &L2Config, alsa_ready: Option<&LaneReady>) -> serde_json::Value {
+fn meta_row(config: &L2Config, alsa_ready: Option<&LaneReady>, pc_ready: Option<&pc_lane::PcLaneReady>) -> serde_json::Value {
     let fake = config.fake.as_ref();
     let sinks = serde_json::json!({
         "pc": config.sinks.pc.as_str(),
@@ -1006,6 +1231,20 @@ fn meta_row(config: &L2Config, alsa_ready: Option<&LaneReady>) -> serde_json::Va
     });
     // Every ALSA device-failure reason, looked up by name like the others.
     let mut failure_time_semantics = failure_time_semantics;
+    for (reason, semantics) in [
+        (crate::l2_pc::FAIL_PC_PAYLOAD_INVALID, "t_submit_us of the submission"),
+        (crate::l2_pc::FAIL_PC_DECODE_FAILED, "t_submit_us of the submission (the decoder's refusal is seen at t_decode_end_us, also on the row)"),
+        (crate::l2_pc::FAIL_WAYLAND_UNEXPECTED_FEEDBACK, "receipt time of the offending feedback event"),
+        (crate::l2_pc::FAIL_WAYLAND_UNEXPECTED_FRAME_CALLBACK, "receipt time of the offending frame callback"),
+        (crate::l2_pc::FAIL_WAYLAND_BAD_TIMESTAMP, "receipt time of the presented event"),
+    ] {
+        failure_time_semantics[reason] = serde_json::Value::from(semantics);
+    }
+    for reason in crate::l2_pc::WAYLAND_DEVICE_FAILURE_REASONS {
+        failure_time_semantics[reason] = serde_json::Value::from(
+            "UNDETERMINABLE (PC device failure): first_integrity_failure_us = null, first_failure_time_determinable = false, first_integrity_failure_detected_us = the detection; sentinel lanes.pc.device_failure keeps observation_interval_us [last_good_us (clock read before the last compositor call that succeeded), detected_us]",
+        );
+    }
     for reason in crate::l2_haptic::ALSA_DEVICE_FAILURE_REASONS {
         failure_time_semantics[reason] = serde_json::Value::from(
             "UNDETERMINABLE until the kernel timestamps are verified on the device (registration 6-1): first_integrity_failure_us = null, first_failure_time_determinable = false, first_integrity_failure_detected_us = the detection; sentinel lanes.haptic.device_failure keeps observation_interval_us [last_good_status_t0_us (clock read before the last healthy status call), detected_us] and the raw kernel_trigger_us (unverified, not an occurrence time)",
@@ -1019,6 +1258,7 @@ fn meta_row(config: &L2Config, alsa_ready: Option<&LaneReady>) -> serde_json::Va
         "output_order_violation": "output rows violating order_rule",
         "terminal_at_or_after_deadline": "terminals whose receipt time is not < close_deadline_us",
         "lanes": "sentinel lanes.<track>: counters of a device lane (null for null/fake lanes); see sink_contracts",
+        "lanes.pc.device_failure": "the first PC device failure (wayland lane) or null; the counterpart of lanes.haptic.device_failure",
     });
     serde_json::json!({
         "role": "meta",
@@ -1038,7 +1278,7 @@ fn meta_row(config: &L2Config, alsa_ready: Option<&LaneReady>) -> serde_json::Va
         "report_window_us": config.report_window_us,
         "report_window_anchor": REPORT_WINDOW_ANCHOR,
         "report_window_rule": "a terminal is accepted iff its receipt time (t_callback_us of an output, t_discard_us of an after-submit discard) < close_deadline_us = finish_start_us + report_window_us (both in the sentinel); equality is rejected; not the H-anchored G_report",
-        "order_rule": "every output row satisfies t_release_us <= t_submit_us <= t_output_us <= t_callback_us <= t_log_arrival_us; the writer checks it after writing the row (values are never clamped) and a violation is the integrity failure output_order_violation",
+        "order_rule": "every output row satisfies t_release_us <= t_submit_us <= t_output_us <= t_callback_us <= t_log_arrival_us, and a PC wayland output row also t_submit_us <= t_decode_start_us <= t_decode_end_us (draco) <= output_detail.t_render_start_us <= t_render_end_us <= t_commit_us <= t_output_us; the writer checks it after writing the row (values are never clamped) and a violation is the integrity failure output_order_violation",
         "row_time_semantics": row_time_semantics,
         "failure_time_semantics": failure_time_semantics,
         "counter_semantics": counter_semantics,
@@ -1049,6 +1289,7 @@ fn meta_row(config: &L2Config, alsa_ready: Option<&LaneReady>) -> serde_json::Va
             "drop_terminals": f.drop_terminals,
         })),
         "alsa": config.alsa.as_ref().zip(alsa_ready).map(|(alsa, ready)| alsa_meta(alsa, ready)),
+        "wayland": config.wayland.as_ref().zip(pc_ready).map(|(wayland, ready)| wayland_meta(wayland, ready)),
     })
 }
 
@@ -1089,17 +1330,22 @@ impl L2Output {
         let mut senders: [Option<SyncSender<SinkMsg>>; 2] = [None, None];
         let mut lane_threads: [Option<JoinHandle<()>>; 2] = [None, None];
 
-        // A device lane goes first: it opens, configures, prefills and starts
-        // its stream (registration 3-3a: before the run's warm-up) and hands
-        // back what it negotiated, which the meta row records. If it cannot,
-        // `start` fails here and the receiver refuses to run; the file then
+        // Device lanes go first, PC then haptic: each opens its device (the
+        // PC lane connects to the compositor, goes fullscreen and presents its
+        // startup frame; the haptic lane opens, configures, prefills and
+        // starts its stream, registration 3-3a: before the run's warm-up) and
+        // hands back what it negotiated, which the meta row records. If one
+        // cannot, `start` fails here and the receiver refuses to run; a device
+        // lane that was already ready is torn down first (its queue closed so
+        // it disconnects, joined within its release bound). The file then
         // holds no meta row, so it can never pass as a run's ledger.
-        let mut alsa_ready = None;
-        if let (L2SinkKind::Alsa, Some(alsa)) = (config.sinks.haptic, config.alsa.clone()) {
-            // Probe-only diagnostics file: created now (create_new, never the
-            // L2 file or an excluded open log) so a bad path fails before the
-            // device opens; written by the lane after its stream stopped.
-            let diagnostics = match &alsa.diagnostics {
+        //
+        // Probe-only diagnostics files are created first (create_new, never
+        // the L2 file or an excluded open log), so a bad path fails before
+        // any device opens; each lane writes its own after its device stopped.
+        let mut alsa_diagnostics = None;
+        if let (L2SinkKind::Alsa, Some(alsa)) = (config.sinks.haptic, config.alsa.as_ref()) {
+            alsa_diagnostics = Some(match &alsa.diagnostics {
                 None => None,
                 Some(diag_path) => {
                     let diag_file = OpenOptions::new()
@@ -1118,7 +1364,51 @@ impl L2Output {
                         dropped: 0,
                     })
                 }
+            });
+        }
+        let mut pc_ready = None;
+        if let (L2SinkKind::Wayland, Some(wayland)) = (config.sinks.pc, config.wayland.clone()) {
+            let diagnostics = match &wayland.diagnostics {
+                None => None,
+                Some(diag_path) => {
+                    let diag_file = OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(diag_path)
+                        .with_context(|| format!("create Wayland diagnostics {} (must not exist)", diag_path.display()))?;
+                    let diag_identity = open_file_identity(&diag_file)?;
+                    let alsa_identity = match &alsa_diagnostics {
+                        Some(Some(diag)) => Some(open_file_identity(diag.file.get_ref())?),
+                        _ => None,
+                    };
+                    if diag_identity == file_identity
+                        || exclude.contains(&diag_identity)
+                        || alsa_identity == Some(diag_identity)
+                    {
+                        bail!("Wayland diagnostics {} is the same file as an open log", diag_path.display());
+                    }
+                    Some(pc_lane::PcDiagLog::new(BufWriter::new(diag_file), config.run_id.clone()))
+                }
             };
+            let (items_tx, items_rx) = mpsc::sync_channel::<SinkMsg>(config.queue_capacity);
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let rows = rows_tx.clone();
+            let lane_shared = shared.clone();
+            let timeout = micros(wayland.ready_timeout_us);
+            let release = micros(wayland.release_timeout_us);
+            let lane = std::thread::Builder::new()
+                .name("l2-sink-pc-wayland".into())
+                .spawn(move || pc_lane::wayland_lane_main(wayland, items_rx, rows, lane_shared, ready_tx, diagnostics))
+                .context("spawn L2 Wayland lane thread")?;
+            let (ready, lane, items_tx) = await_lane_ready("Wayland PC", ready_rx, lane, items_tx, timeout, release)?;
+            pc_ready = Some(ready);
+            let lane_index = L2Modality::Pc.index();
+            senders[lane_index] = Some(items_tx);
+            lane_threads[lane_index] = Some(lane);
+        }
+        let mut alsa_ready = None;
+        if let (L2SinkKind::Alsa, Some(alsa)) = (config.sinks.haptic, config.alsa.clone()) {
+            let diagnostics = alsa_diagnostics.take().flatten();
             let (items_tx, items_rx) = mpsc::sync_channel::<SinkMsg>(config.queue_capacity);
             let (ready_tx, ready_rx) = mpsc::channel();
             let rows = rows_tx.clone();
@@ -1129,14 +1419,32 @@ impl L2Output {
                 .name("l2-sink-haptic-alsa".into())
                 .spawn(move || alsa_lane_main(alsa, items_rx, rows, lane_shared, ready_tx, diagnostics))
                 .context("spawn L2 ALSA lane thread")?;
-            let (ready, lane, items_tx) = await_lane_ready(ready_rx, lane, items_tx, timeout, release)?;
+            let (ready, lane, items_tx) = match await_lane_ready("ALSA haptic", ready_rx, lane, items_tx, timeout, release) {
+                Ok(ready) => ready,
+                Err(error) => {
+                    // Close the PC device lane that is already up before
+                    // reporting: its queue goes, the lane disconnects.
+                    let pc = L2Modality::Pc.index();
+                    if let (Some(pc_tx), Some(pc_lane)) = (senders[pc].take(), lane_threads[pc].take()) {
+                        drop(pc_tx);
+                        let bound = config.wayland.as_ref().map_or(release, |w| micros(w.release_timeout_us));
+                        let note = if join_within(pc_lane, bound) {
+                            "the PC Wayland lane was closed and has disconnected"
+                        } else {
+                            "the PC Wayland lane has NOT exited within its release bound"
+                        };
+                        return Err(error.context(note));
+                    }
+                    return Err(error);
+                }
+            };
             alsa_ready = Some(ready);
             let lane_index = L2Modality::Haptic.index();
             senders[lane_index] = Some(items_tx);
             lane_threads[lane_index] = Some(lane);
         }
 
-        writeln!(w, "{}", meta_row(&config, alsa_ready.as_ref()))?;
+        writeln!(w, "{}", meta_row(&config, alsa_ready.as_ref(), pc_ready.as_ref()))?;
         w.flush()?;
         let writer = {
             let run_id = config.run_id.clone();
@@ -1346,6 +1654,7 @@ fn micros(us: u64) -> Duration {
 /// and the lane is joined within `release`, so the device is released before
 /// any next attempt; the error says whether that happened.
 fn await_lane_ready<T>(
+    label: &str,
     ready_rx: Receiver<std::result::Result<T, String>>,
     lane: JoinHandle<()>,
     items_tx: SyncSender<SinkMsg>,
@@ -1357,7 +1666,7 @@ fn await_lane_ready<T>(
         Ok(Err(error)) => {
             drop(items_tx);
             let _ = lane.join();
-            bail!("L2 ALSA haptic sink failed to start: {error} (lane joined, device closed)");
+            bail!("L2 {label} sink failed to start: {error} (lane joined, device closed)");
         }
         Err(timeout_or_gone) => {
             drop(items_tx);
@@ -1368,10 +1677,10 @@ fn await_lane_ready<T>(
                 RecvTimeoutError::Disconnected => "lane exited without reporting".to_string(),
             };
             if released {
-                bail!("L2 ALSA haptic sink {what}; the lane thread has exited and the device is closed");
+                bail!("L2 {label} sink {what}; the lane thread has exited and the device is closed");
             }
             bail!(
-                "L2 ALSA haptic sink {what}; the lane thread has NOT exited within a further {} us, so the \
+                "L2 {label} sink {what}; the lane thread has NOT exited within a further {} us, so the \
                  device may stay open until this process exits: do not start another attempt before it has",
                 release.as_micros()
             );
@@ -1746,6 +2055,7 @@ impl AlsaLane {
             t_submit_us: Some(s.t_submit_us),
             t_discard_us,
             reason,
+            decode_us: None,
         };
         self.row(row, t_discard_us);
     }
@@ -1769,6 +2079,7 @@ impl AlsaLane {
                     t_submit_us: None,
                     t_discard_us,
                     reason: DISCARD_OUTPUT_QUEUE_FULL,
+                    decode_us: None,
                 };
                 self.row(row, t_discard_us);
             }
@@ -2188,6 +2499,11 @@ fn writer_loop(
                 m.insert("t_submit_us".into(), s.t_submit_us.into());
                 m.insert("t_output_us".into(), t_output_us.into());
                 m.insert("t_callback_us".into(), t_callback_us.into());
+                // v1.4: Draco decode times on the row itself (draco only).
+                if let Some((start, end)) = detail.decode_us() {
+                    m.insert("t_decode_start_us".into(), start.into());
+                    m.insert("t_decode_end_us".into(), end.into());
+                }
                 // Modality-specific device evidence; its schema per sink kind
                 // is `sink_contracts.<track>.output_detail` in the meta row.
                 m.insert("output_detail".into(), detail.to_json(s.identity.modality));
@@ -2195,7 +2511,22 @@ fn writer_loop(
                 summary.max_callback_to_log_us =
                     summary.max_callback_to_log_us.max(t_log.saturating_sub(t_callback_us));
                 // Order rule, checked on the values as written (never clamped).
-                let ordered = s.t_release_us <= s.t_submit_us
+                // A PC Wayland row adds its pipeline: submit <= decode start
+                // <= decode end <= render start <= render end <= commit <=
+                // output (v1.4).
+                let pipeline_ordered = match &detail {
+                    OutputDetail::Wayland(d) => {
+                        let mut chain = vec![s.t_submit_us];
+                        if let Some((start, end)) = d.timing.decode_us {
+                            chain.extend([start, end]);
+                        }
+                        chain.extend([d.timing.t_render_start_us, d.timing.t_render_end_us, d.t_commit_us, t_output_us]);
+                        chain.windows(2).all(|w| w[0] <= w[1])
+                    }
+                    _ => true,
+                };
+                let ordered = pipeline_ordered
+                    && s.t_release_us <= s.t_submit_us
                     && s.t_submit_us <= t_output_us
                     && t_output_us <= t_callback_us
                     && t_callback_us <= t_log;
@@ -2205,7 +2536,7 @@ fn writer_loop(
                 }
                 check_terminal_receipt(t_callback_us, summary, &shared);
             }
-            Row::Discard { identity, t_release_us, t_submit_us, t_discard_us, reason } => {
+            Row::Discard { identity, t_release_us, t_submit_us, t_discard_us, reason, decode_us } => {
                 match t_submit_us {
                     None => {
                         summary.discarded_before_submit += 1;
@@ -2227,6 +2558,11 @@ fn writer_loop(
                 m.insert("t_release_us".into(), t_release_us.into());
                 m.insert("t_submit_us".into(), t_submit_us.into());
                 m.insert("t_discard_us".into(), t_discard_us.into());
+                // v1.4: a decoded (draco) PC frame keeps its decode times.
+                if let Some((start, end)) = decode_us {
+                    m.insert("t_decode_start_us".into(), start.into());
+                    m.insert("t_decode_end_us".into(), end.into());
+                }
                 write_row(w, m, None, summary)?;
             }
             Row::LaneStats { modality, stats } => lane_stats[modality.index()] = Some(stats),
@@ -2391,6 +2727,7 @@ mod tests {
             sinks,
             fake,
             alsa: None,
+            wayland: None,
             queue_capacity: capacity,
             row_capacity: 4096,
             report_window_us: 500_000,
@@ -2780,7 +3117,7 @@ mod tests {
             &path,
             L2SinkKind::Fake,
             vec![
-                Row::Discard { identity: a, t_release_us: now_us(), t_submit_us: None, t_discard_us: now_us(), reason: DISCARD_OUTPUT_QUEUE_FULL },
+                Row::Discard { identity: a, t_release_us: now_us(), t_submit_us: None, t_discard_us: now_us(), reason: DISCARD_OUTPUT_QUEUE_FULL, decode_us: None },
                 Row::Submit(submission(a)),
                 output_row(submission(a)),
             ],
@@ -3194,6 +3531,7 @@ mod tests {
             t_submit_us: None,
             t_discard_us: t,
             reason: DISCARD_OUTPUT_QUEUE_FULL,
+            decode_us: None,
         };
         // A submit and its output, so nothing is left unresolved.
         let submit = |t: u64| {
@@ -3311,7 +3649,7 @@ mod tests {
         out.finish().unwrap();
         let rows = rows(&path);
         let meta = &rows[0];
-        assert_eq!(meta["l2_schema"], "event-pair-l2-v1.3");
+        assert_eq!(meta["l2_schema"], "event-pair-l2-v1.4");
         assert_eq!(meta["report_window_anchor"], "close");
         for key in ["object_rows", "sentinel_row", "receiver_fault", "t_callback_us", "file_order"] {
             assert!(meta["row_time_semantics"][key].is_string(), "{key}");
@@ -3451,7 +3789,7 @@ mod tests {
         let meta = &rows[0];
         assert_eq!(meta["role"], "meta");
         assert_eq!(meta["l2_schema"], L2_SCHEMA);
-        assert_eq!(meta["l2_schema"], "event-pair-l2-v1.3");
+        assert_eq!(meta["l2_schema"], "event-pair-l2-v1.4");
         assert_eq!(meta["sinks"], serde_json::json!({ "pc": "fake", "haptic": "null" }));
         assert_eq!(meta["device_output"], false);
         assert!(meta["device_output_rule"].as_str().unwrap().contains("EVERY track"));
@@ -4156,7 +4494,7 @@ mod tests {
             while items.recv().is_ok() {}
             flag.store(true, Ordering::SeqCst);
         });
-        let error = await_lane_ready(ready_rx, lane, items_tx, Duration::from_millis(1), Duration::from_secs(60))
+        let error = await_lane_ready("ALSA haptic", ready_rx, lane, items_tx, Duration::from_millis(1), Duration::from_secs(60))
             .err()
             .expect("not ready");
         let error = format!("{error:#}");
@@ -4176,7 +4514,7 @@ mod tests {
             let _ = gate_rx.recv();
             flag.store(true, Ordering::SeqCst);
         });
-        let error = await_lane_ready(ready_rx, lane, items_tx, Duration::from_millis(1), Duration::from_millis(20))
+        let error = await_lane_ready("ALSA haptic", ready_rx, lane, items_tx, Duration::from_millis(1), Duration::from_millis(20))
             .err()
             .expect("not ready");
         let error = format!("{error:#}");
@@ -4195,11 +4533,11 @@ mod tests {
         let (ready_rx, lane, items_tx) = stand_in_lane(|ready, _items| {
             ready.send(Err("snd_pcm_open: Device or resource busy".into())).unwrap();
         });
-        let error = format!("{:#}", await_lane_ready(ready_rx, lane, items_tx, Duration::from_secs(60), Duration::from_secs(60)).err().unwrap());
+        let error = format!("{:#}", await_lane_ready("ALSA haptic", ready_rx, lane, items_tx, Duration::from_secs(60), Duration::from_secs(60)).err().unwrap());
         assert!(error.contains("failed to start: snd_pcm_open: Device or resource busy (lane joined, device closed)"), "{error}");
 
         let (ready_rx, lane, items_tx) = stand_in_lane(|ready, _items| drop(ready));
-        let error = format!("{:#}", await_lane_ready(ready_rx, lane, items_tx, Duration::from_secs(60), Duration::from_secs(60)).err().unwrap());
+        let error = format!("{:#}", await_lane_ready("ALSA haptic", ready_rx, lane, items_tx, Duration::from_secs(60), Duration::from_secs(60)).err().unwrap());
         assert!(error.contains("lane exited without reporting") && error.contains("device is closed"), "{error}");
 
         let (ready_rx, lane, items_tx) = stand_in_lane(|ready, items| {
@@ -4207,7 +4545,7 @@ mod tests {
             while items.recv().is_ok() {}
         });
         let (ready, lane, items_tx) =
-            await_lane_ready(ready_rx, lane, items_tx, Duration::from_secs(60), Duration::from_secs(60)).unwrap();
+            await_lane_ready("ALSA haptic", ready_rx, lane, items_tx, Duration::from_secs(60), Duration::from_secs(60)).unwrap();
         assert_eq!(ready, 42);
         drop(items_tx);
         lane.join().unwrap();
@@ -4327,5 +4665,424 @@ mod tests {
         for p in [&path, &diag_path] {
             let _ = std::fs::remove_file(p);
         }
+    }
+
+    // ---- M3: the PC Wayland lane on the simulated compositor -----------------
+
+    use crate::l2_pc::{
+        PcRepresentation, SimCompositorConfig, SimWaylandFault, TierScales, FAIL_PC_DECODE_FAILED,
+        FAIL_PC_PAYLOAD_INVALID, FAIL_WAYLAND_CONNECTION_LOST, FAIL_WAYLAND_FEEDBACK_MISSING,
+        FAIL_WAYLAND_RECONFIGURED, FAIL_WAYLAND_UNEXPECTED_FEEDBACK,
+    };
+
+    fn tiers_meta() -> TierScales {
+        let text = r#"{"schema": "phase4_s3_tiers_v1", "tiers": {
+            "d8": {"tier_id": 2, "depth_scale": 4}, "d7": {"tier_id": 3, "depth_scale": 8},
+            "d6": {"tier_id": 4, "depth_scale": 16}}}"#;
+        TierScales::parse(text.as_bytes(), "test-tiers").unwrap()
+    }
+
+    /// A small fast simulated display: 64x48 (canvas 48), vblank every 5 ms.
+    fn sim_display() -> SimCompositorConfig {
+        let mut sim = SimCompositorConfig::new(64, 48);
+        sim.refresh_us = 5_000;
+        sim
+    }
+
+    const PC_WAYLAND_HAPTIC_NULL: L2Sinks = L2Sinks { pc: L2SinkKind::Wayland, haptic: L2SinkKind::Null };
+
+    fn wayland_config(sim: SimCompositorConfig, representation: PcRepresentation) -> L2Config {
+        let mut c = config_sinks(PC_WAYLAND_HAPTIC_NULL, None, 64);
+        c.wayland = Some(WaylandSinkConfig {
+            buffers: sim.buffers,
+            backend: WaylandBackendKind::Simulated(sim),
+            representation,
+            tiers: tiers_meta(),
+            ready_timeout_us: 5_000_000,
+            release_timeout_us: 5_000_000,
+            diagnostics: None,
+        });
+        c.report_window_us = 1_000_000;
+        c
+    }
+
+    fn pc_frame(seq: u32) -> L2Identity {
+        L2Identity { modality: L2Modality::Pc, tier: 2, seq, pts_us: seq as u64 * 33_333, event_id: seq + 1, route: None }
+    }
+
+    /// d8-like synthetic records (coordinates up to 255, scale 4) and their
+    /// DracoPy encoding, from the skew-draco-sys fixtures (no dataset bytes).
+    fn pc_payload(representation: PcRepresentation) -> bytes::Bytes {
+        let name = match representation {
+            PcRepresentation::Bin => "synthetic_255.bin",
+            PcRepresentation::Draco => "synthetic_255.drc",
+        };
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../skew-draco-sys/tests/fixtures").join(name);
+        bytes::Bytes::from(std::fs::read(path).unwrap())
+    }
+
+    /// Submit `n` PC frames `gap_ms` apart and finish.
+    fn run_pc(config: L2Config, n: u32, gap_ms: u64, name: &str) -> (L2Summary, Vec<serde_json::Value>, PathBuf) {
+        let representation = config.wayland.as_ref().unwrap().representation;
+        let payload = pc_payload(representation);
+        let path = tmp(name);
+        let out = L2Output::start(&path, config).unwrap();
+        let s = out.submitter();
+        for seq in 0..n {
+            assert_eq!(s.submit_payload(pc_frame(seq), now_us(), Some(payload.clone())), L2SubmitOutcome::Submitted);
+            std::thread::sleep(Duration::from_millis(gap_ms));
+        }
+        drop(s);
+        let summary = out.finish().unwrap();
+        let rows = rows(&path);
+        (summary, rows, path)
+    }
+
+    /// Every submission has exactly one terminal (output or discard).
+    fn terminals_by_key(rows: &[serde_json::Value]) -> HashMap<String, Vec<serde_json::Value>> {
+        let mut map: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+        for r in rows.iter().filter(|r| r["role"] == "output" || (r["role"] == "explicit_discard" && r["discard_phase"] == "after_submit")) {
+            map.entry(key(r)).or_default().push(r.clone());
+        }
+        map
+    }
+
+    /// Bin frames, paced: each committed at an opportunity, presented at the
+    /// next vblank, one output per submission with its commit evidence; v1.4
+    /// meta, contract and sentinel; no decode fields for bin; the simulated
+    /// compositor never saw a write into a buffer it held.
+    #[test]
+    fn the_wayland_lane_presents_each_frame_once_with_its_feedback_evidence() {
+        let sim = sim_display();
+        let observer = sim.observer.clone();
+        let (summary, rows, path) = run_pc(wayland_config(sim, PcRepresentation::Bin), 8, 15, "pc-sim-happy");
+        assert!(summary.integrity_ok(PC_WAYLAND_HAPTIC_NULL), "{summary:?}");
+        assert_eq!((summary.submitted, summary.output), (8, 8));
+        let meta = &rows[0];
+        assert_eq!(meta["l2_schema"], "event-pair-l2-v1.4");
+        assert_eq!(meta["sinks"]["pc"], "wayland");
+        assert_eq!(meta["device_output"], false, "a simulated compositor is never a device output");
+        let contract = &meta["sink_contracts"]["pc"];
+        assert_eq!((contract["kind"].as_str(), contract["backend"].as_str()), (Some("wayland"), Some("simulated")));
+        assert_eq!((contract["device_output"].as_bool(), contract["resolves"].as_bool()), (Some(false), Some(true)));
+        for field in ["commit_id", "t_commit_us", "t_render_start_us", "refresh_us", "msc", "flags"] {
+            assert!(contract["output_detail"][field].is_string(), "schema of {field}");
+        }
+        let wayland = &meta["wayland"];
+        assert_eq!(wayland["canvas_side_px"], 48);
+        assert_eq!(wayland["startup"]["clock"], "CLOCK_MONOTONIC");
+        assert_eq!(wayland["representation"], "bin");
+        assert!(wayland["decoder"].is_null(), "no decoder for bin");
+        assert_eq!(wayland["tiers_meta"]["tiers_by_header_tier"]["2"]["depth_scale"], 4);
+        assert_no_raw_ns(&rows);
+        let terminals = terminals_by_key(&rows);
+        let mut previous_commit = 0u64;
+        for submit in rows.iter().filter(|r| r["role"] == "submit") {
+            let t = &terminals[&key(submit)];
+            assert_eq!(t.len(), 1, "exactly one terminal");
+            let o = &t[0];
+            assert_eq!(o["role"], "output");
+            assert!(o.get("t_decode_start_us").is_none() && o.get("t_decode_end_us").is_none(), "bin: no decode fields");
+            let d = &o["output_detail"];
+            assert_eq!((d["device"].as_str(), d["backend"].as_str()), (Some("wayland"), Some("simulated")));
+            let commit_id = d["commit_id"].as_u64().unwrap();
+            assert!(commit_id > previous_commit, "one commit per frame, in release order");
+            previous_commit = commit_id;
+            let v = |k: &str| o[k].as_u64().unwrap();
+            let dv = |k: &str| d[k].as_u64().unwrap();
+            assert!(v("t_submit_us") <= dv("t_render_start_us") && dv("t_render_start_us") <= dv("t_render_end_us"));
+            assert!(dv("t_render_end_us") <= dv("t_commit_us") && dv("t_commit_us") <= v("t_output_us"));
+            assert!(v("t_output_us") <= v("t_callback_us") && v("t_callback_us") <= v("t_log_arrival_us"));
+            assert_eq!(d["refresh_us"], 5_000);
+            assert_eq!(d["flag_names"], serde_json::json!(["vsync", "hw_clock", "hw_completion"]));
+            assert_eq!(d["points"], 1_500);
+            assert_eq!(d["depth_scale"], 4);
+        }
+        let end = sentinel(&rows);
+        assert_eq!(end["integrity_ok"], true);
+        let lane = &end["lanes"]["pc"];
+        assert_eq!((lane["kind"].as_str(), lane["backend"].as_str()), (Some("wayland"), Some("simulated")));
+        assert_eq!(lane["frames_rendered"], 8);
+        assert_eq!(lane["engine"]["commits"], 8);
+        assert_eq!(lane["engine"]["presented"], 8);
+        assert_eq!(lane["committed_without_feedback_at_close"], 0);
+        assert!(lane["device_failure"].is_null());
+        assert_eq!(observer.writes_into_held_buffers.load(Ordering::SeqCst), 0);
+        assert!(observer.dropped.load(Ordering::SeqCst), "disconnected at close");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Draco frames released in bursts: some are replaced in the pending
+    /// slot before any commit (`superseded_before_commit`), the rest are
+    /// presented; EVERY after-submit terminal of a decoded frame carries the
+    /// decode times, which precede the render; bin and draco frames of the
+    /// same content draw the same number of points.
+    #[test]
+    fn draco_terminals_carry_decode_times_and_superseded_frames_are_discarded_before_commit() {
+        let mut sim = sim_display();
+        sim.refresh_us = 40_000; // long frames: bursts must wait
+        let config = wayland_config(sim, PcRepresentation::Draco);
+        let payload = pc_payload(PcRepresentation::Draco);
+        let path = tmp("pc-sim-draco");
+        let out = L2Output::start(&path, config).unwrap();
+        let s = out.submitter();
+        for seq in 0..12u32 {
+            s.submit_payload(pc_frame(seq), now_us(), Some(payload.clone()));
+            if seq % 4 == 3 {
+                std::thread::sleep(Duration::from_millis(60));
+            }
+        }
+        drop(s);
+        let summary = out.finish().unwrap();
+        assert!(summary.integrity_ok(PC_WAYLAND_HAPTIC_NULL), "{summary:?}");
+        let rows = rows(&path);
+        let terminals = terminals_by_key(&rows);
+        let (mut outputs, mut superseded) = (0, 0);
+        for submit in rows.iter().filter(|r| r["role"] == "submit") {
+            let t = &terminals[&key(submit)];
+            assert_eq!(t.len(), 1, "exactly one terminal");
+            let r = &t[0];
+            let start = r["t_decode_start_us"].as_u64().expect("decode start on every draco terminal");
+            let end = r["t_decode_end_us"].as_u64().expect("decode end");
+            assert!(r["t_submit_us"].as_u64().unwrap() <= start && start <= end);
+            match r["role"].as_str().unwrap() {
+                "output" => {
+                    outputs += 1;
+                    assert!(end <= r["output_detail"]["t_render_start_us"].as_u64().unwrap());
+                    assert_eq!(r["output_detail"]["points"], 1_500, "same points as the bin frame");
+                }
+                _ => {
+                    assert_eq!(r["reason"], DISCARD_SUPERSEDED_BEFORE_COMMIT);
+                    assert!(end <= r["t_discard_us"].as_u64().unwrap());
+                    superseded += 1;
+                }
+            }
+        }
+        assert_eq!(outputs + superseded, 12);
+        assert!(outputs >= 3 && superseded >= 1, "outputs {outputs}, superseded {superseded}");
+        let meta = &rows[0];
+        assert_eq!(meta["wayland"]["decoder"]["version"], "1.5.7");
+        assert_eq!(meta["wayland"]["decoder"]["threads"], 1);
+        let lane = &sentinel(&rows)["lanes"]["pc"];
+        assert_eq!(lane["superseded_before_commit"], superseded);
+        assert!(lane["decode_us_max"].as_u64().is_some());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `discarded` feedback is the frame's after-submit terminal (not an
+    /// integrity failure); a frame callback alone never makes an output.
+    #[test]
+    fn a_compositor_discard_is_an_after_submit_terminal() {
+        let mut sim = sim_display();
+        sim.faults.push(SimWaylandFault::DiscardFeedback { commit_id: 2 });
+        let (summary, rows, path) = run_pc(wayland_config(sim, PcRepresentation::Bin), 3, 15, "pc-sim-discarded");
+        assert!(summary.integrity_ok(PC_WAYLAND_HAPTIC_NULL), "{summary:?}");
+        assert_eq!((summary.output, summary.discarded_after_submit), (2, 1));
+        let discard = rows.iter().find(|r| r["role"] == "explicit_discard").unwrap();
+        assert_eq!((discard["reason"].as_str(), discard["discard_phase"].as_str()), (Some(DISCARD_COMPOSITOR_DISCARDED), Some("after_submit")));
+        assert_eq!(discard["seq"], 1);
+        assert_eq!(sentinel(&rows)["lanes"]["pc"]["engine"]["compositor_discarded"], 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A lost compositor connection is an untimed PC device failure:
+    /// `lanes.pc.device_failure`, first_integrity_failure_us null, later
+    /// submissions `device_failure` after submit, and nothing committed after.
+    #[test]
+    fn a_compositor_disconnect_is_an_untimed_pc_device_failure() {
+        let mut sim = sim_display();
+        sim.faults.push(SimWaylandFault::Disconnect { after_start_us: 60_000 });
+        let observer = sim.observer.clone();
+        let (summary, rows, path) = run_pc(wayland_config(sim, PcRepresentation::Bin), 8, 15, "pc-sim-disconnect");
+        assert!(!summary.integrity_ok(PC_WAYLAND_HAPTIC_NULL));
+        assert_eq!(summary.first_integrity_failure_reason.as_deref(), Some(FAIL_WAYLAND_CONNECTION_LOST));
+        assert_eq!(summary.first_integrity_failure_us, None, "no occurrence time is claimed");
+        assert!(!summary.first_failure_time_determinable);
+        let end = sentinel(&rows);
+        let failure = &end["lanes"]["pc"]["device_failure"];
+        assert_eq!(failure["reason"], FAIL_WAYLAND_CONNECTION_LOST);
+        assert_eq!(failure["occurrence_time_determinable"], false);
+        let interval = failure["observation_interval_us"].as_array().unwrap();
+        assert!(interval[0].as_u64() <= interval[1].as_u64());
+        let discards: Vec<_> = rows.iter().filter(|r| r["role"] == "explicit_discard").collect();
+        assert!(!discards.is_empty(), "frames after the failure");
+        assert!(discards.iter().all(|d| d["reason"] == DISCARD_DEVICE_FAILURE && d["discard_phase"] == "after_submit"));
+        // Every submission has at most one terminal; outputs + discards +
+        // unresolved (a commit whose feedback can never come) = submitted.
+        assert!(summary.conservation_ok);
+        assert_eq!(summary.output + summary.discarded_after_submit + summary.submitted_unresolved, 8);
+        assert!(observer.commits.load(Ordering::SeqCst) < 8);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A commit whose feedback never comes stays unresolved (a committed
+    /// frame ends only through its feedback) and is the device failure
+    /// `wayland_feedback_missing` at close.
+    #[test]
+    fn missing_feedback_at_close_leaves_the_frame_unresolved_and_fails_the_pc_device() {
+        let mut sim = sim_display();
+        sim.faults.push(SimWaylandFault::DropFeedback { commit_id: 2 });
+        let mut config = wayland_config(sim, PcRepresentation::Bin);
+        config.report_window_us = 200_000;
+        let (summary, rows, path) = run_pc(config, 3, 15, "pc-sim-missing");
+        assert!(!summary.integrity_ok(PC_WAYLAND_HAPTIC_NULL));
+        assert_eq!(summary.output, 2);
+        assert_eq!(summary.submitted_unresolved_by_track[L2Modality::Pc.index()], 1);
+        assert_eq!(summary.first_integrity_failure_reason.as_deref(), Some(FAIL_WAYLAND_FEEDBACK_MISSING));
+        assert!(!summary.first_failure_time_determinable);
+        let lane = &sentinel(&rows)["lanes"]["pc"];
+        assert_eq!(lane["committed_without_feedback_at_close"], 1);
+        assert_eq!(lane["device_failure"]["reason"], FAIL_WAYLAND_FEEDBACK_MISSING);
+        assert!(rows.iter().all(|r| !(r["seq"] == 1 && (r["role"] == "output" || r["role"] == "explicit_discard"))));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A second `presented` for one commit is a timed integrity failure at
+    /// its receipt; the frame still has exactly one output.
+    #[test]
+    fn a_duplicate_feedback_is_a_timed_integrity_failure() {
+        let mut sim = sim_display();
+        sim.faults.push(SimWaylandFault::DuplicateFeedback { commit_id: 1 });
+        let (summary, rows, path) = run_pc(wayland_config(sim, PcRepresentation::Bin), 2, 15, "pc-sim-duplicate");
+        assert!(!summary.integrity_ok(PC_WAYLAND_HAPTIC_NULL));
+        assert_eq!(summary.output, 2);
+        assert_eq!(summary.first_integrity_failure_reason.as_deref(), Some(FAIL_WAYLAND_UNEXPECTED_FEEDBACK));
+        assert!(summary.first_failure_time_determinable);
+        let first_output = rows.iter().find(|r| r["role"] == "output" && r["seq"] == 0).unwrap();
+        let at = summary.first_integrity_failure_us.unwrap();
+        assert!(at >= first_output["t_callback_us"].as_u64().unwrap(), "timed at the duplicate's receipt");
+        let lane = &sentinel(&rows)["lanes"]["pc"];
+        assert_eq!(lane["engine"]["unexpected_feedback"], 1);
+        assert!(lane["anomalies"][0].as_str().unwrap().contains("already resolved"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A reconfigure after ready is a PC device failure; frames after it are
+    /// `device_failure`, already committed ones still get their feedback.
+    #[test]
+    fn a_reconfigure_after_ready_is_a_pc_device_failure() {
+        let mut sim = sim_display();
+        sim.faults.push(SimWaylandFault::Reconfigure { after_start_us: 50_000 });
+        let (summary, rows, path) = run_pc(wayland_config(sim, PcRepresentation::Bin), 6, 15, "pc-sim-reconfigure");
+        assert_eq!(summary.first_integrity_failure_reason.as_deref(), Some(FAIL_WAYLAND_RECONFIGURED));
+        assert!(!summary.first_failure_time_determinable);
+        assert_eq!(summary.submitted_unresolved, 0, "committed frames still resolved by feedback");
+        assert!(rows.iter().any(|r| r["reason"] == DISCARD_DEVICE_FAILURE));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The compositor never releases a buffer: after the free ones are used
+    /// the pending frame waits — a held buffer is never written — and stays
+    /// unresolved at close.
+    #[test]
+    fn held_buffers_are_never_written_and_the_frame_waits() {
+        let mut sim = sim_display();
+        sim.buffers = 2;
+        sim.faults.push(SimWaylandFault::NeverRelease);
+        let observer = sim.observer.clone();
+        let mut config = wayland_config(sim, PcRepresentation::Bin);
+        config.report_window_us = 150_000;
+        let (summary, rows, path) = run_pc(config, 3, 15, "pc-sim-held");
+        assert_eq!(observer.writes_into_held_buffers.load(Ordering::SeqCst), 0);
+        assert_eq!(observer.commits.load(Ordering::SeqCst), 1, "buffer 0 (startup) and 1 stay held");
+        assert_eq!(summary.output, 1);
+        let lane = &sentinel(&rows)["lanes"]["pc"];
+        assert!(lane["engine"]["commit_waits_for_buffer"].as_u64().unwrap() >= 1);
+        assert_eq!(lane["pending_at_close"], true);
+        assert_eq!(summary.submitted_unresolved, 1, "the pending frame");
+        assert_eq!(rows.iter().filter(|r| r["reason"] == DISCARD_SUPERSEDED_BEFORE_COMMIT).count(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Registration 3-2: clk_id must be CLOCK_MONOTONIC or the run refuses
+    /// to start — no meta row.
+    #[test]
+    fn a_presentation_clock_other_than_monotonic_refuses_the_run() {
+        let mut sim = sim_display();
+        sim.clock_id = libc::CLOCK_MONOTONIC_RAW as u32;
+        let path = tmp("pc-sim-clock");
+        let error = L2Output::start(&path, wayland_config(sim, PcRepresentation::Bin)).err().expect("refused");
+        let error = format!("{error:#}");
+        assert!(error.contains("not CLOCK_MONOTONIC") && error.contains("refuses to start"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"", "no meta row");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An unknown tier and a payload the decoder refuses: submit + an
+    /// after-submit discard + a timed integrity failure at t_submit.
+    #[test]
+    fn unknown_tiers_and_undecodable_payloads_are_terminated_and_fail_integrity() {
+        for (representation, payload, tier, reason, failure) in [
+            (PcRepresentation::Bin, pc_payload(PcRepresentation::Bin), 9u16, DISCARD_PAYLOAD_INVALID, FAIL_PC_PAYLOAD_INVALID),
+            (PcRepresentation::Draco, bytes::Bytes::from_static(b"not draco"), 2, DISCARD_DECODE_FAILED, FAIL_PC_DECODE_FAILED),
+        ] {
+            let path = tmp(&format!("pc-sim-invalid-{}", representation.as_str()));
+            let out = L2Output::start(&path, wayland_config(sim_display(), representation)).unwrap();
+            let s = out.submitter();
+            let identity = L2Identity { tier, ..pc_frame(0) };
+            s.submit_payload(identity, now_us(), Some(payload));
+            drop(s);
+            let summary = out.finish().unwrap();
+            assert!(!summary.integrity_ok(PC_WAYLAND_HAPTIC_NULL));
+            assert_eq!(summary.first_integrity_failure_reason.as_deref(), Some(failure));
+            let rows = rows(&path);
+            let submit = rows.iter().find(|r| r["role"] == "submit").unwrap();
+            assert_eq!(summary.first_integrity_failure_us, submit["t_submit_us"].as_u64());
+            let discard = rows.iter().find(|r| r["role"] == "explicit_discard").unwrap();
+            assert_eq!((discard["reason"].as_str(), discard["discard_phase"].as_str()), (Some(reason), Some("after_submit")));
+            assert_eq!(
+                discard.get("t_decode_start_us").is_some(),
+                representation == PcRepresentation::Draco,
+                "decode times only where a decode ran"
+            );
+            assert!(summary.conservation_ok && summary.submitted_unresolved == 0);
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// Two device lanes: the PC lane is ready, then the haptic stream cannot
+    /// start — the PC lane is closed and has disconnected before `start`
+    /// returns, and the file holds no meta row.
+    #[test]
+    fn a_failed_haptic_start_tears_down_the_ready_pc_lane() {
+        let sim = sim_display();
+        let observer = sim.observer.clone();
+        let mut config = wayland_config(sim, PcRepresentation::Bin);
+        config.sinks = L2Sinks { pc: L2SinkKind::Wayland, haptic: L2SinkKind::Alsa };
+        config.alsa = Some(sim_alsa(vec![SimFault::StartError]));
+        let path = tmp("pc-sim-teardown");
+        let error = format!("{:#}", L2Output::start(&path, config).err().expect("refused"));
+        assert!(error.contains("ALSA haptic sink failed to start"), "{error}");
+        assert!(error.contains("the PC Wayland lane was closed and has disconnected"), "{error}");
+        assert!(observer.dropped.load(Ordering::SeqCst), "the compositor connection is gone");
+        assert_eq!(std::fs::read(&path).unwrap(), b"", "no meta row");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Both tracks on device sinks: the file is a device output only with
+    /// the display backend AND the ALSA device (pure config, nothing opened).
+    #[test]
+    fn device_output_needs_the_display_and_the_alsa_device() {
+        let mut config = wayland_config(sim_display(), PcRepresentation::Bin);
+        config.sinks = L2Sinks { pc: L2SinkKind::Wayland, haptic: L2SinkKind::Alsa };
+        config.alsa = Some(sim_alsa(Vec::new()));
+        assert!(config.validate().is_ok());
+        assert!(!config.device_output_of(L2Modality::Pc) && !config.device_output());
+        config.wayland.as_mut().unwrap().backend = WaylandBackendKind::Display;
+        assert!(config.device_output_of(L2Modality::Pc));
+        assert!(!config.device_output(), "the haptic stream is simulated");
+        config.alsa.as_mut().unwrap().backend = AlsaBackend::Device { name: "hw:1,0".into() };
+        assert!(config.device_output(), "display + ALSA device");
+        // Wayland is a PC sink only, and its options need it.
+        let mut bad = config.clone();
+        bad.sinks.haptic = L2SinkKind::Wayland;
+        assert!(bad.validate().is_err());
+        let mut bad = config.clone();
+        bad.sinks.pc = L2SinkKind::Fake;
+        bad.fake = Some(FakeSinkConfig::offsets(1, 1));
+        assert!(bad.validate().is_err(), "Wayland options without the Wayland sink");
+        let mut bad = config;
+        bad.wayland.as_mut().unwrap().buffers = 1;
+        assert!(bad.validate().is_err());
     }
 }

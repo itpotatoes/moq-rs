@@ -163,6 +163,10 @@ fn main() {
     let mut build = cc::Build::new();
     build
         .cpp(true)
+        // libstdc++ is linked below with `as-needed`, so that binaries of a
+        // dependent package that never call the decoder (e.g. the sender) do
+        // not get a NEEDED libstdc++.so.6.
+        .cpp_link_stdlib(None)
         .no_default_flags(true)
         .warnings(false)
         .extra_warnings(false)
@@ -194,6 +198,7 @@ fn main() {
         .and_then(|text| text.lines().next().map(str::to_string))
         .unwrap_or_else(|| "unknown".into());
     build.compile("skew_draco");
+    println!("cargo:rustc-link-lib=dylib=stdc++");
 
     let (digest, files) = source_digest(&root);
     // The include paths are absolute (machine-specific); record them

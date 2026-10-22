@@ -46,3 +46,7 @@ libloading = "0.8"
 # libwayland-client nor its -dev package is needed to build or to run.
 wayland-client = "0.31.15"
 wayland-protocols = { version = "0.32.13", features = ["client"] }
+# L2 PC sink: the vendored Draco 1.5.7 decoder and the CPU point renderer
+# (workspace crates, opt-level 3 in every profile).
+skew-draco-sys = { path = "../skew-draco-sys" }
+skew-pc-render = { path = "../skew-pc-render" }

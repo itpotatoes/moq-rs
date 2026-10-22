@@ -100,8 +100,8 @@ enum L2SinkArg {
 
 /// Parse `--l2-sink`: `none`; `null` or `fake` for both tracks; or per track
 /// `pc=<kind>,haptic=<kind>` (both keys, once each, any order). PC kinds:
-/// `null`, `fake` (`wayland` is milestone M3); haptic kinds: `null`, `fake`,
-/// `alsa` (the PCM device; `--l2-alsa-*`).
+/// `null`, `fake`, `wayland` (the display; `--l2-wayland-*`); haptic kinds:
+/// `null`, `fake`, `alsa` (the PCM device; `--l2-alsa-*`).
 fn parse_l2_sink(value: &str) -> std::result::Result<L2SinkArg, String> {
     use skew_moq::l2_output::{L2SinkKind, L2Sinks};
     let kind_of = |track: &str, kind: &str| -> std::result::Result<L2SinkKind, String> {
@@ -109,8 +109,9 @@ fn parse_l2_sink(value: &str) -> std::result::Result<L2SinkArg, String> {
             (_, "null") => Ok(L2SinkKind::Null),
             (_, "fake") => Ok(L2SinkKind::Fake),
             ("haptic", "alsa") => Ok(L2SinkKind::Alsa),
-            ("pc", "wayland") => Err("the PC Wayland sink is milestone M3 and not available yet".into()),
-            ("pc", "alsa") => Err("alsa is a haptic sink; use pc=<null|fake>,haptic=<kind>".into()),
+            ("pc", "wayland") => Ok(L2SinkKind::Wayland),
+            ("pc", "alsa") => Err("alsa is a haptic sink; use pc=<null|fake|wayland>,haptic=<kind>".into()),
+            ("haptic", "wayland") => Err("wayland is a PC sink; use pc=wayland,haptic=<kind>".into()),
             _ => Err(format!("unknown {track} sink kind {kind:?}")),
         }
     };
@@ -118,7 +119,8 @@ fn parse_l2_sink(value: &str) -> std::result::Result<L2SinkArg, String> {
         "none" => return Ok(L2SinkArg::None),
         "null" => return Ok(L2SinkArg::Sinks(L2Sinks::both(L2SinkKind::Null))),
         "fake" => return Ok(L2SinkArg::Sinks(L2Sinks::both(L2SinkKind::Fake))),
-        "alsa" => return Err("alsa is a haptic sink; use pc=<null|fake>,haptic=alsa".into()),
+        "alsa" => return Err("alsa is a haptic sink; use pc=<null|fake|wayland>,haptic=alsa".into()),
+        "wayland" => return Err("wayland is a PC sink; use pc=wayland,haptic=<null|fake|alsa>".into()),
         _ => {}
     }
     let (mut pc, mut haptic) = (None, None);
@@ -265,9 +267,12 @@ struct Args {
     /// `null` accepts releases and never resolves them (overhead measurement
     /// only); `fake` emits a synthetic `output` at `t_submit + offset`;
     /// haptic `alsa` plays the released PCM on the device (`--l2-alsa-*`) and
-    /// reports ALSA-derived output times (only an all-device file has
-    /// `device_output: true`; PC `wayland` is milestone M3). Only the ACTUAL
-    /// release points of b1/s1/s2/s3/s3r submit.
+    /// reports ALSA-derived output times; PC `wayland` renders each released
+    /// frame (Draco decoded first under `--representation draco`) into a
+    /// fullscreen window on the user's Wayland display and reports
+    /// `wp_presentation` output times (`--l2-wayland-*`). Only an all-device
+    /// file (`pc=wayland,haptic=alsa`) has `device_output: true`. Only the
+    /// ACTUAL release points of b1/s1/s2/s3/s3r submit.
     #[arg(long, default_value = "none", value_parser = parse_l2_sink)]
     l2_sink: L2SinkArg,
     /// Separate L2 JSONL (schema `skew_moq::l2_output::L2_SCHEMA`, v1.2).
@@ -319,6 +324,17 @@ struct Args {
     /// default 1000).
     #[arg(long)]
     l2_alsa_status_interval_us: Option<u64>,
+    /// PC Wayland sink (`--l2-sink pc=wayland,...`): the tiers meta file
+    /// (schema `phase4_s3_tiers_v1`, e.g. `datasets/tiers_s3/tiers_meta.json`)
+    /// whose `depth_scale` gives each header tier's point scale. Required
+    /// with the Wayland sink; its sha256 is recorded in the L2 meta row. The
+    /// window opens on the display of `WAYLAND_DISPLAY` before the run starts.
+    #[arg(long)]
+    l2_wayland_tiers_meta: Option<PathBuf>,
+    /// PC Wayland sink: wl_shm buffers (default 4; a provisional SINK
+    /// parameter recorded in the L2 meta row).
+    #[arg(long)]
+    l2_wayland_buffers: Option<usize>,
     #[arg(long)]
     s_bytes: u64,
     #[arg(long)]
@@ -1233,9 +1249,11 @@ fn l2_output_config(args: &Args) -> Result<Option<(PathBuf, skew_moq::l2_output:
     use skew_moq::l2_haptic::PlacementConfig;
     use skew_moq::l2_output::{
         AlsaBackend, AlsaSinkConfig, FakeSinkConfig, L2Config, L2Modality, L2SinkKind,
-        ALSA_DEFAULT_BUFFER_FRAMES, ALSA_DEFAULT_DEVICE, ALSA_DEFAULT_PERIOD_FRAMES,
-        ALSA_DEFAULT_PREFILL_FRAMES, ALSA_DEFAULT_QUEUE_FRAMES, ALSA_DEFAULT_STATUS_INTERVAL_US,
-        ALSA_DEFAULT_TARGET_FILL_FRAMES, ALSA_READY_TIMEOUT_US, ALSA_RELEASE_TIMEOUT_US,
+        WaylandBackendKind, WaylandSinkConfig, ALSA_DEFAULT_BUFFER_FRAMES, ALSA_DEFAULT_DEVICE,
+        ALSA_DEFAULT_PERIOD_FRAMES, ALSA_DEFAULT_PREFILL_FRAMES, ALSA_DEFAULT_QUEUE_FRAMES,
+        ALSA_DEFAULT_STATUS_INTERVAL_US, ALSA_DEFAULT_TARGET_FILL_FRAMES, ALSA_READY_TIMEOUT_US,
+        ALSA_RELEASE_TIMEOUT_US, WAYLAND_DEFAULT_BUFFERS, WAYLAND_READY_TIMEOUT_US,
+        WAYLAND_RELEASE_TIMEOUT_US,
     };
     let fake_given =
         args.l2_fake_pc_offset_us.is_some() || args.l2_fake_haptic_offset_us.is_some();
@@ -1246,19 +1264,46 @@ fn l2_output_config(args: &Args) -> Result<Option<(PathBuf, skew_moq::l2_output:
         || args.l2_alsa_prefill_frames.is_some()
         || args.l2_alsa_queue_frames.is_some()
         || args.l2_alsa_status_interval_us.is_some();
+    let wayland_given = args.l2_wayland_tiers_meta.is_some() || args.l2_wayland_buffers.is_some();
     let sinks = match args.l2_sink {
         L2SinkArg::None => {
             if args.l2_log.is_some()
                 || fake_given
                 || alsa_given
+                || wayland_given
                 || args.l2_queue_capacity.is_some()
                 || args.l2_report_window_ms.is_some()
             {
-                bail!("--l2-log/--l2-fake-*/--l2-alsa-*/--l2-queue-capacity/--l2-report-window-ms require an --l2-sink other than none");
+                bail!("--l2-log/--l2-fake-*/--l2-alsa-*/--l2-wayland-*/--l2-queue-capacity/--l2-report-window-ms require an --l2-sink other than none");
             }
             return Ok(None);
         }
         L2SinkArg::Sinks(sinks) => sinks,
+    };
+    let wayland = if sinks.pc == L2SinkKind::Wayland {
+        let tiers_path = args
+            .l2_wayland_tiers_meta
+            .as_ref()
+            .context("--l2-sink pc=wayland requires --l2-wayland-tiers-meta")?;
+        let tiers = skew_moq::l2_pc::TierScales::load(tiers_path).map_err(anyhow::Error::msg)?;
+        Some(WaylandSinkConfig {
+            backend: WaylandBackendKind::Display,
+            representation: match args.representation {
+                Representation::Bin => skew_moq::l2_pc::PcRepresentation::Bin,
+                Representation::Draco => skew_moq::l2_pc::PcRepresentation::Draco,
+            },
+            tiers,
+            buffers: args.l2_wayland_buffers.unwrap_or(WAYLAND_DEFAULT_BUFFERS),
+            ready_timeout_us: WAYLAND_READY_TIMEOUT_US,
+            release_timeout_us: WAYLAND_RELEASE_TIMEOUT_US,
+            // The receiver never writes the probe-only diagnostics file.
+            diagnostics: None,
+        })
+    } else {
+        if wayland_given {
+            bail!("--l2-wayland-* options require --l2-sink pc=wayland,haptic=<kind>");
+        }
+        None
     };
     let alsa = if sinks.haptic == L2SinkKind::Alsa {
         Some(AlsaSinkConfig {
@@ -1331,6 +1376,7 @@ fn l2_output_config(args: &Args) -> Result<Option<(PathBuf, skew_moq::l2_output:
         sinks,
         fake,
         alsa,
+        wayland,
         queue_capacity: args.l2_queue_capacity.unwrap_or(L2_DEFAULT_QUEUE_CAPACITY),
         row_capacity: L2_ROW_CAPACITY,
         report_window_us: ms_to_us(
@@ -9271,6 +9317,8 @@ mod rx_ending_tests {
             l2_alsa_prefill_frames: None,
             l2_alsa_queue_frames: None,
             l2_alsa_status_interval_us: None,
+            l2_wayland_tiers_meta: None,
+            l2_wayland_buffers: None,
             s_bytes: 1,
             c_mbps: None,
             rtt_ms: 0.0,
@@ -9573,6 +9621,8 @@ mod rx_ending_tests {
             l2_alsa_prefill_frames: None,
             l2_alsa_queue_frames: None,
             l2_alsa_status_interval_us: None,
+            l2_wayland_tiers_meta: None,
+            l2_wayland_buffers: None,
             s_bytes: 1,
             c_mbps: None,
             rtt_ms: 0.0,
@@ -9686,6 +9736,8 @@ mod rx_ending_tests {
             l2_alsa_prefill_frames: None,
             l2_alsa_queue_frames: None,
             l2_alsa_status_interval_us: None,
+            l2_wayland_tiers_meta: None,
+            l2_wayland_buffers: None,
             s_bytes: 1,
             c_mbps: None,
             rtt_ms: 0.0,
@@ -14063,6 +14115,7 @@ mod s3_control_loop_tests {
                 sinks: skew_moq::l2_output::L2Sinks::both(L2SinkKind::Fake),
                 fake: Some(FakeSinkConfig::offsets(800, 300)),
                 alsa: None,
+                wayland: None,
                 queue_capacity: 64,
                 row_capacity: 1024,
                 report_window_us: 300_000,
@@ -16429,6 +16482,7 @@ mod l2_hook_tests {
                 sinks: skew_moq::l2_output::L2Sinks::both(L2SinkKind::Fake),
                 fake: Some(FakeSinkConfig::offsets(pc, haptic)),
                 alsa: None,
+                wayland: None,
                 queue_capacity: 64,
                 row_capacity: 1024,
                 report_window_us: 200_000,
@@ -16668,7 +16722,7 @@ mod l2_hook_tests {
         // Malformed specs never parse.
         for spec in [
             "pc=fake", "haptic=fake", "pc=fake,haptic=null,pc=null", "pc=alsa,haptic=null",
-            "pc=wayland,haptic=fake", "pc=fake,haptic=bogus", "video=fake,haptic=null",
+            "pc=fake,haptic=wayland", "wayland", "pc=fake,haptic=bogus", "video=fake,haptic=null",
             "pc=fake;haptic=null", "", "pc=,haptic=null", "fake,null",
         ] {
             assert!(b1_cli(&["--l2-sink", spec, "--l2-log", &fresh_s]).is_err(), "{spec:?}");
@@ -16737,6 +16791,74 @@ mod l2_hook_tests {
         assert!(!fresh.exists(), "validation never creates the L2 log");
     }
 
+    /// M3: `pc=wayland` builds the PC Wayland sink configuration WITHOUT
+    /// connecting to any display (this test never starts the stage): the
+    /// display backend, the representation from `--representation`, the
+    /// tiers meta depth scales (read only, sha256 recorded) and the buffer
+    /// count. `pc=wayland,haptic=alsa` is the all-device configuration.
+    /// Every `--l2-wayland-*` option is refused unless the PC sink is wayland.
+    #[test]
+    fn pc_wayland_config_is_built_without_connecting_and_wayland_options_are_refused_elsewhere() {
+        use skew_moq::l2_output::{L2Modality, L2Sinks, WaylandBackendKind};
+        use skew_moq::l2_pc::PcRepresentation;
+        let fresh = tmp("cli-wayland");
+        let fresh_s = fresh.display().to_string();
+        let tiers = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../datasets/tiers_s3/tiers_meta.json");
+        let tiers_s = tiers.display().to_string();
+        let args = b1_cli(&[
+            "--l2-sink", "pc=wayland,haptic=alsa", "--l2-log", &fresh_s, "--l2-wayland-tiers-meta", &tiers_s,
+        ])
+        .unwrap();
+        let (_, config) = l2_output_config(&args).unwrap().unwrap();
+        assert_eq!(config.sinks, L2Sinks { pc: L2SinkKind::Wayland, haptic: L2SinkKind::Alsa });
+        let wayland = config.wayland.as_ref().expect("the Wayland sink configuration");
+        assert!(matches!(wayland.backend, WaylandBackendKind::Display));
+        assert_eq!(wayland.representation, PcRepresentation::Bin);
+        assert_eq!(wayland.buffers, 4);
+        assert_eq!(wayland.tiers.depth_scale(2), Some(4));
+        assert_eq!(wayland.tiers.depth_scale(3), Some(8));
+        assert_eq!(wayland.tiers.depth_scale(4), Some(16));
+        assert_eq!(wayland.tiers.sha256.len(), 64);
+        assert!(wayland.diagnostics.is_none(), "the receiver never writes the probe diagnostics");
+        assert!(config.device_output_of(L2Modality::Pc));
+        assert!(config.device_output(), "display + ALSA device: the campaign configuration");
+        // Draco: the representation axis selects the decoder.
+        let mut cli: Vec<String> = [
+            "moq_receiver", "--run-id", "t", "--out", "/tmp/skew-l2-unused-rx.jsonl", "--s-bytes", "1",
+            "--pc-rate-hz", "30", "--haptic-rate-hz", "90", "--payload-mode", "frame",
+            "--representation", "draco", "--chunk-bytes", "178",
+            "--reassembly-max-pending-frames", "64", "--reassembly-max-pending-bytes",
+            "67108864", "--reassembly-max-age-ms", "2000", "--topology", "relay",
+            "--duration-s", "1", "--l2-sink", "pc=wayland,haptic=null", "--l2-log",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        cli.extend([fresh_s.clone(), "--l2-wayland-tiers-meta".into(), tiers_s.clone(), "--l2-wayland-buffers".into(), "3".into()]);
+        let (_, config) = l2_output_config(&Args::try_parse_from(cli).unwrap()).unwrap().unwrap();
+        let wayland = config.wayland.clone().unwrap();
+        assert_eq!(wayland.representation, PcRepresentation::Draco);
+        assert_eq!(wayland.buffers, 3);
+        assert!(!config.device_output_of(L2Modality::Haptic) && !config.device_output());
+        // Refused: no tiers meta, a tiers meta of another schema, a missing
+        // file, too few buffers, Wayland options without the Wayland sink.
+        let other_schema = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../datasets/tiers/tiers_meta.json");
+        let other_s = other_schema.display().to_string();
+        for extra in [
+            &["--l2-sink", "pc=wayland,haptic=null", "--l2-log", &fresh_s][..],
+            &["--l2-sink", "pc=wayland,haptic=null", "--l2-log", &fresh_s, "--l2-wayland-tiers-meta", &other_s][..],
+            &["--l2-sink", "pc=wayland,haptic=null", "--l2-log", &fresh_s, "--l2-wayland-tiers-meta", "/nonexistent/tiers_meta.json"][..],
+            &["--l2-sink", "pc=wayland,haptic=null", "--l2-log", &fresh_s, "--l2-wayland-tiers-meta", &tiers_s, "--l2-wayland-buffers", "1"][..],
+            &["--l2-wayland-tiers-meta", &tiers_s][..],
+            &["--l2-sink", "pc=null,haptic=null", "--l2-log", &fresh_s, "--l2-wayland-buffers", "4"][..],
+        ] {
+            let args = b1_cli(extra).unwrap();
+            assert!(l2_output_config(&args).is_err(), "{extra:?}");
+        }
+        assert!(b1_cli(&["--l2-sink", "pc=null,haptic=wayland", "--l2-log", &fresh_s]).is_err());
+        assert!(!fresh.exists(), "validation never creates the L2 log");
+    }
+
     /// F2: an existing L2 path (regular file, symlink to the rx log, dangling
     /// symlink) is refused before any log is opened, and by the start helper
     /// after the rx log is open; the existing bytes are never touched.
@@ -16791,6 +16913,7 @@ mod l2_hook_tests {
                 sinks: skew_moq::l2_output::L2Sinks::both(L2SinkKind::Fake),
                 fake: Some(fake),
                 alsa: None,
+                wayland: None,
                 queue_capacity: 64,
                 row_capacity: 1024,
                 report_window_us: 50_000,

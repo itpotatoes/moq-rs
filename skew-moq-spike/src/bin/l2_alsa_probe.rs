@@ -259,6 +259,7 @@ fn run(args: &Args) -> Result<bool> {
             release_timeout_us: ALSA_RELEASE_TIMEOUT_US,
             diagnostics: args.diagnostics.clone(),
         }),
+        wayland: None,
         queue_capacity: 256,
         row_capacity: 65_536,
         report_window_us: args.report_window_ms.saturating_mul(1_000),

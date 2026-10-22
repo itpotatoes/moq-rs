@@ -16,6 +16,8 @@ pub mod exp2_recorder;
 pub mod l2_alsa;
 pub mod l2_haptic;
 pub mod l2_output;
+pub mod l2_pc;
+pub mod l2_wayland;
 pub mod phase;
 pub mod receive_trace;
 pub mod playout;
