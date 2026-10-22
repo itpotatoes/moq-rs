@@ -5059,6 +5059,74 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// v1.4 extended order rule of PC Wayland rows, replayed through the
+    /// writer: a commit after the reported presentation (the signature of a
+    /// wrong commit_id -> frame mapping), a decode ending after the render
+    /// started, and a render ending after the commit are each an
+    /// `output_order_violation` timed at the row's `t_callback_us`; the
+    /// consistent row passes. Values are written as given.
+    #[test]
+    fn a_pc_wayland_row_out_of_pipeline_order_is_an_integrity_failure() {
+        use crate::l2_pc::{FrameInfo, PcTiming, Presented};
+        let base = now_us();
+        let presented = |t_us: u64| Presented {
+            tv_sec: t_us / 1_000_000,
+            tv_nsec: ((t_us % 1_000_000) * 1_000) as u32,
+            refresh_ns: 16_666_667,
+            seq: 7,
+            flags: 0x7,
+            sync_outputs: 1,
+        };
+        // (name, decode, render start, render end, commit, output, violation?)
+        let cases = [
+            ("pc-order-ok", Some((base + 10, base + 20)), base + 30, base + 40, base + 50, base + 60, false),
+            ("pc-order-commit-after-output", None, base + 30, base + 40, base + 70, base + 60, true),
+            ("pc-order-decode-after-render-start", Some((base + 10, base + 35)), base + 30, base + 40, base + 50, base + 60, true),
+            ("pc-order-render-after-commit", None, base + 30, base + 55, base + 50, base + 60, true),
+        ];
+        for (name, decode_us, render_start, render_end, t_commit, t_output, violation) in cases {
+            let s = L2Submission { identity: id(L2Modality::Pc, 4), t_release_us: base - 5, t_submit_us: base };
+            let t_callback = base + 100;
+            let detail = WaylandOutputDetail {
+                backend: "simulated",
+                commit_id: 1,
+                buffer: 1,
+                timing: PcTiming { decode_us, t_render_start_us: render_start, t_render_end_us: render_end },
+                t_commit_us: t_commit,
+                presented: presented(t_output),
+                info: FrameInfo { points: 1, covered_pixels: 1, depth_scale: 4 },
+            };
+            let path = tmp(name);
+            let summary = replay(
+                &path,
+                L2SinkKind::Fake,
+                vec![
+                    Row::Submit(s),
+                    Row::Output {
+                        submission: s,
+                        t_output_us: t_output,
+                        t_callback_us: t_callback,
+                        detail: OutputDetail::Wayland(Box::new(detail)),
+                    },
+                ],
+                None,
+            );
+            let rows = rows(&path);
+            let o = rows.iter().find(|r| r["role"] == "output").unwrap();
+            assert_eq!(o["output_detail"]["t_commit_us"].as_u64(), Some(t_commit), "{name}: written as is");
+            assert_eq!(o.get("t_decode_start_us").and_then(|v| v.as_u64()), decode_us.map(|d| d.0), "{name}");
+            if violation {
+                assert_eq!(summary.output_order_violation, 1, "{name}");
+                assert_eq!(summary.first_integrity_failure_reason.as_deref(), Some(FAIL_OUTPUT_ORDER), "{name}");
+                assert_eq!(summary.first_integrity_failure_us, Some(t_callback), "{name}");
+            } else {
+                assert_eq!(summary.output_order_violation, 0, "{name}");
+                assert!(summary.integrity_ok(L2Sinks::both(L2SinkKind::Fake)), "{name}: {summary:?}");
+            }
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
     /// Both tracks on device sinks: the file is a device output only with
     /// the display backend AND the ALSA device (pure config, nothing opened).
     #[test]

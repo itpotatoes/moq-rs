@@ -260,9 +260,12 @@ struct Args {
     #[arg(long, default_value_t = 4096)]
     receive_trace_capacity: usize,
     /// L2 output stage (experiment 1-D). `none` (the default) constructs
-    /// nothing: no thread, no file, no row, no device, no library load, no
-    /// clock read, and the rx log is byte-identical to a build without this
-    /// option. Otherwise the sink of each track: `null` or `fake` for both,
+    /// nothing at run time: no thread, no file, no row, no device, no
+    /// runtime library load, no clock read, and the rx log is byte-identical
+    /// to a build without this option. (Since M3 the binary links the
+    /// vendored Draco C++ decoder, so the dynamic linker loads libstdc++.so.6
+    /// at exec, before `main`, whatever this option; no Draco code runs and
+    /// the Draco archive has no static initializer.) Otherwise the sink of each track: `null` or `fake` for both,
     /// or per track `pc=<kind>,haptic=<kind>` (e.g. `pc=fake,haptic=alsa`).
     /// `null` accepts releases and never resolves them (overhead measurement
     /// only); `fake` emits a synthetic `output` at `t_submit + offset`;
