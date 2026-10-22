@@ -1384,6 +1384,38 @@ mod s3_test_seam {
         plan.fired = true;
         Some(plan.cutoff)
     }
+
+    /// A scripted action run ONCE between exit drain pass 1 and the
+    /// subscription teardown of the run with this id (1-D §11-7 M2 work order
+    /// (6)): it receives the rx logger and may publish on the still-open
+    /// scripted tracks, so objects can arrive between the passes
+    /// deterministically. Taken (removed) when run.
+    pub type BetweenPasses = Box<
+        dyn FnOnce(
+                std::sync::Arc<Mutex<skew_moq::JsonlLogger>>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+            + Send,
+    >;
+
+    static BETWEEN: Mutex<Option<HashMap<String, BetweenPasses>>> = Mutex::new(None);
+
+    pub fn arm_between_exit_passes(run_id: &str, action: BetweenPasses) {
+        let mut plans = BETWEEN.lock().unwrap_or_else(|p| p.into_inner());
+        plans.get_or_insert_with(HashMap::new).insert(run_id.to_string(), action);
+    }
+
+    pub async fn between_exit_passes(
+        run_id: &str,
+        logger: &std::sync::Arc<Mutex<skew_moq::JsonlLogger>>,
+    ) {
+        let action = {
+            let mut plans = BETWEEN.lock().unwrap_or_else(|p| p.into_inner());
+            plans.as_mut().and_then(|p| p.remove(run_id))
+        };
+        if let Some(action) = action {
+            action(logger.clone()).await;
+        }
+    }
 }
 
 /// Close the L2 output stage (registration §3-5 order, see `L2Output::finish`)
@@ -3893,6 +3925,36 @@ fn keep_first_cause(outcome_error: &mut Option<anyhow::Error>, error: anyhow::Er
     }
 }
 
+/// The tail of ONE exit-drain event (registration 1-D §11-7 M2 work order
+/// (5), Codex 108 P2): the handler's own `failure` and the epoch-row error
+/// are merged into `outcome_error` — and so, with L2, stamped — BEFORE the
+/// dispatch, in the order they happened; the dispatch error, if any, is
+/// merged after it. First-cause-wins throughout (`keep_first_cause`), so a
+/// cause stored earlier (the error that ended the loop) is never replaced.
+///
+/// Registered policy, which differs from the main loop on purpose: the
+/// dispatch runs EVEN IF the epoch row failed. In the main loop an epoch-row
+/// failure stores the cause and skips the iteration's dispatch (`continue`;
+/// the loop then ends on the cause); here the run is already ending and the
+/// dispatch is what gives every admitted object its terminal row (and, with
+/// L2, its submit), so skipping it would only add unaccounted objects to a
+/// run that already failed. The epoch-row failure is the run's cause (unless
+/// an earlier one exists), and it is stamped before the dispatch's own log
+/// writes and L2 submits.
+fn merge_then_dispatch_at_exit(
+    outcome_error: &mut Option<anyhow::Error>,
+    failure: Option<anyhow::Error>,
+    epoch_logged: Result<()>,
+    dispatch: impl FnOnce() -> Result<()>,
+) {
+    for error in [failure, epoch_logged.err()].into_iter().flatten() {
+        keep_first_cause(outcome_error, error);
+    }
+    if let Err(error) = dispatch() {
+        keep_first_cause(outcome_error, error);
+    }
+}
+
 /// One additive `info` row from the shutdown sequence. Returns the error
 /// instead of propagating it so the caller can fold it into `outcome_error`
 /// with `keep_first_cause` and still finish the shutdown sequence.
@@ -5376,27 +5438,21 @@ fn drain_s3_events_at_exit<H>(
         let epoch_logged = log_common_epochs(scheduler, logger, config);
         // Same terminal accounting as the shutdown flush that follows: no
         // bridge, no render, no audio — this path is teardown, not playback.
-        // Dispatch even if the epoch row failed: every admitted object still
-        // gets its terminal, and the failure is the run's cause below.
-        let dispatched = dispatch_s3_playout_actions(
-            actions,
-            object_routes,
-            tracker,
-            logger,
-            None,
-            false,
-            false,
-            stats,
-            now,
-            &|action| scheduler.action_due_us(action),
-            l2,
-        );
-        // `failure` was stamped where it was stored; an epoch-row or dispatch
-        // error is stored (and stamped) here, in the order they happened.
-        // Same first-writer-wins merge as before.
-        for error in [failure, epoch_logged.err(), dispatched.err()].into_iter().flatten() {
-            keep_first_cause(outcome_error, error);
-        }
+        merge_then_dispatch_at_exit(outcome_error, failure, epoch_logged, || {
+            dispatch_s3_playout_actions(
+                actions,
+                object_routes,
+                tracker,
+                logger,
+                None,
+                false,
+                false,
+                stats,
+                now,
+                &|action| scheduler.action_due_us(action),
+                l2,
+            )
+        });
     };
     ExitDrain {
         drained,
@@ -7182,6 +7238,14 @@ where
         keep_first_cause(&mut outcome_error, error);
     }
 
+    // Test-only (1-D §11-7 M2 work order (6)): a scripted action between
+    // pass 1 and the subscription teardown, keyed by run id, so a test of
+    // THIS loop can make objects arrive between the passes. Outside
+    // `cfg(test)` the statement does not exist; the production binary is
+    // unchanged by it.
+    #[cfg(test)]
+    s3_test_seam::between_exit_passes(&args.run_id, &logger).await;
+
     // Stop every subscription before joining/aborting its drain, then stop the
     // session. No detached reader is allowed to write after shutdown logging.
     // Retiring routes lose their remaining drain window at shutdown; this is
@@ -8349,28 +8413,28 @@ async fn main() -> Result<()> {
     // rx side. Each outcome is now classified and reported.
     let drain_fault = l2_output.as_ref().map(|output| output.fault_stamp());
     let all_drains = join_rx_drains(&mut drains, &drain_fault);
+    // L2 (registration §6-1; 1-D §11-7 M2 work order (7), Codex 107): the
+    // session/max-duration end is stamped inside its select arm at the
+    // moment it is decided, BEFORE the stderr write (a blocked stderr pipe
+    // would otherwise delay the recorded time). Inert without L2.
     let drained = tokio::select! {
         ends = all_drains => Drained::Ends(ends),
         r = &mut session_run => {
-            eprintln!("[rx] session ended before tracks closed: {r:?}");
-            Drained::SessionArm(format!("{r:?}"))
+            let detail = format!("{r:?}");
+            note_l2_fault(l2_output.as_ref(), || {
+                format!("session ended before tracks closed: {detail}")
+            });
+            eprintln!("[rx] session ended before tracks closed: {detail}");
+            Drained::SessionArm(detail)
         }
         _ = tokio::time::sleep_until(deadline) => {
+            note_l2_fault(l2_output.as_ref(), || {
+                "max-duration reached — reception is INCOMPLETE".to_string()
+            });
             eprintln!("[rx] max-duration reached — reception is INCOMPLETE");
             Drained::Timeout
         }
     };
-    // L2 (registration §6-1): the session/max-duration end is recorded here,
-    // with no `.await` since the select returned. Inert without L2.
-    match &drained {
-        Drained::Timeout => note_l2_fault(l2_output.as_ref(), || {
-            "max-duration reached — reception is INCOMPLETE".to_string()
-        }),
-        Drained::SessionArm(detail) => note_l2_fault(l2_output.as_ref(), || {
-            format!("session ended before tracks closed: {detail}")
-        }),
-        Drained::Ends(_) => {}
-    }
 
     // A cancelled select branch must not detach receiver tasks. Abort and join
     // any outstanding producer before closing the scheduler input.
@@ -8501,26 +8565,13 @@ async fn main() -> Result<()> {
             verdict
         }
     };
-    if ending == RxEnding::Normal {
-        println!("[rx] tracks closed");
-    } else {
-        eprintln!("[rx] abnormal ending: {} ({detail})", ending.as_str());
-    }
-
-    let _ = &sub_handles; // keep subscriptions alive until here
+    // L2 (1-D §11-7 M2 work order (7), Codex 107): the ending is classified
+    // at this point, so a not-yet-reported abnormal ending (or malformed
+    // headers, each already stamped where its drain counted it) is the
+    // receiver's first fatal error — stamped NOW, before any stdout/stderr
+    // write below. `note_l2_fault` keeps the earliest stamp. Without L2
+    // nothing here runs.
     let n_bad = bad_headers.load(Ordering::Relaxed);
-    if n_bad > 0 {
-        eprintln!("[rx] {n_bad} object(s) failed header validation and were NOT logged");
-    }
-
-    // L2: the ending is now classified, so a not-yet-reported abnormal ending
-    // (or malformed headers) is the receiver's first fatal error. Every
-    // submitter clone is gone (drains joined, scheduler task joined or
-    // aborted), so close the output stage now — before the rx shutdown rows
-    // and every `process::exit` below, which would skip it. An L2 integrity
-    // failure is judged from the L2 file (sentinel / its absence); it changes
-    // neither the rx log nor the exit code, whose meaning the batch driver
-    // owns. Without L2 nothing here runs.
     if ending != RxEnding::Normal {
         note_l2_fault(l2_output.as_ref(), || {
             format!("abnormal ending: {} ({detail})", ending.as_str())
@@ -8529,6 +8580,23 @@ async fn main() -> Result<()> {
     if n_bad > 0 {
         note_l2_fault(l2_output.as_ref(), || format!("{n_bad} malformed header(s)"));
     }
+    if ending == RxEnding::Normal {
+        println!("[rx] tracks closed");
+    } else {
+        eprintln!("[rx] abnormal ending: {} ({detail})", ending.as_str());
+    }
+
+    let _ = &sub_handles; // keep subscriptions alive until here
+    if n_bad > 0 {
+        eprintln!("[rx] {n_bad} object(s) failed header validation and were NOT logged");
+    }
+
+    // L2: every submitter clone is gone (drains joined, scheduler task joined
+    // or aborted), so close the output stage now — before the rx shutdown
+    // rows and every `process::exit` below, which would skip it. An L2
+    // integrity failure is judged from the L2 file (sentinel / its absence);
+    // it changes neither the rx log nor the exit code, whose meaning the
+    // batch driver owns. Without L2 nothing here runs.
     if let Some(output) = l2_output.take() {
         if let Err(e) = finish_l2_output(output).await {
             eprintln!("[rx] L2 output stage failed to close: {e:#}");
@@ -13129,6 +13197,31 @@ mod s3_control_loop_tests {
         session: SessionEnding,
         extra: &[String],
     ) -> CaseOutcome {
+        run_case_core_between(name, run_id, duration_s, force_ms, script, delayed, session, extra, None)
+            .await
+    }
+
+    /// The info row the between-passes action writes first, so a case can
+    /// tell exit drain pass 1 (before it) from pass 2 (after it).
+    const BETWEEN_PASSES_MARKER: &str = "test_between_exit_passes";
+
+    /// `run_case_core` plus, when `between` is `Some(steps)`, a test-only
+    /// action run once between exit drain pass 1 and the subscription
+    /// teardown (`s3_test_seam::between_exit_passes`): it writes the
+    /// `BETWEEN_PASSES_MARKER` info row, then performs `steps` on the
+    /// still-open scripted tracks.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_case_core_between(
+        name: &str,
+        run_id: &str,
+        duration_s: Option<&str>,
+        force_ms: &str,
+        script: Vec<Call>,
+        delayed: Vec<(u64, Vec<Step>)>,
+        session: SessionEnding,
+        extra: &[String],
+        between: Option<Vec<Step>>,
+    ) -> CaseOutcome {
         let out = test_log_path(name);
         let args = s3_args_with(&out, run_id, duration_s, force_ms, extra);
         let playout = playout_config(&args)
@@ -13169,6 +13262,22 @@ mod s3_control_loop_tests {
             .unwrap(),
         ));
         let seam = ScriptedSeam::new(script);
+        if let Some(steps) = between {
+            let seam = seam.clone();
+            s3_test_seam::arm_between_exit_passes(
+                run_id,
+                Box::new(move |logger| {
+                    Box::pin(async move {
+                        logger
+                            .lock()
+                            .unwrap()
+                            .try_log_info(&format!("\"event\":\"{BETWEEN_PASSES_MARKER}\""))
+                            .expect("write the between-passes marker");
+                        seam.run(&steps).await;
+                    })
+                }),
+            );
+        }
         let side = {
             let seam = seam.clone();
             tokio::spawn(async move {
@@ -14201,6 +14310,160 @@ mod s3_control_loop_tests {
         log_common_epochs(&mut scheduler, &logger, playout).unwrap();
         assert_eq!(rows_of(&rx_path).iter().filter(|r| r["event"] == "timeline_epoch").count(), 1);
         std::fs::remove_file(&rx_path).ok();
+    }
+
+    /// Index of the single between-passes marker row.
+    fn between_marker_at(rows: &[serde_json::Value]) -> usize {
+        let at: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r["role"] == "info" && r["event"] == BETWEEN_PASSES_MARKER)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(at.len(), 1, "exactly one between-passes marker");
+        at[0]
+    }
+
+    /// The single `timeline_epoch` row: `(index, row)`.
+    fn single_epoch(rows: &[serde_json::Value]) -> (usize, &serde_json::Value) {
+        let epochs: Vec<(usize, &serde_json::Value)> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r["role"] == "info" && r["event"] == "timeline_epoch")
+            .collect();
+        assert_eq!(epochs.len(), 1, "exactly one timeline_epoch row");
+        epochs[0]
+    }
+
+    /// 1-D §11-7 M2 work order (6a), REAL control loop: the event carried out
+    /// of the loop is a haptic FILLER (`event_id` 0, never a startup pair),
+    /// and the anchor that completes the exact pair is still QUEUED behind it.
+    /// So the common timeline is first armed by a queued (not carried) event
+    /// in exit drain pass 1: the epoch row precedes the between-passes marker,
+    /// precedes every release, and is written exactly once.
+    #[tokio::test]
+    async fn an_epoch_armed_by_a_queued_anchor_in_exit_pass_one_is_logged_before_its_releases() {
+        let run_id = "epoch-at-exit-queued";
+        s3_test_seam::arm(run_id, 3, S3TestCutoff::MaxDuration);
+        let script = vec![
+            Call { track: PC_NORMAL, before: Vec::new(), answer: Answer::Accept(Vec::new()) },
+            Call {
+                track: HAPTIC_FULL,
+                before: Vec::new(),
+                answer: Answer::Accept(vec![
+                    Step::Publish(PC_NORMAL, vec![(2, 30, 1_000_000, 31), (2, 27, 900_000, 28)]),
+                    Step::Sleep(30),
+                    // Queue: [pc anchor, pc older, haptic FILLER, haptic
+                    // anchor, haptic older]; the 3rd dequeue (carried) is the
+                    // filler, which completes no pair.
+                    Step::Publish(
+                        HAPTIC_FULL,
+                        vec![(0, 91, 1_011_111, 0), (0, 90, 1_000_000, 31), (0, 81, 900_000, 28)],
+                    ),
+                ]),
+            },
+        ];
+        let outcome = run_case_core_between(
+            "epoch-exit-q", run_id, Some("30"), "600000", script, Vec::new(), SessionEnding::Never,
+            &[], Some(Vec::new()),
+        )
+        .await;
+        assert!(s3_test_seam::fired(run_id));
+        assert!(outcome.result.is_err(), "the cutoff ends the run");
+        outcome.assert_every_rx_object_is_terminated();
+        let rows = &outcome.rows;
+        let rx: Vec<String> = rows
+            .iter()
+            .filter(|r| r["role"] == "rx")
+            .map(|r| format!("{}/{}/{}", r["track"], r["seq"], r["event_id"]))
+            .collect();
+        assert_eq!(rx.len(), 5, "{rx:?}");
+        assert_eq!(rx[2], "\"haptic\"/91/0", "the carried event is the filler: {rx:?}");
+        assert_eq!(rx[3], "\"haptic\"/90/31", "the anchor is queued behind it: {rx:?}");
+        let marker_at = between_marker_at(rows);
+        let (epoch_at, epoch) = single_epoch(rows);
+        assert_eq!(epoch["anchor_pts_us"], 1_000_000);
+        assert_eq!(epoch["anchor_event_id"], 31);
+        assert!(epoch_at < marker_at, "armed in exit drain PASS 1 (before the marker)");
+        let t_epoch = epoch["t_epoch"].as_u64().unwrap();
+        let releases: Vec<(usize, &serde_json::Value)> =
+            rows.iter().enumerate().filter(|(_, r)| r["role"] == "release").collect();
+        assert!(!releases.is_empty());
+        for (at, release) in &releases {
+            assert!(*at > epoch_at, "the epoch row precedes every release");
+            let pts = release["pts_us"].as_u64().unwrap();
+            assert_eq!(release["t_due"].as_u64().unwrap(), t_epoch + pts + 100_000 - 1_000_000);
+        }
+        // The older pair is due at the epoch: released in pass 1 itself.
+        let older: Vec<usize> = releases
+            .iter()
+            .filter(|(_, r)| r["pts_us"] == 900_000)
+            .map(|(at, _)| *at)
+            .collect();
+        assert_eq!(older.len(), 2);
+        assert!(older.iter().all(|&at| at < marker_at), "older pair released in pass 1");
+        let shutdown = outcome.shutdown();
+        assert!(shutdown["detail"].as_str().unwrap().contains("max-duration"));
+        // carried filler + the two queued haptic objects, all in pass 1.
+        assert_eq!(shutdown["s3_events_drained_at_exit"], 3, "{shutdown}");
+        assert_eq!(shutdown["s3_event_queue_closed"], true);
+    }
+
+    /// 1-D §11-7 M2 work order (6b), REAL control loop, pass 2: the loop is
+    /// cut right after it dequeued the two PC objects (the older one is
+    /// carried into pass 1, which pairs nothing). The haptic objects are
+    /// published only BETWEEN the passes (test seam), forwarded by the
+    /// still-live haptic drain, and first seen by exit drain PASS 2, which
+    /// arms the epoch: one epoch row after the marker, before the releases.
+    #[tokio::test]
+    async fn an_epoch_first_armed_in_exit_pass_two_of_the_real_loop_is_logged_before_its_releases() {
+        let run_id = "epoch-at-exit-pass-two-loop";
+        s3_test_seam::arm(run_id, 2, S3TestCutoff::MaxDuration);
+        let script = vec![
+            Call { track: PC_NORMAL, before: Vec::new(), answer: Answer::Accept(Vec::new()) },
+            Call {
+                track: HAPTIC_FULL,
+                before: Vec::new(),
+                answer: Answer::Accept(vec![
+                    Step::Publish(PC_NORMAL, vec![(2, 30, 1_000_000, 31), (2, 27, 900_000, 28)]),
+                    Step::Sleep(30),
+                ]),
+            },
+        ];
+        let between = vec![
+            Step::Publish(HAPTIC_FULL, vec![(0, 90, 1_000_000, 31), (0, 81, 900_000, 28)]),
+            // Real time for the live haptic drain to read and enqueue both.
+            Step::Sleep(30),
+        ];
+        let outcome = run_case_core_between(
+            "epoch-exit-p2", run_id, Some("30"), "600000", script, Vec::new(), SessionEnding::Never,
+            &[], Some(between),
+        )
+        .await;
+        assert!(s3_test_seam::fired(run_id));
+        assert!(outcome.result.is_err(), "the cutoff ends the run");
+        outcome.assert_every_rx_object_is_terminated();
+        let rows = &outcome.rows;
+        let marker_at = between_marker_at(rows);
+        let haptic_rx: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r["role"] == "rx" && r["track"] == "haptic")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(haptic_rx.len(), 2, "both haptic objects were received");
+        assert!(haptic_rx.iter().all(|&at| at > marker_at), "received between the passes");
+        let (epoch_at, epoch) = single_epoch(rows);
+        assert_eq!(epoch["anchor_pts_us"], 1_000_000);
+        assert!(epoch_at > marker_at, "first armed in exit drain PASS 2");
+        let releases: Vec<(usize, &serde_json::Value)> =
+            rows.iter().enumerate().filter(|(_, r)| r["role"] == "release").collect();
+        assert_eq!(releases.len(), 4, "{releases:?}");
+        assert!(releases.iter().all(|(at, _)| *at > epoch_at), "epoch row before every release");
+        let shutdown = outcome.shutdown();
+        assert_eq!(shutdown["s3_event_queue_closed"], true, "pass 2 closed the window: {shutdown}");
+        // carried PC older (pass 1) + the two haptic objects (pass 2).
+        assert_eq!(shutdown["s3_events_drained_at_exit"], 3, "{shutdown}");
     }
 
     /// (b) A transition whose request instant falls at/after the window end is
@@ -16331,6 +16594,68 @@ mod l2_hook_tests {
         assert_eq!(format!("{:#}", slot.as_ref().unwrap()), "first");
         set_cause(&mut slot, anyhow::anyhow!("overwrite"));
         assert_eq!(format!("{:#}", slot.unwrap()), "overwrite", "last writer wins as before");
+    }
+
+    /// 1-D §11-7 M2 work order (5), Codex 108 P2 (the minimal test it asked
+    /// for): an exit-drain epoch-row write fails once and the dispatch that
+    /// follows succeeds. The epoch error (or the handler failure that came
+    /// before it) is merged and STAMPED before the dispatch, so the L2
+    /// `receiver_fault` time precedes the dispatch's L2 submit; the dispatch
+    /// still runs ("dispatch anyway"); a later dispatch error never replaces
+    /// the first cause.
+    #[tokio::test]
+    async fn an_exit_epoch_row_failure_is_stamped_before_the_dispatch_that_follows() {
+        for (name, handler_failure, dispatch_fails, expected) in [
+            ("epoch-only", None, false, "injected epoch row write failure"),
+            ("handler-first", Some("handler failure first"), false, "handler failure first"),
+            ("dispatch-later", None, true, "injected epoch row write failure"),
+        ] {
+            let l2_path = tmp(&format!("m2-5-{name}"));
+            let output = fake_output(&l2_path, 0, 0);
+            let submitter = output.submitter();
+            let mut outcome_error: Option<anyhow::Error> = None;
+            let mut dispatched_at: Option<u64> = None;
+            S3_L2_FAULT
+                .scope(output.fault_stamp(), async {
+                    merge_then_dispatch_at_exit(
+                        &mut outcome_error,
+                        handler_failure.map(|m| anyhow::anyhow!(m)),
+                        Err(anyhow::anyhow!("injected epoch row write failure")),
+                        || {
+                            // What an exit-drain release does: one L2 submit.
+                            let t = now_us();
+                            let identity = skew_moq::l2_output::L2Identity {
+                                modality: skew_moq::l2_output::L2Modality::Haptic,
+                                tier: 0,
+                                seq: 81,
+                                pts_us: 900_000,
+                                event_id: 28,
+                                route: Some(("haptic", 0)),
+                            };
+                            submitter.submit(identity, t);
+                            dispatched_at = Some(t);
+                            if dispatch_fails {
+                                bail!("a later dispatch failure");
+                            }
+                            Ok(())
+                        },
+                    );
+                })
+                .await;
+            assert!(dispatched_at.is_some(), "{name}: the dispatch ran anyway");
+            assert_eq!(format!("{:#}", outcome_error.unwrap()), expected, "{name}: first cause kept");
+            drop(submitter);
+            output.finish().unwrap();
+            let l2 = rows(&l2_path);
+            let fault = l2.iter().find(|r| r["role"] == "receiver_fault").expect("stamped");
+            assert_eq!(fault["cause"], expected, "{name}");
+            let submit = l2.iter().find(|r| r["role"] == "submit").expect("the dispatch submitted");
+            assert!(
+                fault["t_us"].as_u64().unwrap() <= submit["t_submit_us"].as_u64().unwrap(),
+                "{name}: stamp {fault} precedes the dispatch's submit {submit}"
+            );
+            let _ = std::fs::remove_file(&l2_path);
+        }
     }
 
     /// H1 class: S3 drain-join panic (`note_s3_drain_join` stores, then logs).
