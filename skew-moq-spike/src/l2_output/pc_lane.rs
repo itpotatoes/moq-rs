@@ -1251,6 +1251,74 @@ mod tests {
         }
     }
 
+    /// Registration 3-3b recording precedence (Codex 116 P2): the last
+    /// commit A (submit 150) never gets its feedback, so at close it is a
+    /// committed frame without feedback, recorded FIRST as the untimed
+    /// wayland_feedback_missing; a rendered frame B (submit 210) is pending
+    /// in branch (i) (A's callback missing), (ii) (callback fired, both
+    /// buffers held) or (iii) (callback fired, buffers free); with and
+    /// without a receiver abort at 100. lanes.pc.device_failure and the
+    /// run's first failure are wayland_feedback_missing (untimed) in every
+    /// case — for (iii) not the timed unresolved at 210 — while the branch
+    /// marker is still set (`committable_pending_at_close == 1` for (iii)).
+    #[test]
+    fn v1_6_committed_frames_without_feedback_are_recorded_before_the_pending_branch() {
+        for state in [CloseState::CallbackMissing, CloseState::AllBuffersHeld, CloseState::Committable] {
+            for abort in [true, false] {
+                let case = format!("{state:?} abort={abort}");
+                let (rows_tx, rows_rx) = mpsc::sync_channel(64);
+                let shared = Arc::new(Shared::default());
+                if abort {
+                    shared.note_receiver_fault(100, "receiver abort");
+                }
+                let mut lane = lane(rows_tx.clone(), shared.clone(), None);
+                if state == CloseState::AllBuffersHeld {
+                    lane.engine = PresentEngine::new(2, &[(0, 0)]);
+                }
+                let a = pc_submission(1, 150);
+                rows_tx.send(Row::Submit(a)).unwrap();
+                let buffer = lane.engine.free_buffer().unwrap();
+                let (commit_a, _) = lane.engine.commit(rendered(a), buffer, 160);
+                // No presented / discarded for A, ever.
+                if state != CloseState::CallbackMissing {
+                    lane.apply(BackendEvent::FrameDone { commit_id: commit_a }, 190);
+                }
+                let b = pc_submission(2, 210);
+                rows_tx.send(Row::Submit(b)).unwrap();
+                assert!(matches!(lane.link.pending.offer(rendered(b)), Offer::Accepted { superseded: None }));
+                shared.finish_start_us.store(500, Ordering::SeqCst);
+                shared.close_deadline_us.store(1_000, Ordering::SeqCst);
+                lane.finish(&startup(), "bin", WorkerStats::default());
+                drop(rows_tx);
+                let (summary, rows) = ledger(rows_rx, shared, "v16-precedence");
+                let pc_lane = &rows.last().unwrap()["lanes"]["pc"];
+                assert!(rows.iter().all(|r| r["role"] != "output" && r["role"] != "explicit_discard"), "{case}: no terminal");
+                assert_eq!(summary.submitted_unresolved, 2, "{case}: A and B");
+                assert!(!summary.integrity_ok(SINKS), "{case}");
+                assert_eq!(summary.first_integrity_failure_reason.as_deref(), Some(FAIL_WAYLAND_FEEDBACK_MISSING), "{case}");
+                assert_eq!(summary.first_integrity_failure_us, None, "{case}: untimed, not B's submit at 210");
+                assert!(!summary.first_failure_time_determinable, "{case}");
+                assert_eq!(summary.receiver_fault.as_ref().map(|(t, _)| *t), abort.then_some(100), "{case}");
+                assert_eq!(pc_lane["device_failure"]["reason"], FAIL_WAYLAND_FEEDBACK_MISSING, "{case}: the first PC device failure");
+                assert_eq!(pc_lane["committed_without_feedback_at_close"], 1, "{case}");
+                assert_eq!(pc_lane["pending_at_close"], true, "{case}");
+                match state {
+                    CloseState::CallbackMissing => assert_eq!(pc_lane["frame_callback_missing_at_close"], commit_a, "{case}"),
+                    _ => assert!(pc_lane["frame_callback_missing_at_close"].is_null(), "{case}"),
+                }
+                match state {
+                    CloseState::AllBuffersHeld => assert_eq!(
+                        pc_lane["buffer_release_missing_at_close"],
+                        serde_json::json!({ "pending_seq": 2, "buffers": 2, "buffers_held": 2, "holding_commit_ids": [0, commit_a] }),
+                        "{case}"
+                    ),
+                    _ => assert!(pc_lane["buffer_release_missing_at_close"].is_null(), "{case}"),
+                }
+                assert_eq!(pc_lane["committable_pending_at_close"], u64::from(state == CloseState::Committable), "{case}: the marker stays");
+            }
+        }
+    }
+
     /// v1.6 branch (iii) is reachable, replayed deterministically: the
     /// commit loop stops at the close deadline (`run`: `try_commit` finds no
     /// frame, then the deadline exit) and the render worker offers its frame
