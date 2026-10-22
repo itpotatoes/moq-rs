@@ -1,0 +1,13 @@
+skew-draco-sys
+==============
+
+This crate contains source files of Google Draco 1.5.7
+(https://github.com/google/draco), Copyright Google Inc. and other
+contributors (see vendor/draco-1.5.7/AUTHORS), licensed under the Apache
+License, Version 2.0 (vendor/draco-1.5.7/LICENSE).
+
+The files under vendor/draco-1.5.7/ are copied UNMODIFIED from the official
+release tarball (see PROVENANCE). Not part of the Draco release and written
+for this crate: vendor/gen/draco/draco_features.h (hand-written in place of
+the CMake-generated header), shim/skew_draco_shim.{h,cc}, src/, build.rs and
+tests/. The upstream release contains no NOTICE file.

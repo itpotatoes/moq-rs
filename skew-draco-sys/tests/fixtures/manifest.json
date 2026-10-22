@@ -1,0 +1,62 @@
+{
+ "generator": "make_fixtures.py",
+ "encoder": "DracoPy 2.0.0",
+ "quantization_bits": 10,
+ "compression_level": 10,
+ "fixtures": [
+  {
+   "name": "synthetic_37",
+   "points": 400,
+   "extent": [
+    37,
+    20,
+    30
+   ],
+   "seed": 11,
+   "non_integer_coordinates": 1132,
+   "max_abs_rounding": 0.017595291137695312,
+   "sha256": {
+    "synthetic_37.bin": "26152333eeda09501d2f29615a6b56c17e9ab05b8d9cd6028e01d31c809288b9",
+    "synthetic_37.drc": "5fe72d719f945486ccb1d2f491e3d5c2da2f7eb85bf8f76d3008df53fc25cf3a",
+    "synthetic_37.dracopy_pos_f32": "70958ad05b53bc47acf3456b7ee00efd3b0c8353e776bdc2c57a93b0b85e7183",
+    "synthetic_37.dracopy_rgb_u8": "89434a471d2138c0d1b8c3ee90b9f9ac9d2f15e3b57d269a65e4386b764ba2b9"
+   }
+  },
+  {
+   "name": "synthetic_255",
+   "points": 1500,
+   "extent": [
+    255,
+    200,
+    180
+   ],
+   "seed": 22,
+   "non_integer_coordinates": 4427,
+   "max_abs_rounding": 0.1231689453125,
+   "sha256": {
+    "synthetic_255.bin": "5f6221872062307f336bf05f03cb8b57aa02fe5b2433186c607b49da9e1accfa",
+    "synthetic_255.drc": "4445bd102cb74f08541e2d7f3cb399c50c59b74ba75098701dbbbc0d94d0339b",
+    "synthetic_255.dracopy_pos_f32": "f8d596add31acb2e391ced332ecee329afe41a1295ef8c2423e4735c9bd59b1e",
+    "synthetic_255.dracopy_rgb_u8": "d33faee462bb10b5ba3b32d6908da593cecd7214ddb834b5bb851603a5c57311"
+   }
+  },
+  {
+   "name": "synthetic_1000",
+   "points": 1200,
+   "extent": [
+    1000,
+    600,
+    400
+   ],
+   "seed": 33,
+   "non_integer_coordinates": 3587,
+   "max_abs_rounding": 0.48876953125,
+   "sha256": {
+    "synthetic_1000.bin": "024a45ca4812b17baa8d85f4881865127c7aa689526f50ddb23c014f838b08ee",
+    "synthetic_1000.drc": "9f296bb70a8f414bcc29667ae36d6e518cd2bbf58001d4a2b5a38b2c9768856c",
+    "synthetic_1000.dracopy_pos_f32": "93be627235c4ac7b4df9fc94038e606b1a367645bf37e15b781ea969bea34c2a",
+    "synthetic_1000.dracopy_rgb_u8": "cda2c380087d6f7945c37e2e4d7dea6b348b8d4dca45c4db7820c762fa017276"
+   }
+  }
+ ]
+}

@@ -1,0 +1,35 @@
+# Skew experiment 1-D (L2, milestone M3): the Google Draco 1.5.7 point-cloud
+# DECODER, vendored as source and compiled with fixed flags (registration
+# md/20261022_실험1D_L2사다리_사전등록_문안.md §3-2, §11-4). See PROVENANCE.
+[package]
+name = "skew-draco-sys"
+version = "0.1.0"
+edition = "2021"
+# Our shim and wrapper; the vendored Draco sources keep their own
+# Apache-2.0 license (vendor/draco-1.5.7/LICENSE).
+license = "Apache-2.0"
+build = "build.rs"
+links = "skew_draco"
+publish = false
+
+[lib]
+name = "skew_draco_sys"
+path = "src/lib.rs"
+
+[build-dependencies]
+# Both already in Cargo.lock (no new download): cc 1.2.40 builds the C++,
+# sha2 0.10 digests the vendored sources for the L2 meta.
+cc = { version = "1.2", features = ["parallel"] }
+sha2 = "0.10"
+
+[dev-dependencies]
+serde_json = "1"
+sha2 = "0.10"
+
+# The opt-in 900-frame byte-exact gate (registration §3-2 freeze
+# precondition). Its own `main`, so a skipped gate is never counted as a
+# passed test: `DRACO_GATE=1 cargo test -p skew-draco-sys --test draco_full_gate`.
+[[test]]
+name = "draco_full_gate"
+path = "tests/draco_full_gate.rs"
+harness = false

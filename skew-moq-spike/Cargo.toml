@@ -41,3 +41,8 @@ sha2 = "0.10"
 # Runtime-loaded libasound for the L2 haptic ALSA sink (no link-time ALSA
 # dependency; already in Cargo.lock via clang-sys, so no new download).
 libloading = "0.8"
+# L2 PC Wayland sink (milestone M3, user approval 2026-10-22 for cargo fetch):
+# the pure-Rust client backend only. No `system`/`dlopen` feature, so neither
+# libwayland-client nor its -dev package is needed to build or to run.
+wayland-client = "0.31.15"
+wayland-protocols = { version = "0.32.13", features = ["client"] }

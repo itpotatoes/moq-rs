@@ -1,0 +1,51 @@
+Provenance of the vendored Draco sources (skew-draco-sys)
+=========================================================
+
+Upstream release
+  URL      https://github.com/google/draco/archive/refs/tags/1.5.7.tar.gz
+  sha256   bf6b105b79223eab2b86795363dfe5e5356050006a96521477973aba8f036fe1
+  version  draco/core/draco_version.h kDracoVersion = "1.5.7"
+  fetched  2026-10-22 (re-downloaded for this check; the sha256 matches the
+           one recorded by the 2026-10-22 decoder investigation)
+  The encoder of the experiment's .drc frames is DracoPy 2.0.0, which
+  bundles Draco 1.5.7 (decoder investigation, TODO 2026-10-22).
+
+What is vendored (vendor/draco-1.5.7/)
+  LICENSE, AUTHORS, and 196 files of src/draco/: the 63 .cc files of Draco's
+  own decoder-only source list (CMakeLists.txt, the Emscripten
+  draco_decoder_src groups attributes, compression_attributes_dec,
+  compression_attributes_pred_schemes_dec, compression_bit_coders,
+  compression_decode, compression_entropy, compression_mesh_traverser,
+  compression_mesh_dec, compression_options, compression_point_cloud_dec,
+  core, dec_config, mesh, metadata_dec, metadata, point_cloud, points_dec;
+  without the JS glue and without mesh_splitter.cc / mesh_utils.cc, which
+  CMake adds only under DRACO_TRANSCODER_SUPPORTED) and the 133 headers they
+  and the shim include (closure from `g++ -std=c++17 -MM`).
+  Every file is byte-identical to the tarball (`cmp`, 2026-10-22). The
+  same src/draco tree was also identical (`diff -rq`, 472 files) to the copy
+  the decoder investigation compiled.
+
+Not from the release
+  vendor/gen/draco/draco_features.h  hand-written; the feature list CMake
+                                     writes for a default non-Emscripten
+                                     build (see the file's comment)
+  shim/skew_draco_shim.{h,cc}        extern "C" shim (exceptions -> codes)
+
+Build (build.rs)
+  cc 1.2.40, default flags disabled, exactly:
+    -std=c++17 -O3 -DNDEBUG -fPIC -ffp-contract=off
+  plus the three include paths; CXXFLAGS and its target/host variants are
+  refused; the compiler identity, the argument vector and the digest below
+  are compiled into the crate (decoder_info()) for the L2 meta row.
+
+Source digest (what decoder_info().vendored_sources_sha256 reports)
+  (cd skew-draco-sys && find vendor shim -type f | LC_ALL=C sort | xargs sha256sum) | sha256sum
+  = 23fd72a3b15ed5499d86199dfcae8927f3affd47bd8451926f1cc56a1f19341a (201 files)
+
+Verification
+  cargo test -p skew-draco-sys                      unit tests, synthetic
+                                                    DracoPy fixtures, 3 real frames
+  DRACO_GATE=1 cargo test -p skew-draco-sys --test draco_full_gate
+      900 frames (d8/d7/d6 x 300): input sha256, DracoPy 2.0.0 float32
+      position bits / colours / point count in point order, and the record
+      multiset of the source .bin, byte-exact.

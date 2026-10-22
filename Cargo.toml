@@ -14,6 +14,8 @@ members = [
 	"moq-catalog",
 	"moq-test-client",
 	"skew-moq-spike",
+	"skew-draco-sys",
+	"skew-pc-render",
 ]
 resolver = "2"
 
@@ -25,3 +27,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Use debug symbols in production until things are more stable
 [profile.release]
 debug = true
+
+# Experiment 1-D L2 output stage (milestone M3): the Draco decoder's record
+# conversion and the CPU point renderer run inside the receiver, whose
+# campaign build is the DEV profile (scripts use target/debug). Optimise just
+# these two crates in every profile; no other package's build changes. (The
+# Draco C++ itself is always -O3, see skew-draco-sys/build.rs.)
+[profile.dev.package.skew-draco-sys]
+opt-level = 3
+
+[profile.dev.package.skew-pc-render]
+opt-level = 3

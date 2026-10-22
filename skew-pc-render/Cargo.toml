@@ -1,0 +1,13 @@
+# Skew experiment 1-D (L2, milestone M3): deterministic CPU point splatting
+# for the PC Wayland sink. A crate of its own only so that the workspace can
+# build it with opt-level 3 in the dev profile (see the workspace Cargo.toml).
+[package]
+name = "skew-pc-render"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "skew_pc_render"
+path = "src/lib.rs"
