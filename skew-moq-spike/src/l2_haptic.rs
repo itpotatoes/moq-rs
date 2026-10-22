@@ -23,7 +23,9 @@
 //! six identical stereo frames (88/89 samples -> 528/534 frames, never a
 //! fixed length). With an empty queue the lane writes ONE period of silence
 //! whenever the queued fill drops below the target `F`. Silence frames are
-//! never an output of any tick.
+//! never an output of any tick. `Q` bounds every frame not yet written to
+//! the device: the waiting queue PLUS the unwritten remainder of the tick
+//! being written (§3-3a "상한", Codex 109).
 //!
 //! Output time (§3-3): from ONE `snd_pcm_status` snapshot, `appl_pos` is the
 //! lane's own `w` at that call and `hw_pos = appl_pos − delay`. A written
@@ -34,6 +36,24 @@
 //! `appl_pos − (buffer − avail)` must never decrease; `delay − (buffer −
 //! avail)` (the driver/codec delay folded into `delay`) is recorded, not
 //! assumed to be zero.
+//!
+//! Playback end (§3-3a "종료", Codex 109 P1): the onset `output` of a tick
+//! does not mean it has been played. The engine tracks the end of the last
+//! written tick, `n_k + frames`, and is idle only once `hw_pos >= n_k +
+//! frames` (its last frame passed) — never waiting for trailing silence.
+//!
+//! Device failures (§6-1, Codex 109 P1): until the meaning of the kernel's
+//! timestamps is verified on the device, NO occurrence time is claimed. A
+//! [`DeviceFailure`] keeps the observation interval (the clock read just
+//! before the last healthy status call — the failure happened after that
+//! call's snapshot, so after this read — up to the detection), the
+//! detection time and the raw kernel trigger time, as separate fields.
+//!
+//! Raw device timestamps (§11-11): the ledger detail ([`AlsaOutputDetail::to_json`])
+//! carries only integer µs CLOCK_MONOTONIC time fields. The raw nanosecond
+//! values and the audio-timestamp domain value (`LINK`: not
+//! CLOCK_MONOTONIC) are kept in [`RawSnapshot`] for the probe-only
+//! diagnostics file and never enter the L2 JSONL.
 
 use std::collections::VecDeque;
 
@@ -82,10 +102,18 @@ pub const FAIL_ALSA_STATUS_ERROR: &str = "alsa_status_error";
 pub const FAIL_ALSA_WRITE_ERROR: &str = "alsa_write_error";
 /// A haptic submission that is not a playable PCM tick.
 pub const FAIL_HAPTIC_PAYLOAD_INVALID: &str = "haptic_payload_invalid";
+/// Every device-failure reason (their occurrence time is undeterminable).
+pub const ALSA_DEVICE_FAILURE_REASONS: [&str; 8] = [
+    FAIL_ALSA_XRUN,
+    FAIL_ALSA_SUSPENDED,
+    FAIL_ALSA_DISCONNECTED,
+    FAIL_ALSA_EPOCH_RESET,
+    FAIL_ALSA_STATE_UNEXPECTED,
+    FAIL_ALSA_STATUS_INCONSISTENT,
+    FAIL_ALSA_STATUS_ERROR,
+    FAIL_ALSA_WRITE_ERROR,
+];
 
-/// `occurred_basis` of a device failure.
-pub const OCCURRED_KERNEL_TRIGGER: &str = "kernel_trigger_htstamp";
-pub const OCCURRED_LAST_GOOD_STATUS: &str = "last_good_status_lower_bound";
 
 /// `round_half_away(num / den)` for `den > 0`, exact in `i128`.
 pub fn div_round_half_away(num: i128, den: i128) -> i128 {
@@ -334,16 +362,104 @@ pub enum Admission {
     PayloadInvalid,
 }
 
-/// A device failure with its occurrence time (registration §6-1).
+/// A device failure (registration §6-1, Codex 109 P1). No occurrence time
+/// is claimed until the meaning of the kernel's timestamps is verified on
+/// the device: the ledger records it as an integrity failure whose time is
+/// undeterminable, and keeps the observation interval, the detection time
+/// and the raw kernel trigger apart.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceFailure {
     pub reason: &'static str,
-    /// The kernel's trigger timestamp when the stop moved it, otherwise the
-    /// end of the last good status snapshot (a documented LOWER bound).
-    pub occurred_us: u64,
-    pub occurred_basis: &'static str,
+    /// Start of the observation interval: the clock read immediately BEFORE
+    /// the last status call that showed a healthy stream (at the latest the
+    /// epoch's first snapshot). The kernel took that snapshot after this
+    /// read and the failure came after the snapshot, so it came after this.
+    pub last_good_status_t0_us: u64,
+    /// End of the observation interval: when the lane detected the failure.
     pub detected_us: u64,
+    /// The trigger timestamp the kernel reported with the failed state, if
+    /// it moved (µs, CLOCK_MONOTONIC). Its relation to the actual underrun
+    /// or state change is NOT verified: not an occurrence time.
+    pub kernel_trigger_us: Option<u64>,
+    /// The same, raw (diagnostics file only).
+    pub kernel_trigger_ns: Option<u64>,
     pub detail: String,
+}
+
+impl DeviceFailure {
+    /// The ledger form (sentinel `lanes.haptic.device_failure`): integer µs
+    /// CLOCK_MONOTONIC only.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "reason": self.reason,
+            "occurrence_time_determinable": false,
+            "observation_interval_us": [self.last_good_status_t0_us, self.detected_us],
+            "last_good_status_t0_us": self.last_good_status_t0_us,
+            "detected_us": self.detected_us,
+            "kernel_trigger_us": self.kernel_trigger_us,
+            "kernel_trigger_semantics": "trigger timestamp the kernel reported with the failed state (unverified; not the underrun instant); not an occurrence time",
+            "detail": self.detail,
+        })
+    }
+}
+
+/// The raw values of one status snapshot. Kept ONLY for the probe's
+/// diagnostics file (registration §11-11): nanoseconds, and an
+/// audio-timestamp value that is not CLOCK_MONOTONIC, never enter the L2
+/// JSONL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawSnapshot {
+    pub htstamp_ns: u64,
+    pub trigger_htstamp_ns: u64,
+    pub driver_htstamp_ns: u64,
+    /// In the audio-timestamp domain of `audio_tstamp.actual_type`.
+    pub audio_htstamp_ns: u64,
+    pub audio_tstamp: AudioTstampReport,
+}
+
+impl RawSnapshot {
+    pub fn of(s: &PcmStatus) -> Self {
+        Self {
+            htstamp_ns: s.htstamp_ns,
+            trigger_htstamp_ns: s.trigger_htstamp_ns,
+            driver_htstamp_ns: s.driver_htstamp_ns,
+            audio_htstamp_ns: s.audio_htstamp_ns,
+            audio_tstamp: s.audio_tstamp,
+        }
+    }
+
+    /// The diagnostics-file form: every value with its unit, clock or
+    /// domain (the audio timestamp's per its ACTUAL type) and origin.
+    pub fn to_diag_json(&self) -> serde_json::Value {
+        let report = &self.audio_tstamp;
+        serde_json::json!({
+            "htstamp_ns": self.htstamp_ns,
+            "trigger_htstamp_ns": self.trigger_htstamp_ns,
+            "driver_htstamp_ns": self.driver_htstamp_ns,
+            "audio_htstamp_ns": self.audio_htstamp_ns,
+            "audio_htstamp_domain": audio_tstamp_domain(report.actual_type),
+            "audio_tstamp_type_actual": audio_tstamp_type_name(report.actual_type),
+            "audio_tstamp_report_valid": report.valid,
+            "audio_tstamp_accuracy_report": report.accuracy_report,
+            "audio_tstamp_accuracy_ns": report.accuracy_report.then_some(report.accuracy_ns),
+        })
+    }
+}
+
+/// What `snd_pcm_status_get_audio_htstamp` measures for an ACTUAL type.
+pub fn audio_tstamp_domain(actual_type: u32) -> &'static str {
+    match actual_type {
+        AUDIO_TSTAMP_TYPE_DEFAULT => {
+            "frames-derived audio time since stream start (hw_ptr / rate, kernel update_audio_tstamp); not CLOCK_MONOTONIC"
+        }
+        AUDIO_TSTAMP_TYPE_LINK
+        | AUDIO_TSTAMP_TYPE_LINK_ABSOLUTE
+        | AUDIO_TSTAMP_TYPE_LINK_ESTIMATED
+        | AUDIO_TSTAMP_TYPE_LINK_SYNCHRONIZED => {
+            "link time of the audio interface (HDA: wall-clock counter since stream start); not CLOCK_MONOTONIC"
+        }
+        _ => "driver-defined audio time (compat/unknown type); not CLOCK_MONOTONIC",
+    }
 }
 
 /// Evidence recorded in the `output_detail` of one haptic `output` row.
@@ -360,9 +476,9 @@ pub struct AlsaOutputDetail {
     /// Clock read immediately before the status call (its end is the row's
     /// `t_callback_us`).
     pub status_t0_us: u64,
-    pub htstamp_ns: u64,
     pub htstamp_us: u64,
-    pub trigger_htstamp_ns: u64,
+    pub trigger_htstamp_us: u64,
+    pub driver_htstamp_us: u64,
     pub appl_pos: u64,
     pub delay_frames: i64,
     pub avail_frames: u64,
@@ -375,8 +491,8 @@ pub struct AlsaOutputDetail {
     pub state: &'static str,
     pub audio_tstamp_type_requested: u32,
     pub audio_tstamp: AudioTstampReport,
-    pub link_audio_tstamp_ns: u64,
-    pub driver_htstamp_ns: u64,
+    /// Raw snapshot values: diagnostics file only, never the ledger.
+    pub raw: RawSnapshot,
 }
 
 impl AlsaOutputDetail {
@@ -392,9 +508,9 @@ impl AlsaOutputDetail {
             "t_write_us": self.t_write_us,
             "t_write_done_us": self.t_write_done_us,
             "status_t0_us": self.status_t0_us,
-            "htstamp_ns": self.htstamp_ns,
             "htstamp_us": self.htstamp_us,
-            "trigger_htstamp_ns": self.trigger_htstamp_ns,
+            "trigger_htstamp_us": self.trigger_htstamp_us,
+            "driver_htstamp_us": self.driver_htstamp_us,
             "appl_pos": self.appl_pos,
             "delay_frames": self.delay_frames,
             "avail_frames": self.avail_frames,
@@ -409,9 +525,6 @@ impl AlsaOutputDetail {
             "audio_tstamp_type_actual": audio_tstamp_type_name(report.actual_type),
             "audio_tstamp_report_valid": report.valid,
             "audio_tstamp_accuracy_report": report.accuracy_report,
-            "audio_tstamp_accuracy_ns": report.accuracy_report.then_some(report.accuracy_ns),
-            "link_audio_tstamp_ns": self.link_audio_tstamp_ns,
-            "driver_htstamp_ns": self.driver_htstamp_ns,
         })
     }
 
@@ -428,9 +541,9 @@ impl AlsaOutputDetail {
             "t_write_us": "clock read after the writei that wrote frame n_k",
             "t_write_done_us": "clock read after the writei that wrote the tick's last frame",
             "status_t0_us": "clock read immediately before the status call; t_callback_us is the read immediately after it",
-            "htstamp_ns": "snd_pcm_status_get_htstamp of the snapshot, ns, CLOCK_MONOTONIC (verified tstamp_type)",
-            "htstamp_us": "htstamp_ns truncated: sec*1e6 + floor(nsec/1000)",
-            "trigger_htstamp_ns": "snd_pcm_status_get_trigger_htstamp (stream start of this epoch while running)",
+            "htstamp_us": "snd_pcm_status_get_htstamp of the snapshot, CLOCK_MONOTONIC (verified tstamp_type), truncated: sec*1e6 + floor(nsec/1000)",
+            "trigger_htstamp_us": "snd_pcm_status_get_trigger_htstamp, CLOCK_MONOTONIC, truncated (the stream start of this epoch while running)",
+            "driver_htstamp_us": "snd_pcm_status_get_driver_htstamp, CLOCK_MONOTONIC, truncated (taken after the reference timestamp)",
             "appl_pos": "frames written by this lane at the status call (the only writer, so the kernel appl_ptr)",
             "delay_frames": "snd_pcm_status_get_delay of the snapshot",
             "avail_frames": "snd_pcm_status_get_avail of the snapshot",
@@ -444,10 +557,7 @@ impl AlsaOutputDetail {
             "audio_tstamp_type_requested": "audio timestamp type requested before every status call (LINK)",
             "audio_tstamp_type_actual": "snd_pcm_status_get_audio_htstamp_report actual_type",
             "audio_tstamp_report_valid": "report valid bit",
-            "audio_tstamp_accuracy_report": "report accuracy_report bit",
-            "audio_tstamp_accuracy_ns": "report accuracy in ns, null unless accuracy_report",
-            "link_audio_tstamp_ns": "snd_pcm_status_get_audio_htstamp, ns, AUDIO-TIMESTAMP DOMAIN (LINK: HDA link wall clock since stream start), NOT CLOCK_MONOTONIC; comparison only, not the registered formula",
-            "driver_htstamp_ns": "snd_pcm_status_get_driver_htstamp, ns, CLOCK_MONOTONIC (taken after the reference timestamp)",
+            "audio_tstamp_accuracy_report": "report accuracy_report bit (the accuracy value and the audio timestamp itself are in the probe-only diagnostics file, registration 11-11)",
         })
     }
 }
@@ -485,7 +595,13 @@ pub struct LaneStats {
     pub writei_max_us: u64,
     pub queued_max_frames: u64,
     pub queued_min_frames: Option<u64>,
-    pub max_write_queue_frames: u64,
+    /// Max of every frame not yet written to the device (waiting queue +
+    /// remainder of the tick being written) right after an admission.
+    pub max_unwritten_tick_frames: u64,
+    /// `n_k + frames` of the latest tick written (one past its last frame).
+    pub last_tick_end_frame: Option<u64>,
+    /// `hw_pos` of the last healthy snapshot.
+    pub last_hw_pos: Option<i64>,
 }
 
 /// Upper bounds (exclusive, µs) of the status-gap histogram buckets.
@@ -519,7 +635,9 @@ impl LaneStats {
             "writei_max_us": self.writei_max_us,
             "queued_max_frames": self.queued_max_frames,
             "queued_min_frames": self.queued_min_frames,
-            "max_write_queue_frames": self.max_write_queue_frames,
+            "max_unwritten_tick_frames": self.max_unwritten_tick_frames,
+            "last_tick_end_frame": self.last_tick_end_frame,
+            "last_hw_pos": self.last_hw_pos,
         })
     }
 }
@@ -558,7 +676,10 @@ struct Current {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EpochStart {
     pub t_start_us: u64,
+    /// Raw (diagnostics); the ledger records it truncated to µs.
     pub trigger_htstamp_ns: u64,
+    /// Clock read immediately before the first status call.
+    pub first_status_t0_us: u64,
     pub first_status: PcmStatus,
 }
 
@@ -574,8 +695,13 @@ pub struct HapticPlacement {
     pending_frames: u64,
     current: Option<Current>,
     in_flight: VecDeque<WrittenTick>,
+    /// `n_k + frames` of the latest written tick (`None` before any).
+    tick_end: Option<u64>,
+    /// `hw_pos` of the last healthy snapshot.
+    last_hw_pos: Option<i64>,
     epoch: Option<EpochStart>,
-    last_good_status_us: u64,
+    /// Clock read just before the last healthy status call.
+    last_good_status_t0_us: u64,
     last_hw_ptr_pos: u64,
     last_htstamp_ns: u64,
     last_status_t0_us: Option<u64>,
@@ -600,8 +726,10 @@ impl HapticPlacement {
             pending_frames: 0,
             current: None,
             in_flight: VecDeque::new(),
+            tick_end: None,
+            last_hw_pos: None,
             epoch: None,
-            last_good_status_us: 0,
+            last_good_status_t0_us: 0,
             last_hw_ptr_pos: 0,
             last_htstamp_ns: 0,
             last_status_t0_us: None,
@@ -631,11 +759,45 @@ impl HapticPlacement {
         self.pending_frames
     }
 
-    /// Nothing queued, nothing partially written, nothing awaiting output.
+    /// Nothing queued, nothing partially written, no onset awaiting its
+    /// output, AND the last written tick fully played: `hw_pos >= n_k +
+    /// frames`, i.e. its LAST frame passed (registration 3-3a "종료"; the
+    /// onset output alone does not mean the tick was played, Codex 109 P1).
+    /// Trailing silence is never waited for.
     pub fn idle(&self) -> bool {
         self.pending.is_empty()
             && self.in_flight.is_empty()
             && !matches!(self.current, Some(Current { kind: ChunkKind::Tick { .. }, .. }))
+            && self.tick_tail_played()
+    }
+
+    /// Whether the last frame of the latest written tick has passed `hw_pos`
+    /// in the last healthy snapshot (true before any tick).
+    pub fn tick_tail_played(&self) -> bool {
+        match self.tick_end {
+            None => true,
+            Some(end) => self.last_hw_pos.is_some_and(|hw_pos| hw_pos >= end as i64),
+        }
+    }
+
+    /// Frames of the latest written tick not yet past `hw_pos` (0 when played).
+    pub fn unplayed_tick_frames(&self) -> u64 {
+        match (self.tick_end, self.last_hw_pos) {
+            (None, _) => 0,
+            (Some(end), Some(hw_pos)) => (end as i64 - hw_pos).max(0) as u64,
+            (Some(end), None) => end,
+        }
+    }
+
+    /// Every tick frame not yet written to the device: the waiting queue
+    /// plus the unwritten remainder of the tick being written (the `Q`
+    /// count, registration 3-3a "상한").
+    pub fn unwritten_tick_frames(&self) -> u64 {
+        let current = match &self.current {
+            Some(c @ Current { kind: ChunkKind::Tick { .. }, .. }) => c.total_frames - c.offset_frames,
+            _ => 0,
+        };
+        self.pending_frames + current
     }
 
     /// Open the stream epoch: write the prefill silence (before start).
@@ -664,7 +826,7 @@ impl HapticPlacement {
     /// request (LINK) that reached the driver makes the report `valid`, and
     /// an `actual_type` outside the known range means the report was
     /// decoded with a wrong layout — both refuse the run.
-    pub fn begin_epoch(&mut self, t_start_us: u64, first_status: PcmStatus, t_status_end_us: u64) -> Result<(), String> {
+    pub fn begin_epoch(&mut self, t_start_us: u64, first_status: PcmStatus, t0: u64) -> Result<(), String> {
         if first_status.state != PcmState::Running {
             return Err(format!("stream not RUNNING after start: {}", first_status.state.as_str()));
         }
@@ -680,10 +842,13 @@ impl HapticPlacement {
         self.epoch = Some(EpochStart {
             t_start_us,
             trigger_htstamp_ns: first_status.trigger_htstamp_ns,
+            first_status_t0_us: t0,
             first_status,
         });
-        self.last_good_status_us = t_status_end_us;
+        self.last_good_status_t0_us = t0;
         self.last_htstamp_ns = first_status.htstamp_ns;
+        self.last_hw_pos = Some(self.w as i64 - first_status.delay);
+        self.stats.last_hw_pos = self.last_hw_pos;
         Ok(())
     }
 
@@ -703,7 +868,7 @@ impl HapticPlacement {
             self.stats.ticks_payload_invalid += 1;
             return Admission::PayloadInvalid;
         }
-        if self.pending_frames + frames > self.cfg.queue_limit_frames {
+        if self.unwritten_tick_frames() + frames > self.cfg.queue_limit_frames {
             self.stats.ticks_queue_full += 1;
             return Admission::QueueFull;
         }
@@ -718,7 +883,8 @@ impl HapticPlacement {
         self.pending.push_back(PendingTick { submission, pcm, frames, samples_8k: samples as u64 });
         self.pending_frames += frames;
         self.stats.ticks_admitted += 1;
-        self.stats.max_write_queue_frames = self.stats.max_write_queue_frames.max(self.pending_frames);
+        self.stats.max_unwritten_tick_frames =
+            self.stats.max_unwritten_tick_frames.max(self.unwritten_tick_frames());
         Admission::Queued
     }
 
@@ -814,6 +980,9 @@ impl HapticPlacement {
             }
             let done = self.current.take().expect("the chunk is complete");
             if let ChunkKind::Tick { submission, n_k, samples_8k, t_write_us } = done.kind {
+                let end = n_k + done.total_frames;
+                self.tick_end = Some(self.tick_end.map_or(end, |e| e.max(end)));
+                self.stats.last_tick_end_frame = self.tick_end;
                 self.in_flight.push_back(WrittenTick {
                     submission,
                     n_k,
@@ -925,9 +1094,9 @@ impl HapticPlacement {
                     t_write_us: tick.t_write_us,
                     t_write_done_us: tick.t_write_done_us,
                     status_t0_us: t0,
-                    htstamp_ns: s.htstamp_ns,
                     htstamp_us,
-                    trigger_htstamp_ns: s.trigger_htstamp_ns,
+                    trigger_htstamp_us: ns_to_us_floor(s.trigger_htstamp_ns),
+                    driver_htstamp_us: ns_to_us_floor(s.driver_htstamp_ns),
                     appl_pos,
                     delay_frames: s.delay,
                     avail_frames: s.avail,
@@ -940,17 +1109,19 @@ impl HapticPlacement {
                     state: s.state.as_str(),
                     audio_tstamp_type_requested: self.audio_tstamp_type_requested,
                     audio_tstamp: s.audio_tstamp,
-                    link_audio_tstamp_ns: s.audio_htstamp_ns,
-                    driver_htstamp_ns: s.driver_htstamp_ns,
+                    raw: RawSnapshot::of(s),
                 },
             });
         }
         self.stats.ticks_output += placed.len() as u64;
         self.stats.queued_max_frames = self.stats.queued_max_frames.max(queued);
         self.stats.queued_min_frames = Some(self.stats.queued_min_frames.map_or(queued, |m| m.min(queued)));
-        self.last_good_status_us = t1;
+        // The device was healthy at this snapshot, taken after `t0`.
+        self.last_good_status_t0_us = t0;
         self.last_hw_ptr_pos = hw_ptr_pos;
         self.last_htstamp_ns = s.htstamp_ns;
+        self.last_hw_pos = Some(hw_pos);
+        self.stats.last_hw_pos = self.last_hw_pos;
         Ok(placed)
     }
 
@@ -973,21 +1144,23 @@ impl HapticPlacement {
         self.failure(reason, after, detected_us, format!("{call}: {error}"))
     }
 
-    /// Occurrence: the kernel trigger timestamp when the stop moved it (and
-    /// it is inside the epoch), otherwise the end of the last good snapshot,
-    /// a LOWER bound. Never after the detection.
+    /// No occurrence time (registration 6-1, Codex 109 P1): the
+    /// observation interval [clock read before the last healthy status
+    /// call, detection], the detection and the raw kernel trigger (when the
+    /// failed state moved it) are kept apart.
     fn failure(&self, reason: &'static str, s: Option<&PcmStatus>, detected_us: u64, detail: String) -> DeviceFailure {
         let epoch = self.epoch.as_ref();
-        let moved_trigger = s.zip(epoch).and_then(|(s, epoch)| {
-            let moved = s.trigger_htstamp_ns != epoch.trigger_htstamp_ns
-                && s.trigger_htstamp_ns >= epoch.trigger_htstamp_ns;
-            moved.then(|| ns_to_us_floor(s.trigger_htstamp_ns))
+        let moved_trigger_ns = s.zip(epoch).and_then(|(s, epoch)| {
+            (s.trigger_htstamp_ns != epoch.trigger_htstamp_ns).then_some(s.trigger_htstamp_ns)
         });
-        let (occurred_us, basis) = match moved_trigger {
-            Some(t) => (t.min(detected_us), OCCURRED_KERNEL_TRIGGER),
-            None => (self.last_good_status_us.min(detected_us), OCCURRED_LAST_GOOD_STATUS),
-        };
-        DeviceFailure { reason, occurred_us, occurred_basis: basis, detected_us, detail }
+        DeviceFailure {
+            reason,
+            last_good_status_t0_us: self.last_good_status_t0_us.min(detected_us),
+            detected_us,
+            kernel_trigger_us: moved_trigger_ns.map(ns_to_us_floor),
+            kernel_trigger_ns: moved_trigger_ns,
+            detail,
+        }
     }
 
     /// Everything submitted that can no longer be output (after a device
@@ -1022,17 +1195,24 @@ pub enum SimFault {
 }
 
 /// Simulated stream configuration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct SimPcmConfig {
     pub period_frames: u64,
     pub buffer_frames: u64,
     /// Position reporting granularity (HDA: 8/16 frames at 48 kHz S16 stereo).
     pub granularity_frames: u64,
-    /// Driver delay folded into `delay` (Realtek on this host: 0).
+    /// Driver delay folded into `delay` (the M2b probe observed 32 frames
+    /// on hw:1,0; the default here is 0).
     pub driver_delay_frames: i64,
     /// The audio timestamp type the "hardware" reports as actual.
     pub audio_tstamp_actual: u32,
     pub faults: Vec<SimFault>,
+    /// Test knob: at most this many frames per `writei` (short writes).
+    pub max_frames_per_write: Option<u64>,
+    /// Test knob: `start` blocks this long in real time (a slow device).
+    pub start_delay_us: u64,
+    /// Test knob: set when the stream is closed (the `SimPcm` dropped).
+    pub release_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl SimPcmConfig {
@@ -1044,6 +1224,9 @@ impl SimPcmConfig {
             driver_delay_frames: 0,
             audio_tstamp_actual: AUDIO_TSTAMP_TYPE_LINK,
             faults: Vec::new(),
+            max_frames_per_write: None,
+            start_delay_us: 0,
+            release_flag: None,
         }
     }
 }
@@ -1180,7 +1363,7 @@ impl HapticPcm for SimPcm {
         let frames = (pcm.len() / PCM_CHANNELS) as u64;
         let queued = self.appl - self.hw_ptr(now_us).min(self.appl);
         let space = self.cfg.buffer_frames.saturating_sub(queued);
-        let n = frames.min(space);
+        let n = frames.min(space).min(self.cfg.max_frames_per_write.unwrap_or(u64::MAX));
         if n == 0 {
             return Err(PcmError::WouldBlock);
         }
@@ -1195,8 +1378,12 @@ impl HapticPcm for SimPcm {
         if self.start_us.is_some() {
             return Err(PcmError::Other { errno: libc::EBADFD, call: "start" });
         }
-        self.start_us = Some(now_us);
-        self.trigger_us = now_us;
+        if self.cfg.start_delay_us > 0 {
+            std::thread::sleep(std::time::Duration::from_micros(self.cfg.start_delay_us));
+        }
+        let at = now_us + self.cfg.start_delay_us;
+        self.start_us = Some(at);
+        self.trigger_us = at;
         Ok(())
     }
 
@@ -1247,6 +1434,14 @@ impl HapticPcm for SimPcm {
     fn stop(&mut self) -> Result<(), PcmError> {
         self.dropped = true;
         Ok(())
+    }
+}
+
+impl Drop for SimPcm {
+    fn drop(&mut self) {
+        if let Some(flag) = &self.cfg.release_flag {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 }
 
@@ -1583,9 +1778,11 @@ mod tests {
     // ---- device failures ---------------------------------------------------
 
     /// An underrun (nothing written for longer than the buffer lasts) is an
-    /// XRUN at the kernel trigger time; no output from that snapshot.
+    /// XRUN. No occurrence time is claimed (registration 6-1, Codex 109
+    /// P1): the observation interval starts at the clock read before the
+    /// last healthy status call, the kernel trigger is kept raw and apart.
     #[test]
-    fn an_xrun_is_a_failure_at_the_kernel_trigger_time() {
+    fn an_xrun_is_a_failure_without_an_occurrence_time() {
         let t0 = 1_000_000;
         let (mut engine, mut pcm) = started(cfg(), SimPcmConfig::new(PERIOD, BUFFER), t0);
         engine.admit(submission(0, t0), Some(&payload(88, 0)));
@@ -1593,14 +1790,18 @@ mod tests {
         // Starved: 1040 frames last 21.67 ms; poll again only at +50 ms.
         let failure = step(&mut engine, &mut pcm, t0 + 50_000).unwrap_err();
         assert_eq!(failure.reason, FAIL_ALSA_XRUN);
-        assert_eq!(failure.occurred_basis, OCCURRED_KERNEL_TRIGGER);
-        assert_eq!(failure.occurred_us, t0 + 21_667, "1040 frames after the start");
-        assert_eq!(failure.detected_us, t0 + 50_000);
+        assert_eq!(failure.kernel_trigger_us, Some(t0 + 21_667), "raw, unverified, not an occurrence time");
+        assert_eq!(failure.kernel_trigger_ns, Some((t0 + 21_667) * 1_000));
+        assert_eq!((failure.last_good_status_t0_us, failure.detected_us), (t0, t0 + 50_000));
+        let json = failure.to_json();
+        assert_eq!(json["occurrence_time_determinable"], false);
+        assert_eq!(json["observation_interval_us"], serde_json::json!([t0, t0 + 50_000]));
+        assert!(json.get("occurred_us").is_none() && json.get("kernel_trigger_ns").is_none());
         assert_eq!(engine.abandon().len(), 1, "the written tick is abandoned, not output");
     }
 
     #[test]
-    fn injected_xrun_and_suspend_use_their_trigger_time() {
+    fn injected_xrun_and_suspend_keep_their_trigger_apart() {
         for (fault, reason) in [
             (SimFault::Xrun { after_start_us: 3_000 }, FAIL_ALSA_XRUN),
             (SimFault::Suspend { after_start_us: 3_000 }, FAIL_ALSA_SUSPENDED),
@@ -1611,24 +1812,56 @@ mod tests {
             let (mut engine, mut pcm) = started(cfg(), sim, t0);
             step(&mut engine, &mut pcm, t0 + 1_000).unwrap();
             let failure = step(&mut engine, &mut pcm, t0 + 4_000).unwrap_err();
-            assert_eq!((failure.reason, failure.occurred_us), (reason, t0 + 3_000));
-            assert_eq!(failure.occurred_basis, OCCURRED_KERNEL_TRIGGER);
+            assert_eq!((failure.reason, failure.kernel_trigger_us), (reason, Some(t0 + 3_000)));
+            assert_eq!((failure.last_good_status_t0_us, failure.detected_us), (t0 + 1_000, t0 + 4_000));
         }
     }
 
-    /// A moved trigger (restart) or a DMA pointer that goes back is an epoch
-    /// reset; a status error has no kernel time, so the last good snapshot
-    /// is the documented lower bound.
+    /// Codex 109 P1 regression 1: good snapshot 3,000 -> (receiver abort
+    /// 4,000, ledger level) -> device error 4,500 -> detection 5,000. The
+    /// engine claims no occurrence time; it keeps [3,000, 5,000] and the
+    /// detection (the ledger test of the same sequence is in `l2_output`).
     #[test]
-    fn epoch_resets_and_status_errors_are_failures_with_their_time_basis() {
+    fn codex109_good_3000_error_4500_detection_5000_claims_no_time() {
+        let t_start = 1_000;
+        let mut sim = SimPcmConfig::new(PERIOD, BUFFER);
+        sim.faults.push(SimFault::StatusError { after_start_us: 3_500 }); // 4,500 absolute
+        let (mut engine, mut pcm) = started(cfg(), sim, t_start);
+        step(&mut engine, &mut pcm, 3_000).unwrap();
+        let failure = step(&mut engine, &mut pcm, 5_000).unwrap_err();
+        assert_eq!(failure.reason, FAIL_ALSA_STATUS_ERROR);
+        assert_eq!((failure.last_good_status_t0_us, failure.detected_us), (3_000, 5_000));
+        assert_eq!(failure.kernel_trigger_us, None, "no kernel time for an error return");
+    }
+
+    /// Codex 109 P1 regression 2: the snapshot is taken at 3,000 but the
+    /// status call only returns at 5,000 (preempted); the device fails at
+    /// 4,000 and is detected at 6,000. The interval must start at the
+    /// clock read BEFORE the healthy call (3,000), never at its return.
+    #[test]
+    fn codex109_snapshot_3000_error_4000_return_5000_keeps_the_pre_call_read() {
+        let t_start = 1_000;
+        let (mut engine, mut pcm) = started(cfg(), SimPcmConfig::new(PERIOD, BUFFER), t_start);
+        let healthy = pcm.status(3_000).unwrap();
+        engine.observe(&healthy, 3_000, 5_000).unwrap();
+        let error = PcmError::Other { errno: libc::EIO, call: "status" };
+        let failure = engine.failure_from_error(&error, None, 6_000, "status");
+        assert_eq!((failure.last_good_status_t0_us, failure.detected_us), (3_000, 6_000));
+        assert!(failure.last_good_status_t0_us <= 4_000, "a true lower bound of the 4,000 failure");
+    }
+
+    /// A moved trigger (restart) or a DMA pointer that goes back is an epoch
+    /// reset; a status error has no kernel time at all.
+    #[test]
+    fn epoch_resets_and_status_errors_keep_interval_detection_and_trigger_apart() {
         let t0 = 1_000_000;
         let mut sim = SimPcmConfig::new(PERIOD, BUFFER);
         sim.faults.push(SimFault::EpochReset { after_start_us: 2_500, rewind_frames: 0 });
         let (mut engine, mut pcm) = started(cfg(), sim, t0);
         step(&mut engine, &mut pcm, t0 + 2_000).unwrap();
         let failure = step(&mut engine, &mut pcm, t0 + 3_000).unwrap_err();
-        assert_eq!((failure.reason, failure.occurred_us), (FAIL_ALSA_EPOCH_RESET, t0 + 2_500));
-        assert_eq!(failure.occurred_basis, OCCURRED_KERNEL_TRIGGER);
+        assert_eq!((failure.reason, failure.kernel_trigger_us), (FAIL_ALSA_EPOCH_RESET, Some(t0 + 2_500)));
+        assert_eq!(failure.last_good_status_t0_us, t0 + 2_000);
 
         // Pointer regression with the trigger unchanged (observed directly).
         let (mut engine, mut pcm) = started(cfg(), SimPcmConfig::new(PERIOD, BUFFER), t0);
@@ -1640,7 +1873,7 @@ mod tests {
         back.avail = BUFFER - 100; // ...100 queued: the DMA pointer went back 100 frames
         let failure = engine.observe(&back, t0 + 7_000, t0 + 7_001).unwrap_err();
         assert_eq!(failure.reason, FAIL_ALSA_EPOCH_RESET);
-        assert_eq!((failure.occurred_us, failure.occurred_basis), (t0 + 6_000, OCCURRED_LAST_GOOD_STATUS));
+        assert_eq!((failure.last_good_status_t0_us, failure.kernel_trigger_us), (t0 + 6_000, None));
 
         let mut sim = SimPcmConfig::new(PERIOD, BUFFER);
         sim.faults.push(SimFault::StatusError { after_start_us: 4_000 });
@@ -1648,8 +1881,7 @@ mod tests {
         step(&mut engine, &mut pcm, t0 + 3_000).unwrap();
         let failure = step(&mut engine, &mut pcm, t0 + 5_000).unwrap_err();
         assert_eq!(failure.reason, FAIL_ALSA_STATUS_ERROR);
-        assert_eq!((failure.occurred_us, failure.detected_us), (t0 + 3_000, t0 + 5_000));
-        assert_eq!(failure.occurred_basis, OCCURRED_LAST_GOOD_STATUS);
+        assert_eq!((failure.last_good_status_t0_us, failure.detected_us), (t0 + 3_000, t0 + 5_000));
     }
 
     #[test]
@@ -1664,11 +1896,77 @@ mod tests {
         engine.admit(submission(2, t0 + 1_900), Some(&payload(89, 0)));
         let failure = step(&mut engine, &mut pcm, t0 + 2_000).unwrap_err();
         assert_eq!(failure.reason, FAIL_ALSA_WRITE_ERROR);
-        assert_eq!(failure.occurred_us, t0 + 2_000, "the last good status of this iteration");
-        assert_eq!(failure.occurred_basis, OCCURRED_LAST_GOOD_STATUS);
+        assert_eq!(failure.last_good_status_t0_us, t0 + 2_000, "the healthy status of this iteration");
         let abandoned: Vec<u32> = engine.abandon().iter().map(|s| s.identity.seq).collect();
         assert_eq!(abandoned, vec![0, 1, 2], "written, in progress and queued");
-        assert!(engine.idle());
+        assert_eq!(engine.unwritten_tick_frames(), 0);
+        assert!(engine.in_flight.is_empty());
+    }
+
+    // ---- playback end (Codex 109 P1-2) and Q (P2) --------------------------
+
+    /// The snapshot with `hw_pos` = `target` on top of the simulated one
+    /// (queued and delay consistent, no driver delay).
+    fn snapshot_at(pcm: &mut SimPcm, engine: &HapticPlacement, t: u64, target: u64) -> PcmStatus {
+        let mut s = pcm.status(t).unwrap();
+        let queued = engine.written_frames() - target;
+        s.delay = queued as i64;
+        s.avail = BUFFER - queued;
+        s
+    }
+
+    /// Codex 109 P1 regression: n_k 512, 528 frames, hw_pos 528 — the onset
+    /// output is emitted but 512 frames are unplayed, so the engine is NOT
+    /// idle; it is idle only once hw_pos >= n_k + frames (the last frame
+    /// passed). The same for a 534-frame tick.
+    #[test]
+    fn codex109_the_engine_is_idle_only_after_the_last_tick_frame_passed() {
+        for samples in [88usize, 89] {
+            let frames = 6 * samples as u64;
+            let t0 = 1_000_000;
+            let (mut engine, mut pcm) = started(cfg(), SimPcmConfig::new(PERIOD, BUFFER), t0);
+            engine.admit(submission(0, t0), Some(&payload(samples, 0)));
+            step(&mut engine, &mut pcm, t0).unwrap();
+            assert_eq!(engine.in_flight.front().map(|t| t.n_k), Some(512));
+            let end = 512 + frames;
+            assert_eq!(engine.stats().last_tick_end_frame, Some(end));
+            let s = snapshot_at(&mut pcm, &engine, t0 + 1_000, 528);
+            let placed = engine.observe(&s, t0 + 1_000, t0 + 1_000).unwrap();
+            assert_eq!(placed.len(), 1, "the onset output");
+            assert!(engine.in_flight.is_empty());
+            assert!(!engine.idle(), "{samples}: onset output does not mean played");
+            assert_eq!(engine.unplayed_tick_frames(), end - 528);
+            let s = snapshot_at(&mut pcm, &engine, t0 + 2_000, end - 1);
+            engine.observe(&s, t0 + 2_000, t0 + 2_000).unwrap();
+            assert!(!engine.idle() && engine.unplayed_tick_frames() == 1, "{samples}: one frame left");
+            let s = snapshot_at(&mut pcm, &engine, t0 + 3_000, end);
+            engine.observe(&s, t0 + 3_000, t0 + 3_000).unwrap();
+            assert!(engine.idle() && engine.tick_tail_played(), "{samples}: last frame passed");
+            assert_eq!(engine.unplayed_tick_frames(), 0);
+        }
+    }
+
+    /// Codex 109 P2 regression: Q = 534 with a short write in progress
+    /// (64 of 534 written, 470 unwritten) must refuse another 534-frame tick
+    /// (1,004 unwritten), and accept again once the remainder is written.
+    #[test]
+    fn codex109_q_counts_the_unwritten_remainder_of_the_tick_being_written() {
+        let t0 = 1_000_000;
+        let c = PlacementConfig { queue_limit_frames: 534, ..cfg() };
+        let mut sim = SimPcmConfig::new(PERIOD, BUFFER);
+        sim.max_frames_per_write = Some(64);
+        let (mut engine, mut pcm) = started(c, sim, t0);
+        assert_eq!(engine.admit(submission(0, t0), Some(&payload(89, 0))), Admission::Queued);
+        step(&mut engine, &mut pcm, t0).unwrap();
+        assert_eq!(engine.unwritten_tick_frames(), 534 - 64, "short write in progress");
+        assert_eq!(engine.admit(submission(1, t0), Some(&payload(89, 0))), Admission::QueueFull);
+        let mut t = t0;
+        while engine.unwritten_tick_frames() > 0 {
+            t += 1_000;
+            step(&mut engine, &mut pcm, t).unwrap();
+        }
+        assert_eq!(engine.admit(submission(2, t), Some(&payload(89, 0))), Admission::Queued);
+        assert!(engine.stats().max_unwritten_tick_frames <= 534);
     }
 
     /// Conservation inside the engine: admitted = written + pending, and

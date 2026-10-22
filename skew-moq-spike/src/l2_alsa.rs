@@ -57,6 +57,14 @@ use crate::l2_haptic::{
 /// The runtime library (no dev symlink needed).
 pub const LIBASOUND: &str = "libasound.so.2";
 
+/// `snd_pcm_status_sizeof()` of the ABI the transcription assumed: x86-64
+/// alsa-lib with a 64-bit `struct timespec` (`snd_htimestamp_t`, 16 bytes;
+/// kernel uapi `struct snd_pcm_status` = 152 bytes). A different size means
+/// a different ABI (e.g. 32-bit time) under which the declared timestamp
+/// layout would be wrong, so `open` refuses it (runtime guard, Codex 109).
+pub const EXPECTED_STATUS_SIZEOF: usize = 152;
+const _: () = assert!(std::mem::size_of::<libc::timespec>() == 16, "snd_htimestamp_t is a 16-byte timespec");
+
 const SND_PCM_STREAM_PLAYBACK: c_uint = 0;
 const SND_PCM_NONBLOCK: c_int = 0x1;
 const SND_PCM_ACCESS_RW_INTERLEAVED: c_uint = 3;
@@ -273,12 +281,18 @@ impl AlsaPcm {
     /// anything that is not exactly the registered stream.
     pub fn open(device: &str, placement: &PlacementConfig) -> Result<Self, String> {
         let api = Api::load()?;
+        // Runtime ABI guard, before the device is touched.
+        let status_struct_bytes = unsafe { (api.snd_pcm_status_sizeof)() };
+        if status_struct_bytes != EXPECTED_STATUS_SIZEOF {
+            return Err(format!(
+                "{LIBASOUND}: snd_pcm_status_sizeof() = {status_struct_bytes}, the transcribed ABI assumes {EXPECTED_STATUS_SIZEOF} (x86-64, 64-bit timespec): refused"
+            ));
+        }
         let name = CString::new(device).map_err(|_| format!("device name {device:?} contains NUL"))?;
         let mut pcm: *mut Pcm = null_mut();
         // SAFETY: valid out-pointer and NUL-terminated name.
         let rc = unsafe { (api.snd_pcm_open)(&mut pcm, name.as_ptr(), SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK) };
         api.check(rc, &format!("snd_pcm_open({device}, PLAYBACK, NONBLOCK)"))?;
-        let status_struct_bytes = unsafe { (api.snd_pcm_status_sizeof)() };
         let mut this = Self {
             api,
             pcm,
@@ -321,6 +335,7 @@ impl AlsaPcm {
             "sw_silence_threshold": 0,
             "sw_silence_size": 0,
             "status_struct_bytes": this.status_struct_bytes,
+            "status_struct_guard": format!("snd_pcm_status_sizeof() must equal {EXPECTED_STATUS_SIZEOF} (checked at open, else refused)"),
             "binding": "libloading, declarations transcribed from alsa-sys 0.3.1 generated.rs (bindgen of asoundlib.h)",
         });
         Ok(this)
@@ -561,8 +576,8 @@ mod tests {
         match Api::load() {
             Ok(api) => {
                 assert!(!api.version().is_empty());
-                // x86-64 `struct snd_pcm_status` (kernel uapi) is 152 bytes.
-                assert_eq!(unsafe { (api.snd_pcm_status_sizeof)() }, 152);
+                // The runtime guard's expectation holds on this host.
+                assert_eq!(unsafe { (api.snd_pcm_status_sizeof)() }, EXPECTED_STATUS_SIZEOF);
                 assert!(api.strerror(-libc::EBUSY).to_lowercase().contains("busy"));
             }
             Err(error) if error.starts_with("cannot load") => {

@@ -1235,7 +1235,7 @@ fn l2_output_config(args: &Args) -> Result<Option<(PathBuf, skew_moq::l2_output:
         AlsaBackend, AlsaSinkConfig, FakeSinkConfig, L2Config, L2Modality, L2SinkKind,
         ALSA_DEFAULT_BUFFER_FRAMES, ALSA_DEFAULT_DEVICE, ALSA_DEFAULT_PERIOD_FRAMES,
         ALSA_DEFAULT_PREFILL_FRAMES, ALSA_DEFAULT_QUEUE_FRAMES, ALSA_DEFAULT_STATUS_INTERVAL_US,
-        ALSA_DEFAULT_TARGET_FILL_FRAMES, ALSA_READY_TIMEOUT_US,
+        ALSA_DEFAULT_TARGET_FILL_FRAMES, ALSA_READY_TIMEOUT_US, ALSA_RELEASE_TIMEOUT_US,
     };
     let fake_given =
         args.l2_fake_pc_offset_us.is_some() || args.l2_fake_haptic_offset_us.is_some();
@@ -1278,6 +1278,9 @@ fn l2_output_config(args: &Args) -> Result<Option<(PathBuf, skew_moq::l2_output:
                 .l2_alsa_status_interval_us
                 .unwrap_or(ALSA_DEFAULT_STATUS_INTERVAL_US),
             ready_timeout_us: ALSA_READY_TIMEOUT_US,
+            release_timeout_us: ALSA_RELEASE_TIMEOUT_US,
+            // The receiver never writes the probe-only diagnostics file.
+            diagnostics: None,
         })
     } else {
         if alsa_given {

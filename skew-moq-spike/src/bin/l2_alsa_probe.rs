@@ -19,7 +19,8 @@
 //! pw-reserve -n Audio1 -r &      # ask the holder (PipeWire/WirePlumber) to release card1; keep it
 //! RESERVE=$!
 //! sleep 1                         # let the release complete
-//! target/debug/l2_alsa_probe --i-have-approval --l2-log /fresh/path/probe-l2.jsonl
+//! target/debug/l2_alsa_probe --i-have-approval --l2-log /fresh/path/probe-l2.jsonl \
+//!     --diagnostics /fresh/path/probe-alsa-diagnostics.jsonl
 //! kill "$RESERVE"; wait "$RESERVE"   # give card1 back
 //! ```
 //!
@@ -48,7 +49,7 @@ use skew_moq::l2_output::{
     AlsaBackend, AlsaSinkConfig, L2Config, L2Identity, L2Modality, L2Output, L2SinkKind, L2Sinks,
     ALSA_DEFAULT_BUFFER_FRAMES, ALSA_DEFAULT_DEVICE, ALSA_DEFAULT_PERIOD_FRAMES, ALSA_DEFAULT_PREFILL_FRAMES,
     ALSA_DEFAULT_QUEUE_FRAMES, ALSA_DEFAULT_STATUS_INTERVAL_US, ALSA_DEFAULT_TARGET_FILL_FRAMES,
-    ALSA_READY_TIMEOUT_US,
+    ALSA_READY_TIMEOUT_US, ALSA_RELEASE_TIMEOUT_US,
 };
 use skew_moq::{now_us, pcm_tick_payload, timestamp_us, PCM_SAMPLE_RATE_HZ};
 
@@ -67,6 +68,12 @@ struct Args {
     /// The L2 JSONL to create (must not exist).
     #[arg(long)]
     l2_log: Option<PathBuf>,
+    /// Optional probe-only diagnostics JSONL to create (must not exist): the
+    /// raw snapshot values (ns, and the audio timestamp in its own domain)
+    /// that the L2 JSONL does not carry (registration 11-11). Never an
+    /// analysis time axis.
+    #[arg(long)]
+    diagnostics: Option<PathBuf>,
     #[arg(long, default_value = "l2-alsa-probe")]
     run_id: String,
     #[arg(long, default_value = ALSA_DEFAULT_DEVICE)]
@@ -249,6 +256,8 @@ fn run(args: &Args) -> Result<bool> {
             },
             status_interval_us: args.status_interval_us,
             ready_timeout_us: ALSA_READY_TIMEOUT_US,
+            release_timeout_us: ALSA_RELEASE_TIMEOUT_US,
+            diagnostics: args.diagnostics.clone(),
         }),
         queue_capacity: 256,
         row_capacity: 65_536,
