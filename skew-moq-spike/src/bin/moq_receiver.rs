@@ -278,7 +278,7 @@ struct Args {
     /// ACTUAL release points of b1/s1/s2/s3/s3r submit.
     #[arg(long, default_value = "none", value_parser = parse_l2_sink)]
     l2_sink: L2SinkArg,
-    /// Separate L2 JSONL (schema `skew_moq::l2_output::L2_SCHEMA`, v1.2).
+    /// Separate L2 JSONL (schema tag `skew_moq::l2_output::L2_SCHEMA`).
     /// Required iff `--l2-sink` is not `none`; must not exist yet and must
     /// not be the rx log.
     #[arg(long)]
