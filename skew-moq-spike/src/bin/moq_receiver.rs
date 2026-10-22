@@ -90,6 +90,14 @@ enum Arm {
     P1,
 }
 
+/// `--l2-sink`. `None` is the pre-L2 receiver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum L2SinkArg {
+    None,
+    Null,
+    Fake,
+}
+
 impl Arm {
     fn as_str(self) -> &'static str {
         match self {
@@ -205,6 +213,30 @@ struct Args {
     /// the planned object count; overflow is counted and fails the seal.
     #[arg(long, default_value_t = 4096)]
     receive_trace_capacity: usize,
+    /// L2 output stage (experiment 1-D, milestone M1, device-free). `none`
+    /// (the default) constructs nothing: no thread, no file, no row, and the
+    /// rx log is byte-identical to a build without this option. `null` accepts
+    /// releases and never resolves them (overhead measurement only); `fake`
+    /// emits a synthetic `output` at `t_submit + offset`. Only the ACTUAL
+    /// release points of b1/s1/s2/s3/s3r submit.
+    #[arg(long, value_enum, default_value = "none")]
+    l2_sink: L2SinkArg,
+    /// Separate L2 JSONL (`event-pair-l2-v0`). Required iff `--l2-sink` is not
+    /// `none`; must differ from `--out`.
+    #[arg(long)]
+    l2_log: Option<PathBuf>,
+    /// Fake sink: `t_output_us = t_submit_us + offset` for PC objects.
+    #[arg(long)]
+    l2_fake_pc_offset_us: Option<u64>,
+    /// Fake sink: `t_output_us = t_submit_us + offset` for haptic objects.
+    #[arg(long)]
+    l2_fake_haptic_offset_us: Option<u64>,
+    /// Bound of the non-blocking release -> sink submission queue.
+    #[arg(long)]
+    l2_queue_capacity: Option<usize>,
+    /// Report window after submissions close, in ms.
+    #[arg(long)]
+    l2_report_window_ms: Option<u64>,
     #[arg(long)]
     s_bytes: u64,
     #[arg(long)]
@@ -1105,6 +1137,114 @@ fn validate_queue_policy(
     Ok(())
 }
 
+/// M1 defaults, recorded in the L2 meta row. Not experimental parameters of
+/// any method: they bound the device-free output stage only.
+const L2_DEFAULT_QUEUE_CAPACITY: usize = 256;
+const L2_ROW_CAPACITY: usize = 65_536;
+const L2_DEFAULT_REPORT_WINDOW_MS: u64 = 1_000;
+
+/// Validate the L2 output-stage options before any log is opened. `Ok(None)`
+/// for `--l2-sink none`, which must also carry no other L2 option.
+fn l2_output_config(args: &Args) -> Result<Option<(PathBuf, skew_moq::l2_output::L2Config)>> {
+    use skew_moq::l2_output::{FakeSinkConfig, L2Config, L2SinkKind};
+    let fake_given =
+        args.l2_fake_pc_offset_us.is_some() || args.l2_fake_haptic_offset_us.is_some();
+    let sink = match args.l2_sink {
+        L2SinkArg::None => {
+            if args.l2_log.is_some()
+                || fake_given
+                || args.l2_queue_capacity.is_some()
+                || args.l2_report_window_ms.is_some()
+            {
+                bail!("--l2-log/--l2-fake-*/--l2-queue-capacity/--l2-report-window-ms require --l2-sink null|fake");
+            }
+            return Ok(None);
+        }
+        L2SinkArg::Null => L2SinkKind::Null,
+        L2SinkArg::Fake => L2SinkKind::Fake,
+    };
+    // The registered 1-D ladder (B1, S1, S2, S3, S3R). M1/S2Eq share the S1
+    // dispatcher but are not 1-D methods; s3np and the exp2 arms have no hook.
+    if !matches!(args.arm, Arm::B1 | Arm::S1 | Arm::S2 | Arm::S3 | Arm::S3r) {
+        bail!("--l2-sink supports only --arm b1|s1|s2|s3|s3r, not {}", args.arm.as_str());
+    }
+    if args.exp2_out.is_some() {
+        bail!("--l2-sink cannot be combined with the exp2 recorder (it has its own L2 ledger)");
+    }
+    if args.render || args.audio {
+        bail!("--l2-sink replaces the Stage A bridge; do not combine it with --render/--audio");
+    }
+    let path = args.l2_log.clone().context("--l2-sink null|fake requires --l2-log")?;
+    if path == args.out {
+        bail!("--l2-log must differ from --out");
+    }
+    let fake = match sink {
+        L2SinkKind::Fake => Some(FakeSinkConfig::offsets(
+            args.l2_fake_pc_offset_us
+                .context("--l2-sink fake requires --l2-fake-pc-offset-us")?,
+            args.l2_fake_haptic_offset_us
+                .context("--l2-sink fake requires --l2-fake-haptic-offset-us")?,
+        )),
+        L2SinkKind::Null => {
+            if fake_given {
+                bail!("--l2-fake-* options require --l2-sink fake");
+            }
+            None
+        }
+    };
+    let config = L2Config {
+        run_id: args.run_id.clone(),
+        method: args.arm.as_str().to_string(),
+        sink,
+        fake,
+        queue_capacity: args.l2_queue_capacity.unwrap_or(L2_DEFAULT_QUEUE_CAPACITY),
+        row_capacity: L2_ROW_CAPACITY,
+        report_window_us: ms_to_us(
+            args.l2_report_window_ms.unwrap_or(L2_DEFAULT_REPORT_WINDOW_MS),
+            "l2-report-window-ms",
+        )?,
+    };
+    config.validate()?;
+    Ok(Some((path, config)))
+}
+
+/// Close the L2 output stage (registration §3-5 order, see `L2Output::finish`)
+/// off the async runtime. Returns whether the instrumentation is intact.
+async fn finish_l2_output(output: skew_moq::l2_output::L2Output) -> Result<skew_moq::l2_output::L2Summary> {
+    let sink = output.sink_kind();
+    let summary = tokio::task::spawn_blocking(move || output.finish())
+        .await
+        .context("L2 finish task join")??;
+    if !summary.integrity_ok(sink) {
+        eprintln!("[rx] L2 instrumentation integrity failure: {summary:?}");
+    }
+    Ok(summary)
+}
+
+/// Hand one released object to the L2 output stage. Called ONLY at the
+/// actual release points: the B1 branch of the drain (B1's rx row, with
+/// `t_play == t_recv`, is its release), `dispatch_playout_actions` after
+/// `try_log_release` (S1/S2/S3R) and `dispatch_s3_playout_actions` after
+/// `try_log_release_s3` (S3, the released route copy only). Never blocks.
+fn submit_l2_release(l2: &skew_moq::l2_output::L2Submitter, h: &Header, t_release: u64, route: Option<(&'static str, u64)>) {
+    let modality = match h.track_id {
+        TRACK_PC => skew_moq::l2_output::L2Modality::Pc,
+        TRACK_HAPTIC => skew_moq::l2_output::L2Modality::Haptic,
+        _ => return,
+    };
+    l2.submit(
+        skew_moq::l2_output::L2Identity {
+            modality,
+            tier: h.tier,
+            seq: h.seq,
+            pts_us: h.pts_us,
+            event_id: h.event_id,
+            route,
+        },
+        t_release,
+    );
+}
+
 fn validate_phase4_v5_args(args: &Args) -> Result<()> {
     if args.arm != Arm::B1 && args.payload_mode != PayloadMode::Frame {
         bail!(
@@ -1468,6 +1608,9 @@ fn dispatch_playout_actions(
     // Experiment 2: S1 terminals are also logged into the exp2 ledger
     // (logging only; `None` for every other caller).
     exp2: Option<&Exp2Shared>,
+    // L2 output stage (1-D M1): released objects only, after the release row.
+    // `None` for s3np and whenever `--l2-sink none`.
+    l2: Option<&skew_moq::l2_output::L2Submitter>,
 ) -> std::io::Result<()> {
     for action in actions {
         let t_due = due_us(&action);
@@ -1499,6 +1642,9 @@ fn dispatch_playout_actions(
                     action_time,
                     t_due,
                 )?;
+                if let Some(l2) = l2 {
+                    submit_l2_release(l2, &h, action_time, None);
+                }
                 exp2_s1_action(exp2, &h, action_time, t_due, None)?;
                 stats.released += 1;
                 let observe =
@@ -1570,6 +1716,7 @@ fn dispatch_common_actions(
     audio: bool,
     stats: &mut PlayoutStats,
     exp2: &Option<Exp2Shared>,
+    l2: &Option<skew_moq::l2_output::L2Submitter>,
 ) -> std::io::Result<()> {
     dispatch_playout_actions(
         actions,
@@ -1580,6 +1727,7 @@ fn dispatch_common_actions(
         stats,
         &|action| scheduler.action_due_us(action),
         exp2.as_ref(),
+        l2.as_ref(),
     )
 }
 
@@ -1591,6 +1739,9 @@ async fn run_playout_scheduler(
     render: bool,
     audio: bool,
     exp2: Option<Exp2Shared>,
+    // Owned by the task so releases in the post-FIN drain below are
+    // submitted too; dropped when the task returns.
+    l2: Option<skew_moq::l2_output::L2Submitter>,
 ) -> Result<PlayoutStats> {
     let mut scheduler = PlayoutScheduler::new(config).map_err(anyhow::Error::msg)?;
     let mut stats = PlayoutStats::default();
@@ -1637,13 +1788,13 @@ async fn run_playout_scheduler(
             }
         };
         log_common_epochs(&mut scheduler, &logger, config)?;
-        dispatch_common_actions(actions, &scheduler, &logger, &bridge, render, audio, &mut stats, &exp2)?;
+        dispatch_common_actions(actions, &scheduler, &logger, &bridge, render, audio, &mut stats, &exp2, &l2)?;
     }
 
     if !scheduler.is_started() {
         exp2_s1_seal_if_due(&exp2, &scheduler)?;
         let actions = scheduler.finish_without_epoch();
-        dispatch_common_actions(actions, &scheduler, &logger, &bridge, render, audio, &mut stats, &exp2)?;
+        dispatch_common_actions(actions, &scheduler, &logger, &bridge, render, audio, &mut stats, &exp2, &l2)?;
     } else {
         // Producer ended: deterministically drain the bounded timeline, then
         // return so logger finalization cannot race a detached scheduler task.
@@ -1654,7 +1805,7 @@ async fn run_playout_scheduler(
             tokio::time::sleep(Duration::from_micros(wakeup.saturating_sub(now_us()))).await;
             exp2_s1_seal_if_due(&exp2, &scheduler)?;
             let actions = scheduler.advance(now_us());
-            dispatch_common_actions(actions, &scheduler, &logger, &bridge, render, audio, &mut stats, &exp2)?;
+            dispatch_common_actions(actions, &scheduler, &logger, &bridge, render, audio, &mut stats, &exp2, &l2)?;
         }
     }
     Ok(stats)
@@ -1737,6 +1888,8 @@ async fn run_s3np_release_scheduler(
             &mut stats,
             &|action| scheduler.action_due_us(action),
             None,
+            // s3np is not a 1-D method: no L2 hook.
+            None,
         )?;
     }
 
@@ -1754,6 +1907,8 @@ async fn run_s3np_release_scheduler(
             audio,
             &mut stats,
             &|action| scheduler.action_due_us(action),
+            None,
+            // s3np is not a 1-D method: no L2 hook.
             None,
         )?;
     }
@@ -2912,6 +3067,9 @@ fn dispatch_s3_playout_actions(
     now: u64,
     // Stage-9 decision 9-6 `t_due`, from the scheduler that emitted the action.
     due_us: &dyn Fn(&PlayoutAction) -> Option<u64>,
+    // L2 output stage (1-D M1): the RELEASED route copy only. `None` for P1
+    // and whenever `--l2-sink none`.
+    l2: Option<&skew_moq::l2_output::L2Submitter>,
 ) -> Result<()> {
     settle_tracker_batch(tracker, &actions, now).map_err(anyhow::Error::msg)?;
     for action in actions {
@@ -2937,6 +3095,14 @@ fn dispatch_s3_playout_actions(
                         now.max(object.t_recv),
                         t_due,
                     )?;
+                if let Some(l2) = l2 {
+                    submit_l2_release(
+                        l2,
+                        &header,
+                        now.max(object.t_recv),
+                        Some((route.name, route.generation)),
+                    );
+                }
                 if let Some(t_due) = t_due {
                     if (now.max(object.t_recv) as i64 - t_due as i64) < -MAX_NEGATIVE_LATENESS_US {
                         stats.negative_lateness += 1;
@@ -4935,6 +5101,8 @@ fn drain_s3_events_at_exit<H>(
     refused_after_run_end: &mut u64,
     faults: &mut S3SwitchTargetFaults,
     outcome_error: &mut Option<anyhow::Error>,
+    // A release emitted while draining at exit is a real release.
+    l2: Option<&skew_moq::l2_output::L2Submitter>,
 ) -> ExitDrain {
     let mut drained = 0u64;
     let disconnected = loop {
@@ -4985,6 +5153,7 @@ fn drain_s3_events_at_exit<H>(
             stats,
             now,
             &|action| scheduler.action_due_us(action),
+            l2,
         );
         for error in [failure, dispatched.err()].into_iter().flatten() {
             if outcome_error.is_none() {
@@ -6139,6 +6308,13 @@ where
     // site.
     T: std::fmt::Debug + S3SessionOutcome,
 {
+    // L2 output stage (1-D M1); `None` with `--l2-sink none`. An early `?`
+    // return below leaves the L2 file without its sentinel (fail closed).
+    let mut l2_output = match l2_output_config(args)? {
+        Some((path, config)) => Some(skew_moq::l2_output::L2Output::start(&path, config)?),
+        None => None,
+    };
+    let l2_submitter = l2_output.as_ref().map(|output| output.submitter());
     let mut controller = S3Controller::new(runtime.controller).map_err(anyhow::Error::msg)?;
     let gate = S3SwitchGate::new(runtime.switch)
         .map_err(|error| anyhow::anyhow!("create S3 switch gate: {error:?}"))?;
@@ -6444,6 +6620,7 @@ where
             &mut stats,
             now,
             &|action| scheduler.action_due_us(action),
+            l2_submitter.as_ref(),
         ) {
             outcome_error = Some(error);
             continue;
@@ -6704,6 +6881,7 @@ where
         &mut switch_refused_after_run_end,
         &mut switch_faults,
         &mut outcome_error,
+        l2_submitter.as_ref(),
     );
     s3_events_drained_at_exit += pass_one.drained;
 
@@ -6797,6 +6975,7 @@ where
         &mut switch_refused_after_run_end,
         &mut switch_faults,
         &mut outcome_error,
+        l2_submitter.as_ref(),
     );
     s3_events_drained_at_exit += pass_two.drained;
     let event_queue_closed = pass_two.disconnected;
@@ -6850,6 +7029,9 @@ where
                 &mut stats,
                 now,
                 &|action| scheduler.action_due_us(action),
+                // The bounded shutdown flush releases for real: submit them
+                // (unlike the Stage A bridge, which is already closed here).
+                l2_submitter.as_ref(),
             ) {
                 keep_first_cause(&mut outcome_error, error);
                 break;
@@ -6870,8 +7052,20 @@ where
             now,
             // No epoch was ever armed, so no object had a deadline.
             &|_| None,
+            // Drops only; nothing is submitted.
+            l2_submitter.as_ref(),
         ) {
             keep_first_cause(&mut outcome_error, error);
+        }
+    }
+
+    // Submissions end with the shutdown flush above; close the L2 stage
+    // before the shutdown rows so no `?` below can skip it. Its integrity is
+    // judged from the L2 file, not from the rx log or the exit status.
+    drop(l2_submitter);
+    if let Some(output) = l2_output.take() {
+        if let Err(e) = finish_l2_output(output).await {
+            eprintln!("[rx] S3 L2 output stage failed to close: {e:#}");
         }
     }
 
@@ -7127,6 +7321,9 @@ async fn main() -> Result<()> {
     }
     validate_queue_policy(args.queue_policy, args.arm, args.payload_mode)?;
     let s1_config = playout_config(&args)?;
+    // Validate the L2 options before any log is opened (the instance itself
+    // is started later, on the path that owns it).
+    l2_output_config(&args)?;
     let s3np_config = s3np_release_config(&args)?;
     let s3_runtime = s3_runtime_config(&args)?;
     let p1_runtime = p1_runtime_config(&args)?;
@@ -7296,6 +7493,15 @@ async fn main() -> Result<()> {
         )
         .await;
     }
+
+    // L2 output stage (1-D M1). `--l2-sink none` constructs nothing, so the
+    // pre-L2 receiver path is unchanged. S3 owns its own instance inside
+    // `run_s3_control`.
+    let mut l2_output = match l2_output_config(&args)? {
+        Some((path, config)) => Some(skew_moq::l2_output::L2Output::start(&path, config)?),
+        None => None,
+    };
+    let l2_submitter = l2_output.as_ref().map(|output| output.submitter());
 
     let receive_trace = args.receive_trace.as_ref()
         .map(|path| receive_trace::Trace::start(path, &args.run_id, args.receive_trace_capacity)).transpose()?;
@@ -7501,6 +7707,8 @@ async fn main() -> Result<()> {
             // exp2 logging is only ever enabled for S1 among the arms that
             // run this scheduler (exp2_cli_config refuses M1/S2/S2Eq/S3r).
             exp2_shared.clone(),
+            // `l2_output_config` admits only s1/s2/s3r among these arms.
+            l2_submitter.clone(),
         ));
         println!(
             "[rx] S1 scheduler: D_play={}ms startup={}ms late={}ms policy={} objects/track={} span={}ms",
@@ -7573,6 +7781,7 @@ async fn main() -> Result<()> {
         let ingress_drops = ingress_drops.clone();
         let ingress_log_failed = ingress_log_failed.clone();
         let wire_stats_out = wire_stats.clone();
+        let l2_b1 = if args.arm == Arm::B1 { l2_submitter.clone() } else { None };
         // Logical slots this drain owns: its own for pc/haptic, both for mixed.
         let owned_slots: Vec<usize> = if name == SHARED_FIFO_TRACK {
             vec![0, 1]
@@ -7765,9 +7974,20 @@ async fn main() -> Result<()> {
                                 ingress_log_failed.fetch_add(1, Ordering::Relaxed);
                             }
                         }
-                    } else if fwd {
-                        if let Some(tx) = &ftx {
-                            let _ = tx.try_send(logical_obj); // drop-on-full (latest-wins-ish)
+                    } else {
+                        // B1 release point (1-D §3-1): B1 has no scheduler,
+                        // so the rx row above (`t_play == t_recv`) IS the
+                        // release. `l2_b1` is `Some` only for `--arm b1`; the
+                        // S1 family passes through the same rx row but takes
+                        // the scheduler branch above and submits at its own
+                        // release in `dispatch_playout_actions`.
+                        if let Some(l2) = &l2_b1 {
+                            submit_l2_release(l2, &h, t, None);
+                        }
+                        if fwd {
+                            if let Some(tx) = &ftx {
+                                let _ = tx.try_send(logical_obj); // drop-on-full (latest-wins-ish)
+                            }
                         }
                     }
                 }
@@ -7794,6 +8014,7 @@ async fn main() -> Result<()> {
         }));
     }
     drop(ftx); // only the drain clones keep the channel open now
+    drop(l2_submitter); // only the drain/scheduler clones submit from here on
 
     // Wait for both drains to finish (tracks closed by publisher) or session
     // end / timeout.
@@ -7891,6 +8112,17 @@ async fn main() -> Result<()> {
         if exp2_outcome.as_deref() != Some("ok") {
             eprintln!("[rx] {}", exp2_outcome.as_deref().unwrap_or_default());
             scheduler_finalize_failed = true;
+        }
+    }
+
+    // L2: every submitter clone is gone (drains joined, scheduler task
+    // joined or aborted), so close the output stage now — before any
+    // `process::exit` below, which would skip it. An L2 integrity failure is
+    // judged from the L2 file (sentinel / its absence); it changes neither
+    // the rx log nor the exit code, whose meaning the batch driver owns.
+    if let Some(output) = l2_output.take() {
+        if let Err(e) = finish_l2_output(output).await {
+            eprintln!("[rx] L2 output stage failed to close: {e:#}");
         }
     }
 
@@ -8481,6 +8713,12 @@ mod rx_ending_tests {
             out: PathBuf::from("/dev/null"),
             receive_trace: None,
             receive_trace_capacity: 4096,
+            l2_sink: L2SinkArg::None,
+            l2_log: None,
+            l2_fake_pc_offset_us: None,
+            l2_fake_haptic_offset_us: None,
+            l2_queue_capacity: None,
+            l2_report_window_ms: None,
             s_bytes: 1,
             c_mbps: None,
             rtt_ms: 0.0,
@@ -8770,6 +9008,12 @@ mod rx_ending_tests {
             out: PathBuf::from("/dev/null"),
             receive_trace: None,
             receive_trace_capacity: 4096,
+            l2_sink: L2SinkArg::None,
+            l2_log: None,
+            l2_fake_pc_offset_us: None,
+            l2_fake_haptic_offset_us: None,
+            l2_queue_capacity: None,
+            l2_report_window_ms: None,
             s_bytes: 1,
             c_mbps: None,
             rtt_ms: 0.0,
@@ -8870,6 +9114,12 @@ mod rx_ending_tests {
             out: PathBuf::from("/dev/null"),
             receive_trace: None,
             receive_trace_capacity: 4096,
+            l2_sink: L2SinkArg::None,
+            l2_log: None,
+            l2_fake_pc_offset_us: None,
+            l2_fake_haptic_offset_us: None,
+            l2_queue_capacity: None,
+            l2_report_window_ms: None,
             s_bytes: 1,
             c_mbps: None,
             rtt_ms: 0.0,
@@ -12192,6 +12442,16 @@ mod s3_control_loop_tests {
         duration_s: Option<&str>,
         force_ms: &str,
     ) -> Args {
+        s3_args_with(out, run_id, duration_s, force_ms, &[])
+    }
+
+    fn s3_args_with(
+        out: &std::path::Path,
+        run_id: &str,
+        duration_s: Option<&str>,
+        force_ms: &str,
+        extra: &[String],
+    ) -> Args {
         let out = out.display().to_string();
         let mut cli = vec![
             "moq_receiver",
@@ -12285,6 +12545,7 @@ mod s3_control_loop_tests {
             cli.push("--duration-s");
             cli.push(duration_s);
         }
+        cli.extend(extra.iter().map(String::as_str));
         Args::try_parse_from(cli).expect("registered S3 receiver CLI must parse")
     }
 
@@ -12486,8 +12747,21 @@ mod s3_control_loop_tests {
         delayed: Vec<(u64, Vec<Step>)>,
         session: SessionEnding,
     ) -> CaseOutcome {
+        run_case_inner_with(name, duration_s, force_ms, script, delayed, session, &[]).await
+    }
+
+    /// `run_case_inner` with extra receiver CLI flags (the L2 cases).
+    async fn run_case_inner_with(
+        name: &str,
+        duration_s: Option<&str>,
+        force_ms: &str,
+        script: Vec<Call>,
+        delayed: Vec<(u64, Vec<Step>)>,
+        session: SessionEnding,
+        extra: &[String],
+    ) -> CaseOutcome {
         let out = test_log_path(name);
-        let args = s3_args(&out, "loop-test", duration_s, force_ms);
+        let args = s3_args_with(&out, "loop-test", duration_s, force_ms, extra);
         let playout = playout_config(&args)
             .expect("playout config")
             .expect("S3 uses the common scheduler");
@@ -12879,6 +13153,129 @@ mod s3_control_loop_tests {
         assert_eq!(shutdown["s3_switch_suppressed_after_end"], 0);
         assert_eq!(shutdown["s3_switch_refused_after_run_end"], 0);
         outcome.assert_every_rx_object_is_terminated();
+    }
+
+    /// 1-D M1 (e)/(c)/(d): with `--l2-sink fake`, S3 submits exactly the
+    /// RELEASED route copy of each object — never a dropped copy of the same
+    /// event on the other route — and every L2 row carries the release row's
+    /// identity including `wire_track`/`route_generation`.
+    #[tokio::test]
+    async fn s3_l2_submits_only_the_released_route_copy_with_its_identity() {
+        let l2_path = test_log_path("s3-l2-route");
+        let extra: Vec<String> = [
+            "--l2-sink", "fake", "--l2-log", &l2_path.display().to_string(),
+            "--l2-fake-pc-offset-us", "2000", "--l2-fake-haptic-offset-us", "500",
+            "--l2-report-window-ms", "200",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let mut script = initial_calls(Vec::new());
+        script.push(Call {
+            track: PC_CRITICAL,
+            before: Vec::new(),
+            answer: Answer::Accept(Vec::new()),
+        });
+        script.push(Call {
+            track: HAPTIC_ESSENTIAL,
+            before: Vec::new(),
+            answer: Answer::Accept(vec![
+                Step::Publish(PC_CRITICAL, vec![(4, 2, 33_333, 2)]),
+                Step::Publish(HAPTIC_ESSENTIAL, vec![(0, 2, 33_333, 2)]),
+                Step::Yield(50),
+            ]),
+        });
+        let outcome = run_case_inner_with(
+            "s3-l2-a",
+            Some("30"),
+            "20",
+            script,
+            vec![
+                (
+                    // AFTER the apply: the same event on BOTH PC routes. The
+                    // cancelled Normal-route copy is beyond the barrier
+                    // (stale drop); the Critical-route copy is released.
+                    150,
+                    vec![
+                        Step::Publish(PC_NORMAL, vec![(2, 4, 99_999, 4)]),
+                        Step::Publish(PC_CRITICAL, vec![(4, 4, 99_999, 4)]),
+                        Step::Publish(HAPTIC_ESSENTIAL, vec![(0, 4, 99_999, 4)]),
+                        Step::Yield(50),
+                    ],
+                ),
+                (
+                    250,
+                    vec![
+                        Step::Fin(PC_CRITICAL),
+                        Step::Fin(HAPTIC_ESSENTIAL),
+                        Step::Fin(PC_NORMAL),
+                        Step::Fin(HAPTIC_FULL),
+                    ],
+                ),
+            ],
+            SessionEnding::Never,
+            &extra,
+        )
+        .await;
+        assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+        outcome.assert_every_rx_object_is_terminated();
+        let l2_text = std::fs::read_to_string(&l2_path).expect("L2 log written");
+        std::fs::remove_file(&l2_path).ok();
+        if std::env::var_os("SKEW_TEST_DUMP").is_some() {
+            eprintln!("---- L2 ----\n{l2_text}");
+        }
+        let l2: Vec<serde_json::Value> =
+            l2_text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(l2[0]["role"], "meta");
+        assert_eq!(l2[0]["l2_schema"], "event-pair-l2-v0");
+        assert_eq!(l2[0]["method"], "s3");
+        assert_eq!(l2[0]["run_id"], "loop-test");
+        let last = l2.last().unwrap();
+        assert_eq!(last["role"], "instrumentation_end");
+        assert_eq!(last["integrity_ok"], true, "{last}");
+        assert_eq!(l2.iter().filter(|r| r["role"] == "instrumentation_end").count(), 1);
+
+        let key = |r: &serde_json::Value| {
+            format!(
+                "{}/{}/{}/{}/{}/{}/{}",
+                r["track"], r["wire_track"], r["route_generation"], r["tier"], r["seq"],
+                r["pts_us"], r["event_id"]
+            )
+        };
+        let releases: Vec<&serde_json::Value> =
+            outcome.rows.iter().filter(|r| r["role"] == "release").collect();
+        let drops: Vec<&serde_json::Value> =
+            outcome.rows.iter().filter(|r| r["role"] == "drop").collect();
+        let submits: Vec<&serde_json::Value> = l2.iter().filter(|r| r["role"] == "submit").collect();
+        let outputs: Vec<&serde_json::Value> = l2.iter().filter(|r| r["role"] == "output").collect();
+        assert!(!releases.is_empty() && !drops.is_empty(), "case must release and drop");
+        assert_eq!(submits.len(), releases.len(), "one submit per release");
+        assert_eq!(outputs.len(), releases.len(), "one terminal per submit");
+        for release in &releases {
+            let k = key(release);
+            let s: Vec<_> = submits.iter().filter(|r| key(r) == k).collect();
+            let o: Vec<_> = outputs.iter().filter(|r| key(r) == k).collect();
+            assert_eq!((s.len(), o.len()), (1, 1), "release {k}");
+            assert_eq!(s[0]["t_release_us"], release["t_release"], "{k}");
+            assert_eq!(s[0]["run_id"], "loop-test");
+            assert!(s[0]["t_submit_us"].as_u64() >= s[0]["t_release_us"].as_u64());
+            assert!(o[0]["t_log_arrival_us"].as_u64() >= o[0]["t_output_us"].as_u64());
+        }
+        for drop in &drops {
+            let k = key(drop);
+            assert!(
+                l2.iter().all(|r| key(r) != k),
+                "a dropped route copy must have no L2 row: {k}"
+            );
+        }
+        // The duplicated PC event 99_999: released on pc-d6, dropped on pc.
+        let pc_dup: Vec<_> =
+            submits.iter().filter(|r| r["track"] == "pc" && r["pts_us"] == 99_999).collect();
+        assert_eq!(pc_dup.len(), 1, "exactly one route copy of the event is submitted");
+        assert_eq!(pc_dup[0]["wire_track"], PC_CRITICAL);
+        assert_eq!(pc_dup[0]["route_generation"], 1);
+        assert!(releases.iter().any(|r| r["wire_track"] == PC_CRITICAL && r["pts_us"] == 99_999));
+        assert!(drops.iter().any(|r| r["wire_track"] == PC_NORMAL && r["pts_us"] == 99_999));
     }
 
     /// (b) A transition whose request instant falls at/after the window end is
@@ -14639,6 +15036,7 @@ mod exp2_receiver_tests {
             &mut stats,
             &|_| Some(due),
             Some(&shared),
+            None,
         )
         .unwrap();
         // without the hook nothing reaches the exp2 ledger (unchanged S1)
@@ -14655,5 +15053,223 @@ mod exp2_receiver_tests {
         assert_eq!(rows.iter().filter(|r| r["role"] == "rx").count(), 1);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&legacy_path);
+    }
+}
+
+// ---- 1-D M1: L2 output stage hooks (device-free) ---------------------------
+#[cfg(test)]
+mod l2_hook_tests {
+    use super::*;
+    use skew_moq::l2_output::{FakeSinkConfig, L2Config, L2Output, L2SinkKind};
+
+    fn tmp(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("skew-l2hook-{}-{}-{name}.jsonl", std::process::id(), now_us()))
+    }
+
+    fn rx_logger(path: &std::path::Path) -> Arc<Mutex<JsonlLogger>> {
+        Arc::new(Mutex::new(
+            JsonlLogger::new(
+                path, "l2-hook", "moq", "rx", None, 0.0, 0.0, 0.0, 1, 30, 90, 1, None, None,
+                Some("both"), Some(TERM_PROTOCOL_V), None, None, None,
+            )
+            .unwrap(),
+        ))
+    }
+
+    fn fake_output(path: &std::path::Path, pc: u64, haptic: u64) -> L2Output {
+        L2Output::start(
+            path,
+            L2Config {
+                run_id: "l2-hook".into(),
+                method: "s1".into(),
+                sink: L2SinkKind::Fake,
+                fake: Some(FakeSinkConfig::offsets(pc, haptic)),
+                queue_capacity: 64,
+                row_capacity: 1024,
+                report_window_us: 200_000,
+            },
+        )
+        .unwrap()
+    }
+
+    fn object(track_id: u8, tier: u16, seq: u32, pts_us: u64, event_id: u32, t_recv: u64) -> PlayoutObject {
+        let header = unpack_header(&pack_header(track_id, tier, seq, pts_us, event_id, t_recv, 4)).unwrap();
+        PlayoutObject { header, t_recv, bytes: Bytes::from(vec![0u8; HDR + 4]) }
+    }
+
+    /// Release, release, drop. `t_recv` is far in the future so
+    /// `action_time = now.max(t_recv) = t_recv` and the rx rows are
+    /// deterministic, which is what makes a byte comparison meaningful.
+    fn actions(base: u64) -> Vec<PlayoutAction> {
+        vec![
+            PlayoutAction::Release(object(TRACK_PC, 2, 0, 0, 1, base)),
+            PlayoutAction::Release(object(TRACK_HAPTIC, 0, 0, 0, 1, base + 1)),
+            PlayoutAction::Drop {
+                object: object(TRACK_PC, 2, 1, 33_333, 2, base + 2),
+                reason: skew_moq::playout::DROP_LATE,
+                had_epoch: true,
+            },
+        ]
+    }
+
+    fn run_dispatch(
+        rx_path: &std::path::Path,
+        acts: Vec<PlayoutAction>,
+        l2: Option<&skew_moq::l2_output::L2Submitter>,
+    ) {
+        let logger = rx_logger(rx_path);
+        let mut stats = PlayoutStats::default();
+        dispatch_playout_actions(
+            acts, &logger, None, false, false, &mut stats,
+            &|a| Some(a.object().t_recv), None, l2,
+        )
+        .unwrap();
+        assert_eq!((stats.released, stats.dropped), (2, 1));
+    }
+
+    fn rows(path: &std::path::Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+    }
+
+    fn ident(r: &serde_json::Value) -> String {
+        format!("{}/{}/{}/{}/{}", r["track"], r["tier"], r["seq"], r["pts_us"], r["event_id"])
+    }
+
+    /// (a) The hook changes nothing in the rx log: the same actions dispatched
+    /// with and without an L2 submitter produce byte-identical rx JSONL.
+    #[test]
+    fn the_rx_log_is_byte_identical_with_and_without_the_l2_hook() {
+        let base = now_us() + 3_600_000_000;
+        let (a, b, l2_path) = (tmp("rx-none"), tmp("rx-fake"), tmp("l2-a"));
+        run_dispatch(&a, actions(base), None);
+        let output = fake_output(&l2_path, 0, 0);
+        run_dispatch(&b, actions(base), Some(&output.submitter()));
+        output.finish().unwrap();
+        let (ta, tb) = (std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
+        assert!(!ta.is_empty());
+        assert_eq!(ta, tb, "rx log must not depend on the L2 hook");
+        for p in [&a, &b, &l2_path] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    /// (b)(c)(d) S1-family release point: one submit + one output per RELEASE,
+    /// nothing for the drop, identity and `t_release` equal to the release row,
+    /// sentinel last.
+    #[test]
+    fn s1_dispatch_submits_each_release_once_with_the_release_identity() {
+        let (rx_path, l2_path) = (tmp("rx-s1"), tmp("l2-s1"));
+        let output = fake_output(&l2_path, 1_000, 300);
+        run_dispatch(&rx_path, actions(now_us()), Some(&output.submitter()));
+        let summary = output.finish().unwrap();
+        assert_eq!((summary.submitted, summary.output, summary.submitted_unresolved), (2, 2, 0));
+        let rx = rows(&rx_path);
+        let l2 = rows(&l2_path);
+        assert_eq!(l2.last().unwrap()["role"], "instrumentation_end");
+        let releases: Vec<_> = rx.iter().filter(|r| r["role"] == "release").collect();
+        assert_eq!(releases.len(), 2);
+        for rel in &releases {
+            let s: Vec<_> = l2.iter().filter(|r| r["role"] == "submit" && ident(r) == ident(rel)).collect();
+            let o: Vec<_> = l2.iter().filter(|r| r["role"] == "output" && ident(r) == ident(rel)).collect();
+            assert_eq!((s.len(), o.len()), (1, 1), "{}", ident(rel));
+            assert_eq!(s[0]["t_release_us"], rel["t_release"]);
+            assert_eq!(o[0]["t_release_us"], rel["t_release"]);
+            assert_eq!(s[0]["run_id"], "l2-hook");
+            assert!(s[0].get("wire_track").is_none(), "no route fields outside S3");
+        }
+        let dropped = rx.iter().find(|r| r["role"] == "drop").unwrap();
+        assert!(l2.iter().all(|r| ident(r) != ident(dropped)), "scheduler drops are not submitted");
+        for p in [&rx_path, &l2_path] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    /// The B1 hook maps the rx header verbatim (B1's rx row is its release).
+    #[test]
+    fn b1_release_hook_carries_the_header_identity_and_rx_time() {
+        let l2_path = tmp("l2-b1");
+        let output = fake_output(&l2_path, 0, 0);
+        let o = object(TRACK_HAPTIC, 0, 7, 77_777, 8, now_us());
+        submit_l2_release(&output.submitter(), &o.header, o.t_recv, None);
+        output.finish().unwrap();
+        let l2 = rows(&l2_path);
+        let s = l2.iter().find(|r| r["role"] == "submit").unwrap();
+        assert_eq!(
+            (s["track"].as_str(), s["tier"].as_u64(), s["seq"].as_u64(), s["pts_us"].as_u64(), s["event_id"].as_u64()),
+            (Some("haptic"), Some(0), Some(7), Some(77_777), Some(8))
+        );
+        assert_eq!(s["t_release_us"].as_u64(), Some(o.t_recv));
+        let _ = std::fs::remove_file(&l2_path);
+    }
+
+    fn b1_cli(extra: &[&str]) -> std::result::Result<Args, clap::Error> {
+        let mut cli: Vec<String> = [
+            "moq_receiver", "--run-id", "t", "--out", "/tmp/skew-l2-unused-rx.jsonl", "--s-bytes", "1",
+            "--pc-rate-hz", "30", "--haptic-rate-hz", "90", "--payload-mode", "frame",
+            "--representation", "bin", "--chunk-bytes", "178",
+            "--reassembly-max-pending-frames", "64", "--reassembly-max-pending-bytes",
+            "67108864", "--reassembly-max-age-ms", "2000", "--topology", "relay",
+            "--duration-s", "1",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        cli.extend(extra.iter().map(|s| s.to_string()));
+        Args::try_parse_from(cli)
+    }
+
+    #[test]
+    fn l2_sink_defaults_to_none_and_none_constructs_nothing() {
+        let args = b1_cli(&[]).unwrap();
+        assert_eq!(args.l2_sink, L2SinkArg::None);
+        assert!(l2_output_config(&args).unwrap().is_none());
+        // Any other L2 option without a sink is refused, not ignored.
+        for extra in [
+            &["--l2-log", "/tmp/x.jsonl"][..],
+            &["--l2-fake-pc-offset-us", "1"][..],
+            &["--l2-queue-capacity", "4"][..],
+            &["--l2-report-window-ms", "4"][..],
+        ] {
+            assert!(l2_output_config(&b1_cli(extra).unwrap()).is_err(), "{extra:?}");
+        }
+    }
+
+    #[test]
+    fn l2_options_are_validated_before_any_log_opens() {
+        let ok = b1_cli(&[
+            "--l2-sink", "fake", "--l2-log", "/tmp/skew-l2-unused.jsonl",
+            "--l2-fake-pc-offset-us", "1000", "--l2-fake-haptic-offset-us", "200",
+        ])
+        .unwrap();
+        let (path, config) = l2_output_config(&ok).unwrap().unwrap();
+        assert_eq!(path, PathBuf::from("/tmp/skew-l2-unused.jsonl"));
+        assert_eq!(config.method, "b1");
+        assert_eq!(config.queue_capacity, L2_DEFAULT_QUEUE_CAPACITY);
+        assert_eq!(config.report_window_us, L2_DEFAULT_REPORT_WINDOW_MS * 1_000);
+        let null = b1_cli(&["--l2-sink", "null", "--l2-log", "/tmp/skew-l2-unused.jsonl"]).unwrap();
+        assert!(l2_output_config(&null).unwrap().is_some());
+        let refused: &[&[&str]] = &[
+            // no log path
+            &["--l2-sink", "null"],
+            // fake without offsets
+            &["--l2-sink", "fake", "--l2-log", "/tmp/a.jsonl"],
+            // fake offsets on the null sink
+            &["--l2-sink", "null", "--l2-log", "/tmp/a.jsonl", "--l2-fake-pc-offset-us", "1"],
+            // same file as the rx log
+            &["--l2-sink", "null", "--l2-log", "/tmp/skew-l2-unused-rx.jsonl"],
+            // Stage A bridge
+            &["--l2-sink", "null", "--l2-log", "/tmp/a.jsonl", "--render"],
+            // not a 1-D method
+            &["--l2-sink", "null", "--l2-log", "/tmp/a.jsonl", "--arm", "s3np"],
+            &["--l2-sink", "null", "--l2-log", "/tmp/a.jsonl", "--arm", "m1"],
+            &["--l2-sink", "null", "--l2-log", "/tmp/a.jsonl", "--arm", "s2eq"],
+            &["--l2-sink", "null", "--l2-log", "/tmp/a.jsonl", "--arm", "p0"],
+            // zero queue
+            &["--l2-sink", "null", "--l2-log", "/tmp/a.jsonl", "--l2-queue-capacity", "0"],
+        ];
+        for extra in refused {
+            let args = b1_cli(extra).unwrap();
+            assert!(l2_output_config(&args).is_err(), "{extra:?}");
+        }
     }
 }
