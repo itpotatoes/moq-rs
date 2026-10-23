@@ -43,6 +43,57 @@ use skew_moq::s3_switch::{Route, S3SwitchGate, SwitchApplied, SwitchConfig, Swit
 use skew_moq::exp2_recorder::{Exp2Method, Exp2Recorder};
 use skew_moq::*;
 
+/// TEST-ONLY clock seam (registration 1-D §7-1 ①, Codex 125). Outside
+/// `cfg(test)` this item does not exist and every `now_us()` in this file is
+/// `skew_moq::now_us` (CLOCK_MONOTONIC) through the glob import above — the
+/// production binary is unchanged. In a test build this local function
+/// shadows that glob import for the whole receiver: with a virtual clock
+/// installed on the current thread ([`rx_virtual_clock::install`]) it is the
+/// paused tokio clock offset to a fixed base, so the receiver's clock reads
+/// and its `tokio::time::sleep`s agree in virtual time; without one (every
+/// other test) it is the real `skew_moq::now_us()`.
+#[cfg(test)]
+fn now_us() -> u64 {
+    rx_virtual_clock::now_us()
+}
+
+#[cfg(test)]
+mod rx_virtual_clock {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// `(base_us, tokio instant at install)`.
+        static CLOCK: Cell<Option<(u64, tokio::time::Instant)>> = const { Cell::new(None) };
+    }
+
+    pub fn now_us() -> u64 {
+        match CLOCK.with(|clock| clock.get()) {
+            Some((base_us, t0)) => {
+                base_us + tokio::time::Instant::now().saturating_duration_since(t0).as_micros() as u64
+            }
+            None => skew_moq::now_us(),
+        }
+    }
+
+    /// Uninstalls the virtual clock of this thread when dropped.
+    pub struct Installed(());
+
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            CLOCK.with(|clock| clock.set(None));
+        }
+    }
+
+    /// Virtual time `base_us` from now on this thread. Meaningful on a
+    /// current-thread runtime with paused time only (every task of the run
+    /// then reads it): tokio advances that clock in whole 1 ms ticks, so
+    /// every virtual instant is `base_us` + a multiple of 1,000 us.
+    pub fn install(base_us: u64) -> Installed {
+        CLOCK.with(|clock| clock.set(Some((base_us, tokio::time::Instant::now()))));
+        Installed(())
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum Arm {
     B1,
@@ -16119,6 +16170,252 @@ mod s3_control_loop_tests {
             );
         }
     }
+
+    // ---- 1-D §7-1 ① (Codex 125): S3 output-stage logic equivalence ---------
+
+    /// The receiver's virtual base for the S3 neutrality runs: below every
+    /// real CLOCK_MONOTONIC reading, so the L2 stage's real `t_submit` never
+    /// precedes a virtual `t_release`.
+    const NEUTRALITY_BASE_US: u64 = 10_000_000;
+    const NEUTRALITY_RUN_ID: &str = "neutrality-s3";
+
+    /// One run of a scripted S3 case through the REAL S3 control loop
+    /// (`run_s3_control`: scripted subscribe seam, real tracks and drain
+    /// tasks, the controller FSM, the switch gate and barrier, route
+    /// retirement, both exit drain passes, the shutdown flush, the L2 hook in
+    /// `dispatch_s3_playout_actions`) on the paused tokio clock with the
+    /// receiver's virtual clock installed. `l2` = the L2 flags of the
+    /// variant (`None` = `--l2-sink none`; `--l2-log` is added here).
+    /// Returns the run result, the rx JSONL and the L2 rows.
+    async fn neutrality_s3_run(
+        tag: &str,
+        duration_s: &str,
+        force_ms: &str,
+        script: Vec<Call>,
+        delayed: Vec<(u64, Vec<Step>)>,
+        l2: Option<&[&str]>,
+    ) -> (Result<()>, String, Option<Vec<serde_json::Value>>) {
+        // Before the clock is installed: a real-time, unique L2 path.
+        let l2_path = test_log_path(&format!("neutrality-{tag}-l2"));
+        let extra: Vec<String> = match l2 {
+            None => Vec::new(),
+            Some(flags) => ["--l2-log".to_string(), l2_path.display().to_string()]
+                .into_iter()
+                .chain(flags.iter().map(|s| s.to_string()))
+                .collect(),
+        };
+        let clock = rx_virtual_clock::install(NEUTRALITY_BASE_US);
+        let outcome = run_case_core(
+            &format!("neutrality-{tag}"),
+            NEUTRALITY_RUN_ID,
+            Some(duration_s),
+            force_ms,
+            script,
+            delayed,
+            SessionEnding::Never,
+            &extra,
+        )
+        .await;
+        drop(clock);
+        let l2_rows = l2.map(|_| {
+            let text = std::fs::read_to_string(&l2_path).expect("L2 log written");
+            std::fs::remove_file(&l2_path).ok();
+            text.lines().map(|l| serde_json::from_str(l).unwrap()).collect::<Vec<serde_json::Value>>()
+        });
+        (outcome.result, outcome.text, l2_rows)
+    }
+
+    const NEUTRALITY_FAKE: &[&str] = &[
+        "--l2-sink", "fake", "--l2-fake-pc-offset-us", "2000", "--l2-fake-haptic-offset-us", "500",
+        "--l2-report-window-ms", "200",
+    ];
+    /// Saturation: a one-slot submission queue per track; how many releases
+    /// find it full depends on the real-time lane threads (it varies run to
+    /// run), which is exactly what must NOT reach the rx log.
+    const NEUTRALITY_FAKE_Q1: &[&str] = &[
+        "--l2-sink", "fake", "--l2-fake-pc-offset-us", "2000", "--l2-fake-haptic-offset-us", "500",
+        "--l2-report-window-ms", "200", "--l2-queue-capacity", "1",
+    ];
+    const NEUTRALITY_PC_ONLY: &[&str] = &[
+        "--l2-sink", "pc=fake,haptic=null", "--l2-fake-pc-offset-us", "2000", "--l2-fake-haptic-offset-us", "500",
+        "--l2-report-window-ms", "200",
+    ];
+
+    fn neutrality_first_difference(a: &str, b: &str) -> String {
+        for (i, (x, y)) in a.lines().zip(b.lines()).enumerate() {
+            if x != y {
+                return format!("line {}:\n  off: {x}\n  on:  {y}", i + 1);
+            }
+        }
+        format!("line counts {} vs {}", a.lines().count(), b.lines().count())
+    }
+
+    /// The S3 decisions of one rx log, for the report.
+    fn neutrality_s3_decisions(text: &str) -> String {
+        let rows: Vec<serde_json::Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        let count = |f: &dyn Fn(&serde_json::Value) -> bool| rows.iter().filter(|r| f(r)).count();
+        let mut drops: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+        for r in rows.iter().filter(|r| r["role"] == "drop") {
+            *drops.entry(r["drop_reason"].as_str().unwrap_or("?").to_string()).or_default() += 1;
+        }
+        let mut s3: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+        for r in rows.iter().filter(|r| r["role"].as_str().is_some_and(|role| role.starts_with("s3"))) {
+            *s3.entry(format!("{}/{}", r["role"].as_str().unwrap(), r["event"].as_str().unwrap_or("-"))).or_default() += 1;
+        }
+        format!(
+            "rows {} rx {} release {} drop {drops:?} epochs {} s3 rows {s3:?}",
+            rows.len(),
+            count(&|r| r["role"] == "rx"),
+            count(&|r| r["role"] == "release"),
+            count(&|r| r["event"] == "timeline_epoch"),
+        )
+    }
+
+    /// Gate + equivalence for one S3 script: the variant runs twice and must
+    /// reproduce itself byte-for-byte; every L2 variant must then equal the
+    /// L2-off rx log byte-for-byte, with the same run result.
+    async fn neutrality_s3_assert(
+        name: &str,
+        duration_s: &str,
+        force_ms: &str,
+        case: fn() -> (Vec<Call>, Vec<(u64, Vec<Step>)>),
+    ) -> String {
+        let run = |tag: String, l2: Option<&'static [&'static str]>| {
+            let (script, delayed) = case();
+            async move { neutrality_s3_run(&tag, duration_s, force_ms, script, delayed, l2).await }
+        };
+        let (off_result, off, _) = run(format!("{name}-off-1"), None).await;
+        let (_, off_again, _) = run(format!("{name}-off-2"), None).await;
+        assert!(off == off_again, "{name}: gate (off twice): {}", neutrality_first_difference(&off, &off_again));
+        let (_, fake, fake_l2) = run(format!("{name}-fake-1"), Some(NEUTRALITY_FAKE)).await;
+        let (_, fake_again, _) = run(format!("{name}-fake-2"), Some(NEUTRALITY_FAKE)).await;
+        assert!(fake == fake_again, "{name}: gate (fake twice): {}", neutrality_first_difference(&fake, &fake_again));
+        let (q1_result, q1, q1_l2) = run(format!("{name}-q1"), Some(NEUTRALITY_FAKE_Q1)).await;
+        let (_, pc_only, _) = run(format!("{name}-pc-only"), Some(NEUTRALITY_PC_ONLY)).await;
+        for (variant, text) in [("fake", &fake), ("fake, queue 1", &q1), ("pc=fake,haptic=null", &pc_only)] {
+            assert!(off == *text, "{name}: L2 {variant} changed the rx log: {}", neutrality_first_difference(&off, text));
+        }
+        assert_eq!(format!("{off_result:?}"), format!("{q1_result:?}"), "{name}: the run result");
+        // The hook was live: one submission or pre-submit discard per release.
+        let releases = off.lines().filter(|l| l.contains("\"role\":\"release\"")).count();
+        for (variant, l2) in [("fake", fake_l2.as_ref().unwrap()), ("fake, queue 1", q1_l2.as_ref().unwrap())] {
+            let submits = l2.iter().filter(|r| r["role"] == "submit").count();
+            let full = l2
+                .iter()
+                .filter(|r| r["role"] == "explicit_discard" && r["reason"] == skew_moq::l2_output::DISCARD_OUTPUT_QUEUE_FULL)
+                .count();
+            assert_eq!(submits + full, releases, "{name}: {variant}");
+            assert_eq!(l2.last().unwrap()["role"], "instrumentation_end", "{name}: {variant}");
+        }
+        let full_q1 = q1_l2
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|r| r["role"] == "explicit_discard" && r["reason"] == skew_moq::l2_output::DISCARD_OUTPUT_QUEUE_FULL)
+            .count();
+        eprintln!("[neutrality] s3 {name}: {} | rx bytes {} | queue-1 output_queue_full {full_q1}", neutrality_s3_decisions(&off), off.len());
+        off
+    }
+
+    /// S3 case 1: the forced deadline misses drive the controller to
+    /// Haptic-Critical, the switch is requested, both targets answer, the
+    /// switch is applied (route generation 1); afterwards the same event on
+    /// BOTH PC routes (the cancelled route's copy is a stale drop, the new
+    /// route's copy is released); all routes end with FIN (normal end, both
+    /// exit drain passes).
+    fn neutrality_switch_case() -> (Vec<Call>, Vec<(u64, Vec<Step>)>) {
+        let mut script = initial_calls(Vec::new());
+        script.push(Call { track: PC_CRITICAL, before: Vec::new(), answer: Answer::Accept(Vec::new()) });
+        script.push(Call {
+            track: HAPTIC_ESSENTIAL,
+            before: Vec::new(),
+            answer: Answer::Accept(vec![
+                Step::Publish(PC_CRITICAL, vec![(4, 2, 33_333, 2)]),
+                Step::Publish(HAPTIC_ESSENTIAL, vec![(0, 2, 33_333, 2)]),
+                Step::Yield(50),
+            ]),
+        });
+        let delayed = vec![
+            (
+                151,
+                vec![
+                    Step::Publish(PC_NORMAL, vec![(2, 4, 99_999, 4)]),
+                    Step::Publish(PC_CRITICAL, vec![(4, 4, 99_999, 4)]),
+                    Step::Publish(HAPTIC_ESSENTIAL, vec![(0, 4, 99_999, 4)]),
+                    Step::Yield(50),
+                ],
+            ),
+            (
+                253,
+                vec![Step::Fin(PC_CRITICAL), Step::Fin(HAPTIC_ESSENTIAL), Step::Fin(PC_NORMAL), Step::Fin(HAPTIC_FULL)],
+            ),
+        ];
+        (script, delayed)
+    }
+
+    /// S3 case 2: no switch; objects still buffered when the current PC
+    /// route fails with an object cut short (`ServeError::Size`): the error
+    /// exit runs both exit drain passes and the shutdown flush.
+    fn neutrality_error_case() -> (Vec<Call>, Vec<(u64, Vec<Step>)>) {
+        let delayed = vec![(
+            31,
+            vec![
+                Step::Publish(PC_NORMAL, vec![(2, 2, 33_333, 2)]),
+                Step::Publish(HAPTIC_FULL, vec![(0, 2, 33_333, 2), (0, 3, 44_444, 3)]),
+                Step::Yield(50),
+                Step::Truncated(PC_NORMAL, (2, 3, 66_666, 3)),
+                Step::Yield(50),
+            ],
+        )];
+        (initial_calls(Vec::new()), delayed)
+    }
+
+    /// S3 case 3: a burst — 20 haptic objects whose PTS lie 40 us apart, so
+    /// their deadlines share one or two 1 ms ticks and are released in one
+    /// dispatch batch (a tight submit loop that a one-slot L2 queue cannot
+    /// absorb), plus PC frames on the same timeline; FIN ends the run.
+    fn neutrality_burst_case() -> (Vec<Call>, Vec<(u64, Vec<Step>)>) {
+        let burst: Vec<(u16, u32, u64, u32)> = (0..20u32).map(|i| (0, 100 + i, 300_000 + i as u64 * 40, 0)).collect();
+        let pcs: Vec<(u16, u32, u64, u32)> = (3..9u32).map(|k| (2, 10 + k, k as u64 * 33_333, 0)).collect();
+        let delayed = vec![
+            (31, vec![Step::Publish(HAPTIC_FULL, burst), Step::Publish(PC_NORMAL, pcs), Step::Yield(50)]),
+            (603, vec![Step::Fin(PC_NORMAL), Step::Fin(HAPTIC_FULL)]),
+        ];
+        (initial_calls(Vec::new()), delayed)
+    }
+
+    /// Registration 1-D §7-1 ① (Codex 125), S3: the same scripted input on
+    /// the same virtual clock gives a byte-identical rx log — every rx,
+    /// release and drop row (route-tagged identity, reason, times, `t_due`),
+    /// the epoch row, every controller-state, switch request/apply,
+    /// retirement and shutdown row — with the L2 output stage off and on
+    /// (fake sinks; a one-slot queue; PC fake + haptic null). FIXED-INPUT
+    /// LOGIC EQUIVALENCE ONLY: the CPU cost of the output stage is the
+    /// device test §7-1 ②. Only CLI-reachable sinks run here (the simulated
+    /// device backends exist only as library configs; they run in
+    /// `l2_neutrality_tests` through the common-timeline task).
+    #[tokio::test(start_paused = true)]
+    async fn neutrality_s3_switch_and_fin_are_identical_with_the_output_stage_off_and_on() {
+        let off = neutrality_s3_assert("switch", "30", "20", neutrality_switch_case).await;
+        assert!(off.contains("\"role\":\"s3_switch\"") && off.contains("\"event\":\"apply\""), "a switch is applied");
+        assert!(off.contains("\"drop_reason\":\"stale_tier\"") || off.contains("stale"), "the cancelled route's copy is dropped");
+        assert!(off.contains("\"wire_track\":\"pc-d6\""), "releases on the new route");
+        assert!(off.contains("\"ending\":\"normal\""), "normal end after FIN");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn neutrality_s3_release_burst_is_identical_with_the_output_stage_off_and_on() {
+        let off = neutrality_s3_assert("burst", "30", "600000", neutrality_burst_case).await;
+        assert!(off.lines().filter(|l| l.contains("\"role\":\"release\"")).count() >= 26, "the burst is released");
+        assert!(off.contains("\"ending\":\"normal\""));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn neutrality_s3_error_exit_is_identical_with_the_output_stage_off_and_on() {
+        let off = neutrality_s3_assert("error", "30", "600000", neutrality_error_case).await;
+        assert!(off.contains("\"ending\":\"error\"") && off.contains("wrong size"), "the error exit");
+        assert!(off.contains("\"role\":\"release\""), "the shutdown flush releases what was buffered");
+    }
 }
 
 // ---- Experiment 2 (WP3) receiver boundaries --------------------------------
@@ -17323,4 +17620,563 @@ mod l2_hook_tests {
         }
     }
 
+}
+
+// ---- 1-D §7-1 ①: output-stage logic equivalence on a virtual clock ----------
+/// Registration 1-D §7-1 ① (Codex 125): for one FIXED input on one virtual
+/// clock, the receiver makes byte-identical decisions with the L2 output
+/// stage off (`--l2-sink none`: no submitter, no L2 file) and on — the fake
+/// sinks on both tracks, the simulated device sinks on both tracks (PC
+/// Wayland on `SimCompositor`, haptic ALSA on `SimPcm`), and a saturated
+/// output queue (PC fake lane held at its start gate, queue capacity 1, so
+/// releases become `output_queue_full` before submit).
+///
+/// What runs: the REAL common-timeline release task `run_playout_scheduler`
+/// — its select loop, `PlayoutScheduler`, epoch rows, `dispatch_playout_actions`
+/// with the L2 hook right after each release row, the post-input exit drain
+/// and the pre-epoch `finish_without_epoch`. S1, S2 and S3R are this ONE
+/// receiver function (they differ in subscription/transport settings and in
+/// the stream the sender produces, never in this code), so they appear as
+/// three input shapes through one code path: S1 = startup timeout and re-arm,
+/// buffer bounds, boundary arrivals, exit drain; S2 = late and missing PC
+/// (the 67 ms delivery timeout upstream) with timely haptic; S3R = a replayed
+/// PC tier trajectory 2 -> 4 -> 3. The feeder plays the drain's part: it
+/// writes the drain's `rx` row and hands the object to the same bounded
+/// ingress channel. The static drain closure itself (inline in
+/// `receiver_main`, which also holds the B1 release point) is NOT executed.
+/// S3 runs through the real S3 control loop in
+/// `s3_control_loop_tests::neutrality_*`.
+///
+/// Compared: the whole L1-R rx log BYTE-FOR-BYTE (meta, rx, every
+/// release/drop row with identity, reason, `t_release`/`t_drop` and `t_due`,
+/// every `timeline_epoch` row with anchor and `rearm_index`) and the
+/// scheduler task's counters. Gate first: each variant runs twice and must
+/// reproduce itself byte-for-byte (the fixture is deterministic) before any
+/// on/off comparison counts.
+///
+/// FIXED-INPUT LOGIC EQUIVALENCE ONLY. On the paused tokio clock no L2 work
+/// (lane threads, writer, sinks — all real-time OS threads) can move a
+/// receiver clock read, so this shows that the decisions do not DEPEND on the
+/// output stage; it says nothing about the CPU/latency cost of the output
+/// stage. Real contention is the device test §7-1 ②.
+///
+/// Virtual time: tokio's paused clock moves in whole 1 ms ticks, so every
+/// arrival is a whole ms and a deadline wakes at the next whole ms. No
+/// `tokio::select!` in the receiver is `biased`, so a feeder event sharing a
+/// tick with a scheduler wakeup would make the order of the two a coin toss:
+/// every plan is checked to keep all its ticks apart
+/// (`assert_no_tick_collisions`).
+#[cfg(test)]
+mod l2_neutrality_tests {
+    use super::*;
+    use skew_moq::l2_haptic::{PlacementConfig, SimPcmConfig};
+    use skew_moq::l2_output::{
+        AlsaBackend, AlsaSinkConfig, FakeSinkConfig, L2Config, L2Output, L2SinkKind, L2Sinks, L2Summary,
+        WaylandBackendKind, WaylandSinkConfig,
+    };
+    use skew_moq::l2_pc::{PcRepresentation, SimCompositorConfig, TierScales};
+    use std::sync::Barrier;
+
+    /// Virtual 10 s: below every real CLOCK_MONOTONIC reading, so the L2
+    /// stage's real `t_submit` is never before a virtual `t_release`.
+    const BASE_US: u64 = 10_000_000;
+    const RUN_ID: &str = "l2-neutrality";
+    const TIERS: &str = r#"{"schema": "phase4_s3_tiers_v1", "tiers": {
+        "d8": {"tier_id": 2, "depth_scale": 4}, "d7": {"tier_id": 3, "depth_scale": 8},
+        "d6": {"tier_id": 4, "depth_scale": 16}}}"#;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Variant {
+        /// `--l2-sink none`: no L2 output stage at all.
+        Off,
+        /// fake sinks on both tracks.
+        Fake,
+        /// simulated device sinks on both tracks (Wayland + ALSA lanes).
+        SimDevices,
+        /// PC fake lane held at its start gate, queue capacity 1: every PC
+        /// release after the first is `output_queue_full` before submit.
+        Saturated,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct Arrival {
+        at_ms: u64,
+        track_id: u8,
+        tier: u16,
+        seq: u32,
+        pts_us: u64,
+        event_id: u32,
+    }
+
+    /// PC frame `k` (30 Hz grid, event id `k + 1`).
+    fn pc(k: u32, tier: u16, at_ms: u64) -> Arrival {
+        Arrival { at_ms, track_id: TRACK_PC, tier, seq: k, pts_us: timestamp_us(k as u64, 30), event_id: k + 1 }
+    }
+
+    /// Haptic tick `j` (90 Hz grid; anchors `j % 3 == 0` carry event id
+    /// `j / 3 + 1`, the others 0).
+    fn hap(j: u32, at_ms: u64) -> Arrival {
+        let event_id = if j % 3 == 0 { j / 3 + 1 } else { 0 };
+        Arrival { at_ms, track_id: TRACK_HAPTIC, tier: 0, seq: j, pts_us: timestamp_us(j as u64, 90), event_id }
+    }
+
+    /// The tick `delay_ms` after the object's slot on a timeline armed at
+    /// `epoch_ms` on `anchor_pts`.
+    fn slot_plus(epoch_ms: u64, anchor_pts: u64, pts_us: u64, delay_ms: u64) -> u64 {
+        epoch_ms + (pts_us - anchor_pts).div_ceil(1_000) + delay_ms
+    }
+
+    fn payload(track_id: u8) -> Vec<u8> {
+        if track_id == TRACK_PC {
+            // 400 records, coordinates <= 37: drawable at every tier scale.
+            std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../skew-draco-sys/tests/fixtures/synthetic_37.bin"))
+                .expect("synthetic PC fixture")
+        } else {
+            // One 8 kHz S16_LE mono tick of 88 samples.
+            (0..176u32).map(|i| (i % 7) as u8).collect()
+        }
+    }
+
+    fn s_family_config() -> PlayoutConfig {
+        // The registered S1/S2/S3R values (the S3 harness uses the same).
+        PlayoutConfig {
+            d_play_us: 100_000,
+            startup_timeout_us: 2_000_000,
+            startup_rearm_limit: 1,
+            late_tolerance_us: 10_000,
+            max_objects_per_track: 4_096,
+            max_span_us: 3_000_000,
+            late_policy: LatePolicy::DropLate,
+        }
+    }
+
+    /// A path no other run of this process can share: the tests run in
+    /// parallel and several use the same method name.
+    fn tmp(name: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("skew-l2neutral-{}-{n}-{}-{name}.jsonl", std::process::id(), skew_moq::now_us()))
+    }
+
+    fn rx_logger(path: &std::path::Path) -> Arc<Mutex<JsonlLogger>> {
+        Arc::new(Mutex::new(
+            JsonlLogger::new(
+                path, RUN_ID, "moq", "rx", None, 0.0, 0.0, 0.0, 1, 30, 90, 1, None, None,
+                Some("both"), Some(TERM_PROTOCOL_V), None, None, None,
+            )
+            .unwrap(),
+        ))
+    }
+
+    fn l2_config(method: &str, variant: Variant, gate: Option<Arc<Barrier>>) -> Option<L2Config> {
+        let base = |sinks: L2Sinks| L2Config {
+            run_id: RUN_ID.into(),
+            method: method.into(),
+            sinks,
+            fake: None,
+            alsa: None,
+            wayland: None,
+            queue_capacity: 64,
+            row_capacity: 8_192,
+            report_window_us: 300_000,
+            max_tracked_objects: 8_192,
+        };
+        match variant {
+            Variant::Off => None,
+            Variant::Fake => {
+                let mut c = base(L2Sinks::both(L2SinkKind::Fake));
+                c.fake = Some(FakeSinkConfig::offsets(2_000, 500));
+                Some(c)
+            }
+            Variant::SimDevices => {
+                let mut c = base(L2Sinks { pc: L2SinkKind::Wayland, haptic: L2SinkKind::Alsa });
+                let mut sim = SimCompositorConfig::new(64, 48);
+                sim.refresh_us = 5_000;
+                c.wayland = Some(WaylandSinkConfig {
+                    buffers: sim.buffers,
+                    backend: WaylandBackendKind::Simulated(sim),
+                    representation: PcRepresentation::Bin,
+                    tiers: TierScales::parse(TIERS.as_bytes(), "neutrality-tiers").unwrap(),
+                    ready_timeout_us: 5_000_000,
+                    release_timeout_us: 5_000_000,
+                    diagnostics: None,
+                });
+                c.alsa = Some(AlsaSinkConfig {
+                    backend: AlsaBackend::Simulated(SimPcmConfig::new(512, 16_384)),
+                    placement: PlacementConfig {
+                        period_frames: 512,
+                        buffer_frames: 16_384,
+                        target_fill_frames: 4_800,
+                        prefill_frames: 4_800,
+                        queue_limit_frames: 48_000,
+                    },
+                    status_interval_us: 1_000,
+                    ready_timeout_us: 5_000_000,
+                    release_timeout_us: 5_000_000,
+                    diagnostics: None,
+                });
+                Some(c)
+            }
+            Variant::Saturated => {
+                let mut c = base(L2Sinks { pc: L2SinkKind::Fake, haptic: L2SinkKind::Null });
+                let mut fake = FakeSinkConfig::offsets(2_000, 500);
+                fake.start_gate = gate;
+                c.fake = Some(fake);
+                c.queue_capacity = 1;
+                Some(c)
+            }
+        }
+    }
+
+    struct Run {
+        rx: Vec<u8>,
+        stats: (u64, u64, u64, u64),
+        l2: Option<(L2Summary, Vec<serde_json::Value>)>,
+    }
+
+    impl Run {
+        fn rows(&self) -> Vec<serde_json::Value> {
+            String::from_utf8(self.rx.clone())
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect()
+        }
+    }
+
+    /// One run of the real release task on a fresh virtual clock: the feeder
+    /// sleeps (virtually) to each arrival, writes the drain's rx row, hands
+    /// the object to the ingress channel; the input closes at `close_ms`.
+    async fn run_common(method: &str, plan: &[Arrival], close_ms: u64, variant: Variant) -> Run {
+        let config = s_family_config();
+        let rx_path = tmp(&format!("{method}-{variant:?}-rx"));
+        let l2_path = tmp(&format!("{method}-{variant:?}-l2"));
+        let logger = rx_logger(&rx_path);
+        let gate = (variant == Variant::Saturated).then(|| Arc::new(Barrier::new(2)));
+        let output = l2_config(method, variant, gate.clone()).map(|config| L2Output::start(&l2_path, config).unwrap());
+        let submitter = output.as_ref().map(|output| output.submitter());
+        let clock = rx_virtual_clock::install(BASE_US);
+        let t0 = tokio::time::Instant::now();
+        let (tx, rx) = mpsc::channel::<PlayoutObject>(config.max_objects_per_track * 2);
+        let task = tokio::spawn(run_playout_scheduler(config, rx, logger.clone(), None, false, false, None, submitter));
+        for a in plan {
+            tokio::time::sleep_until(t0 + Duration::from_millis(a.at_ms)).await;
+            let t = now_us();
+            assert_eq!(t, BASE_US + a.at_ms * 1_000, "virtual arrival tick");
+            let payload = payload(a.track_id);
+            let t_gen = t - 20_000;
+            let packed = pack_header(a.track_id, a.tier, a.seq, a.pts_us, a.event_id, t_gen, payload.len() as u32);
+            let header = unpack_header(&packed).unwrap();
+            let mut bytes = packed.to_vec();
+            bytes.extend_from_slice(&payload);
+            logger.lock().unwrap().log_rx(
+                track_name(a.track_id), a.tier, a.seq, a.pts_us, a.event_id, payload.len() as u32, t, t, t_gen,
+            );
+            tx.try_send(PlayoutObject { header, t_recv: t, bytes: Bytes::from(bytes) })
+                .expect("the fixture never fills the ingress channel");
+        }
+        tokio::time::sleep_until(t0 + Duration::from_millis(close_ms)).await;
+        drop(tx);
+        let stats = task.await.unwrap().unwrap();
+        drop(clock);
+        let l2 = output.map(|output| {
+            if let Some(gate) = &gate {
+                gate.wait();
+            }
+            let summary = output.finish().unwrap();
+            let rows: Vec<serde_json::Value> = std::fs::read_to_string(&l2_path)
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            (summary, rows)
+        });
+        let rx = std::fs::read(&rx_path).unwrap();
+        let _ = std::fs::remove_file(&rx_path);
+        let _ = std::fs::remove_file(&l2_path);
+        Run { rx, stats: (stats.released, stats.dropped, stats.bridge_observer_dropped, stats.negative_lateness), l2 }
+    }
+
+    /// Fixture validity: no feeder event (arrival, input close) shares a
+    /// 1 ms tick with a possible scheduler wakeup — the deadline of any
+    /// object that waits in the buffer, or a startup timeout.
+    fn assert_no_tick_collisions(plan: &[Arrival], close_ms: u64, rows: &[serde_json::Value]) {
+        let config = s_family_config();
+        let mut forbidden = std::collections::BTreeSet::new();
+        // Startup windows: from the first arrival, and from the first
+        // arrival after each startup timeout (the re-arm).
+        let timeouts: Vec<&serde_json::Value> =
+            rows.iter().filter(|r| r["role"] == "drop" && r["drop_reason"] == skew_moq::playout::DROP_STARTUP_TIMEOUT).collect();
+        let mut window_start = plan.first().map(|a| a.at_ms);
+        let mut timeout_ticks: Vec<u64> = timeouts
+            .iter()
+            .map(|r| (r["t_drop"].as_u64().unwrap() - BASE_US) / 1_000)
+            .collect();
+        timeout_ticks.dedup();
+        for tick in &timeout_ticks {
+            if let Some(start) = window_start {
+                forbidden.insert(start + config.startup_timeout_us / 1_000);
+            }
+            window_start = plan.iter().map(|a| a.at_ms).find(|at| at > tick);
+        }
+        if let Some(start) = window_start {
+            forbidden.insert(start + config.startup_timeout_us / 1_000);
+        }
+        // Deadlines on the (last) armed timeline.
+        if let Some(epoch) = rows.iter().rev().find(|r| r["event"] == "timeline_epoch") {
+            let t_epoch = epoch["t_epoch"].as_u64().unwrap();
+            let anchor = epoch["anchor_pts_us"].as_u64().unwrap();
+            for a in plan {
+                let due = (t_epoch + config.d_play_us + a.pts_us).saturating_sub(anchor);
+                let arrival_us = BASE_US + a.at_ms * 1_000;
+                if arrival_us < due {
+                    forbidden.insert((due - BASE_US).div_ceil(1_000));
+                }
+            }
+        }
+        let mut events: Vec<u64> = plan.iter().map(|a| a.at_ms).collect();
+        events.push(close_ms);
+        let clashes: Vec<u64> = events.iter().copied().filter(|t| forbidden.contains(t)).collect();
+        assert!(clashes.is_empty(), "fixture ticks shared with scheduler wakeups: {clashes:?}");
+        let mut sorted = events.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), events.len(), "two feeder events on one tick");
+    }
+
+    fn first_difference(a: &[u8], b: &[u8]) -> String {
+        let (a, b) = (String::from_utf8_lossy(a), String::from_utf8_lossy(b));
+        for (i, (x, y)) in a.lines().zip(b.lines()).enumerate() {
+            if x != y {
+                return format!("line {}:\n  off: {x}\n  on:  {y}", i + 1);
+            }
+        }
+        format!("line counts {} vs {}", a.lines().count(), b.lines().count())
+    }
+
+    /// The decisions of one log, for the report: release/drop counts and
+    /// drop reasons, epochs `(t_epoch, anchor_pts, anchor_event, rearm)`.
+    fn decisions(rows: &[serde_json::Value]) -> String {
+        let releases = rows.iter().filter(|r| r["role"] == "release").count();
+        let mut reasons: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+        for r in rows.iter().filter(|r| r["role"] == "drop") {
+            *reasons.entry(r["drop_reason"].as_str().unwrap().to_string()).or_default() += 1;
+        }
+        let epochs: Vec<String> = rows
+            .iter()
+            .filter(|r| r["event"] == "timeline_epoch")
+            .map(|r| format!("({},{},{},{})", r["t_epoch"], r["anchor_pts_us"], r["anchor_event_id"], r["rearm_index"]))
+            .collect();
+        format!("rx {} release {releases} drop {reasons:?} epochs {epochs:?}", rows.iter().filter(|r| r["role"] == "rx").count())
+    }
+
+    /// The equivalence check of one input shape: gate (each variant
+    /// reproduces itself), then every L2-on variant == L2 off, byte for byte.
+    async fn assert_equivalent(method: &str, plan: &[Arrival], close_ms: u64) -> Vec<serde_json::Value> {
+        let off = run_common(method, plan, close_ms, Variant::Off).await;
+        let rows = off.rows();
+        assert_no_tick_collisions(plan, close_ms, &rows);
+        let off_again = run_common(method, plan, close_ms, Variant::Off).await;
+        assert!(off.rx == off_again.rx, "{method}: gate (off twice): {}", first_difference(&off.rx, &off_again.rx));
+        let fake = run_common(method, plan, close_ms, Variant::Fake).await;
+        let fake_again = run_common(method, plan, close_ms, Variant::Fake).await;
+        assert!(fake.rx == fake_again.rx, "{method}: gate (fake twice): {}", first_difference(&fake.rx, &fake_again.rx));
+        let sim = run_common(method, plan, close_ms, Variant::SimDevices).await;
+        let saturated = run_common(method, plan, close_ms, Variant::Saturated).await;
+        let releases = rows.iter().filter(|r| r["role"] == "release").count() as u64;
+        for (name, run) in [("fake", &fake), ("sim-devices", &sim), ("saturated", &saturated)] {
+            assert!(off.rx == run.rx, "{method}: L2 {name} changed the L1-R log: {}", first_difference(&off.rx, &run.rx));
+            assert_eq!(off.stats, run.stats, "{method}: L2 {name} changed the scheduler counters");
+            // The hook was live: one L2 submission (or pre-submit discard) per release row.
+            let (summary, l2_rows) = run.l2.as_ref().expect("an L2 variant");
+            assert_eq!(summary.submitted + summary.discarded_before_submit, releases, "{method}: {name}: {summary:?}");
+            assert_eq!((l2_rows[0]["role"].as_str(), l2_rows[0]["method"].as_str()), (Some("meta"), Some(method)), "{method}: {name}");
+            assert_eq!(l2_rows.last().unwrap()["role"], "instrumentation_end", "{method}: {name}");
+        }
+        assert!(off.l2.is_none());
+        // Not asserted: whether the fake variant's 64-slot queue overflows
+        // depends on the real-time lane threads (the virtual run takes a few
+        // ms of real time; under CPU contention a descheduled lane lets it
+        // fill). Its count is reported; the rx log must not depend on it.
+        let (fake_summary, _) = fake.l2.as_ref().unwrap();
+        let (saturated_summary, saturated_rows) = saturated.l2.as_ref().unwrap();
+        assert!(
+            saturated_rows.iter().any(|r| r["role"] == "explicit_discard" && r["reason"] == skew_moq::l2_output::DISCARD_OUTPUT_QUEUE_FULL),
+            "{method}: the saturated variant must hit output_queue_full: {saturated_summary:?}"
+        );
+        eprintln!(
+            "[neutrality] {method}: {} | rx bytes {} | L2 fake submitted {} (+{} queue full) | sim submitted {} (+{}) | saturated submitted {} discarded_before_submit {}",
+            decisions(&rows),
+            off.rx.len(),
+            fake_summary.submitted,
+            fake_summary.discarded_before_submit,
+            sim.l2.as_ref().unwrap().0.submitted,
+            sim.l2.as_ref().unwrap().0.discarded_before_submit,
+            saturated_summary.submitted,
+            saturated_summary.discarded_before_submit,
+        );
+        rows
+    }
+
+    fn lateness(rows: &[serde_json::Value], role: &str, track: &str, seq: u64) -> (i64, Option<String>) {
+        let r = rows
+            .iter()
+            .find(|r| r["role"] == role && r["track"] == track && r["seq"] == seq)
+            .unwrap_or_else(|| panic!("no {role} row for {track} seq {seq}"));
+        let t = if role == "release" { r["t_release"].as_u64() } else { r["t_drop"].as_u64() }.unwrap() as i64;
+        (t - r["t_due"].as_u64().unwrap() as i64, r["drop_reason"].as_str().map(str::to_string))
+    }
+
+    /// S1 input shape: a startup window without a pair (startup timeout,
+    /// re-arm), the re-armed epoch, timely 30/90 Hz flow, a corrupt
+    /// far-future PC PTS (span and horizon bound drops), the four boundary
+    /// arrivals (exactly at due, exactly at due + late tolerance, 1 ms past
+    /// it, a buffered object whose deadline is a whole ms), and buffered
+    /// objects at input close (exit drain).
+    fn s1_plan() -> (Vec<Arrival>, u64) {
+        let mut plan = vec![pc(0, 2, 3), hap(1, 9), pc(1, 2, 37), pc(2, 2, 70)];
+        // Re-arm: the exact pair (pts 2.1 s, event 64) completes at 2104 ms.
+        let (epoch_ms, anchor) = (2_104, timestamp_us(63, 30));
+        plan.push(pc(63, 2, 2_101));
+        plan.push(hap(189, epoch_ms));
+        for k in 64..=74u32 {
+            plan.push(pc(k, 2, slot_plus(epoch_ms, anchor, timestamp_us(k as u64, 30), 27)));
+        }
+        for j in 190..=225u32 {
+            plan.push(hap(j, slot_plus(epoch_ms, anchor, timestamp_us(j as u64, 90), 13)));
+        }
+        // A corrupt far-future PC PTS (10 s): the PC span bound drops the
+        // older buffered PC frames, the horizon drops the object itself.
+        plan.push(pc(300, 2, 2_290));
+        // Boundaries (whole-ms deadlines: pts - anchor is a whole ms):
+        // due(pts) = 2104 + 100 + (pts - 2.1 s).
+        plan.push(pc(90, 2, 3_104)); // pts 3.0 s, due 3104: arrives exactly at its due
+        plan.push(hap(279, 3_214)); // pts 3.1 s, due 3204: exactly at due + 10 ms -> released
+        plan.push(hap(288, 3_264)); // pts 3.2 s, due 3304: buffered, wakes exactly at its due
+        plan.push(pc(96, 2, 3_315)); // pts 3.2 s, due 3304: 11 ms late -> dropped
+        // Exit drain: buffered at input close (3350), released at 3404 / 3416.
+        plan.push(pc(99, 2, 3_340));
+        plan.push(hap(297, 3_343));
+        plan.push(hap(298, 3_346));
+        plan.sort_by_key(|a| a.at_ms);
+        (plan, 3_350)
+    }
+
+    /// S2 input shape: the epoch at once, timely haptic, PC late within
+    /// tolerance, late beyond it, exactly at and 1 ms past due + tolerance,
+    /// PC frames that never arrive (removed upstream by the 67 ms delivery
+    /// timeout), and the exit drain.
+    fn s2_plan() -> (Vec<Arrival>, u64) {
+        let (epoch_ms, anchor) = (7, 0);
+        let mut plan = vec![pc(0, 2, 4), hap(0, epoch_ms)];
+        for j in 1..=60u32 {
+            plan.push(hap(j, slot_plus(epoch_ms, anchor, timestamp_us(j as u64, 90), 6)));
+        }
+        for k in 1..=20u32 {
+            let slot = |delay| slot_plus(epoch_ms, anchor, timestamp_us(k as u64, 30), delay);
+            match k {
+                4 => plan.push(pc(k, 2, slot(105))),   // 5.667 ms after its due: released late
+                5 => plan.push(pc(k, 2, slot(130))),   // 29.7 ms after its due: dropped late
+                6..=8 => {}                            // never delivered (delivery timeout)
+                12 => plan.push(pc(k, 2, 517)),        // pts 0.4 s, due 507: exactly due + 10 ms
+                15 => plan.push(pc(k, 2, 618)),        // pts 0.5 s, due 607: 11 ms late
+                _ => plan.push(pc(k, 2, slot(31))),
+            }
+        }
+        plan.sort_by_key(|a| a.at_ms);
+        (plan, 712)
+    }
+
+    /// S3R input shape: the S2 receiver fed a replayed tier trajectory on
+    /// the single PC track: tier 2 (d8) for frames 1..9, 4 (d6) for 10..19,
+    /// 3 (d7) for 20..29, haptic unchanged; exit drain at the end.
+    fn s3r_plan() -> (Vec<Arrival>, u64) {
+        let (epoch_ms, anchor) = (8, 0);
+        let mut plan = vec![pc(0, 2, 5), hap(0, epoch_ms)];
+        for k in 1..=29u32 {
+            let tier = match k {
+                1..=9 => 2,
+                10..=19 => 4,
+                _ => 3,
+            };
+            plan.push(pc(k, tier, slot_plus(epoch_ms, anchor, timestamp_us(k as u64, 30), 28)));
+        }
+        for j in 1..=87u32 {
+            plan.push(hap(j, slot_plus(epoch_ms, anchor, timestamp_us(j as u64, 90), 9)));
+        }
+        plan.sort_by_key(|a| a.at_ms);
+        (plan, 1_012)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn s1_scheduler_decisions_are_identical_with_the_output_stage_off_and_on() {
+        let (plan, close_ms) = s1_plan();
+        let rows = assert_equivalent("s1", &plan, close_ms).await;
+        // The shape is what it claims to be.
+        let reason_count = |reason: &str| rows.iter().filter(|r| r["role"] == "drop" && r["drop_reason"] == reason).count();
+        assert_eq!(reason_count(skew_moq::playout::DROP_STARTUP_TIMEOUT), 4, "the unpaired startup window");
+        assert!(reason_count(skew_moq::playout::DROP_BUFFER_SPAN_LIMIT) >= 2, "span + horizon bound drops");
+        let epochs: Vec<&serde_json::Value> = rows.iter().filter(|r| r["event"] == "timeline_epoch").collect();
+        assert_eq!(epochs.len(), 1);
+        assert_eq!((epochs[0]["t_epoch"].as_u64(), epochs[0]["rearm_index"].as_u64()), (Some(BASE_US + 2_104_000), Some(1)));
+        assert_eq!(lateness(&rows, "release", "pc", 90), (0, None), "arrives exactly at its due");
+        assert_eq!(lateness(&rows, "release", "haptic", 279), (10_000, None), "exactly at due + tolerance");
+        assert_eq!(lateness(&rows, "release", "haptic", 288), (0, None), "woken exactly at a whole-ms due");
+        assert_eq!(lateness(&rows, "drop", "pc", 96), (11_000, Some("late".into())), "1 ms past due + tolerance");
+        let close_us = BASE_US + close_ms * 1_000;
+        let drained: Vec<&serde_json::Value> =
+            rows.iter().filter(|r| r["role"] == "release" && r["t_release"].as_u64().unwrap() > close_us).collect();
+        assert_eq!(drained.len(), 3, "the exit drain releases what was buffered at input close");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn s2_scheduler_decisions_are_identical_with_the_output_stage_off_and_on() {
+        let (plan, close_ms) = s2_plan();
+        let rows = assert_equivalent("s2", &plan, close_ms).await;
+        assert_eq!(lateness(&rows, "release", "pc", 4).0, 5_667, "late within tolerance");
+        assert_eq!(lateness(&rows, "drop", "pc", 5).1.as_deref(), Some("late"));
+        assert_eq!(lateness(&rows, "release", "pc", 12), (10_000, None), "exactly at due + tolerance");
+        assert_eq!(lateness(&rows, "drop", "pc", 15), (11_000, Some("late".into())), "1 ms past due + tolerance");
+        assert!(rows.iter().all(|r| !(r["track"] == "pc" && (6..=8).contains(&r["seq"].as_u64().unwrap_or(0)))), "never delivered");
+        let haptic_drops = rows.iter().filter(|r| r["role"] == "drop" && r["track"] == "haptic").count();
+        assert_eq!(haptic_drops, 0, "haptic stays timely");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn s3r_scheduler_decisions_are_identical_with_the_output_stage_off_and_on() {
+        let (plan, close_ms) = s3r_plan();
+        let rows = assert_equivalent("s3r", &plan, close_ms).await;
+        for tier in [2u64, 4, 3] {
+            assert!(
+                rows.iter().any(|r| r["role"] == "release" && r["track"] == "pc" && r["tier"] == tier),
+                "PC released on tier {tier}"
+            );
+        }
+        assert_eq!(rows.iter().filter(|r| r["role"] == "drop").count(), 0);
+        assert_eq!(rows.iter().filter(|r| r["role"] == "release").count(), plan.len());
+    }
+
+    /// Termination before any epoch: `finish_without_epoch` drops everything
+    /// as `shutdown_before_epoch`; nothing is released, nothing submitted.
+    #[tokio::test(start_paused = true)]
+    async fn the_pre_epoch_shutdown_is_identical_with_the_output_stage_off_and_on() {
+        let plan = vec![pc(0, 2, 5), pc(1, 2, 38), hap(1, 41), pc(2, 2, 72)];
+        let off = run_common("s1", &plan, 100, Variant::Off).await;
+        assert_no_tick_collisions(&plan, 100, &off.rows());
+        let off_again = run_common("s1", &plan, 100, Variant::Off).await;
+        assert!(off.rx == off_again.rx, "gate");
+        for variant in [Variant::Fake, Variant::SimDevices, Variant::Saturated] {
+            let on = run_common("s1", &plan, 100, variant).await;
+            assert!(off.rx == on.rx, "{variant:?}: {}", first_difference(&off.rx, &on.rx));
+            assert_eq!(off.stats, on.stats);
+            assert_eq!(on.l2.as_ref().unwrap().0.submitted, 0, "{variant:?}: nothing released, nothing submitted");
+        }
+        let rows = off.rows();
+        assert_eq!(
+            rows.iter().filter(|r| r["role"] == "drop" && r["drop_reason"] == skew_moq::playout::DROP_SHUTDOWN_BEFORE_EPOCH).count(),
+            4
+        );
+        assert!(rows.iter().all(|r| r["role"] != "release" && r["event"] != "timeline_epoch"));
+        eprintln!("[neutrality] pre-epoch shutdown: {}", decisions(&rows));
+    }
 }

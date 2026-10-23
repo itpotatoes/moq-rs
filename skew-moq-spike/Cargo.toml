@@ -50,3 +50,10 @@ wayland-protocols = { version = "0.32.13", features = ["client"] }
 # (workspace crates, opt-level 3 in every profile).
 skew-draco-sys = { path = "../skew-draco-sys" }
 skew-pc-render = { path = "../skew-pc-render" }
+
+[dev-dependencies]
+# Test-only (registration 1-D §7-1 ①, Codex 125): paused tokio time for the
+# receiver's virtual-clock logic-equivalence fixture. The same tokio package
+# as above (no new crate, Cargo.lock unchanged); with resolver 2 the feature
+# reaches test builds only, never the production binaries.
+tokio = { version = "1", features = ["test-util"] }
