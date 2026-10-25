@@ -9864,6 +9864,20 @@ fn cal_arrival_row(
     }
 }
 
+/// Classify one ingress object (its late / diagnostic row, if any).
+fn cal_admit(
+    sched: &mut skew_moq::cal_playout::CalScheduler,
+    object: PlayoutObject,
+    logger: &Arc<Mutex<JsonlLogger>>,
+) -> Result<()> {
+    let (header, t_recv) = (object.header, object.t_recv);
+    let arrival = sched.arrive(header, t_recv, object.bytes);
+    if let Some(row) = cal_arrival_row(arrival, &header, t_recv) {
+        log_cal_info(logger, &row)?;
+    }
+    Ok(())
+}
+
 /// The calibration scheduler task. Errors are stamped as L2 receiver faults
 /// at the moment the task returns them (fail closed).
 #[allow(clippy::too_many_arguments)]
@@ -9950,17 +9964,23 @@ async fn cal_run_schedule(
         let wake = sched.next_wakeup_us();
         tokio::select! {
             message = input.recv(), if open => match message {
-                Some(object) => {
-                    let (header, t_recv) = (object.header, object.t_recv);
-                    let arrival = sched.arrive(header, t_recv, object.bytes);
-                    if let Some(row) = cal_arrival_row(arrival, &header, t_recv) {
-                        log_cal_info(&logger, &row)?;
-                    }
-                }
+                Some(object) => cal_admit(&mut sched, object, &logger)?,
                 None => open = false,
             },
             _ = tokio::time::sleep(Duration::from_micros(wake.unwrap_or(0).saturating_sub(now_us()))),
                 if wake.is_some() => {}
+        }
+        // Codex 158a P2: admit EVERY ingress message already queued before
+        // anything is released, so the tie order (due, pc before haptic,
+        // index) holds among all objects the scheduler holds at the release.
+        // An object still between its drain stamp and the channel is outside
+        // that order (`CAL_RELEASE_TIE_RULE`).
+        while open {
+            match input.try_recv() {
+                Ok(object) => cal_admit(&mut sched, object, &logger)?,
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => open = false,
+            }
         }
         if sched.is_sealed() {
             continue;
@@ -19019,6 +19039,92 @@ mod l2_hook_tests {
     }
 
     // ------------------------------------------- §7-1 calibration receiver
+
+    /// Codex 158a P2 (inverted): two equal-due objects already queued in
+    /// the ingress channel, the scheduler waking ~1 ms after the due — both
+    /// are admitted before the release, so the tie order holds (PC first).
+    #[tokio::test]
+    async fn calibration_queued_ingress_keeps_the_pc_first_tie_codex158a() {
+        use skew_moq::cal_playout::{CalConfig, CalPlan, CalScheduler};
+        use skew_moq::exp2_recorder::{haptic_slot_identity, pc_slot_identity};
+        let rx_path = tmp("cal-tie-rx");
+        let l2_path = tmp("cal-tie-l2");
+        let logger = rx_logger(&rx_path);
+        let mut output = Some(fake_output(&l2_path, 0, 0));
+        let due = now_us() - 1_000;
+        let d_cal_us = 400_000;
+        let t0_us = due - pc_slot_identity(1199).0 - d_cal_us;
+        let sched = CalScheduler::new(CalConfig { t0_us, d_cal_us }, CalPlan::registered()).unwrap();
+        let t_cut = sched.h_cal_us() + 200_000;
+        let (tx, rx) = mpsc::channel(8);
+        for (track, tier, seq, (pts, event)) in [
+            (TRACK_HAPTIC, 0, 3597, haptic_slot_identity(3597)),
+            (TRACK_PC, 2, 1199, pc_slot_identity(1199)),
+        ] {
+            tx.send(object(track, tier, seq, pts, event, due - 100)).await.unwrap();
+        }
+        drop(tx);
+        let (cut_tx, cut_rx) = tokio::sync::oneshot::channel();
+        let report = cal_run_schedule(sched, t_cut, rx, logger.clone(), output.as_ref().unwrap().submitter(), cut_tx, Arc::new(AtomicBool::new(false))).await.unwrap();
+        let mut handoff = Exp2CutHandoff { rx: Some(cut_rx), rule: L2CloseRule::Calibration };
+        handoff.poll_now(&mut output, &logger);
+        finish_l2_output(output.take().unwrap()).await.unwrap();
+        let rx_rows = rows(&rx_path);
+        let releases: Vec<_> = rx_rows.iter().filter(|r| r["event"] == "cal_release").collect();
+        let order: Vec<_> = releases.iter().map(|r| r["track"].as_str().unwrap()).collect();
+        assert_eq!(order, vec!["pc", "haptic"], "PC first among the admitted equal-due objects");
+        assert_eq!(releases[0]["due_us"], releases[1]["due_us"]);
+        assert_eq!(report.stats.late, 0);
+        let _ = std::fs::remove_file(&rx_path);
+        let _ = std::fs::remove_file(&l2_path);
+    }
+
+    /// The rule's scope: an on-time object that reaches the scheduler only
+    /// after an equal-due object was released (still in the drain hand-off
+    /// at that release) is released at once on arrival — after it, with its
+    /// lateness recorded, never late, never reordered.
+    #[tokio::test]
+    async fn calibration_handoff_after_the_release_is_outside_the_tie_rule() {
+        use skew_moq::cal_playout::{CalConfig, CalPlan, CalScheduler};
+        use skew_moq::exp2_recorder::{haptic_slot_identity, pc_slot_identity};
+        let rx_path = tmp("cal-handoff-rx");
+        let l2_path = tmp("cal-handoff-l2");
+        let logger = rx_logger(&rx_path);
+        let mut output = Some(fake_output(&l2_path, 0, 0));
+        let due = now_us() + 40_000;
+        let d_cal_us = 400_000;
+        let t0_us = due - pc_slot_identity(1199).0 - d_cal_us;
+        let sched = CalScheduler::new(CalConfig { t0_us, d_cal_us }, CalPlan::registered()).unwrap();
+        let t_cut = sched.h_cal_us() + 200_000;
+        let (tx, rx) = mpsc::channel(8);
+        let (cut_tx, cut_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(cal_run_schedule(sched, t_cut, rx, logger.clone(), output.as_ref().unwrap().submitter(), cut_tx, Arc::new(AtomicBool::new(false))));
+        let (pts, event) = haptic_slot_identity(3597);
+        tx.send(object(TRACK_HAPTIC, 0, 3597, pts, event, now_us())).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await; // the haptic due passed: released
+        let (pts, event) = pc_slot_identity(1199);
+        tx.send(object(TRACK_PC, 2, 1199, pts, event, due - 100)).await.unwrap();
+        drop(tx);
+        let report = task.await.unwrap().unwrap();
+        let mut handoff = Exp2CutHandoff { rx: Some(cut_rx), rule: L2CloseRule::Calibration };
+        handoff.poll_now(&mut output, &logger);
+        finish_l2_output(output.take().unwrap()).await.unwrap();
+        let rx_rows = rows(&rx_path);
+        let releases: Vec<_> = rx_rows.iter().filter(|r| r["event"] == "cal_release").collect();
+        let order: Vec<_> = releases.iter().map(|r| r["track"].as_str().unwrap()).collect();
+        assert_eq!(order, vec!["haptic", "pc"], "the late hand-off is outside the tie order");
+        assert_eq!(report.stats.late, 0, "t_recv <= due: on time");
+        let pc = releases[1];
+        let lateness = pc["t_release_us"].as_u64().unwrap() - pc["due_us"].as_u64().unwrap();
+        assert!(lateness >= 30_000, "its hand-off delay is recorded as release lateness ({lateness} us)");
+        assert!(report.max_release_lateness_us >= lateness);
+        let meta_rule = skew_moq::cal_playout::CAL_RELEASE_TIE_RULE;
+        assert!(meta_rule.contains("admitted to the scheduler") && meta_rule.contains("hand-off"));
+        let _ = std::fs::remove_file(&rx_path);
+        let _ = std::fs::remove_file(&l2_path);
+    }
+
+
 
     /// A calibration receiver CLI from `(flag, value)` pairs (`""` = a bare
     /// flag); `None` drops a flag of the registered shape, so a test can

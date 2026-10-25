@@ -28,14 +28,19 @@ use crate::exp2_playout::Modality;
 use crate::exp2_recorder::{haptic_slot_identity, pc_slot_identity, N_HAPTIC, N_PC};
 use crate::{Header, TRACK_HAPTIC, TRACK_PC};
 
-/// Seal execution delay after `H_cal`. Not a scientific parameter (same
-/// meaning as the exp2 B1/S1 seal delay): it only lets an object stamped
-/// `t_recv <= due` that is still between its receive stamp and this
+/// Seal execution delay after `H_cal`: the exp2 B1/S1 seal delay itself
+/// (one definition). Not a scientific parameter: it only lets an object
+/// stamped `t_recv <= due` that is still between its receive stamp and this
 /// scheduler reach it before the slot is sealed `missing`.
-pub const CAL_SEAL_EXECUTION_DELAY_US: u64 = 100_000;
+pub const CAL_SEAL_EXECUTION_DELAY_US: u64 = crate::exp2_recorder::PLAIN_SEAL_EXECUTION_DELAY_US;
 /// Release order of slots with the same due (PC `i` and haptic `3i` share
-/// their pts, so their due): PC first, then by slot index.
-pub const CAL_RELEASE_TIE_RULE: &str = "(due_us, pc before haptic, slot index)";
+/// their pts, so their due): PC first, then by slot index — among the
+/// objects the scheduler holds when the release runs. Every ingress message
+/// already queued is admitted before a release (Codex 158a); an object still
+/// between its drain stamp and the scheduler is outside this order (released
+/// at once on arrival if it was on time). The actual order is the order of
+/// the `cal_release` rows.
+pub const CAL_RELEASE_TIE_RULE: &str = "(due_us, pc before haptic, slot index) among the objects admitted to the scheduler when the release runs (every queued ingress message is admitted first); an object still in the drain-to-scheduler hand-off is outside this order and is released at once on arrival if on time; the actual order is the cal_release row order";
 pub const CAL_LATE_RULE: &str = "late iff t_recv_us > due_us (no tolerance); a late object is never submitted";
 pub const CAL_PLAN_SOURCE: &str = "exp2 contract §1 plan (pc_slot_identity / haptic_slot_identity, N_PC = 1200, N_HAPTIC = 3600)";
 pub const CAL_H_RULE: &str = "H_cal = t0 + max planned pts + D_cal (the last planned due)";

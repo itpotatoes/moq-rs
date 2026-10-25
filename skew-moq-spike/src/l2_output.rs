@@ -1680,8 +1680,10 @@ impl L2Output {
         })
     }
 
+    /// A producer handle. Valid until the close starts (`start_close_until`
+    /// or `finish`); a clone taken earlier then gets `AfterClose`.
     pub fn submitter(&self) -> L2Submitter {
-        self.submitter.clone().expect("the stage handle lives until finish")
+        self.submitter.clone().expect("the stage handle lives until the close starts")
     }
 
     /// Experiment 2: start the close NOW with an ABSOLUTE close deadline
