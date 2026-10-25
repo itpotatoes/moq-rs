@@ -1337,13 +1337,20 @@ fn l2_output_config(args: &Args) -> Result<Option<(PathBuf, skew_moq::l2_output:
         None
     };
     let any_fake = L2Modality::ALL.iter().any(|m| sinks.of(*m) == L2SinkKind::Fake);
-    // The registered 1-D ladder (B1, S1, S2, S3, S3R). M1/S2Eq share the S1
-    // dispatcher but are not 1-D methods; s3np and the exp2 arms have no hook.
-    if !matches!(args.arm, Arm::B1 | Arm::S1 | Arm::S2 | Arm::S3 | Arm::S3r) {
-        bail!("--l2-sink supports only --arm b1|s1|s2|s3|s3r, not {}", args.arm.as_str());
-    }
-    if args.exp2_out.is_some() {
-        bail!("--l2-sink cannot be combined with the exp2 recorder (it has its own L2 ledger)");
+    // The registered 1-D ladder (B1, S1, S2, S3, S3R), or experiment 2: with
+    // the exp2 recorder the L2 submits come from the recorder's release rows
+    // (exp2_recorder L2 link: one submit per exp2 release row, same time),
+    // for b1/s1 and the exp2 arms (s3npa-prime, p0np, p0, p1) alike. M1/S2Eq
+    // share the S1 dispatcher but are not 1-D methods; s3np has no hook. The
+    // exp2 recorder itself refuses every other arm.
+    let exp2 = args.exp2_out.is_some();
+    if !(matches!(args.arm, Arm::B1 | Arm::S1 | Arm::S2 | Arm::S3 | Arm::S3r)
+        || (exp2 && args.arm.is_exp2_core()))
+    {
+        bail!(
+            "--l2-sink supports only --arm b1|s1|s2|s3|s3r, or an exp2 arm with the exp2 recorder, not {}",
+            args.arm.as_str()
+        );
     }
     if args.render || args.audio {
         bail!("--l2-sink replaces the Stage A bridge; do not combine it with --render/--audio");
@@ -1807,14 +1814,46 @@ fn exp2_flush_side_rows(recorder: &mut Exp2Recorder<Exp2File>, logger: &Arc<Mute
     Ok(())
 }
 
+/// One additive rx `info` row with the exp2 L2 link counters (`None`: the
+/// recorder never opened or its lock was poisoned — `attached:false`).
+fn log_exp2_l2_link(
+    logger: &Arc<Mutex<JsonlLogger>>,
+    stats: Option<&skew_moq::exp2_recorder::Exp2L2Stats>,
+) -> Result<()> {
+    let body = match stats {
+        Some(s) => format!(
+            "\"event\":\"exp2_l2_link\",\"attached\":true,\"rule\":\"one L2 submit per exp2 release row, same t_release_us\",\"held\":{},\"submitted\":{},\"disposed\":{},\"missing_payload\":{},\"cap_refused\":{},\"held_at_seal\":{},\"held_at_detach\":{},\"max_held_bytes\":{},\"held_bytes_cap\":{}",
+            s.held,
+            s.submitted,
+            s.disposed,
+            s.missing_payload,
+            s.cap_refused,
+            s.held_at_seal,
+            s.held_at_detach,
+            s.max_held_bytes,
+            skew_moq::exp2_recorder::EXP2_L2_HELD_BYTES_CAP,
+        ),
+        None => "\"event\":\"exp2_l2_link\",\"attached\":false".to_string(),
+    };
+    logger
+        .lock()
+        .map_err(|_| anyhow::anyhow!("RX logger poisoned"))?
+        .try_log_info(&body)?;
+    Ok(())
+}
+
 /// Static-path drain hook: offer a received (non-warm-up) object to the exp2
 /// recorder.  Returns the admitted slot, if any.  Failures are counted and
-/// fail the run at shutdown (they are never silently dropped).
+/// fail the run at shutdown (they are never silently dropped).  `payload` is
+/// the complete object for the recorder's L2 link (`None` without L2): the
+/// recorder holds it until the slot's terminal row and submits it right after
+/// the slot's exp2 release row.
 fn exp2_drain_admit(
     exp2: &Exp2Shared,
     header: Header,
     t_recv: u64,
     failures: &AtomicU64,
+    payload: Option<skew_moq::exp2_recorder::Exp2L2Payload>,
 ) -> Option<(skew_moq::exp2_playout::Modality, u32)> {
     use skew_moq::exp2_recorder::{Admission, Exp2Rx};
     let mut guard = match exp2.lock() {
@@ -1831,11 +1870,14 @@ fn exp2_drain_admit(
         failures.fetch_add(1, Ordering::Relaxed);
         return None;
     };
-    match recorder.admit(Exp2Rx {
-        header,
-        route_generation: 0,
-        t_recv_us: t_recv,
-    }) {
+    match recorder.admit_with_payload(
+        Exp2Rx {
+            header,
+            route_generation: 0,
+            t_recv_us: t_recv,
+        },
+        payload,
+    ) {
         Ok(Admission::Admitted(m, index)) => Some((m, index)),
         Ok(_) => None,
         Err(error) => {
@@ -1925,9 +1967,16 @@ async fn run_exp2_static_task(
     mut input: Option<mpsc::Receiver<Exp2Input>>,
     s1_done: Arc<AtomicBool>,
     logger: Arc<Mutex<JsonlLogger>>,
+    // The L2 output stage's submitter, moved into the recorder (L2 link)
+    // before any object can be admitted; the receiver detaches it after this
+    // task ends and before `L2Output::finish`.
+    l2: Option<skew_moq::l2_output::L2Submitter>,
 ) -> Result<()> {
     let phase = exp2_wait_t0(&cli).await?;
-    let recorder = exp2_open_recorder(&cli, phase.t0_us)?;
+    let mut recorder = exp2_open_recorder(&cli, phase.t0_us)?;
+    if let Some(l2) = l2 {
+        recorder.attach_l2(l2).context("attach the exp2 L2 link")?;
+    }
     let (horizon, end_at) = (recorder.horizon_us(), recorder.end_at_us());
     *exp2.lock().map_err(|_| anyhow::anyhow!("exp2 recorder poisoned"))? = Some(recorder);
     logger
@@ -5914,6 +5963,9 @@ struct P1Loop<H> {
     window_end_us: Option<u64>,
     recv: [u64; 2],
     requests: Vec<skew_moq::exp2_fsm::TierRequest>,
+    /// L2 enabled: admitted copies carry their bytes and wire track to the
+    /// recorder's L2 link.
+    l2_payloads: bool,
 }
 
 /// Route one wire event through the switch ingress into the exp2 recorder.
@@ -5952,7 +6004,15 @@ fn handle_p1_wire_event<H>(
                                 route_generation: routed.route.generation,
                                 t_recv_us: routed.object.t_recv,
                             };
-                            if let Admission::Admitted(m, index) = recorder.admit(rx)? {
+                            let payload = state.l2_payloads.then(|| {
+                                skew_moq::exp2_recorder::Exp2L2Payload {
+                                    bytes: routed.object.bytes.clone(),
+                                    wire_track: Some(routed.route.name),
+                                }
+                            });
+                            if let Admission::Admitted(m, index) =
+                                recorder.admit_with_payload(rx, payload)?
+                            {
                                 let requests =
                                     recorder.feed_arrival(m, index, routed.object.t_recv)?;
                                 state.requests.extend(requests);
@@ -6113,9 +6173,55 @@ async fn run_exp2_p1_control<S, T>(
     cli: Arc<Exp2Cli>,
     logger: Arc<Mutex<JsonlLogger>>,
     namespace: TrackNamespace,
+    subscriber: S,
+    session_run: tokio::task::JoinHandle<T>,
+    phase_task: tokio::task::JoinHandle<Result<skew_moq::phase::PhaseControl>>,
+) -> Result<()>
+where
+    S: S3SubscribeSeam,
+    T: std::fmt::Debug + S3SessionOutcome,
+{
+    // L2 output stage, exactly as S3 (`run_s3_control`): started after the
+    // session setup, and with L2 the whole control task (and every drain it
+    // spawns) runs inside the L2 fault stamp scope, so every first cause
+    // stored through `keep_first_cause` is stamped where it is stored. The
+    // submits come from the recorder's L2 link (one per exp2 release row).
+    let l2_output = start_l2_output_at(args, &logger, "after_session_setup")?;
+    match l2_output.as_ref().map(|output| output.fault_stamp()) {
+        Some(stamp) => {
+            S3_L2_FAULT
+                .scope(
+                    stamp,
+                    run_exp2_p1_control_body(
+                        args, runtime, cli, logger, namespace, subscriber, session_run,
+                        phase_task, l2_output,
+                    ),
+                )
+                .await
+        }
+        None => {
+            run_exp2_p1_control_body(
+                args, runtime, cli, logger, namespace, subscriber, session_run, phase_task,
+                None,
+            )
+            .await
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_exp2_p1_control_body<S, T>(
+    args: &Args,
+    runtime: P1RuntimeConfig,
+    cli: Arc<Exp2Cli>,
+    logger: Arc<Mutex<JsonlLogger>>,
+    namespace: TrackNamespace,
     mut subscriber: S,
     mut session_run: tokio::task::JoinHandle<T>,
     mut phase_task: tokio::task::JoinHandle<Result<skew_moq::phase::PhaseControl>>,
+    // An early `?` return below leaves the L2 file without its sentinel
+    // (fail closed).
+    mut l2_output: Option<skew_moq::l2_output::L2Output>,
 ) -> Result<()>
 where
     S: S3SubscribeSeam,
@@ -6164,6 +6270,7 @@ where
         window_end_us: None,
         recv: [0, 0],
         requests: Vec::new(),
+        l2_payloads: l2_output.is_some(),
     };
     let initial = state.ingress.gate().active_routes();
     for (role, route) in [
@@ -6297,7 +6404,12 @@ where
                     .map_err(|e| anyhow::anyhow!("PhaseControl task failed: {e}"))
                     .and_then(|p| p)
                     .and_then(|phase| {
-                        let recorder = exp2_open_recorder(&cli, phase.t0_us)?;
+                        let mut recorder = exp2_open_recorder(&cli, phase.t0_us)?;
+                        if let Some(output) = l2_output.as_ref() {
+                            recorder
+                                .attach_l2(output.submitter())
+                                .context("attach the exp2 L2 link")?;
+                        }
                         Ok((phase.t0_us, recorder))
                     });
                 match opened {
@@ -6711,6 +6823,26 @@ where
         || n_log_failed > 0
         || drains_unjoined > 0
         || !sentinel;
+    // L2: a final-integrity failure without an earlier recorded cause is
+    // first recorded here (a stored cause was stamped by `keep_first_cause`).
+    // Then detach the recorder's L2 link (its submitter clone) and close the
+    // L2 stage before the shutdown rows, so no `?` below can skip it.
+    if let Some(output) = l2_output.as_ref() {
+        if failed {
+            note_l2_fault(Some(output), || {
+                format!(
+                    "P1 final integrity failure: bad_headers={n_bad} ingress_drops={n_ingress_drop} log_failed={n_log_failed} drains_unjoined={drains_unjoined} exp2_sentinel={sentinel}"
+                )
+            });
+        }
+        let detached = state.recorder.as_mut().and_then(|r| r.detach_l2());
+        log_exp2_l2_link(&logger, detached.as_ref())?;
+    }
+    if let Some(output) = l2_output.take() {
+        if let Err(e) = finish_l2_output(output).await {
+            eprintln!("[rx] P1 L2 output stage failed to close: {e:#}");
+        }
+    }
     {
         let mut legacy = logger.lock().map_err(|_| anyhow::anyhow!("RX logger poisoned"))?;
         legacy.try_log_info(&format!(
@@ -8057,6 +8189,25 @@ async fn receiver_main() -> Result<()> {
         .await;
     }
 
+    // S3 owns its own L2 instance (inside `run_s3_control`) and never runs
+    // the exp2 recorder (`exp2_cli_config` refuses it), so it returns before
+    // either is constructed here.
+    if args.arm == Arm::S3 {
+        return run_s3_receiver(
+            &args,
+            s1_config.expect("S3 requires the common playout scheduler"),
+            s3_runtime.expect("validated S3 runtime config"),
+            logger,
+        )
+        .await;
+    }
+
+    // L2 output stage (1-D M1). `--l2-sink none` constructs nothing, so the
+    // pre-L2 receiver path is unchanged. Started before the exp2 recorder task
+    // so that the recorder's L2 link exists before any object is admitted.
+    let mut l2_output = start_l2_output_at(&args, &logger, "before_session")?;
+    let l2_submitter = l2_output.as_ref().map(|output| output.submitter());
+
     // Experiment 2 (static path): the recorder task starts BEFORE connecting
     // so it observes the PhaseControl receipt before the registered warm-up
     // start, exactly like the sender (`phase::wait_phase_control`).
@@ -8070,6 +8221,11 @@ async fn receiver_main() -> Result<()> {
     } else {
         (None, None)
     };
+    // Experiment 2 with L2: the submits come from the recorder's release rows
+    // (one per exp2 release row, same time; exp2_recorder L2 link) for every
+    // method, so the 1-D release hooks (B1 drain, S1 dispatch) stay off and
+    // the drains hand each admitted object's bytes to the recorder instead.
+    let exp2_l2 = exp2_shared.is_some() && l2_submitter.is_some();
     let mut exp2_task = match (&exp2_cli, &exp2_shared) {
         (Some(cli), Some(shared)) => Some(tokio::spawn(run_exp2_static_task(
             cli.clone(),
@@ -8077,25 +8233,12 @@ async fn receiver_main() -> Result<()> {
             exp2_rx,
             exp2_s1_done.clone(),
             logger.clone(),
+            l2_submitter.clone(),
         ))),
         _ => None,
     };
-
-    if args.arm == Arm::S3 {
-        return run_s3_receiver(
-            &args,
-            s1_config.expect("S3 requires the common playout scheduler"),
-            s3_runtime.expect("validated S3 runtime config"),
-            logger,
-        )
-        .await;
-    }
-
-    // L2 output stage (1-D M1). `--l2-sink none` constructs nothing, so the
-    // pre-L2 receiver path is unchanged. S3 owns its own instance inside
-    // `run_s3_control`.
-    let mut l2_output = start_l2_output_at(&args, &logger, "before_session")?;
-    let l2_submitter = l2_output.as_ref().map(|output| output.submitter());
+    // The 1-D release-point submitter: `None` whenever exp2 owns the L2 submits.
+    let l2_release_hook = if exp2_shared.is_some() { None } else { l2_submitter.clone() };
 
     let receive_trace = args.receive_trace.as_ref()
         .map(|path| receive_trace::Trace::start(path, &args.run_id, args.receive_trace_capacity)).transpose()?;
@@ -8301,8 +8444,9 @@ async fn receiver_main() -> Result<()> {
             // exp2 logging is only ever enabled for S1 among the arms that
             // run this scheduler (exp2_cli_config refuses M1/S2/S2Eq/S3r).
             exp2_shared.clone(),
-            // `l2_output_config` admits only s1/s2/s3r among these arms.
-            l2_submitter.clone(),
+            // `l2_output_config` admits only s1/s2/s3r among these arms; with
+            // exp2 (S1) the recorder submits instead (`l2_release_hook` None).
+            l2_release_hook.clone(),
         ));
         println!(
             "[rx] S1 scheduler: D_play={}ms startup={}ms late={}ms policy={} objects/track={} span={}ms",
@@ -8375,7 +8519,9 @@ async fn receiver_main() -> Result<()> {
         let ingress_drops = ingress_drops.clone();
         let ingress_log_failed = ingress_log_failed.clone();
         let wire_stats_out = wire_stats.clone();
-        let l2_b1 = if args.arm == Arm::B1 { l2_submitter.clone() } else { None };
+        let l2_b1 = if args.arm == Arm::B1 { l2_release_hook.clone() } else { None };
+        // exp2 + L2: the admitted object's bytes go to the recorder's L2 link.
+        let exp2_l2_payloads = exp2_l2;
         // Every L2-enabled drain stamps its fatal conditions (FAILED track
         // end, malformed header, rx/drop log failure, closed scheduler) at
         // the moment they happen (registration §6-1). A fault stamp is not a
@@ -8520,9 +8666,13 @@ async fn receiver_main() -> Result<()> {
                     counts[slot].fetch_add(1, Ordering::Relaxed);
                     // Experiment 2: offer the object to the recorder (rx row;
                     // B1 release := t_recv; core arms -> exp2 ingress).
-                    let exp2_slot = exp2_shared
-                        .as_ref()
-                        .and_then(|exp2| exp2_drain_admit(exp2, h, t, &exp2_failures));
+                    let exp2_slot = exp2_shared.as_ref().and_then(|exp2| {
+                        let payload = exp2_l2_payloads.then(|| skew_moq::exp2_recorder::Exp2L2Payload {
+                            bytes: logical_obj.clone(),
+                            wire_track: None,
+                        });
+                        exp2_drain_admit(exp2, h, t, &exp2_failures, payload)
+                    });
                     if let (Some(slot), Some(tx), Some(exp2)) = (exp2_slot, &exp2_tx, &exp2_shared) {
                         let input = Exp2Input { modality: slot.0, index: slot.1, t_recv_us: t };
                         match tx.try_send(input) {
@@ -8626,6 +8776,7 @@ async fn receiver_main() -> Result<()> {
     }
     drop(ftx); // only the drain clones keep the channel open now
     drop(l2_submitter); // only the drain/scheduler clones submit from here on
+    drop(l2_release_hook);
 
     // Wait for both drains to finish (tracks closed by publisher) or session
     // end / timeout.
@@ -8728,9 +8879,23 @@ async fn receiver_main() -> Result<()> {
             (None, n) => format!("exp2 drain-side failures: {n}"),
         });
         if exp2_outcome.as_deref() != Some("ok") {
+            // L2 (registration §6-1): stamped before the stderr write below.
+            note_l2_fault(l2_output.as_ref(), || {
+                exp2_outcome.clone().unwrap_or_default()
+            });
             eprintln!("[rx] {}", exp2_outcome.as_deref().unwrap_or_default());
             scheduler_finalize_failed = true;
         }
+    }
+    // Experiment 2 + L2: the recorder's L2 link holds a submitter clone;
+    // detach it now (every exp2 release is <= H, long before here) so that
+    // `L2Output::finish` below sees no live producer, and record its counters
+    // in the rx log (the exp2 JSONL schema stays pinned).
+    if exp2_l2 {
+        let detached = exp2_shared
+            .as_ref()
+            .and_then(|shared| shared.lock().ok().and_then(|mut guard| guard.as_mut().and_then(|r| r.detach_l2())));
+        log_exp2_l2_link(&logger, detached.as_ref())?;
     }
 
     let n_pc = counts[0].load(Ordering::Relaxed);
@@ -13605,6 +13770,20 @@ mod s3_control_loop_tests {
         hold_ms: u64,
         publish: bool,
     ) -> (Result<()>, Vec<serde_json::Value>) {
+        let (result, rows, _) = p1_loop_case_with(name, t0, force_ms, hold_ms, publish, false).await;
+        (result, rows)
+    }
+
+    /// [`p1_loop_case`], optionally with a fake L2 sink (`--l2-sink fake`);
+    /// returns the L2 rows and the legacy rx rows as well.
+    async fn p1_loop_case_with(
+        name: &str,
+        t0: u64,
+        force_ms: u64,
+        hold_ms: u64,
+        publish: bool,
+        l2: bool,
+    ) -> (Result<()>, Vec<serde_json::Value>, Option<(Vec<serde_json::Value>, Vec<serde_json::Value>)>) {
         let force_ms = force_ms.to_string();
         use skew_moq::exp2_recorder::{canonical_json_bytes, haptic_slot_identity, pc_slot_identity};
         let dir = test_log_path(name);
@@ -13669,6 +13848,14 @@ mod s3_control_loop_tests {
             cli.push(flag.to_string());
             cli.push(path.display().to_string());
         }
+        let l2_log = dir.join("l2.jsonl");
+        if l2 {
+            cli.extend(strings(&[
+                "--l2-sink", "fake", "--l2-fake-pc-offset-us", "1000",
+                "--l2-fake-haptic-offset-us", "2000", "--l2-log",
+            ]));
+            cli.push(l2_log.display().to_string());
+        }
         let args = Args::try_parse_from(cli).expect("P1 CLI parses");
         let runtime = p1_runtime_config(&args).unwrap().unwrap();
         let exp2 = Arc::new(exp2_cli_config(&args).unwrap().unwrap());
@@ -13730,13 +13917,17 @@ mod s3_control_loop_tests {
         .await;
         side.abort();
         let _ = side.await;
-        let rows: Vec<serde_json::Value> = std::fs::read_to_string(&exp2_out)
-            .unwrap()
-            .lines()
-            .map(|l| serde_json::from_str(l).unwrap())
-            .collect();
+        let read = |path: &std::path::Path| -> Vec<serde_json::Value> {
+            std::fs::read_to_string(path)
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect()
+        };
+        let rows = read(&exp2_out);
+        let l2_rows = l2.then(|| (read(&l2_log), read(&legacy)));
         std::fs::remove_dir_all(&dir).ok();
-        (result, rows)
+        (result, rows, l2_rows)
     }
 
     /// Contract v4 follow-up J: while a P1 switch's target SUBSCRIBEs are in
@@ -13781,6 +13972,57 @@ mod s3_control_loop_tests {
         assert!(rows.iter().any(|r| r["role"] == "integrity_warning"
             && r["kind"] == "p1_switch_effect_timeout"));
         assert!(!rows.iter().any(|r| r["role"] == "instrumentation_end"), "fail closed: no sentinel");
+    }
+
+    /// Experiment 2 + L2 (P1, fake sink, the real P1 loop): every exp2
+    /// release row has exactly one L2 submit with the same identity, the
+    /// admitted copy's wire track and route generation, and the same
+    /// `t_release_us`; nothing else is submitted. The run's first cause (the
+    /// registered effect timeout) is the L2 receiver fault, the link is
+    /// detached before the L2 sentinel (integrity_ok: no live producer, no
+    /// unresolved submit) and its counters are in the rx log.
+    #[tokio::test]
+    async fn exp2_p1_l2_submits_exactly_the_release_rows() {
+        let (result, rows, l2) =
+            p1_loop_case_with("p1-l2", now_us() + 300_000, 100, 1_500, true, true).await;
+        let error = format!("{:#}", result.expect_err("an unapplied switch must fail the run"));
+        assert!(error.contains("effect timeout"), "{error}");
+        let (l2, legacy) = l2.expect("L2 rows");
+        assert_eq!(l2[0]["role"], "meta");
+        assert_eq!(l2[0]["method"], "p1");
+        let key = |r: &serde_json::Value| {
+            (
+                r["track"].as_str().unwrap().to_string(),
+                r["seq"].as_u64().unwrap(),
+                r["pts_us"].as_u64().unwrap(),
+                r["event_id"].as_u64().unwrap(),
+                r["route_generation"].as_u64().unwrap(),
+                r["t_release_us"].as_u64().unwrap(),
+            )
+        };
+        let mut releases: Vec<_> = rows.iter().filter(|r| r["role"] == "release").map(key).collect();
+        let mut submits: Vec<_> = l2.iter().filter(|r| r["role"] == "submit").map(key).collect();
+        releases.sort();
+        submits.sort();
+        assert!(!releases.is_empty(), "the loop released objects");
+        assert_eq!(submits, releases, "one L2 submit per exp2 release row");
+        for r in l2.iter().filter(|r| r["role"] == "submit") {
+            assert_eq!(r["wire_track"], r["track"], "current-route copies (pc / haptic)");
+        }
+        let sentinel = l2.last().unwrap();
+        assert_eq!(sentinel["role"], "instrumentation_end");
+        assert_eq!(sentinel["integrity_ok"], true, "{sentinel}");
+        assert!(
+            sentinel["receiver_fault_cause"].as_str().unwrap().contains("effect timeout"),
+            "{sentinel}"
+        );
+        let link = legacy
+            .iter()
+            .find(|r| r["event"] == "exp2_l2_link")
+            .expect("exp2_l2_link rx row");
+        assert_eq!(link["attached"], true);
+        assert_eq!(link["submitted"].as_u64().unwrap() as usize, releases.len());
+        assert_eq!(link["missing_payload"], 0);
     }
 
     /// Codex 85: a switch requested late in the window whose SUBSCRIBEs are
@@ -16191,6 +16433,31 @@ mod exp2_receiver_tests {
         Args::try_parse_from(cli(arm, &extra)).expect("CLI parses")
     }
 
+    /// `--l2-sink` joins the exp2 recorder for all six exp2 methods (the L2
+    /// meta names the arm); without the recorder the exp2 arms stay refused,
+    /// and validation never creates the L2 log.
+    #[test]
+    fn l2_sink_joins_the_exp2_recorder_for_every_exp2_method() {
+        let meta = tmp("meta.json");
+        let log = tmp("exp2-l2.jsonl");
+        let l2: Vec<String> = ["--l2-sink", "null", "--l2-log"]
+            .iter()
+            .map(|s| s.to_string())
+            .chain(std::iter::once(log.display().to_string()))
+            .collect();
+        for arm in ["b1", "s1", "s3npa-prime", "p0np", "p0", "p1"] {
+            let mut extra = exp2_flags(&meta, "345000");
+            extra.extend(l2.clone());
+            let (path, config) = l2_output_config(&parse(arm, &extra)).unwrap().unwrap();
+            assert_eq!(path, log);
+            assert_eq!(config.method, arm);
+        }
+        for arm in ["s3npa-prime", "p0np", "p0", "p1"] {
+            assert!(l2_output_config(&parse(arm, &l2)).is_err(), "{arm} without the recorder");
+        }
+        assert!(!log.exists());
+    }
+
     const S1_OPTS: [&str; 14] = [
         "--d-play-ms", "100", "--startup-timeout-ms", "2000", "--startup-rearm-limit", "1",
         "--late-tolerance-ms", "10", "--buffer-max-objects-per-track", "4096",
@@ -16453,7 +16720,7 @@ mod exp2_receiver_tests {
         let header = pack_header(TRACK_PC, 2, 0, 0, 1, t0, 4);
         let header = unpack_header(&header).unwrap();
         let t_recv = now_us();
-        let slot = exp2_drain_admit(&shared, header, t_recv, &failures);
+        let slot = exp2_drain_admit(&shared, header, t_recv, &failures, None);
         assert_eq!(slot, Some((Modality::Pc, 0)));
         let legacy_path = tmp("s1-legacy.jsonl");
         let logger = Arc::new(Mutex::new(
@@ -16492,6 +16759,136 @@ mod exp2_receiver_tests {
         assert_eq!(rows.iter().filter(|r| r["role"] == "rx").count(), 1);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&legacy_path);
+    }
+
+    /// Experiment 2 + L2, static path (drain admit -> recorder -> L2 link):
+    /// B1 submits at its admission with `t_release == t_recv`; S1 submits only
+    /// through the recorder's release row — the dispatch's 1-D hook is off
+    /// (`l2 = None`, as `l2_release_hook` is in exp2 mode) — and an S1 drop
+    /// is never submitted. Every submit equals an exp2 release row.
+    #[test]
+    fn exp2_static_l2_link_b1_and_s1_submit_the_release_rows() {
+        use skew_moq::exp2_recorder::{
+            haptic_slot_identity, pc_slot_identity, Exp2L2Payload, Exp2RecorderConfig, N_HAPTIC,
+            N_PC,
+        };
+        use skew_moq::l2_output::{FakeSinkConfig, L2Config, L2Output, L2SinkKind, L2Sinks};
+        for method in [Exp2Method::B1, Exp2Method::S1] {
+            let t0 = now_us();
+            let ledger = skew_moq::exp2_playout::Exp2OpportunityLedger {
+                t0_us: t0,
+                pc_pts_us: (0..N_PC as u64).map(|i| pc_slot_identity(i).0).collect(),
+                haptic_pts_us: (0..N_HAPTIC as u64).map(|k| haptic_slot_identity(k).0).collect(),
+            };
+            let path = tmp("static-l2-exp2.jsonl");
+            let mut recorder = Exp2Recorder::new(
+                std::fs::File::create(&path).unwrap(),
+                Box::new(now_us),
+                Exp2RecorderConfig {
+                    method,
+                    run_id: "t".into(),
+                    ledger,
+                    delta_max_us: 345_000,
+                    g_report_us: 1_000_000,
+                },
+            )
+            .unwrap();
+            let mut meta = serde_json::Map::new();
+            meta.insert("run_id".into(), serde_json::json!("t"));
+            meta.insert("method".into(), serde_json::json!(method.label()));
+            meta.insert("t0_us".into(), serde_json::json!(t0));
+            recorder.write_meta(meta).unwrap();
+            let l2_path = tmp("static-l2.jsonl");
+            let output = L2Output::start(
+                &l2_path,
+                L2Config {
+                    run_id: "t".into(),
+                    method: if method == Exp2Method::B1 { "b1" } else { "s1" }.into(),
+                    sinks: L2Sinks::both(L2SinkKind::Fake),
+                    fake: Some(FakeSinkConfig::offsets(1_000, 2_000)),
+                    alsa: None,
+                    wayland: None,
+                    queue_capacity: 64,
+                    row_capacity: 4_096,
+                    report_window_us: 200_000,
+                    max_tracked_objects: 4_096,
+                },
+            )
+            .unwrap();
+            recorder.attach_l2(output.submitter()).unwrap();
+            let shared: Exp2Shared = Arc::new(Mutex::new(Some(recorder)));
+            let failures = AtomicU64::new(0);
+            let object = |i: u32| {
+                let raw = pack_header(TRACK_PC, 2, i, pc_slot_identity(i as u64).0, i + 1, t0, 4);
+                let header = unpack_header(&raw).unwrap();
+                let mut bytes = raw.to_vec();
+                bytes.extend_from_slice(&[7u8; 4]);
+                (header, Bytes::from(bytes))
+            };
+            let t_recv = now_us();
+            let mut objects = Vec::new();
+            for i in 0..2u32 {
+                let (header, bytes) = object(i);
+                let payload = Exp2L2Payload { bytes: bytes.clone(), wire_track: None };
+                let slot = exp2_drain_admit(&shared, header, t_recv, &failures, Some(payload));
+                assert_eq!(slot, Some((Modality::Pc, i)));
+                objects.push(PlayoutObject { header, t_recv, bytes });
+            }
+            let legacy_path = tmp("static-l2-legacy.jsonl");
+            if method == Exp2Method::S1 {
+                let logger = Arc::new(Mutex::new(
+                    JsonlLogger::new(
+                        &legacy_path, "t", "moq", "rx", None, 0.0, 0.0, 0.0, 1, 30, 90, 1, None,
+                        None, Some("both"), Some(TERM_PROTOCOL_V), None, None, None,
+                    )
+                    .unwrap(),
+                ));
+                let mut stats = PlayoutStats::default();
+                let drop = objects.pop().unwrap();
+                let release = objects.pop().unwrap();
+                dispatch_playout_actions(
+                    vec![
+                        PlayoutAction::Release(release),
+                        PlayoutAction::Drop { object: drop, reason: "late", had_epoch: true },
+                    ],
+                    &logger,
+                    None,
+                    false,
+                    false,
+                    &mut stats,
+                    &|_| Some(t_recv),
+                    Some(&shared),
+                    None, // exp2 mode: the recorder submits
+                )
+                .unwrap();
+            }
+            assert_eq!(failures.load(Ordering::Relaxed), 0);
+            let link = shared.lock().unwrap().as_mut().unwrap().detach_l2().unwrap();
+            drop(shared);
+            let summary = output.finish().unwrap();
+            let read = |p: &PathBuf| -> Vec<serde_json::Value> {
+                std::fs::read_to_string(p).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+            };
+            let exp2_rows = read(&path);
+            let l2_rows = read(&l2_path);
+            let key = |r: &serde_json::Value| {
+                (r["seq"].as_u64().unwrap(), r["pts_us"].as_u64().unwrap(), r["event_id"].as_u64().unwrap(), r["t_release_us"].as_u64().unwrap())
+            };
+            let releases: Vec<_> = exp2_rows.iter().filter(|r| r["role"] == "release").map(key).collect();
+            let submits: Vec<_> = l2_rows.iter().filter(|r| r["role"] == "submit").map(key).collect();
+            let expected = if method == Exp2Method::B1 { 2 } else { 1 };
+            assert_eq!(releases.len(), expected, "{method:?}");
+            assert_eq!(submits, releases, "{method:?}: one submit per exp2 release row");
+            if method == Exp2Method::B1 {
+                assert!(releases.iter().all(|k| k.3 == t_recv), "B1 release := t_recv");
+            }
+            assert_eq!((link.submitted, link.missing_payload), (expected as u64, 0));
+            assert_eq!(link.held_at_detach, 2 - expected as u64 - u64::from(method == Exp2Method::S1));
+            assert!(summary.integrity_ok(L2Sinks::both(L2SinkKind::Fake)), "{summary:?}");
+            for p in [&path, &l2_path, &legacy_path] {
+                let _ = std::fs::remove_file(p);
+            }
+        }
     }
 }
 
