@@ -520,7 +520,9 @@ impl ObjectForwarder {
     /// Drive the real subgroup reader and all forwarders together. A child
     /// failure cancels the other in-task futures before returning the error.
     /// Keep watching remote cancellation after the track producer has ended:
-    /// outstanding subgroup writes can still fail during this drain.
+    /// outstanding subgroup writes can still fail during this drain. The
+    /// producer has ended when its writer is dropped or closed with `Done`;
+    /// any other track terminal is an error that ends the forward at once.
     ///
     /// Child errors pass through unchanged: they are already classified at
     /// their source. A child `Cancel` can only come from a vanished forwarder
@@ -562,9 +564,23 @@ impl ObjectForwarder {
                         result?;
                     }
                 }
-                result = subgroups.next(), if !done => match result? {
-                    Some(subgroup) => tasks.push(forward(subgroup)),
-                    None => done = true,
+                result = subgroups.next(), if !done => match result {
+                    Ok(Some(subgroup)) => tasks.push(forward(subgroup)),
+                    // The normal end of the track producer: `Ok(None)` when its
+                    // writer was dropped, `Err(Done)` when it was closed with
+                    // `Done`, which is what a relay's upstream PUBLISH_DONE
+                    // (TrackEnded) does through `Subscribe::error(Done)`. That
+                    // control message is sent at CONTROL_STREAM_PRIORITY and
+                    // can overtake the tail of the last object on its data
+                    // stream. No new subgroup can appear, but every child
+                    // already forwarding owns its own subgroup and object
+                    // readers and must finish (or fail) on its own: returning
+                    // here would drop it, quinn FINs a dropped send stream, and
+                    // the downstream subscriber would read the truncated object
+                    // as `wrong size`. Every other terminal (`Closed(code)`,
+                    // `Cancel`, ...) still ends the forward at once.
+                    Ok(None) | Err(ServeError::Done) => done = true,
+                    Err(err) => return Err(err.into()),
                 },
                 _ = std::future::ready(()), if done && tasks.is_empty() => return Ok(()),
             }
@@ -1222,6 +1238,130 @@ mod tests {
         assert!(futures::poll!(&mut forward).is_pending());
         tx.send(Err(ServeError::Cancel)).unwrap();
         assert!(matches!(forward.await, Err(SessionError::Serve(ServeError::Cancel))));
+    }
+
+    /// One subgroup whose single 5-byte object has only "he" written, forwarded
+    /// by the real `forward_subgroups` + `serve_subgroup_objects` into buffers.
+    /// Returns the forward future, the still-open object writer (and its
+    /// subgroup writer), the track's subgroups writer, and the captured output.
+    #[allow(clippy::type_complexity)]
+    fn in_flight_subgroup_forward() -> (
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SessionError>>>>,
+        serve::SubgroupObjectWriter,
+        serve::SubgroupWriter,
+        serve::SubgroupsWriter,
+        Arc<Mutex<Vec<bytes::BytesMut>>>,
+    ) {
+        use crate::coding::TrackNamespace;
+        let (writer, reader) = serve::Track::new(
+            TrackNamespace::from_utf8_path("test"), "pc").produce();
+        let mut groups = writer.subgroups().unwrap();
+        let mut subgroup = groups.append(1).unwrap();
+        let mut object = subgroup.create(5, None).unwrap();
+        object.write(bytes::Bytes::from_static(b"he")).unwrap();
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let sink = output.clone();
+        let forward = Box::pin(async move {
+            let TrackReaderMode::Subgroups(subgroups) = reader.mode().await? else {
+                panic!("subgroups expected");
+            };
+            let state = State::<ObjectForwarderState>::default();
+            ObjectForwarder::forward_subgroups(subgroups, std::future::pending(), |subgroup| {
+                let header = data::SubgroupHeader {
+                    header_type: data::StreamHeaderType::SubgroupIdExt,
+                    track_alias: 42, group_id: subgroup.group_id,
+                    subgroup_id: Some(subgroup.subgroup_id),
+                    publisher_priority: subgroup.priority,
+                };
+                let state = state.clone();
+                let sink = sink.clone();
+                async move {
+                    let buffer = ObjectForwarder::serve_subgroup_to_buffer(header, subgroup,
+                        state, DeliveryFilter { forward: true, start_location: None,
+                                                end_group_id: None },
+                        None).await?;
+                    sink.lock().unwrap().push(buffer);
+                    Ok::<(), SessionError>(())
+                }
+            }).await
+        });
+        (forward, object, subgroup, groups, output)
+    }
+
+    /// Relay end-of-run race (exp2 tier-4 diagnostic 2026-10-02, relay P1):
+    /// the upstream PUBLISH_DONE(TrackEnded) closes the relay's local track
+    /// with `Done` (`Subscribe::error(Done)` -> `SubgroupsWriter::close(Done)`)
+    /// while the tail of the last object is still arriving. That is the normal
+    /// end of the track producer: the in-flight child keeps its own subgroup
+    /// and object readers and must forward the complete object. Cancelling it
+    /// would drop its stream, which quinn FINs, and the downstream subscriber
+    /// reads a truncated object as `wrong size`.
+    #[tokio::test]
+    async fn producer_done_close_drains_the_in_flight_subgroup() {
+        use bytes::{Buf, Bytes};
+
+        use crate::coding::Decode;
+
+        let (mut forward, mut object, subgroup, groups, output) = in_flight_subgroup_forward();
+        assert!(futures::poll!(&mut forward).is_pending());
+        groups.close(ServeError::Done).unwrap();
+        assert!(futures::poll!(&mut forward).is_pending(),
+            "a Done-closed track producer must not cancel the in-flight subgroup");
+        object.write(Bytes::from_static(b"llo")).unwrap();
+        drop(object);
+        drop(subgroup);
+        tokio::time::timeout(std::time::Duration::from_secs(1), forward)
+            .await.expect("drained forward must finish").unwrap();
+        let buffers = output.lock().unwrap();
+        assert_eq!(buffers.len(), 1);
+        let mut buf = buffers[0].clone().freeze();
+        let header_type = data::StreamHeaderType::decode(&mut buf).unwrap();
+        let _ = data::SubgroupHeader::decode(header_type, &mut buf).unwrap();
+        let object = data::SubgroupObjectExt::decode(&mut buf).unwrap();
+        assert_eq!(object.payload_length, 5);
+        assert_eq!(&buf.copy_to_bytes(object.payload_length)[..], b"hello");
+        assert!(!buf.has_remaining());
+    }
+
+    /// Only `Done` is the producer's normal end. Any other terminal on the
+    /// track (an upstream REQUEST_ERROR / PUBLISH_DONE error code, e.g. the
+    /// S3 run-ended code the relay passes through) still fails the forward
+    /// at once, exactly as before.
+    #[tokio::test]
+    async fn producer_error_close_still_fails_the_forward() {
+        let (mut forward, object, subgroup, groups, _output) = in_flight_subgroup_forward();
+        assert!(futures::poll!(&mut forward).is_pending());
+        groups.close(ServeError::Closed(21315)).unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), forward)
+            .await.expect("an error close must not wait for the child");
+        assert!(matches!(result, Err(SessionError::Serve(ServeError::Closed(21315)))),
+            "unexpected result {result:?}");
+        drop((object, subgroup));
+    }
+
+    /// After a `Done` close the in-flight child's own failure is still a
+    /// fault: an aborted object, or an object writer that vanishes before its
+    /// declared size (upstream stream cut), fails the forward instead of
+    /// hanging or passing.
+    #[tokio::test]
+    async fn child_failure_after_producer_done_close_still_fails_the_forward() {
+        for abort in [Some(ServeError::Cancel), Some(ServeError::Size), None] {
+            let (mut forward, object, subgroup, groups, _output) =
+                in_flight_subgroup_forward();
+            assert!(futures::poll!(&mut forward).is_pending());
+            groups.close(ServeError::Done).unwrap();
+            assert!(futures::poll!(&mut forward).is_pending());
+            match abort.clone() {
+                Some(cause) => object.abort(cause).unwrap(),
+                None => drop(object), // remain > 0: SubgroupObjectWriter::drop -> Size
+            }
+            let result = tokio::time::timeout(std::time::Duration::from_secs(1), forward)
+                .await.expect("child failure must reach the parent");
+            assert!(result.is_err(), "child failure after Done was swallowed ({abort:?})");
+            assert!(!matches!(result, Err(SessionError::Serve(ServeError::Done))));
+            assert!(!matches!(result, Err(SessionError::Serve(ServeError::Cancel))));
+            drop(subgroup);
+        }
     }
 
     #[tokio::test]
