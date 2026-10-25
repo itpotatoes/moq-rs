@@ -88,6 +88,14 @@ enum Arm {
     /// through the S3 make-before-break switch path.
     #[value(name = "p1")]
     P1,
+    /// Registration §7-1: the L2 equipment calibration workload — NO
+    /// experimental method (decision 3, 2026-10-25: rx + L2 only, no exp2
+    /// JSONL). Fixed-delay playout `t_release = t0 + pts + D_cal` on the
+    /// PhaseControl t0 (`cal_playout`); no epoch search, no controller, no
+    /// delivery timeout, no tier switching. The sender is the static
+    /// `--arm b1` stream.
+    #[value(name = "calibration")]
+    Calibration,
 }
 
 /// `--l2-sink`. `None` is the pre-L2 receiver; otherwise the sink of each
@@ -159,6 +167,7 @@ impl Arm {
             Self::P0np => "p0np",
             Self::P0 => "p0",
             Self::P1 => "p1",
+            Self::Calibration => "calibration",
         }
     }
 
@@ -553,6 +562,16 @@ struct Args {
     /// echoed so the exp2 meta records all four inherited P1 switch settings.
     #[arg(long)]
     s3_producer_shutdown_timeout_ms: Option<u64>,
+    /// `--arm calibration` only (registration §7-1): the fixed playout delay
+    /// D_cal in µs, `t_release = t0 + pts + D_cal`. A registration slot:
+    /// REQUIRED, no default.
+    #[arg(long)]
+    cal_d_play_us: Option<u64>,
+    /// `--arm calibration` only: a test/loopback run. The rx `cal_meta` row
+    /// then says `cal_test_mode: true`, `scientific_eligible: false` (its
+    /// D_cal is provisional, never the slot value).
+    #[arg(long)]
+    cal_test_mode: bool,
 }
 
 /// `--duration-s` as exact integer microseconds. A fractional microsecond would
@@ -591,6 +610,12 @@ fn playout_config(args: &Args) -> Result<Option<PlayoutConfig>> {
         || args.buffer_max_span_ms.is_some()
         || args.late_policy.is_some()
         || args.pc_delivery_timeout_ms.is_some();
+    if args.arm == Arm::Calibration {
+        if supplied {
+            bail!("--arm calibration has no method: the S1 scheduler options and --pc-delivery-timeout-ms are refused");
+        }
+        return Ok(None);
+    }
     if args.arm == Arm::B1 {
         if supplied {
             bail!("S1 scheduler options require --arm s1; B1 must remain uncontrolled");
@@ -599,7 +624,7 @@ fn playout_config(args: &Args) -> Result<Option<PlayoutConfig>> {
     }
 
     match args.arm {
-        Arm::B1 => unreachable!("handled above"),
+        Arm::B1 | Arm::Calibration => unreachable!("handled above"),
         Arm::S3npaPrime | Arm::P0np | Arm::P0 | Arm::P1 => unreachable!("handled above"),
         Arm::S1 | Arm::M1 => {
             if args.pc_delivery_timeout_ms.is_some() {
@@ -743,6 +768,11 @@ struct Exp2Cli {
 }
 
 fn exp2_cli_config(args: &Args) -> Result<Option<Exp2Cli>> {
+    // §7-1 calibration writes no exp2 JSONL: `calibration_config` owns its
+    // --batch-id/--phase-control and refuses every exp2 recorder option.
+    if args.arm == Arm::Calibration {
+        return Ok(None);
+    }
     let supplied = [
         args.exp2_out.is_some(),
         args.opportunities.is_some(),
@@ -1170,7 +1200,7 @@ fn phase4_transport(args: &Args) -> Option<Phase4TransportMeta> {
             data_priority_mapping: args.data_priority_mapping.as_str(),
             pc_delivery_timeout_ms: args.pc_delivery_timeout_ms,
         }),
-        Arm::B1 | Arm::S1 => None,
+        Arm::B1 | Arm::S1 | Arm::Calibration => None,
         Arm::M1 => Some(Phase4TransportMeta {
             arm: "m1",
             pc_subgroup_mapping: "frame-per-subgroup",
@@ -1344,8 +1374,10 @@ fn l2_output_config(args: &Args) -> Result<Option<(PathBuf, skew_moq::l2_output:
     // share the S1 dispatcher but are not 1-D methods; s3np has no hook. The
     // exp2 recorder itself refuses every other arm.
     let exp2 = args.exp2_out.is_some();
+    let calibration = args.arm == Arm::Calibration;
     if !(matches!(args.arm, Arm::B1 | Arm::S1 | Arm::S2 | Arm::S3 | Arm::S3r)
-        || (exp2 && args.arm.is_exp2_core()))
+        || (exp2 && args.arm.is_exp2_core())
+        || calibration)
     {
         bail!(
             "--l2-sink supports only --arm b1|s1|s2|s3|s3r, or an exp2 arm with the exp2 recorder, not {}",
@@ -1356,6 +1388,12 @@ fn l2_output_config(args: &Args) -> Result<Option<(PathBuf, skew_moq::l2_output:
     // is a §0-3 slot passed by the runner — never the 1-D default window.
     if exp2 && args.l2_report_window_ms.is_none() {
         bail!("--l2-sink with the exp2 recorder requires --l2-report-window-ms (= G_report,L2; no default)");
+    }
+    // §7-1 calibration: G_report,L2 comes OUT of the calibration, so the
+    // close window is the calibration-only W_cal (not a slot) — never the
+    // 1-D default either.
+    if calibration && args.l2_report_window_ms.is_none() {
+        bail!("--arm calibration requires --l2-report-window-ms (= W_cal, the calibration-only report window; no default)");
     }
     if args.render || args.audio {
         bail!("--l2-sink replaces the Stage A bridge; do not combine it with --render/--audio");
@@ -1872,17 +1910,77 @@ fn exp2_l2_start_close(
     cut: Exp2L2Cut,
     logger: &Arc<Mutex<JsonlLogger>>,
 ) {
+    l2_start_close_at_cut(l2, cut, logger, L2CloseRule::Exp2);
+}
+
+/// Which absolute-close rule a cut hand-over applies: the strings of its rx
+/// rows and fault causes (the experiment-2 ones are unchanged).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum L2CloseRule {
+    /// `T_cut = H + G_report,L2` (Codex 155 P1-1).
+    Exp2,
+    /// Registration §7-1 calibration: `H_cal + W_cal` (W_cal = the
+    /// calibration-only report window, not a slot).
+    Calibration,
+}
+
+impl L2CloseRule {
+    fn close_event(self) -> &'static str {
+        match self {
+            Self::Exp2 => "exp2_l2_close",
+            Self::Calibration => "cal_l2_close",
+        }
+    }
+
+    fn rule_text(self) -> &'static str {
+        match self {
+            Self::Exp2 => "absolute close deadline T_cut = H + G_report,L2",
+            Self::Calibration => "absolute close deadline H_cal + W_cal (W_cal: calibration-only report window, not a slot)",
+        }
+    }
+
+    fn close_failed(self) -> &'static str {
+        match self {
+            Self::Exp2 => "exp2 L2 close at T_cut failed",
+            Self::Calibration => "calibration L2 close at H_cal + W_cal failed",
+        }
+    }
+
+    fn finish_event(self) -> &'static str {
+        match self {
+            Self::Exp2 => "exp2_l2_finish",
+            Self::Calibration => "cal_l2_finish",
+        }
+    }
+
+    fn missing_close(self) -> &'static str {
+        match self {
+            Self::Exp2 => "exp2 run sealed but its L2 close at T_cut never started",
+            Self::Calibration => "calibration run sealed but its L2 close at H_cal + W_cal never started",
+        }
+    }
+}
+
+/// [`exp2_l2_start_close`] for either close rule.
+fn l2_start_close_at_cut(
+    l2: Option<&mut skew_moq::l2_output::L2Output>,
+    cut: Exp2L2Cut,
+    logger: &Arc<Mutex<JsonlLogger>>,
+    rule: L2CloseRule,
+) {
     let Some(output) = l2 else { return };
     let started_us = now_us();
     let result = output.start_close_until(cut.t_cut_us);
     let error = result.as_ref().err().map(|e| format!("{e:#}"));
     if let Some(error) = &error {
         if !output.receiver_fault_noted() {
-            output.receiver_fault(now_us(), &format!("exp2 L2 close at T_cut failed: {error}"));
+            output.receiver_fault(now_us(), &format!("{}: {error}", rule.close_failed()));
         }
     }
     let body = format!(
-        "\"event\":\"exp2_l2_close\",\"rule\":\"absolute close deadline T_cut = H + G_report,L2\",\"t_cut_us\":{},\"detached_at_us\":{},\"close_started_us\":{started_us},\"started_after_t_cut\":{},\"error\":{}",
+        "\"event\":\"{}\",\"rule\":\"{}\",\"t_cut_us\":{},\"detached_at_us\":{},\"close_started_us\":{started_us},\"started_after_t_cut\":{},\"error\":{}",
+        rule.close_event(),
+        rule.rule_text(),
         cut.t_cut_us,
         cut.detached_at_us,
         started_us >= cut.t_cut_us,
@@ -1894,7 +1992,7 @@ fn exp2_l2_start_close(
         .and_then(|mut l| l.try_log_info(&body).map_err(anyhow::Error::from));
     if let Err(e) = logged {
         if !output.receiver_fault_noted() {
-            output.receiver_fault(now_us(), &format!("exp2_l2_close rx row not written: {e:#}"));
+            output.receiver_fault(now_us(), &format!("{} rx row not written: {e:#}", rule.close_event()));
         }
     }
 }
@@ -1905,13 +2003,23 @@ fn exp2_l2_start_close(
 /// failed). Diagnostic only: the L2 file is already complete, so a failed
 /// write is reported on stderr.
 fn log_exp2_l2_finish(logger: &Arc<Mutex<JsonlLogger>>, summary: &skew_moq::l2_output::L2Summary) {
+    log_l2_finish_row(logger, summary, L2CloseRule::Exp2);
+}
+
+/// [`log_exp2_l2_finish`] for either close rule.
+fn log_l2_finish_row(
+    logger: &Arc<Mutex<JsonlLogger>>,
+    summary: &skew_moq::l2_output::L2Summary,
+    rule: L2CloseRule,
+) {
     let opt = |v: Option<u64>| v.map(|t| t.to_string()).unwrap_or_else(|| "null".into());
     let [pc, haptic] = summary.lane_end_us;
     let held = summary
         .close_deadline_us
         .map(|d| summary.lane_end_us.iter().all(|end| end.is_some_and(|t| t >= d)));
     let body = format!(
-        "\"event\":\"exp2_l2_finish\",\"finish_start_us\":{},\"close_deadline_us\":{},\"lane_end_us\":{{\"pc\":{},\"haptic\":{}}},\"lanes_ended_at_or_after_deadline\":{}",
+        "\"event\":\"{}\",\"finish_start_us\":{},\"close_deadline_us\":{},\"lane_end_us\":{{\"pc\":{},\"haptic\":{}}},\"lanes_ended_at_or_after_deadline\":{}",
+        rule.finish_event(),
         opt(summary.finish_start_us),
         opt(summary.close_deadline_us),
         opt(pc),
@@ -1923,7 +2031,7 @@ fn log_exp2_l2_finish(logger: &Arc<Mutex<JsonlLogger>>, summary: &skew_moq::l2_o
         .map_err(|_| anyhow::anyhow!("RX logger poisoned"))
         .and_then(|mut l| l.try_log_info(&body).map_err(anyhow::Error::from));
     if let Err(e) = logged {
-        eprintln!("[rx] exp2_l2_finish rx row not written: {e:#}");
+        eprintln!("[rx] {} rx row not written: {e:#}", rule.finish_event());
     }
 }
 
@@ -1931,6 +2039,8 @@ fn log_exp2_l2_finish(logger: &Arc<Mutex<JsonlLogger>>, summary: &skew_moq::l2_o
 /// `None` once the hand-over resolved (applied, or the sender went away).
 struct Exp2CutHandoff {
     rx: Option<tokio::sync::oneshot::Receiver<Exp2L2Cut>>,
+    /// The close rule the cut applies (row and fault strings).
+    rule: L2CloseRule,
 }
 
 impl Exp2CutHandoff {
@@ -1943,7 +2053,7 @@ impl Exp2CutHandoff {
     ) {
         self.rx = None;
         if let Ok(cut) = got {
-            exp2_l2_start_close(l2.as_mut(), cut, logger);
+            l2_start_close_at_cut(l2.as_mut(), cut, logger, self.rule);
         }
     }
 
@@ -2070,15 +2180,23 @@ async fn wait_exp2_task<T>(
 /// fallback (it has failed through its exp2 outcome already). Returns
 /// whether the fault was raised.
 fn exp2_l2_require_close_at_cut(sealed: bool, l2: Option<&skew_moq::l2_output::L2Output>) -> bool {
+    l2_require_close_at_cut(sealed, l2, L2CloseRule::Exp2)
+}
+
+/// [`exp2_l2_require_close_at_cut`] for either close rule.
+fn l2_require_close_at_cut(
+    sealed: bool,
+    l2: Option<&skew_moq::l2_output::L2Output>,
+    rule: L2CloseRule,
+) -> bool {
     let Some(output) = l2 else { return false };
     if !sealed || output.close_started() {
         return false;
     }
     note_l2_fault(Some(output), || {
-        "exp2 run sealed but its L2 close at T_cut never started: finish would apply the relative deadline"
-            .to_string()
+        format!("{}: finish would apply the relative deadline", rule.missing_close())
     });
-    eprintln!("[rx] exp2 run sealed but its L2 close at T_cut never started");
+    eprintln!("[rx] {}", rule.missing_close());
     true
 }
 
@@ -8420,6 +8538,7 @@ async fn receiver_main() -> Result<()> {
     let s3_runtime = s3_runtime_config(&args)?;
     let p1_runtime = p1_runtime_config(&args)?;
     let exp2_cli = exp2_cli_config(&args)?.map(Arc::new);
+    let cal_cli = calibration_config(&args)?;
     let phase4_transport = phase4_transport(&args);
     let replay_meta = match (args.arm.replays_tier_schedule(), &args.tier_schedule) {
         (true, Some(path)) => {
@@ -8541,6 +8660,11 @@ async fn receiver_main() -> Result<()> {
             replay: replay_meta,
         }),
     )?));
+
+    // Registration §7-1 calibration: its own receiver (no method, no exp2).
+    if let Some(cal) = cal_cli {
+        return run_calibration_receiver(&args, cal, logger).await;
+    }
 
     if args.arm == Arm::P1 {
         return run_exp2_p1_receiver(
@@ -9175,7 +9299,7 @@ async fn receiver_main() -> Result<()> {
     // exp2 + L2 only: the seal hand-over (T_cut). `None` in every other mode,
     // where `wait_rx_end` is exactly the historical three-branch `select!`
     // (Codex 156a P2: no disabled fourth branch, same tie-break).
-    let mut exp2_cut = exp2_l2_cut_rx.map(|rx| Exp2CutHandoff { rx: Some(rx) });
+    let mut exp2_cut = exp2_l2_cut_rx.map(|rx| Exp2CutHandoff { rx: Some(rx), rule: L2CloseRule::Exp2 });
     let drained = wait_rx_end(
         join_rx_drains(&mut drains, &drain_fault),
         &mut session_run,
@@ -9491,6 +9615,784 @@ async fn receiver_main() -> Result<()> {
     }
     // Header integrity outranks a nominally normal ending: a run that carried
     // malformed objects is not a valid measurement even if the tracks FINed.
+    if n_bad > 0 {
+        eprintln!("[rx] FATAL: {n_bad} malformed header(s); exiting {EXIT_RX_HEADER_INVALID}");
+        std::process::exit(EXIT_RX_HEADER_INVALID);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Registration §7-1: the L2 equipment calibration workload (`--arm calibration`).
+//
+// Decision 3 (2026-10-25): rx + L2 only, no exp2 JSONL, D_cal a registration
+// slot, a calibration-only report window W_cal (G_report,L2 comes out of the
+// calibration). Its own receiver function, so the 1-D and exp2 paths are not
+// touched: connect, subscribe both static tracks, drain (rx rows), and hand
+// every complete object to the fixed-delay scheduler task (`cal_playout`),
+// which submits each on-time object to the L2 output stage at its release.
+// ---------------------------------------------------------------------------
+
+/// Validated calibration options.
+#[derive(Debug, Clone)]
+struct CalCli {
+    d_cal_us: u64,
+    /// W_cal: the calibration-only report window (`--l2-report-window-ms`).
+    w_cal_us: u64,
+    batch_id: String,
+    phase_control: PathBuf,
+    run_id: String,
+    topology: Topology,
+    representation: Representation,
+    test_mode: bool,
+}
+
+/// Calibration ingress bound (the S1/exp2 bound, 2 × 4096 > 4,800 objects).
+const CAL_INGRESS_CAPACITY: usize = 2 * 4096;
+
+fn calibration_config(args: &Args) -> Result<Option<CalCli>> {
+    if args.arm != Arm::Calibration {
+        if args.cal_d_play_us.is_some() || args.cal_test_mode {
+            bail!("--cal-d-play-us/--cal-test-mode require --arm calibration");
+        }
+        return Ok(None);
+    }
+    let d_cal_us = args.cal_d_play_us.context(
+        "--arm calibration requires --cal-d-play-us (D_cal, a registration slot; no default)",
+    )?;
+    if d_cal_us == 0 {
+        bail!("--cal-d-play-us must be positive");
+    }
+    if args.l2_sink == L2SinkArg::None {
+        bail!("--arm calibration requires an --l2-sink other than none (the output path is what is calibrated)");
+    }
+    let w_cal_ms = args.l2_report_window_ms.context(
+        "--arm calibration requires --l2-report-window-ms (= W_cal, the calibration-only report window; no default)",
+    )?;
+    if w_cal_ms == 0 {
+        bail!("--l2-report-window-ms must be positive");
+    }
+    let (Some(batch_id), Some(phase_control)) = (args.batch_id.clone(), args.phase_control.clone()) else {
+        bail!("--arm calibration requires --batch-id and --phase-control (the PhaseControl t0)");
+    };
+    if args.exp2_out.is_some()
+        || args.opportunities.is_some()
+        || args.exp2_meta.is_some()
+        || args.delta_max_us.is_some()
+        || args.exp2_sender_wire.is_some()
+        || args.exp2_test_mode
+        || args.exp2_test_force_hc_at_ms.is_some()
+        || args.s3_producer_shutdown_timeout_ms.is_some()
+    {
+        bail!("--arm calibration writes no exp2 JSONL: the exp2 recorder options are refused");
+    }
+    if args.tracks != RxTrackSel::Both || args.queue_policy != QueuePolicy::Separate {
+        bail!("--arm calibration requires --tracks both and --queue-policy separate");
+    }
+    if args.payload_mode != PayloadMode::Frame {
+        bail!("--arm calibration requires --payload-mode frame");
+    }
+    if args.render || args.audio {
+        bail!("--arm calibration submits to the L2 output stage only; --render/--audio are refused");
+    }
+    use skew_moq::exp2_recorder::{HAPTIC_RATE_HZ, PC_RATE_HZ, RUN_DURATION_US};
+    if args.pc_rate_hz != PC_RATE_HZ || args.haptic_rate_hz != HAPTIC_RATE_HZ {
+        bail!("--arm calibration plays the registered plan: --pc-rate-hz {PC_RATE_HZ} --haptic-rate-hz {HAPTIC_RATE_HZ}");
+    }
+    let duration_us = duration_us_exact(
+        args.duration_s
+            .context("--arm calibration requires --duration-s 40 (the registered plan)")?,
+    )?;
+    if duration_us != RUN_DURATION_US {
+        bail!("--arm calibration plays the registered {RUN_DURATION_US} us plan, not {duration_us} us");
+    }
+    Ok(Some(CalCli {
+        d_cal_us,
+        w_cal_us: ms_to_us(w_cal_ms, "l2-report-window-ms")?,
+        batch_id,
+        phase_control,
+        run_id: args.run_id.clone(),
+        topology: args.topology,
+        representation: args.representation,
+        test_mode: args.cal_test_mode,
+    }))
+}
+
+fn log_cal_info(logger: &Arc<Mutex<JsonlLogger>>, body: &str) -> Result<()> {
+    logger
+        .lock()
+        .map_err(|_| anyhow::anyhow!("RX logger poisoned"))?
+        .try_log_info(body)
+        .context("calibration rx row not written")
+}
+
+/// The static part of the calibration meta (written before connecting).
+fn cal_meta_body(cal: &CalCli) -> String {
+    use skew_moq::cal_playout::{
+        CAL_H_RULE, CAL_LATE_RULE, CAL_PLAN_SOURCE, CAL_RELEASE_TIE_RULE, CAL_SEAL_EXECUTION_DELAY_US,
+    };
+    use skew_moq::exp2_recorder::{N_HAPTIC, N_PC};
+    format!(
+        "\"event\":\"cal_meta\",\"mode\":\"calibration\",\"registration\":\"§7-1 L2 equipment calibration (no method)\",\"d_cal_us\":{},\"w_cal_us\":{},\"w_cal_is_slot\":false,\"representation\":\"{}\",\"topology\":\"{}\",\"n_pc\":{N_PC},\"n_haptic\":{N_HAPTIC},\"plan\":\"{}\",\"release_rule\":\"due_us = t0 + pts + D_cal; t_release_us = the actual dispatch instant (>= due_us), the L2 submit's t_release_us\",\"tie_rule\":\"{}\",\"late_rule\":\"{}\",\"h_rule\":\"{}\",\"seal_execution_delay_us\":{CAL_SEAL_EXECUTION_DELAY_US},\"close_rule\":\"absolute close deadline H_cal + W_cal (start_close_until)\",\"exp2_jsonl\":false,\"cal_test_mode\":{},\"scientific_eligible\":{}",
+        cal.d_cal_us,
+        cal.w_cal_us,
+        cal.representation.as_str(),
+        cal.topology.as_str(),
+        json_escape(CAL_PLAN_SOURCE),
+        json_escape(CAL_RELEASE_TIE_RULE),
+        json_escape(CAL_LATE_RULE),
+        json_escape(CAL_H_RULE),
+        cal.test_mode,
+        !cal.test_mode,
+    )
+}
+
+/// Outer-channel submit accounting of the calibration release rows (the
+/// exp2 link counter names; the ALSA-internal queue-full stage is in the L2
+/// file, `lanes.haptic.queue_full_discards`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CalSubmitCounts {
+    submit_attempted: u64,
+    submit_accepted: u64,
+    discarded_before_submit: u64,
+    refused_after_close: u64,
+    refused_sink_gone: u64,
+}
+
+impl CalSubmitCounts {
+    fn note(&mut self, outcome: skew_moq::l2_output::L2SubmitOutcome) {
+        use skew_moq::l2_output::L2SubmitOutcome;
+        self.submit_attempted += 1;
+        match outcome {
+            L2SubmitOutcome::Submitted => self.submit_accepted += 1,
+            L2SubmitOutcome::QueueFull => self.discarded_before_submit += 1,
+            L2SubmitOutcome::AfterClose => self.refused_after_close += 1,
+            L2SubmitOutcome::SinkGone => self.refused_sink_gone += 1,
+        }
+    }
+}
+
+/// What the calibration task reports to main.
+#[derive(Debug, Clone, Default)]
+struct CalReport {
+    stats: skew_moq::cal_playout::CalStats,
+    submits: CalSubmitCounts,
+    max_release_lateness_us: u64,
+    sealed: bool,
+}
+
+fn cal_identity_fields(m: skew_moq::exp2_playout::Modality, h: &Header) -> String {
+    format!(
+        "\"track\":\"{}\",\"tier\":{},\"seq\":{},\"pts_us\":{},\"event_id\":{}",
+        m.as_str(),
+        h.tier,
+        h.seq,
+        h.pts_us,
+        h.event_id
+    )
+}
+
+/// Release one due object: the rx `cal_release` row (written first, as the
+/// exp2 recorder writes its release row before the submit), then the L2
+/// submit with the same `t_release_us` (the actual dispatch instant).
+fn cal_release(
+    object: skew_moq::cal_playout::CalObject,
+    logger: &Arc<Mutex<JsonlLogger>>,
+    submitter: Option<&skew_moq::l2_output::L2Submitter>,
+    report: &mut CalReport,
+) -> Result<()> {
+    use skew_moq::l2_output::{L2Identity, L2Modality};
+    let t_release_us = now_us().max(object.due_us);
+    report.max_release_lateness_us = report.max_release_lateness_us.max(t_release_us - object.due_us);
+    log_cal_info(
+        logger,
+        &format!(
+            "\"event\":\"cal_release\",{},\"due_us\":{},\"t_release_us\":{t_release_us},\"t_recv_us\":{},\"gen_ts_us\":{}",
+            cal_identity_fields(object.modality, &object.header),
+            object.due_us,
+            object.t_recv_us,
+            object.header.gen_ts_us,
+        ),
+    )?;
+    let submitter = submitter.context("a calibration release after the seal")?;
+    let h = object.header;
+    let identity = L2Identity {
+        modality: match object.modality {
+            skew_moq::exp2_playout::Modality::Pc => L2Modality::Pc,
+            skew_moq::exp2_playout::Modality::Haptic => L2Modality::Haptic,
+        },
+        tier: h.tier,
+        seq: h.seq,
+        pts_us: h.pts_us,
+        event_id: h.event_id,
+        route: None,
+    };
+    let payload = (object.bytes.len() >= HDR).then(|| object.bytes.slice(HDR..));
+    report.submits.note(submitter.submit_payload(identity, t_release_us, payload));
+    Ok(())
+}
+
+fn cal_arrival_row(
+    arrival: skew_moq::cal_playout::CalArrival,
+    header: &Header,
+    t_recv_us: u64,
+) -> Option<String> {
+    use skew_moq::cal_playout::CalArrival;
+    let track = track_name(header.track_id);
+    let identity = format!(
+        "\"track\":\"{track}\",\"tier\":{},\"seq\":{},\"pts_us\":{},\"event_id\":{}",
+        header.tier, header.seq, header.pts_us, header.event_id
+    );
+    match arrival {
+        CalArrival::Held { .. } => None,
+        CalArrival::Late { due_us, .. } => Some(format!(
+            "\"event\":\"cal_late\",{identity},\"due_us\":{due_us},\"t_recv_us\":{t_recv_us},\"late_by_us\":{},\"submitted\":false",
+            t_recv_us - due_us
+        )),
+        CalArrival::AfterSeal { due_us, .. } => Some(format!(
+            "\"event\":\"cal_diagnostic\",\"kind\":\"after_seal\",{identity},\"due_us\":{due_us},\"t_recv_us\":{t_recv_us},\"submitted\":false"
+        )),
+        CalArrival::Duplicate { .. } => Some(format!(
+            "\"event\":\"cal_diagnostic\",\"kind\":\"duplicate\",{identity},\"t_recv_us\":{t_recv_us},\"submitted\":false"
+        )),
+        CalArrival::IdentityMismatch { .. } => Some(format!(
+            "\"event\":\"cal_diagnostic\",\"kind\":\"identity_mismatch\",{identity},\"t_recv_us\":{t_recv_us},\"submitted\":false"
+        )),
+        CalArrival::Orphan => Some(format!(
+            "\"event\":\"cal_diagnostic\",\"kind\":\"orphan\",{identity},\"t_recv_us\":{t_recv_us},\"submitted\":false"
+        )),
+    }
+}
+
+/// The calibration scheduler task. Errors are stamped as L2 receiver faults
+/// at the moment the task returns them (fail closed).
+#[allow(clippy::too_many_arguments)]
+async fn run_cal_task(
+    cal: CalCli,
+    input: mpsc::Receiver<PlayoutObject>,
+    logger: Arc<Mutex<JsonlLogger>>,
+    submitter: skew_moq::l2_output::L2Submitter,
+    fault: Option<skew_moq::l2_output::L2FaultStamp>,
+    cut: tokio::sync::oneshot::Sender<Exp2L2Cut>,
+    sealed: Arc<AtomicBool>,
+) -> Result<CalReport> {
+    let result = run_cal_task_body(cal, input, logger, submitter, cut, sealed).await;
+    if let Err(error) = &result {
+        stamp_static_fault(&fault, || format!("calibration scheduler failed: {error:#}"));
+    }
+    result
+}
+
+async fn run_cal_task_body(
+    cal: CalCli,
+    input: mpsc::Receiver<PlayoutObject>,
+    logger: Arc<Mutex<JsonlLogger>>,
+    submitter: skew_moq::l2_output::L2Submitter,
+    cut: tokio::sync::oneshot::Sender<Exp2L2Cut>,
+    sealed: Arc<AtomicBool>,
+) -> Result<CalReport> {
+    use skew_moq::cal_playout::{CalConfig, CalPlan, CalScheduler};
+    let phase = skew_moq::phase::wait_phase_control(
+        cal.phase_control.clone(),
+        &cal.batch_id,
+        &cal.run_id,
+        exp2_phase_arm(cal.topology),
+        EXP2_PHASE_WAIT,
+    )
+    .await
+    .context("calibration: read the PhaseControl t0")?;
+    let sched = CalScheduler::new(
+        CalConfig { t0_us: phase.t0_us, d_cal_us: cal.d_cal_us },
+        CalPlan::registered(),
+    )
+    .map_err(anyhow::Error::msg)?;
+    let t_cut_us = sched
+        .h_cal_us()
+        .checked_add(cal.w_cal_us)
+        .context("H_cal + W_cal overflows u64")?;
+    log_cal_info(
+        &logger,
+        &format!(
+            "\"event\":\"cal_schedule\",\"t0_us\":{},\"d_cal_us\":{},\"h_cal_us\":{},\"seal_at_us\":{},\"w_cal_us\":{},\"close_deadline_us\":{t_cut_us},\"phase_sha256\":\"{}\"",
+            phase.t0_us,
+            cal.d_cal_us,
+            sched.h_cal_us(),
+            sched.seal_at_us(),
+            cal.w_cal_us,
+            phase.digest(),
+        ),
+    )?;
+    cal_run_schedule(sched, t_cut_us, input, logger, submitter, cut, sealed).await
+}
+
+/// The calibration schedule from the first arrival to the seal and the end
+/// of the input: arrivals are classified (late/diagnostic rows), every due
+/// object is released at its due (actual dispatch instant, never earlier),
+/// the seal writes the `missing` rows and `cal_l2_link`, drops the
+/// submitter and hands `H_cal + W_cal` over to main.
+async fn cal_run_schedule(
+    mut sched: skew_moq::cal_playout::CalScheduler,
+    t_cut_us: u64,
+    mut input: mpsc::Receiver<PlayoutObject>,
+    logger: Arc<Mutex<JsonlLogger>>,
+    submitter: skew_moq::l2_output::L2Submitter,
+    cut: tokio::sync::oneshot::Sender<Exp2L2Cut>,
+    sealed: Arc<AtomicBool>,
+) -> Result<CalReport> {
+    let mut report = CalReport::default();
+    let mut submitter = Some(submitter);
+    let mut cut = Some(cut);
+    let mut open = true;
+    loop {
+        if sched.is_sealed() && !open {
+            break;
+        }
+        let wake = sched.next_wakeup_us();
+        tokio::select! {
+            message = input.recv(), if open => match message {
+                Some(object) => {
+                    let (header, t_recv) = (object.header, object.t_recv);
+                    let arrival = sched.arrive(header, t_recv, object.bytes);
+                    if let Some(row) = cal_arrival_row(arrival, &header, t_recv) {
+                        log_cal_info(&logger, &row)?;
+                    }
+                }
+                None => open = false,
+            },
+            _ = tokio::time::sleep(Duration::from_micros(wake.unwrap_or(0).saturating_sub(now_us()))),
+                if wake.is_some() => {}
+        }
+        if sched.is_sealed() {
+            continue;
+        }
+        let now = now_us();
+        if now >= sched.seal_at_us() {
+            let (released, missing) = sched.seal(now).map_err(anyhow::Error::msg)?;
+            for object in released {
+                cal_release(object, &logger, submitter.as_ref(), &mut report)?;
+            }
+            for slot in missing {
+                log_cal_info(
+                    &logger,
+                    &format!(
+                        "\"event\":\"cal_missing\",\"track\":\"{}\",\"pts_us\":{},\"event_id\":{},\"due_us\":{},\"submitted\":false",
+                        slot.modality.as_str(),
+                        sched.plan().pts(slot.modality, slot.index),
+                        sched.plan().event_id(slot.modality, slot.index),
+                        slot.due_us,
+                    ),
+                )?;
+            }
+            anyhow::ensure!(sched.all_terminal(), "a calibration slot has no terminal after the seal");
+            // Sealed: no release (and so no submit) can follow. The submitter
+            // goes (L2 finish needs no live producer), the accounting row is
+            // written, and main starts the close at H_cal + W_cal.
+            drop(submitter.take());
+            sealed.store(true, Ordering::Release);
+            report.sealed = true;
+            report.stats = sched.stats().clone();
+            let detached_at_us = now_us();
+            let s = &report.stats;
+            let c = report.submits;
+            log_cal_info(
+                &logger,
+                &format!(
+                    "\"event\":\"cal_l2_link\",\"detached\":\"after_seal\",\"detached_at_us\":{detached_at_us},\"t_cut_us\":{t_cut_us},\"submit_attempted\":{},\"submit_accepted\":{},\"discarded_before_submit\":{},\"refused_after_close\":{},\"refused_sink_gone\":{},\"released\":{},\"late\":{},\"missing\":{},\"after_seal\":{},\"duplicate\":{},\"identity_mismatch\":{},\"orphan\":{},\"arrivals\":{},\"max_release_lateness_us\":{}",
+                    c.submit_attempted,
+                    c.submit_accepted,
+                    c.discarded_before_submit,
+                    c.refused_after_close,
+                    c.refused_sink_gone,
+                    s.released,
+                    s.late,
+                    s.missing,
+                    s.after_seal,
+                    s.duplicate,
+                    s.identity_mismatch,
+                    s.orphan,
+                    s.arrivals,
+                    report.max_release_lateness_us,
+                ),
+            )?;
+            if let Some(tx) = cut.take() {
+                // main may already be gone (fail closed there); nothing to do.
+                let _ = tx.send(Exp2L2Cut { t_cut_us, detached_at_us });
+            }
+        } else {
+            for object in sched.take_due(now) {
+                cal_release(object, &logger, submitter.as_ref(), &mut report)?;
+            }
+        }
+    }
+    report.stats = sched.stats().clone();
+    Ok(report)
+}
+
+/// `--arm calibration`: the whole receiver (registration §7-1).
+async fn run_calibration_receiver(
+    args: &Args,
+    cal: CalCli,
+    logger: Arc<Mutex<JsonlLogger>>,
+) -> Result<()> {
+    log_cal_info(&logger, &cal_meta_body(&cal))?;
+    let mut l2_output = start_l2_output_at(args, &logger, "before_session")?;
+    let output = l2_output.as_ref().context("--arm calibration requires the L2 output stage")?;
+    let submitter = output.submitter();
+    let fault = Some(output.fault_stamp());
+
+    let (cal_tx, cal_rx) = mpsc::channel::<PlayoutObject>(CAL_INGRESS_CAPACITY);
+    let (cut_tx, cut_rx) = tokio::sync::oneshot::channel::<Exp2L2Cut>();
+    let sealed = Arc::new(AtomicBool::new(false));
+    let mut cal_task = tokio::spawn(run_cal_task(
+        cal.clone(),
+        cal_rx,
+        logger.clone(),
+        submitter,
+        fault.clone(),
+        cut_tx,
+        sealed.clone(),
+    ));
+
+    let (sess, tp) = establish(args).await?;
+    let (session, mut subscriber) = session_handshake(args, sess, tp).await?;
+    let mut session_run = tokio::spawn(session.run());
+    let namespace = TrackNamespace::from_utf8_path(&args.run_id);
+    let names = args.queue_policy.wire_tracks();
+    let _announce_guard: Option<PublishedNamespace> = if args.listen.is_some() {
+        Some(
+            ack_published_namespace(&mut subscriber, &namespace, args.subscribe_timeout)
+                .await
+                .context("직결 토폴로지 announce 응답")?,
+        )
+    } else {
+        None
+    };
+
+    // The static subscribe loop (as `receiver_main`), without any SUBSCRIBE
+    // parameter: calibration requests no DELIVERY_TIMEOUT.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(args.max_duration);
+    let sub_started = tokio::time::Instant::now();
+    let sub_deadline = sub_started + Duration::from_secs_f64(args.subscribe_timeout);
+    let mut sub_stats = SubscribeStats::default();
+    let (received, sub_handles, _keep_reader) = 'outer: loop {
+        let (mut sub_tracks, _req, mut sub_reader) = Tracks::new(namespace.clone()).produce();
+        let mut this_recv = Vec::new();
+        let mut this_handles = Vec::new();
+        let mut fatal: Option<anyhow::Error> = None;
+        let mut ok = true;
+        for &name in names {
+            let Some(tw) = sub_tracks.create(name) else {
+                ok = false;
+                break;
+            };
+            let Some(rr) = sub_reader.get_track_reader(&namespace, name) else {
+                ok = false;
+                break;
+            };
+            match subscriber.subscribe_open_with_params(tw, KeyValuePairs::default()).await {
+                Ok(h) => {
+                    this_handles.push(h);
+                    this_recv.push((name, rr));
+                }
+                Err(e) if is_retryable_subscribe_error(&e) => {
+                    ok = false;
+                    break;
+                }
+                Err(e) => {
+                    fatal = Some(anyhow::anyhow!("subscribe {name} failed: {e}"));
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if let Some(e) = fatal {
+            return Err(e);
+        }
+        if ok {
+            sub_stats.waited_ms = sub_started.elapsed().as_millis() as u64;
+            break 'outer (this_recv, this_handles, sub_reader);
+        }
+        if tokio::time::Instant::now() >= sub_deadline {
+            bail!(
+                "could not subscribe within {}s ({} retries; publisher never announced?)",
+                args.subscribe_timeout,
+                sub_stats.retries
+            );
+        }
+        if session_run.is_finished() {
+            bail!("session ended before subscribe succeeded");
+        }
+        sub_stats.retries += 1;
+        tokio::time::sleep(Duration::from_millis(args.subscribe_retry_ms)).await;
+    };
+    println!("[rx] calibration: subscribed {} on {}", names.join("+"), args.run_id);
+    let mut readiness_components: Vec<&str> = match args.topology {
+        Topology::Relay => vec!["sender_relay_session", "relay_receiver_session"],
+        Topology::Direct => vec!["sender_receiver_session"],
+    };
+    readiness_components.push("pc_subscription");
+    readiness_components.push("haptic_subscription");
+    logger
+        .lock()
+        .unwrap()
+        .log_readiness(now_us(), &readiness_components)
+        .context("failed to record readiness components")?;
+
+    let counts: Vec<Arc<AtomicU64>> = (0..2).map(|_| Arc::new(AtomicU64::new(0))).collect();
+    let bad_headers = Arc::new(AtomicU64::new(0));
+    let ingress_drops = Arc::new(AtomicU64::new(0));
+    let log_failed = Arc::new(AtomicU64::new(0));
+    let mut drains = Vec::new();
+    for (name, received_track) in received.into_iter() {
+        let logger = logger.clone();
+        let counts = counts.clone();
+        let bad = bad_headers.clone();
+        let ingress_drops = ingress_drops.clone();
+        let log_failed = log_failed.clone();
+        let cal_tx = cal_tx.clone();
+        let l2_fault = fault.clone();
+        drains.push(tokio::spawn(async move {
+            let inner = async {
+                let mut subgroups = match received_track.mode().await? {
+                    TrackReaderMode::Subgroups(s) => s,
+                    _ => return Err(DrainFail::NonSubgroup),
+                };
+                while let Some(mut sg) = subgroups.next().await? {
+                    while let Some(obj) = sg.read_next().await? {
+                        let t = now_us(); // complete reception
+                        let Some(h) = unpack_header(&obj) else {
+                            bad.fetch_add(1, Ordering::Relaxed);
+                            stamp_static_fault(&l2_fault, || format!("malformed header on {name}"));
+                            continue;
+                        };
+                        let Some(track) = demux_track(name, h.track_id) else {
+                            bad.fetch_add(1, Ordering::Relaxed);
+                            stamp_static_fault(&l2_fault, || format!("malformed header on {name}"));
+                            continue;
+                        };
+                        if h.version != VERSION || obj.len() != HDR + h.payload_len as usize {
+                            bad.fetch_add(1, Ordering::Relaxed);
+                            stamp_static_fault(&l2_fault, || format!("malformed header on {name}"));
+                            continue;
+                        }
+                        if is_warmup_seq(h.seq) {
+                            if logger.lock().unwrap().try_log_warmup_rx(
+                                track, h.tier, h.seq, h.pts_us, h.event_id,
+                                h.payload_len, h.gen_ts_us, t,
+                            ).is_err() {
+                                log_failed.fetch_add(1, Ordering::Relaxed);
+                                stamp_static_fault(&l2_fault, || format!("warm-up rx log write failed on {name}"));
+                            }
+                            continue;
+                        }
+                        logger.lock().unwrap().log_rx(
+                            track, h.tier, h.seq, h.pts_us, h.event_id, h.payload_len, t, t, h.gen_ts_us,
+                        );
+                        counts[track_slot(track)].fetch_add(1, Ordering::Relaxed);
+                        let object = PlayoutObject { header: h, t_recv: t, bytes: obj.clone() };
+                        if let Err(error) = cal_tx.try_send(object) {
+                            // Never scheduled: not submitted, and the run is
+                            // not a calibration (`cal_result`).
+                            let reason = match error {
+                                mpsc::error::TrySendError::Full(_) => "ingress_queue_full",
+                                mpsc::error::TrySendError::Closed(_) => "scheduler_closed",
+                            };
+                            ingress_drops.fetch_add(1, Ordering::Relaxed);
+                            let logged = logger.lock().unwrap().try_log_drop(
+                                track, h.tier, h.seq, h.pts_us, h.event_id, now_us().max(t), reason, None,
+                            );
+                            if logged.is_err() || reason == "scheduler_closed" {
+                                log_failed.fetch_add(1, Ordering::Relaxed);
+                                stamp_static_fault(&l2_fault, || format!("calibration ingress {reason} on {name}"));
+                            }
+                        }
+                    }
+                }
+                Ok::<(), DrainFail>(())
+            };
+            let ended = match inner.await {
+                Ok(()) => (name, TrackEnd::Fin, String::new()),
+                Err(DrainFail::Serve(e)) => (name, classify_track_end(&e), format!("{e}")),
+                Err(DrainFail::NonSubgroup) => (name, TrackEnd::Failed, "non-subgroup delivery".into()),
+            };
+            if ended.1 == TrackEnd::Failed {
+                stamp_static_fault(&l2_fault, || format!("track {name} ended Failed: {}", ended.2));
+            }
+            ended
+        }));
+    }
+
+    let drain_fault = fault.clone();
+    let mut handoff = Exp2CutHandoff { rx: Some(cut_rx), rule: L2CloseRule::Calibration };
+    let drained = wait_rx_end(
+        join_rx_drains(&mut drains, &drain_fault),
+        &mut session_run,
+        deadline,
+        &mut l2_output,
+        Some(&mut handoff),
+        &logger,
+    )
+    .await;
+    for drain in &drains {
+        if !drain.is_finished() {
+            drain.abort();
+        }
+    }
+    for drain in &mut drains {
+        if !drain.is_finished() {
+            let _ = drain.await;
+        }
+    }
+    drop(cal_tx);
+
+    // The scheduler runs its schedule to the seal; the cut is still served
+    // while it does (`wait_exp2_task`).
+    let mut finalize_failed = false;
+    let mut report = CalReport::default();
+    match wait_exp2_task(&mut cal_task, deadline, &mut l2_output, Some(&mut handoff), &logger).await {
+        Ok(Ok(Ok(r))) => report = r,
+        Ok(Ok(Err(e))) => {
+            note_l2_fault(l2_output.as_ref(), || format!("calibration scheduler failed: {e:#}"));
+            eprintln!("[rx] calibration scheduler failed: {e:#}");
+            finalize_failed = true;
+        }
+        Ok(Err(e)) => {
+            note_l2_fault(l2_output.as_ref(), || format!("calibration scheduler join failed: {e}"));
+            eprintln!("[rx] calibration scheduler join failed: {e}");
+            finalize_failed = true;
+        }
+        Err(_) => {
+            cal_task.abort();
+            let _ = cal_task.await;
+            note_l2_fault(l2_output.as_ref(), || {
+                "calibration scheduler did not reach its seal before --max-duration".to_string()
+            });
+            eprintln!("[rx] calibration scheduler did not reach its seal before --max-duration");
+            finalize_failed = true;
+        }
+    }
+    handoff.poll_now(&mut l2_output, &logger);
+    l2_require_close_at_cut(sealed.load(Ordering::Acquire), l2_output.as_ref(), L2CloseRule::Calibration);
+
+    let n_pc = counts[0].load(Ordering::Relaxed);
+    let n_hap = counts[1].load(Ordering::Relaxed);
+    let n_bad = bad_headers.load(Ordering::Relaxed);
+    let n_ingress = ingress_drops.load(Ordering::Relaxed);
+    let session_already_joined = matches!(&drained, Drained::SessionArm(_));
+    let mut reports_out: Vec<DrainReport> = Vec::new();
+    let (ending, detail) = match drained {
+        Drained::Timeout => (RxEnding::Timeout, format!("rule=max_duration max_duration={}", args.max_duration)),
+        Drained::SessionArm(d) => (RxEnding::SessionEnded, format!("rule=session_arm {d}")),
+        Drained::Ends(ends) => {
+            let ambiguous = ends.iter().any(|(_, e, _)| *e == TrackEnd::Cancelled);
+            if ambiguous {
+                let grace = tokio::time::Instant::now() + Duration::from_millis(500);
+                while !session_run.is_finished() && tokio::time::Instant::now() < grace {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+            let reports = expand_reports(ends, n_pc, n_hap, args);
+            let verdict = classify_ending_with_timeout(&reports, session_run.is_finished(), false);
+            reports_out = reports;
+            verdict
+        }
+    };
+    if ending != RxEnding::Normal {
+        note_l2_fault(l2_output.as_ref(), || format!("abnormal ending: {} ({detail})", ending.as_str()));
+    }
+    if n_bad > 0 {
+        note_l2_fault(l2_output.as_ref(), || format!("{n_bad} malformed header(s)"));
+    }
+    if let Some(output) = l2_output.take() {
+        match finish_l2_output(output).await {
+            Ok(summary) => log_l2_finish_row(&logger, &summary, L2CloseRule::Calibration),
+            Err(e) => eprintln!("[rx] calibration L2 output stage failed to close: {e:#}"),
+        }
+    }
+
+    // `cal_result`: the receiver's facts; whether the run IS a calibration
+    // (late = missing = ... = 0, every L2 terminal received before the close
+    // deadline) is judged from these rows and the L2 file by the checker.
+    let s = &report.stats;
+    let mut problems = Vec::new();
+    for (key, value) in [
+        ("late", s.late),
+        ("missing", s.missing),
+        ("after_seal", s.after_seal),
+        ("duplicate", s.duplicate),
+        ("identity_mismatch", s.identity_mismatch),
+        ("orphan", s.orphan),
+        ("ingress_drops", n_ingress),
+        ("discarded_before_submit", report.submits.discarded_before_submit),
+        ("refused_after_close", report.submits.refused_after_close),
+        ("refused_sink_gone", report.submits.refused_sink_gone),
+    ] {
+        if value > 0 {
+            problems.push(format!("{key}={value}"));
+        }
+    }
+    if !report.sealed {
+        problems.push("not_sealed".into());
+    }
+    if finalize_failed {
+        problems.push("scheduler_failed".into());
+    }
+    let mut record_io_failed = finalize_failed || log_failed.load(Ordering::Relaxed) > 0;
+    {
+        let mut lg = match logger.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for body in [
+            format!(
+                "\"recv_pc\":{n_pc},\"recv_haptic\":{n_hap},\"bad_headers\":{n_bad},\"cal_ingress_dropped\":{n_ingress},\"cal_released\":{},\"cal_late\":{},\"cal_missing\":{}",
+                s.released, s.late, s.missing
+            ),
+            format!(
+                "\"event\":\"shutdown\",\"ending\":\"{}\",\"exit_code\":{},\"bad_headers\":{},\"subscribe_retries\":{},\"subscribe_wait_ms\":{},\"tracks\":{},\"detail\":\"{}\"",
+                ending.as_str(),
+                ending.exit_code(),
+                n_bad,
+                sub_stats.retries,
+                sub_stats.waited_ms,
+                tracks_json(&reports_out),
+                json_escape(&detail)
+            ),
+            format!(
+                "\"event\":\"cal_result\",\"outcome\":\"{}\",\"problems\":[{}],\"max_release_lateness_us\":{}",
+                if problems.is_empty() { "ok" } else { "not_a_calibration" },
+                problems.iter().map(|p| format!("\"{p}\"")).collect::<Vec<_>>().join(","),
+                report.max_release_lateness_us,
+            ),
+        ] {
+            if lg.try_log_info(&body).is_err() {
+                record_io_failed = true;
+            }
+        }
+        if lg.try_flush().is_err() {
+            record_io_failed = true;
+        }
+    }
+    let _ = &sub_handles;
+    session_run.abort();
+    if !session_already_joined {
+        let _ = tokio::time::timeout(Duration::from_secs(2), &mut session_run).await;
+    }
+    println!(
+        "[rx] calibration done ({}): pc={n_pc} haptic={n_hap} released={} late={} missing={} -> {}",
+        ending.as_str(),
+        s.released,
+        s.late,
+        s.missing,
+        args.out.display()
+    );
+    if record_io_failed {
+        eprintln!("[rx] FATAL: could not write the calibration shutdown record; exiting {EXIT_FINALIZE_FAILED}");
+        std::process::exit(EXIT_FINALIZE_FAILED);
+    }
+    if ending != RxEnding::Normal {
+        std::process::exit(ending.exit_code());
+    }
     if n_bad > 0 {
         eprintln!("[rx] FATAL: {n_bad} malformed header(s); exiting {EXIT_RX_HEADER_INVALID}");
         std::process::exit(EXIT_RX_HEADER_INVALID);
@@ -9991,6 +10893,8 @@ mod rx_ending_tests {
             exp2_test_force_hc_at_ms: None,
             exp2_sender_wire: None,
             s3_producer_shutdown_timeout_ms: None,
+            cal_d_play_us: None,
+            cal_test_mode: false,
         };
 
         let a = base(RxTrackSel::Both, Some(60.0));
@@ -10295,6 +11199,8 @@ mod rx_ending_tests {
             exp2_test_force_hc_at_ms: None,
             exp2_sender_wire: None,
             s3_producer_shutdown_timeout_ms: None,
+            cal_d_play_us: None,
+            cal_test_mode: false,
         };
         let cfg = playout_config(&base).unwrap().unwrap();
         assert_eq!(cfg.d_play_us, 50_000);
@@ -10410,6 +11316,8 @@ mod rx_ending_tests {
             exp2_test_force_hc_at_ms: None,
             exp2_sender_wire: None,
             s3_producer_shutdown_timeout_ms: None,
+            cal_d_play_us: None,
+            cal_test_mode: false,
         };
 
         assert!(playout_config(&args).is_ok());
@@ -18020,7 +18928,7 @@ mod l2_hook_tests {
                         } else {
                             keep.push(tx);
                         }
-                        Some(Exp2CutHandoff { rx: Some(rx) })
+                        Some(Exp2CutHandoff { rx: Some(rx), rule: L2CloseRule::Exp2 })
                     }
                 };
                 let d = wait_rx_end(
@@ -18053,7 +18961,7 @@ mod l2_hook_tests {
             let mut l2_output = Some(fake_output(&path, 0, 0));
             let logger = rx_logger(&tmp("early-drain-rx"));
             let (tx, rx) = tokio::sync::oneshot::channel::<Exp2L2Cut>();
-            let mut handoff = Some(Exp2CutHandoff { rx: Some(rx) });
+            let mut handoff = Some(Exp2CutHandoff { rx: Some(rx), rule: L2CloseRule::Exp2 });
             let mut session_run = tokio::spawn(std::future::pending::<()>());
             let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
             let drained = wait_rx_end(
@@ -18108,6 +19016,245 @@ mod l2_hook_tests {
             let _ = std::fs::remove_file(&path);
         }
         assert!(!exp2_l2_require_close_at_cut(true, None), "inert without L2");
+    }
+
+    // ------------------------------------------- §7-1 calibration receiver
+
+    /// A calibration receiver CLI from `(flag, value)` pairs (`""` = a bare
+    /// flag); `None` drops a flag of the registered shape, so a test can
+    /// remove or replace any input without duplicating it.
+    fn cal_cli(changes: &[(&str, Option<&str>)], l2_log: &str) -> std::result::Result<Args, clap::Error> {
+        let mut pairs: Vec<(String, String)> = [
+            ("--run-id", "t"), ("--out", "/tmp/skew-cal-unused-rx.jsonl"), ("--s-bytes", "1"),
+            ("--pc-rate-hz", "30"), ("--haptic-rate-hz", "90"), ("--payload-mode", "frame"),
+            ("--representation", "bin"), ("--chunk-bytes", "178"),
+            ("--reassembly-max-pending-frames", "64"), ("--reassembly-max-pending-bytes", "67108864"),
+            ("--reassembly-max-age-ms", "2000"), ("--topology", "direct"), ("--listen", "127.0.0.1:4443"),
+            ("--tls-cert", "/tmp/x.crt"), ("--tls-key", "/tmp/x.key"), ("--arm", "calibration"),
+            ("--cal-d-play-us", "250000"), ("--l2-sink", "fake"), ("--l2-log", l2_log),
+            ("--l2-fake-pc-offset-us", "1"), ("--l2-fake-haptic-offset-us", "1"),
+            ("--l2-report-window-ms", "2000"), ("--batch-id", "b"), ("--phase-control", "/tmp/p.json"),
+            ("--duration-s", "40"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        for (flag, value) in changes {
+            match (pairs.iter().position(|(k, _)| k == flag), value) {
+                (Some(i), Some(v)) => pairs[i].1 = v.to_string(),
+                (Some(i), None) => {
+                    pairs.remove(i);
+                }
+                (None, Some(v)) => pairs.push((flag.to_string(), v.to_string())),
+                (None, None) => {}
+            }
+        }
+        let mut cli = vec!["moq_receiver".to_string()];
+        for (k, v) in pairs {
+            cli.push(k);
+            if !v.is_empty() {
+                cli.push(v);
+            }
+        }
+        Args::try_parse_from(cli)
+    }
+
+    /// The validators `receiver_main` runs before any log is opened.
+    fn validate_receiver(args: &Args) -> Result<Option<CalCli>> {
+        validate_phase4_v5_args(args)?;
+        validate_queue_policy(args.queue_policy, args.arm, args.payload_mode)?;
+        playout_config(args)?;
+        l2_output_config(args)?;
+        s3np_release_config(args)?;
+        s3_runtime_config(args)?;
+        p1_runtime_config(args)?;
+        exp2_cli_config(args)?;
+        calibration_config(args)
+    }
+
+    /// §7-1 arguments: D_cal, the sink, the L2 log, W_cal, the PhaseControl
+    /// and the registered 40 s plan are required (no defaults); every method
+    /// option (S1 scheduler, delivery timeout, exp2 recorder, S3) is refused;
+    /// the L2 meta method is "calibration"; both representations are accepted.
+    #[test]
+    fn calibration_cli_requires_its_inputs_and_refuses_method_options() {
+        let log = tmp("cal-cli-l2");
+        let log = log.display().to_string();
+        for rep in ["bin", "draco"] {
+            let args = cal_cli(&[("--representation", Some(rep))], &log).unwrap();
+            let cal = validate_receiver(&args).unwrap().expect("calibration config");
+            assert_eq!((cal.d_cal_us, cal.w_cal_us, cal.test_mode), (250_000, 2_000_000, false));
+            assert_eq!(cal.representation.as_str(), rep);
+            let (_, config) = l2_output_config(&args).unwrap().unwrap();
+            assert_eq!(config.method, "calibration");
+            assert!(phase4_transport(&args).is_none());
+            assert!(exp2_cli_config(&args).unwrap().is_none(), "no exp2 JSONL");
+        }
+        let test_mode = cal_cli(&[("--cal-test-mode", Some(""))], &log).unwrap();
+        assert!(validate_receiver(&test_mode).unwrap().unwrap().test_mode);
+        let l2_none: &[(&str, Option<&str>)] = &[
+            ("--l2-sink", None), ("--l2-log", None), ("--l2-fake-pc-offset-us", None),
+            ("--l2-fake-haptic-offset-us", None), ("--l2-report-window-ms", None),
+        ];
+        let cases: Vec<(&str, Vec<(&str, Option<&str>)>)> = vec![
+            ("no D_cal", vec![("--cal-d-play-us", None)]),
+            ("D_cal 0", vec![("--cal-d-play-us", Some("0"))]),
+            ("no W_cal", vec![("--l2-report-window-ms", None)]),
+            ("W_cal 0", vec![("--l2-report-window-ms", Some("0"))]),
+            ("no batch id", vec![("--batch-id", None)]),
+            ("no phase control", vec![("--phase-control", None)]),
+            ("no duration", vec![("--duration-s", None)]),
+            ("30 s plan", vec![("--duration-s", Some("30"))]),
+            ("no L2 log", vec![("--l2-log", None)]),
+            ("no L2 sink", l2_none.to_vec()),
+            ("other rates", vec![("--pc-rate-hz", Some("20")), ("--haptic-rate-hz", Some("60"))]),
+            ("S1 D_play", vec![("--d-play-ms", Some("100"))]),
+            ("S1 late policy", vec![("--late-policy", Some("drop-late"))]),
+            ("delivery timeout", vec![("--pc-delivery-timeout-ms", Some("345"))]),
+            ("exp2 out", vec![("--exp2-out", Some("/tmp/e.jsonl"))]),
+            ("exp2 delta", vec![("--delta-max-us", Some("345000"))]),
+            ("exp2 test mode", vec![("--exp2-test-mode", Some(""))]),
+            ("S3 window", vec![("--s3-window-ms", Some("1000"))]),
+            ("pc only", vec![("--tracks", Some("pc"))]),
+            ("shared fifo", vec![("--queue-policy", Some("shared_fifo"))]),
+            ("equal chunk", vec![("--payload-mode", Some("equal-chunk"))]),
+        ];
+        for (name, changes) in cases {
+            let args = cal_cli(&changes, &log).unwrap_or_else(|e| panic!("{name}: the CLI must parse: {e}"));
+            assert!(validate_receiver(&args).is_err(), "{name} must be refused");
+        }
+        // the calibration options belong to --arm calibration only
+        for extra in [&["--cal-d-play-us", "1"][..], &["--cal-test-mode"][..]] {
+            let args = b1_cli(extra).unwrap();
+            assert!(calibration_config(&args).is_err(), "{extra:?} without --arm calibration");
+        }
+        // the exp2 close strings stay as they were (moq-rs ebd6ecb)
+        assert_eq!(L2CloseRule::Exp2.close_event(), "exp2_l2_close");
+        assert_eq!(L2CloseRule::Exp2.rule_text(), "absolute close deadline T_cut = H + G_report,L2");
+        assert_eq!(L2CloseRule::Exp2.finish_event(), "exp2_l2_finish");
+        assert_eq!(L2CloseRule::Exp2.close_failed(), "exp2 L2 close at T_cut failed");
+        assert_eq!(L2CloseRule::Exp2.missing_close(), "exp2 run sealed but its L2 close at T_cut never started");
+    }
+
+    /// The schedule end to end on a fake L2 stage (t0 in the past so the
+    /// last dues are ~0.3 s ahead): µs-exact `due_us = t0 + pts + D_cal`,
+    /// release at or after the due in the tie order, a late object recorded
+    /// and never submitted, one L2 submit per release row with the same
+    /// `t_release_us`, `missing` rows at the seal, the accounting row, and
+    /// the cut `H_cal + W_cal` applied as the absolute close deadline (lanes
+    /// held to it).
+    #[tokio::test]
+    async fn calibration_schedule_releases_at_the_fixed_delay_one_to_one() {
+        use skew_moq::cal_playout::{CalConfig, CalPlan, CalScheduler};
+        use skew_moq::exp2_recorder::{haptic_slot_identity, pc_slot_identity};
+        let d_cal = 200_000;
+        let w_cal = 300_000;
+        let t0 = now_us() - 39_900_000;
+        let sched = CalScheduler::new(CalConfig { t0_us: t0, d_cal_us: d_cal }, CalPlan::registered()).unwrap();
+        let h_cal = sched.h_cal_us();
+        assert_eq!(h_cal, t0 + 39_988_888 + d_cal);
+        let t_cut = h_cal + w_cal;
+        let l2_path = tmp("cal-sched-l2");
+        let mut l2_output = Some(fake_output(&l2_path, 2_000, 1_000));
+        let rx_path = tmp("cal-sched-rx");
+        let logger = rx_logger(&rx_path);
+        let (tx, rx) = mpsc::channel(64);
+        let (cut_tx, cut_rx) = tokio::sync::oneshot::channel();
+        let sealed = Arc::new(AtomicBool::new(false));
+        let submitter = l2_output.as_ref().unwrap().submitter();
+        let task = tokio::spawn(cal_run_schedule(sched, t_cut, rx, logger.clone(), submitter, cut_tx, sealed.clone()));
+        let pc = |i: u64, t: u64| {
+            let (pts, e) = pc_slot_identity(i);
+            object(TRACK_PC, 2, i as u32, pts, e, t)
+        };
+        let hap = |k: u64, t: u64| {
+            let (pts, e) = haptic_slot_identity(k);
+            object(TRACK_HAPTIC, 0, k as u32, pts, e, t)
+        };
+        let now = now_us();
+        let due_h3599 = t0 + haptic_slot_identity(3599).0 + d_cal;
+        for o in [
+            hap(3597, now),               // same due as PC 1199, released after it
+            pc(1199, now),
+            hap(3598, now),
+            hap(3599, due_h3599 + 1),     // 1 us late: never submitted
+            pc(0, t0),                    // on time, found long after its due: released at once
+            pc(1199, now),                // duplicate
+            object(TRACK_PC, 2, 9, 123, 1, now), // orphan pts
+        ] {
+            tx.send(o).await.unwrap();
+        }
+        drop(tx);
+        let report = task.await.unwrap().unwrap();
+        assert!(report.sealed && sealed.load(Ordering::Acquire));
+        let s = &report.stats;
+        assert_eq!((s.released, s.late, s.missing, s.duplicate, s.orphan), (4, 1, 4_795, 1, 1));
+        assert_eq!(
+            (report.submits.submit_attempted, report.submits.submit_accepted, report.submits.discarded_before_submit),
+            (4, 4, 0)
+        );
+        // main's side: the hand-over applies the absolute deadline
+        let mut handoff = Exp2CutHandoff { rx: Some(cut_rx), rule: L2CloseRule::Calibration };
+        handoff.poll_now(&mut l2_output, &logger);
+        assert!(handoff.rx.is_none());
+        assert!(l2_output.as_ref().unwrap().close_started());
+        assert!(!l2_require_close_at_cut(true, l2_output.as_ref(), L2CloseRule::Calibration));
+        let summary = finish_l2_output(l2_output.take().unwrap()).await.unwrap();
+        log_l2_finish_row(&logger, &summary, L2CloseRule::Calibration);
+        assert_eq!(summary.close_deadline_us, Some(t_cut), "close deadline = H_cal + W_cal");
+        for end in summary.lane_end_us {
+            assert!(end.unwrap() >= t_cut, "lanes held to the deadline");
+        }
+        assert_eq!(summary.submitted, 4);
+        let rx_rows = rows(&rx_path);
+        let event = |name: &str| rx_rows.iter().filter(|r| r["event"] == name).cloned().collect::<Vec<_>>();
+        let releases = event("cal_release");
+        assert_eq!(releases.len(), 4);
+        for r in &releases {
+            let (track, pts) = (r["track"].as_str().unwrap(), r["pts_us"].as_u64().unwrap());
+            assert_eq!(r["due_us"].as_u64().unwrap(), t0 + pts + d_cal, "{track} {pts}: µs-exact due");
+            assert!(r["t_release_us"].as_u64().unwrap() >= r["due_us"].as_u64().unwrap());
+        }
+        let order: Vec<_> = releases.iter().map(|r| (r["track"].as_str().unwrap().to_string(), r["seq"].as_u64().unwrap())).collect();
+        assert_eq!(order, vec![("pc".into(), 0), ("pc".into(), 1199), ("haptic".into(), 3597), ("haptic".into(), 3598)]);
+        let late = event("cal_late");
+        assert_eq!(late.len(), 1);
+        assert_eq!((late[0]["seq"].as_u64(), late[0]["late_by_us"].as_u64(), late[0]["submitted"].as_bool()), (Some(3599), Some(1), Some(false)));
+        assert_eq!(event("cal_missing").len(), 4_795);
+        let kinds: Vec<_> = event("cal_diagnostic").iter().map(|r| r["kind"].as_str().unwrap().to_string()).collect();
+        assert_eq!(kinds, vec!["duplicate".to_string(), "orphan".to_string()]);
+        let link = &event("cal_l2_link")[0];
+        assert_eq!((link["submit_attempted"].as_u64(), link["submit_accepted"].as_u64(), link["t_cut_us"].as_u64()), (Some(4), Some(4), Some(t_cut)));
+        let close = &event("cal_l2_close")[0];
+        assert_eq!(close["t_cut_us"].as_u64(), Some(t_cut));
+        assert_eq!(close["started_after_t_cut"], false);
+        assert!(close["rule"].as_str().unwrap().contains("H_cal + W_cal"));
+        assert_eq!(event("cal_l2_finish")[0]["lanes_ended_at_or_after_deadline"], true);
+        assert!(event("exp2_l2_close").is_empty() && event("exp2_l2_finish").is_empty());
+        // 1:1: every release row is one L2 submit, same identity and t_release_us
+        let l2 = rows(&l2_path);
+        let mut submits: Vec<_> = l2.iter().filter(|r| r["role"] == "submit")
+            .map(|r| (ident(r), r["t_release_us"].as_u64().unwrap())).collect();
+        let mut released: Vec<_> = releases.iter().map(|r| (ident(r), r["t_release_us"].as_u64().unwrap())).collect();
+        submits.sort();
+        released.sort();
+        assert_eq!(submits, released);
+        // (the test stage's own meta says "s1"; the receiver's L2 method
+        // "calibration" is pinned by the CLI test)
+        assert_eq!(l2[0]["method"], "s1");
+        let _ = std::fs::remove_file(&l2_path);
+    }
+
+    /// A sealed calibration that reaches the finish without its close is a
+    /// receiver fault with the calibration wording.
+    #[test]
+    fn sealed_calibration_without_the_close_is_a_receiver_fault() {
+        let path = tmp("cal-no-close");
+        let output = fake_output(&path, 0, 0);
+        assert!(l2_require_close_at_cut(true, Some(&output), L2CloseRule::Calibration));
+        let summary = output.finish().unwrap();
+        assert!(summary.receiver_fault.unwrap().1.starts_with("calibration run sealed"));
+        let _ = std::fs::remove_file(&path);
     }
 
     fn unresolved_stage(path: &std::path::Path) -> L2Output {

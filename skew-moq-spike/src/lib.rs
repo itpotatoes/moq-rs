@@ -10,6 +10,7 @@ use std::path::Path;
 
 use anyhow::Context;
 
+pub mod cal_playout;
 pub mod exp2_fsm;
 pub mod exp2_playout;
 pub mod exp2_recorder;
