@@ -38,8 +38,9 @@ use crate::exp2_playout::{
     CommittedDue, Exp2Decision, Exp2Mode, Exp2OpportunityLedger, Exp2Params, Exp2Playout,
     Exp2SchedulerLedger, Modality, SchedulerTerminal,
 };
+use crate::l2_output::{L2Identity, L2Modality, L2Submitter};
 use crate::s3_controller::HapticMode;
-use crate::{is_warmup_seq, Header, TRACK_HAPTIC, TRACK_PC};
+use crate::{is_warmup_seq, Header, HDR, TRACK_HAPTIC, TRACK_PC};
 
 pub const EXP2_CONTRACT_VERSION: &str = "exp2-contract-v4";
 pub const EXP2_METRIC_SCHEMA_VERSION: &str = "exp2-v3";
@@ -518,6 +519,80 @@ pub struct Exp2RecorderStats {
     pub tier_switches: u64,
 }
 
+// --------------------------------------------------------------------------
+// L2 output link (experiment 2 L2 campaign)
+// --------------------------------------------------------------------------
+//
+// Rule: while an L2 output stage is attached, every exp2 `release` row is
+// followed (after its write completed, no await in between) by exactly one
+// L2 submit of the same object with the same `t_release_us`; nothing else is
+// ever submitted. So the L2 ledger and the exp2 release ledger share one
+// release definition for all six methods, and "submitted <= H" holds by
+// construction (registration §4-5). The admitted copy's bytes are held from
+// admission until the slot's terminal row: a release submits them, any other
+// terminal (drop, sealing, seal drop) disposes of them, and the seal disposes
+// of whatever is left.
+
+/// Upper bound on the payload bytes held between admission and terminal. An
+/// implementation bound (memory safety), not an experimental parameter: a held
+/// object leaves at its slot's terminal row, at the latest at the H seal, so a
+/// normal run holds well under one `B_play` worth of PC frames. Exceeding it
+/// is a recorded L2 receiver fault (fail closed), never a silent skip.
+pub const EXP2_L2_HELD_BYTES_CAP: usize = 256 * 1024 * 1024;
+
+/// The admitted copy handed to [`Exp2Recorder::admit_with_payload`].
+#[derive(Debug, Clone)]
+pub struct Exp2L2Payload {
+    /// The object's bytes: the 32-byte header followed by the payload. Only
+    /// the slice after the header goes to the sink (reference count, no copy).
+    pub bytes: bytes::Bytes,
+    /// `Some(wire track)` for a P1 route copy (the L2 identity then carries
+    /// `(wire_track, admitted route_generation)`), `None` for the static path.
+    pub wire_track: Option<&'static str>,
+}
+
+/// Counters of the L2 link, reported by the receiver (rx `info` row), never
+/// in the exp2 JSONL (its schema is pinned).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Exp2L2Stats {
+    /// Payloads taken into the store at admission.
+    pub held: u64,
+    /// L2 submits, one per release row written while attached.
+    pub submitted: u64,
+    /// Payloads disposed of by a non-release terminal row.
+    pub disposed: u64,
+    /// Release rows without a held payload (a recorded receiver fault).
+    pub missing_payload: u64,
+    /// Admissions not held because of [`EXP2_L2_HELD_BYTES_CAP`] (fault).
+    pub cap_refused: u64,
+    /// Payloads still held after the seal wrote every terminal (disposed).
+    pub held_at_seal: u64,
+    /// Payloads still held when the link was detached (disposed).
+    pub held_at_detach: u64,
+    /// Largest number of payload bytes held at once.
+    pub max_held_bytes: u64,
+}
+
+struct Exp2L2Held {
+    header: Header,
+    payload: Exp2L2Payload,
+}
+
+struct Exp2L2Link {
+    submitter: L2Submitter,
+    held: HashMap<(usize, u32), Exp2L2Held>,
+    held_bytes: usize,
+    cap_bytes: usize,
+    stats: Exp2L2Stats,
+}
+
+fn l2_modality(m: Modality) -> L2Modality {
+    match m {
+        Modality::Pc => L2Modality::Pc,
+        Modality::Haptic => L2Modality::Haptic,
+    }
+}
+
 /// An object as received (header + route), independent of transport.
 #[derive(Debug, Clone, Copy)]
 pub struct Exp2Rx {
@@ -562,6 +637,8 @@ pub struct Exp2Recorder<W: Write> {
     max_write_lag_us: u64,
     /// Last committed Δ_eff per modality (controller rows on change).
     last_delta_eff: [Option<u64>; 2],
+    /// The L2 output link, `None` unless an L2 stage is attached.
+    l2: Option<Exp2L2Link>,
 }
 
 impl<W: Write> Exp2Recorder<W> {
@@ -626,6 +703,7 @@ impl<W: Write> Exp2Recorder<W> {
             side_rows: Vec::new(),
             max_write_lag_us: 0,
             last_delta_eff: [None, None],
+            l2: None,
         })
     }
 
@@ -660,6 +738,151 @@ impl<W: Write> Exp2Recorder<W> {
 
     pub fn stats(&self) -> &Exp2RecorderStats {
         &self.stats
+    }
+
+    // ------------------------------------------------------------ L2 link
+
+    /// Attach the L2 output stage. Must happen before the first rx row, so
+    /// that every admitted copy can carry its payload.
+    pub fn attach_l2(&mut self, submitter: L2Submitter) -> Result<()> {
+        self.attach_l2_with_cap(submitter, EXP2_L2_HELD_BYTES_CAP)
+    }
+
+    fn attach_l2_with_cap(&mut self, submitter: L2Submitter, cap_bytes: usize) -> Result<()> {
+        ensure!(self.l2.is_none(), "exp2 L2 link attached twice");
+        ensure!(self.stats.rx_rows == 0, "exp2 L2 link attached after the first rx row");
+        self.l2 = Some(Exp2L2Link {
+            submitter,
+            held: HashMap::new(),
+            held_bytes: 0,
+            cap_bytes,
+            stats: Exp2L2Stats::default(),
+        });
+        Ok(())
+    }
+
+    /// Detach the L2 output stage: drops the submitter clone (`L2Output::finish`
+    /// requires every clone gone) and every payload still held. Returns the
+    /// link counters, `None` if nothing was attached.
+    pub fn detach_l2(&mut self) -> Option<Exp2L2Stats> {
+        let mut link = self.l2.take()?;
+        link.stats.held_at_detach = link.held.len() as u64;
+        link.held.clear();
+        Some(link.stats)
+    }
+
+    /// The link counters while attached.
+    pub fn l2_stats(&self) -> Option<&Exp2L2Stats> {
+        self.l2.as_ref().map(|link| &link.stats)
+    }
+
+    /// Record a receiver fault on the attached L2 stage (earliest wins).
+    fn l2_fault(&mut self, cause: String) {
+        let Some(link) = self.l2.as_ref() else { return };
+        let t_us = (self.clock)();
+        link.submitter.receiver_fault(t_us, &cause);
+    }
+
+    /// Hold the admitted copy's payload until the slot's terminal row. A
+    /// store over its bound is a recorded L2 receiver fault AND an error of
+    /// this call (fail closed: the run cannot account for this object).
+    fn l2_hold(&mut self, m: Modality, index: u32, header: Header, payload: Option<Exp2L2Payload>) -> Result<()> {
+        if self.l2.is_none() || self.sealed || self.ended {
+            return Ok(());
+        }
+        let Some(payload) = payload else {
+            // Detected at the release (missing_payload): a slot that is never
+            // released needs no payload.
+            return Ok(());
+        };
+        let link = self.l2.as_mut().expect("checked above");
+        let len = payload.bytes.len();
+        if link.held_bytes + len > link.cap_bytes {
+            link.stats.cap_refused += 1;
+            let cause = format!(
+                "exp2 L2 payload store over its {} B bound at {}[{index}]",
+                link.cap_bytes,
+                m.as_str()
+            );
+            self.l2_fault(cause.clone());
+            bail!(cause);
+        }
+        link.held_bytes += len;
+        link.stats.held += 1;
+        link.stats.max_held_bytes = link.stats.max_held_bytes.max(link.held_bytes as u64);
+        if let Some(old) = link.held.insert((m.ix(), index), Exp2L2Held { header, payload }) {
+            // A slot is admitted once; a second hold would be a recorder bug.
+            link.held_bytes -= old.payload.bytes.len();
+            let cause = format!("exp2 L2 payload held twice for {}[{index}]", m.as_str());
+            self.l2_fault(cause.clone());
+            bail!(cause);
+        }
+        Ok(())
+    }
+
+    /// The release row of `(m, index)` was written: submit its payload. A
+    /// release without a held payload is a recorded L2 receiver fault AND an
+    /// error of this call (fail closed).
+    fn l2_release(&mut self, m: Modality, index: u32, t_release_us: u64) -> Result<()> {
+        if self.l2.is_none() || self.ended {
+            return Ok(());
+        }
+        let admitted_gen = self.slots[m.ix()][index as usize].admitted_gen;
+        let link = self.l2.as_mut().expect("checked above");
+        let Some(held) = link.held.remove(&(m.ix(), index)) else {
+            link.stats.missing_payload += 1;
+            let cause = format!(
+                "exp2 release {}[{index}] at {t_release_us} without a held L2 payload",
+                m.as_str()
+            );
+            self.l2_fault(cause.clone());
+            bail!(cause);
+        };
+        link.held_bytes -= held.payload.bytes.len();
+        let route = match (held.payload.wire_track, admitted_gen) {
+            (None, _) => None,
+            (Some(wire_track), Some(generation)) => Some((wire_track, generation)),
+            (Some(_), None) => {
+                link.stats.missing_payload += 1;
+                let cause = format!("exp2 release {}[{index}] of a route copy that was never admitted", m.as_str());
+                self.l2_fault(cause.clone());
+                bail!(cause);
+            }
+        };
+        let h = held.header;
+        let bytes = held.payload.bytes;
+        let payload = (bytes.len() >= HDR).then(|| bytes.slice(HDR..));
+        link.submitter.submit_payload(
+            L2Identity {
+                modality: l2_modality(m),
+                tier: h.tier,
+                seq: h.seq,
+                pts_us: h.pts_us,
+                event_id: h.event_id,
+                route,
+            },
+            t_release_us,
+            payload,
+        );
+        link.stats.submitted += 1;
+        Ok(())
+    }
+
+    /// A non-release terminal row of `(m, index)`: dispose of its payload.
+    fn l2_dispose(&mut self, m: Modality, index: u32) {
+        let Some(link) = self.l2.as_mut() else { return };
+        if let Some(held) = link.held.remove(&(m.ix(), index)) {
+            link.held_bytes -= held.payload.bytes.len();
+            link.stats.disposed += 1;
+        }
+    }
+
+    /// After the seal every slot has its terminal row: nothing may be held.
+    fn l2_after_seal(&mut self) {
+        let Some(link) = self.l2.as_mut() else { return };
+        link.stats.held_at_seal += link.held.len() as u64;
+        link.held.clear();
+        link.held_bytes = 0;
     }
 
     pub fn core(&self) -> Option<&Exp2Playout> {
@@ -897,6 +1120,14 @@ impl<W: Write> Exp2Recorder<W> {
     /// the caller must then call [`Self::feed_arrival`] (static path: from the
     /// scheduler task; P1: immediately).
     pub fn admit(&mut self, rx: Exp2Rx) -> Result<Admission> {
+        self.admit_with_payload(rx, None)
+    }
+
+    /// [`Self::admit`] with the copy's bytes for the attached L2 stage: the
+    /// first admitted copy's payload is held until its slot's terminal row
+    /// (ignored without an L2 link, after the seal, and for every copy that
+    /// is not admitted).
+    pub fn admit_with_payload(&mut self, rx: Exp2Rx, payload: Option<Exp2L2Payload>) -> Result<Admission> {
         if self.ended {
             self.stats.rows_refused_after_end += 1;
             return Ok(Admission::NotAdmitted);
@@ -916,6 +1147,7 @@ impl<W: Write> Exp2Recorder<W> {
             slot.t_recv_us = Some(rx.t_recv_us);
             slot.payload_len = rx.header.payload_len;
         }
+        self.l2_hold(m, index, rx.header, payload)?;
         if self.method == Exp2Method::B1 {
             if self.sealed || rx.t_recv_us > self.h {
                 self.stats.post_horizon_arrivals += 1;
@@ -1321,7 +1553,9 @@ impl<W: Write> Exp2Recorder<W> {
             row.insert("grace".into(), json!(g));
         }
         self.slots[m.ix()][index as usize].terminal = true;
-        self.write_value(row, true)
+        self.write_value(row, true)?;
+        // L2: the release row is written; submit the same object, same time.
+        self.l2_release(m, index, t_release_us)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1353,7 +1587,9 @@ impl<W: Write> Exp2Recorder<W> {
             row.insert("t_observed_us".into(), json!(t));
         }
         self.slots[m.ix()][index as usize].terminal = true;
-        self.write_value(row, true)
+        self.write_value(row, true)?;
+        self.l2_dispose(m, index);
+        Ok(())
     }
 
     /// A sealing row (contract v4 §9): `t_us` is the ACTUAL write instant
@@ -1367,7 +1603,9 @@ impl<W: Write> Exp2Recorder<W> {
             row.insert("due_us".into(), json!(d));
         }
         self.slots[m.ix()][index as usize].terminal = true;
-        self.write_value(row, false)
+        self.write_value(row, false)?;
+        self.l2_dispose(m, index);
+        Ok(())
     }
 
     /// A drop decided by the seal (delivery timeout label, S1 unreleased,
@@ -1395,7 +1633,9 @@ impl<W: Write> Exp2Recorder<W> {
             row.insert(k, v);
         }
         self.slots[m.ix()][index as usize].terminal = true;
-        self.write_value(row, true)
+        self.write_value(row, true)?;
+        self.l2_dispose(m, index);
+        Ok(())
     }
 
     /// Contract v4 §9 / registration §2-2: a slot never admitted but with an
@@ -1481,6 +1721,7 @@ impl<W: Write> Exp2Recorder<W> {
                 }
             }
         }
+        self.l2_after_seal();
         Ok(requests)
     }
 
@@ -1517,6 +1758,7 @@ impl<W: Write> Exp2Recorder<W> {
                 }
             }
         }
+        self.l2_after_seal();
         Ok(())
     }
 
@@ -1572,7 +1814,8 @@ impl<W: Write> Exp2Recorder<W> {
                     row.insert("t_recv_us".into(), json!(t));
                 }
                 self.slots[m.ix()][index as usize].terminal = true;
-                self.write_value(row, true)
+                self.write_value(row, true)?;
+                self.l2_release(m, index, at_us)
             }
             Some(reason) => {
                 // S1 has no Δ_eff: only the due is recorded (write_drop's
@@ -1588,7 +1831,9 @@ impl<W: Write> Exp2Recorder<W> {
                     row.insert("due_us".into(), json!(d));
                 }
                 self.slots[m.ix()][index as usize].terminal = true;
-                self.write_value(row, true)
+                self.write_value(row, true)?;
+                self.l2_dispose(m, index);
+                Ok(())
             }
         }
     }
@@ -2087,6 +2332,16 @@ mod tests {
         delay: impl Fn(Modality, u32) -> Option<u64>,
         gen: impl Fn(Modality, u32) -> u64,
     ) -> Vec<Value> {
+        drive_with(rig, delay, gen, |_, _| None)
+    }
+
+    /// [`drive`] handing each copy's bytes to `admit_with_payload`.
+    fn drive_with(
+        rig: &mut Rig,
+        delay: impl Fn(Modality, u32) -> Option<u64>,
+        gen: impl Fn(Modality, u32) -> u64,
+        payload: impl Fn(Modality, u32) -> Option<Exp2L2Payload>,
+    ) -> Vec<Value> {
         let mut arrivals: Vec<(u64, Modality, u32)> = Vec::new();
         for m in Modality::ALL {
             let n = if m == Modality::Pc { N_PC } else { N_HAPTIC };
@@ -2118,7 +2373,9 @@ mod tests {
                     route_generation: gen(m, index),
                     t_recv_us: ta,
                 };
-                if let Admission::Admitted(mm, ii) = rig.rec.admit(rx).unwrap() {
+                if let Admission::Admitted(mm, ii) =
+                    rig.rec.admit_with_payload(rx, payload(m, index)).unwrap()
+                {
                     if rig.rec.method().core_mode().is_some() {
                         rig.rec.feed_arrival(mm, ii, ta).unwrap();
                     }
@@ -2510,6 +2767,265 @@ mod tests {
         assert_eq!(get(3)["reason"], json!(S1_UNRELEASED_AT_HORIZON));
         assert_eq!(get(4)["role"], json!("no_object"));
         assert_eq!(r.rec.stats().post_horizon_terminals_suppressed, 1);
+    }
+
+    // ------------------------------------------------------------ L2 link
+
+    use crate::l2_output::{FakeSinkConfig, L2Config, L2Output, L2SinkKind, L2Sinks};
+
+    fn l2_output(name: &str, sink: L2SinkKind) -> (std::path::PathBuf, L2Output) {
+        let path = std::env::temp_dir().join(format!(
+            "skew-exp2-l2-{}-{}-{name}.jsonl",
+            std::process::id(),
+            crate::now_us()
+        ));
+        let config = L2Config {
+            run_id: "run-1".into(),
+            method: "exp2-test".into(),
+            sinks: L2Sinks::both(sink),
+            fake: (sink == L2SinkKind::Fake).then(|| FakeSinkConfig::offsets(1_000, 2_000)),
+            alsa: None,
+            wayland: None,
+            queue_capacity: 8_192,
+            row_capacity: 65_536,
+            report_window_us: 200_000,
+            max_tracked_objects: 65_536,
+        };
+        let output = L2Output::start(&path, config).unwrap();
+        (path, output)
+    }
+
+    fn file_rows(path: &std::path::Path) -> Vec<Value> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    fn l2_payload(m: Modality, index: u32, wire: Option<&'static str>) -> Exp2L2Payload {
+        let mut bytes = vec![0xA5u8; HDR];
+        bytes.extend_from_slice(&index.to_le_bytes());
+        bytes.push(m.ix() as u8);
+        Exp2L2Payload { bytes: bytes::Bytes::from(bytes), wire_track: wire }
+    }
+
+    /// (track, seq, pts_us, event_id, route_generation-or-none) -> t_release.
+    type ReleaseKey = (String, u64, u64, u64, Option<u64>);
+
+    fn exp2_releases(rows: &[Value], with_route: bool) -> HashMap<ReleaseKey, u64> {
+        let mut out = HashMap::new();
+        for row in rows.iter().filter(|r| r["role"] == json!("release")) {
+            let key = (
+                row["track"].as_str().unwrap().to_string(),
+                row["seq"].as_u64().unwrap(),
+                row["pts_us"].as_u64().unwrap(),
+                row["event_id"].as_u64().unwrap(),
+                with_route.then(|| row["route_generation"].as_u64().unwrap()),
+            );
+            assert!(out.insert(key, row["t_release_us"].as_u64().unwrap()).is_none());
+        }
+        out
+    }
+
+    fn l2_submits(rows: &[Value], role: &str) -> HashMap<ReleaseKey, u64> {
+        let mut out = HashMap::new();
+        for row in rows.iter().filter(|r| r["role"] == json!(role)) {
+            let key = (
+                row["track"].as_str().unwrap().to_string(),
+                row["seq"].as_u64().unwrap(),
+                row["pts_us"].as_u64().unwrap(),
+                row["event_id"].as_u64().unwrap(),
+                row.get("route_generation").and_then(Value::as_u64),
+            );
+            assert!(out.insert(key, row["t_release_us"].as_u64().unwrap()).is_none(), "{role} twice");
+        }
+        out
+    }
+
+    /// The L2 link rule for every core method and B1: one L2 submit per exp2
+    /// release row, same identity and t_release, nothing else submitted
+    /// (dropped / sealed / late / lost slots, route copies), every payload
+    /// gone after the seal, and the fake sink resolves every submit.
+    #[test]
+    fn exp2_l2_link_submits_exactly_the_release_rows() {
+        for method in [
+            Exp2Method::B1,
+            Exp2Method::S3npaPrime,
+            Exp2Method::P0np,
+            Exp2Method::P0,
+            Exp2Method::P1,
+        ] {
+            let (path, output) = l2_output(&format!("{method:?}"), L2SinkKind::Fake);
+            let mut r = rig(method);
+            r.rec.attach_l2(output.submitter()).unwrap();
+            let p1 = method == Exp2Method::P1;
+            // P1: slots admitted on two route generations; the L2 identity
+            // carries the admitted copy's wire track and generation.
+            let rows = drive_with(
+                &mut r,
+                lossy(11),
+                |_, i| if p1 && i % 7 == 0 { 1 } else { 0 },
+                |m, i| Some(l2_payload(m, i, p1.then_some(if m == Modality::Pc { "pc" } else { "haptic" }))),
+            );
+            assert_contract_shape(&rows);
+            assert_single_terminal(&rows);
+            let stats = r.rec.detach_l2().expect("attached");
+            let summary = output.finish().unwrap();
+            let l2 = file_rows(&path);
+            let releases = exp2_releases(&rows, p1);
+            assert!(!releases.is_empty(), "{method:?}");
+            assert_eq!(l2_submits(&l2, "submit"), releases, "{method:?}: submits == release rows");
+            assert_eq!(l2_submits(&l2, "output"), releases, "{method:?}: fake outputs == release rows");
+            assert_eq!(stats.submitted as usize, releases.len(), "{method:?}");
+            assert_eq!((stats.missing_payload, stats.cap_refused, stats.held_at_seal, stats.held_at_detach), (0, 0, 0, 0), "{method:?}");
+            assert_eq!(stats.held, stats.submitted + stats.disposed, "{method:?}: every held payload left");
+            if p1 {
+                for row in l2.iter().filter(|r| r["role"] == json!("submit")) {
+                    let wire = row["wire_track"].as_str().unwrap();
+                    assert_eq!(wire, row["track"].as_str().unwrap(), "P1 wire track carried");
+                }
+            } else {
+                assert!(l2.iter().all(|r| r.get("wire_track").is_none()), "static path: no route identity");
+            }
+            assert_eq!(summary.submitted as usize, releases.len());
+            assert_eq!(summary.submitted_unresolved, 0);
+            assert!(summary.integrity_ok(L2Sinks::both(L2SinkKind::Fake)), "{method:?} {summary:?}");
+            let sentinel = l2.last().unwrap();
+            assert_eq!(sentinel["role"], json!("instrumentation_end"));
+            assert_eq!(sentinel["integrity_ok"], json!(true));
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// S1: releases come from the S1 scheduler hooks; an S1 action after H
+    /// (suppressed in the exp2 ledger) never reaches L2, nor do S1 drops,
+    /// the pending/unreleased seal rows, or unadmitted slots.
+    #[test]
+    fn exp2_l2_link_s1_follows_the_exp2_ledger_not_post_h_actions() {
+        let h = horizon_us(T0);
+        let (path, output) = l2_output("s1", L2SinkKind::Null);
+        let mut r = rig(Exp2Method::S1);
+        r.rec.attach_l2(output.submitter()).unwrap();
+        r.set(T0 + 100);
+        r.rec.advance(T0 + 100).unwrap();
+        for (i, t) in [(0u32, T0 + 1_000), (1, T0 + 40_000), (2, T0 + 70_000), (3, T0 + 100_000)] {
+            let rx = Exp2Rx { header: header(Modality::Pc, i, slot_ref(Modality::Pc, i)), route_generation: 0, t_recv_us: t };
+            let admitted = r.rec.admit_with_payload(rx, Some(l2_payload(Modality::Pc, i, None))).unwrap();
+            assert!(matches!(admitted, Admission::Admitted(..)));
+        }
+        r.set(T0 + 140_000);
+        r.rec.s1_release(&header(Modality::Pc, 0, T0), T0 + 101_000, Some(T0 + 101_000)).unwrap();
+        r.rec.s1_drop(&header(Modality::Pc, 1, T0), T0 + 140_000, "late", Some(T0 + 134_000)).unwrap();
+        r.set(h);
+        let pts2 = pc_slot_identity(2).0;
+        r.rec.seal_s1(&|pts| Some(if pts == pts2 { h + 5 } else { h - 5 })).unwrap();
+        // the S1 scheduler still releases pc[3] after H: suppressed, not L2
+        r.rec.s1_release(&header(Modality::Pc, 3, T0), h + 1, Some(h - 5)).unwrap();
+        r.set(h + G_REPORT_R_US);
+        r.rec.advance(h + G_REPORT_R_US).unwrap();
+        assert!(r.rec.finish(h + G_REPORT_R_US, None).unwrap());
+        let stats = r.rec.detach_l2().unwrap();
+        output.finish().unwrap();
+        let l2 = file_rows(&path);
+        let submits = l2_submits(&l2, "submit");
+        assert_eq!(submits, exp2_releases(&r.sink.rows(), false));
+        assert_eq!(submits.len(), 1, "only pc[0]");
+        assert_eq!(submits.values().next(), Some(&(T0 + 101_000)), "L2 t_release == exp2 t_release");
+        assert_eq!((stats.held, stats.submitted, stats.disposed, stats.held_at_seal), (4, 1, 3, 0));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Fail closed: a release whose payload was never handed over is a
+    /// recorded L2 receiver fault (and no submit); a full payload store
+    /// refuses to hold and the later release is a fault too.
+    #[test]
+    fn exp2_l2_link_missing_payload_and_store_bound_are_faults() {
+        for capped in [false, true] {
+            let (path, output) = l2_output(if capped { "cap" } else { "missing" }, L2SinkKind::Null);
+            let mut r = rig(Exp2Method::B1);
+            let cap = if capped { HDR } else { EXP2_L2_HELD_BYTES_CAP };
+            r.rec.attach_l2_with_cap(output.submitter(), cap).unwrap();
+            r.set(T0 + 10_000);
+            r.rec.advance(T0 + 10_000).unwrap();
+            let rx = Exp2Rx { header: header(Modality::Pc, 0, T0), route_generation: 0, t_recv_us: T0 + 10_000 };
+            let payload = capped.then(|| l2_payload(Modality::Pc, 0, None));
+            // B1 releases inside admit: the fault is an error of the call.
+            let error = r.rec.admit_with_payload(rx, payload).unwrap_err();
+            let expected = if capped { "bound" } else { "without a held L2 payload" };
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+            let stats = r.rec.detach_l2().unwrap();
+            assert_eq!(stats.submitted, 0);
+            assert_eq!(stats.missing_payload, u64::from(!capped));
+            assert_eq!(stats.cap_refused, u64::from(capped));
+            let summary = output.finish().unwrap();
+            // The writer reports the receiver fault in the sentinel (§6-1
+            // input); the run itself fails through the recorder error.
+            let fault = summary.receiver_fault.clone().expect("receiver fault recorded");
+            assert!(fault.1.contains("exp2"), "{fault:?}");
+            let l2 = file_rows(&path);
+            let sentinel = l2.last().unwrap();
+            assert!(sentinel["receiver_fault_cause"].as_str().unwrap().contains(expected), "{sentinel}");
+            assert!(!l2.iter().any(|r| r["role"] == json!("submit")));
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// Route copies: only the first ADMITTED copy is held and submitted, with
+    /// its own wire track and generation; a later copy of the same slot
+    /// (`route_copy_discard`) and a gate-discarded copy never reach L2.
+    #[test]
+    fn exp2_l2_link_route_copies_never_reach_l2() {
+        let (path, output) = l2_output("copies", L2SinkKind::Null);
+        let mut r = rig(Exp2Method::B1);
+        r.rec.attach_l2(output.submitter()).unwrap();
+        r.set(T0 + 10_000);
+        r.rec.advance(T0 + 10_000).unwrap();
+        let copy = |gen: u64, t: u64| Exp2Rx {
+            header: header(Modality::Pc, 0, T0),
+            route_generation: gen,
+            t_recv_us: t,
+        };
+        let first = r.rec.admit_with_payload(copy(0, T0 + 10_000), Some(l2_payload(Modality::Pc, 0, Some("pc")))).unwrap();
+        assert!(matches!(first, Admission::Admitted(..)));
+        r.set(T0 + 20_000);
+        let second = r.rec.admit_with_payload(copy(1, T0 + 20_000), Some(l2_payload(Modality::Pc, 0, Some("pc-d6")))).unwrap();
+        assert_eq!(second, Admission::CopyDiscarded);
+        r.rec.discard_route_copy(Exp2Rx { header: header(Modality::Pc, 1, T0), route_generation: 1, t_recv_us: T0 + 40_000 }, SWITCH_BARRIER).unwrap();
+        let stats = r.rec.detach_l2().unwrap();
+        assert_eq!((stats.held, stats.submitted), (1, 1));
+        output.finish().unwrap();
+        let l2 = file_rows(&path);
+        let submits: Vec<_> = l2.iter().filter(|r| r["role"] == json!("submit")).collect();
+        assert_eq!(submits.len(), 1);
+        assert_eq!(submits[0]["wire_track"], json!("pc"));
+        assert_eq!(submits[0]["route_generation"], json!(0));
+        assert_eq!(submits[0]["t_release_us"], json!(T0 + 10_000));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Attaching after the first rx row would leave earlier admissions
+    /// without payloads: refused. Without a link nothing changes.
+    #[test]
+    fn exp2_l2_link_attach_rules_and_inert_without_link() {
+        let (path, output) = l2_output("attach", L2SinkKind::Null);
+        let mut r = rig(Exp2Method::B1);
+        r.set(T0 + 10_000);
+        r.rec.advance(T0 + 10_000).unwrap();
+        let rx = Exp2Rx { header: header(Modality::Pc, 0, T0), route_generation: 0, t_recv_us: T0 + 10_000 };
+        r.rec.admit_with_payload(rx, Some(l2_payload(Modality::Pc, 0, None))).unwrap();
+        assert!(r.rec.l2_stats().is_none());
+        assert!(r.rec.attach_l2(output.submitter()).is_err());
+        assert!(r.rec.detach_l2().is_none());
+        output.finish().unwrap();
+        let _ = std::fs::remove_file(&path);
+        let mut r = rig(Exp2Method::B1);
+        let (path, output) = l2_output("twice", L2SinkKind::Null);
+        r.rec.attach_l2(output.submitter()).unwrap();
+        assert!(r.rec.attach_l2(output.submitter()).is_err());
+        r.rec.detach_l2();
+        output.finish().unwrap();
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
