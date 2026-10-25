@@ -19092,6 +19092,20 @@ mod l2_hook_tests {
         }
         let test_mode = cal_cli(&[("--cal-test-mode", Some(""))], &log).unwrap();
         assert!(validate_receiver(&test_mode).unwrap().unwrap().test_mode);
+        // The device PC sink keeps its own rule: the tiers meta is required
+        // iff pc=wayland (the tier-2 d8 scale; nothing P1-specific).
+        let tiers = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../datasets/tiers_s3/tiers_meta.json");
+        let tiers = tiers.display().to_string();
+        for rep in ["bin", "draco"] {
+            let wayland = [("--l2-sink", Some("pc=wayland,haptic=fake")),
+                           ("--representation", Some(rep))];
+            let mut with_tiers = wayland.to_vec();
+            with_tiers.push(("--l2-wayland-tiers-meta", Some(tiers.as_str())));
+            let args = cal_cli(&with_tiers, &log).unwrap();
+            assert!(validate_receiver(&args).unwrap().is_some(), "pc=wayland with the tiers meta ({rep})");
+            let args = cal_cli(&wayland, &log).unwrap();
+            assert!(validate_receiver(&args).is_err(), "pc=wayland without the tiers meta ({rep})");
+        }
         let l2_none: &[(&str, Option<&str>)] = &[
             ("--l2-sink", None), ("--l2-log", None), ("--l2-fake-pc-offset-us", None),
             ("--l2-fake-haptic-offset-us", None), ("--l2-report-window-ms", None),
