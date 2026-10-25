@@ -782,6 +782,14 @@ struct Shared {
     failures: Mutex<FailureLog>,
     /// Earliest receiver fault `(t_us, cause)`; written before the sentinel.
     receiver_fault: Mutex<Option<(u64, String)>>,
+    /// Experiment 2 (`start_close_until`): every lane keeps observing its
+    /// sink until the close deadline (an idle lane does not end early); only
+    /// a device failure ends a device lane earlier. Never set by `finish`
+    /// alone (the 1-D close is unchanged).
+    hold_until_deadline: AtomicBool,
+    /// Exit instant of each lane thread ([`L2Modality::index`]; 0 = not
+    /// ended); in memory only (never written to the L2 file).
+    lane_end_us: [AtomicU64; 2],
 }
 
 impl Shared {
@@ -850,6 +858,15 @@ impl Shared {
     fn receiver_fault_noted(&self) -> bool {
         self.receiver_fault.lock().unwrap_or_else(|p| p.into_inner()).is_some()
     }
+
+    /// See [`Shared::hold_until_deadline`]; read after `Closing`.
+    fn holds_until_deadline(&self) -> bool {
+        self.hold_until_deadline.load(Ordering::SeqCst)
+    }
+
+    fn note_lane_end(&self, modality: L2Modality) {
+        self.lane_end_us[modality.index()].store(now_us().max(1), Ordering::SeqCst);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -897,6 +914,9 @@ pub struct L2Summary {
     pub first_failure_time_determinable: bool,
     /// The earliest fatal receiver error, if the receiver reported one.
     pub receiver_fault: Option<(u64, String)>,
+    /// Exit instant of each lane thread ([`L2Modality::index`]), filled by
+    /// `finish` after the joins; in memory only, never in the L2 file.
+    pub lane_end_us: [Option<u64>; 2],
 }
 
 impl L2Summary {
@@ -1549,9 +1569,13 @@ impl L2Output {
             let lane_shared = shared.clone();
             let timeout = micros(wayland.ready_timeout_us);
             let release = micros(wayland.release_timeout_us);
+            let end_shared = shared.clone();
             let lane = std::thread::Builder::new()
                 .name("l2-sink-pc-wayland".into())
-                .spawn(move || pc_lane::wayland_lane_main(wayland, items_rx, rows, lane_shared, ready_tx, diagnostics))
+                .spawn(move || {
+                    pc_lane::wayland_lane_main(wayland, items_rx, rows, lane_shared, ready_tx, diagnostics);
+                    end_shared.note_lane_end(L2Modality::Pc);
+                })
                 .context("spawn L2 Wayland lane thread")?;
             let (ready, lane, items_tx) = await_lane_ready("pc", "wayland", ready_rx, lane, items_tx, timeout, release)?;
             pc_ready = Some(ready);
@@ -1568,9 +1592,13 @@ impl L2Output {
             let lane_shared = shared.clone();
             let timeout = micros(alsa.ready_timeout_us);
             let release = micros(alsa.release_timeout_us);
+            let end_shared = shared.clone();
             let lane = std::thread::Builder::new()
                 .name("l2-sink-haptic-alsa".into())
-                .spawn(move || alsa_lane_main(alsa, items_rx, rows, lane_shared, ready_tx, diagnostics))
+                .spawn(move || {
+                    alsa_lane_main(alsa, items_rx, rows, lane_shared, ready_tx, diagnostics);
+                    end_shared.note_lane_end(L2Modality::Haptic);
+                })
                 .context("spawn L2 ALSA lane thread")?;
             let (ready, lane, items_tx) = match await_lane_ready("haptic", "alsa", ready_rx, lane, items_tx, timeout, release) {
                 Ok(ready) => ready,
@@ -1617,7 +1645,10 @@ impl L2Output {
             let cap = config.max_tracked_objects;
             let lane = std::thread::Builder::new()
                 .name(format!("l2-sink-{}", modality.as_str()))
-                .spawn(move || sink_loop(kind, fake, items_rx, rows, shared, cap))
+                .spawn(move || {
+                    sink_loop(kind, fake, items_rx, rows, shared.clone(), cap);
+                    shared.note_lane_end(modality);
+                })
                 .context("spawn L2 sink thread")?;
             senders[modality.index()] = Some(items_tx);
             lane_threads[modality.index()] = Some(lane);
@@ -1680,6 +1711,11 @@ impl L2Output {
 
     /// Phase 1 of the close (shared by `finish` and `start_close_until`).
     fn begin_close(&mut self, absolute_deadline_us: Option<u64>) {
+        // Experiment 2 only: the lanes observe until the absolute deadline
+        // (published before `Closing`, which is when a lane reads it).
+        if absolute_deadline_us.is_some() {
+            self.shared.hold_until_deadline.store(true, Ordering::SeqCst);
+        }
         // The deadline goes first and is independent of the message queue, so
         // a callback a lane handles before it sees `Closing` is still held to
         // it. `CLOSE_PENDING` covers the instant before the clock read.
@@ -1757,10 +1793,14 @@ impl L2Output {
             .send(Row::End)
             .map_err(|_| anyhow::anyhow!("L2 writer thread is gone before the sentinel"))?;
         let writer = self.writer.take().expect("writer joined only once");
-        match writer.join() {
-            Ok(result) => result.context("write L2 log"),
+        let mut summary = match writer.join() {
+            Ok(result) => result.context("write L2 log")?,
             Err(_) => bail!("L2 writer thread panicked"),
-        }
+        };
+        summary.lane_end_us = L2Modality::ALL.map(|m| {
+            Some(self.shared.lane_end_us[m.index()].load(Ordering::SeqCst)).filter(|t| *t > 0)
+        });
+        Ok(summary)
     }
 }
 
@@ -2006,6 +2046,10 @@ fn sink_loop(
         if producers_gone {
             match next {
                 Some(due) => std::thread::sleep(micros(due.saturating_sub(now))),
+                // Experiment 2: the lane observes until the deadline.
+                None if shared.holds_until_deadline() => {
+                    std::thread::sleep(micros(deadline_us.saturating_sub(now)))
+                }
                 // Nothing left that can be received before the deadline: the
                 // rest stays unresolved (no row).
                 None => break,
@@ -2492,7 +2536,11 @@ impl AlsaLane {
                 if now >= deadline_us {
                     break;
                 }
-                if producers_gone && (self.failed.is_some() || self.engine.idle()) {
+                // Experiment 2 (`start_close_until`): an idle stream keeps
+                // being fed silence and observed until the deadline; only a
+                // device failure ends the lane earlier.
+                let idle_ends = self.engine.idle() && !self.shared.holds_until_deadline();
+                if producers_gone && (self.failed.is_some() || idle_ends) {
                     break;
                 }
             }
@@ -5619,5 +5667,137 @@ mod tests {
         let mut bad = config;
         bad.wayland.as_mut().unwrap().buffers = 1;
         assert!(bad.validate().is_err());
+    }
+
+    // ---------------------------------------- Codex 156a: lanes hold to T_cut
+
+    /// Wait (bounded) until every lane thread has ended.
+    fn lanes_finished_within(out: &L2Output, bound: Duration) -> bool {
+        let until = std::time::Instant::now() + bound;
+        while !out.lanes.iter().all(|h| h.is_finished()) {
+            if std::time::Instant::now() >= until {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        true
+    }
+
+    /// Codex 156a P1-2 (inverted): after `start_close_until`, idle lanes
+    /// (fake, and the simulated Wayland + ALSA device lanes) keep observing
+    /// until T_cut instead of ending at once; every lane ends at or after it.
+    #[test]
+    fn start_close_until_idle_lanes_observe_until_the_deadline() {
+        let device_cfg = || {
+            let mut cfg = wayland_config(sim_display(), PcRepresentation::Bin);
+            cfg.sinks.haptic = L2SinkKind::Alsa;
+            cfg.alsa = Some(sim_alsa(Vec::new()));
+            cfg
+        };
+        let cases: [(&str, L2Config); 2] = [
+            ("fake", config(L2SinkKind::Fake, Some(FakeSinkConfig::offsets(0, 0)), 8)),
+            ("sim-devices", device_cfg()),
+        ];
+        for (name, cfg) in cases {
+            let path = tmp(&format!("hold-idle-{name}"));
+            let mut out = L2Output::start(&path, cfg).unwrap();
+            let cut = now_us() + 300_000;
+            out.start_close_until(cut).unwrap();
+            assert!(!lanes_finished_within(&out, Duration::from_millis(150)), "{name}: idle lanes held");
+            assert!(now_us() < cut);
+            let summary = out.finish().unwrap();
+            assert_eq!(summary.close_deadline_us, Some(cut), "{name}");
+            for m in L2Modality::ALL {
+                let end = summary.lane_end_us[m.index()].expect("lane end stamped");
+                assert!(end >= cut, "{name} {}: lane ended {} us before T_cut", m.as_str(), cut.saturating_sub(end));
+            }
+            assert!(summary.integrity_ok(out_sinks(&path)), "{name}");
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    fn out_sinks(path: &Path) -> L2Sinks {
+        let meta = rows(path).into_iter().next().unwrap();
+        let kind = |v: &serde_json::Value| match v.as_str().unwrap() {
+            "fake" => L2SinkKind::Fake,
+            "null" => L2SinkKind::Null,
+            "alsa" => L2SinkKind::Alsa,
+            "wayland" => L2SinkKind::Wayland,
+            other => panic!("sink {other}"),
+        };
+        L2Sinks { pc: kind(&meta["sinks"]["pc"]), haptic: kind(&meta["sinks"]["haptic"]) }
+    }
+
+    /// Codex 156a fault-exposure counterexample (inverted): the same T_cut
+    /// and the same simulated XRUN 50 ms after the stream start; one stage
+    /// starts its close at once, the other 100 ms later — both observe the
+    /// XRUN (`alsa_xrun`, integrity failure).
+    #[test]
+    fn same_t_cut_gives_the_same_fault_exposure_whatever_the_close_start() {
+        let early_path = tmp("exposure-early");
+        let late_path = tmp("exposure-late");
+        let cfg = || alsa_config(vec![SimFault::Xrun { after_start_us: 50_000 }]);
+        let mut early = L2Output::start(&early_path, cfg()).unwrap();
+        let mut late = L2Output::start(&late_path, cfg()).unwrap();
+        let cut = now_us() + 300_000;
+        early.start_close_until(cut).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        late.start_close_until(cut).unwrap();
+        let a = early.finish().unwrap();
+        let b = late.finish().unwrap();
+        assert_eq!((a.close_deadline_us, b.close_deadline_us), (Some(cut), Some(cut)));
+        for (summary, path) in [(&a, &early_path), (&b, &late_path)] {
+            assert!(!summary.integrity_ok(PC_FAKE_HAPTIC_ALSA));
+            let all = rows(path);
+            assert_eq!(sentinel(&all)["lanes"]["haptic"]["device_failure"]["reason"], FAIL_ALSA_XRUN);
+            // the device failure ends the haptic lane before T_cut; the
+            // healthy fake PC lane holds to it
+            assert!(summary.lane_end_us[L2Modality::Pc.index()].unwrap() >= cut);
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// A device failure is the only early end in hold mode: the failed ALSA
+    /// lane ends before T_cut.
+    #[test]
+    fn start_close_until_device_failure_ends_the_lane_early() {
+        let path = tmp("hold-failure");
+        let mut out = L2Output::start(&path, alsa_config(vec![SimFault::Xrun { after_start_us: 20_000 }])).unwrap();
+        let cut = now_us() + 600_000;
+        out.start_close_until(cut).unwrap();
+        let summary = out.finish().unwrap();
+        let haptic_end = summary.lane_end_us[L2Modality::Haptic.index()].unwrap();
+        assert!(haptic_end < cut, "a failed device lane ends at once");
+        assert!(summary.lane_end_us[L2Modality::Pc.index()].unwrap() >= cut);
+        assert_eq!(sentinel(&rows(&path))["lanes"]["haptic"]["device_failure"]["reason"], FAIL_ALSA_XRUN);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 1-D fixation: `finish` alone keeps the early end of idle lanes (the
+    /// close returns long before finish_start + report_window).
+    #[test]
+    fn finish_alone_still_ends_idle_lanes_early() {
+        let device_cfg = || {
+            let mut cfg = wayland_config(sim_display(), PcRepresentation::Bin);
+            cfg.sinks.haptic = L2SinkKind::Alsa;
+            cfg.alsa = Some(sim_alsa(Vec::new()));
+            cfg.report_window_us = 1_000_000;
+            cfg
+        };
+        let mut fake = config(L2SinkKind::Fake, Some(FakeSinkConfig::offsets(0, 0)), 8);
+        fake.report_window_us = 1_000_000;
+        for (name, cfg) in [("fake", fake), ("sim-devices", device_cfg())] {
+            let path = tmp(&format!("finish-idle-{name}"));
+            let out = L2Output::start(&path, cfg).unwrap();
+            let before = std::time::Instant::now();
+            let summary = out.finish().unwrap();
+            assert!(before.elapsed() < Duration::from_millis(500), "{name}: idle lanes end early under finish");
+            let deadline = summary.close_deadline_us.unwrap();
+            assert_eq!(deadline, summary.finish_start_us.unwrap() + 1_000_000, "{name}: 1-D relative deadline");
+            for m in L2Modality::ALL {
+                assert!(summary.lane_end_us[m.index()].unwrap() < deadline, "{name}");
+            }
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }

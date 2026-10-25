@@ -61,9 +61,20 @@ pub const SWITCH_BARRIER: &str = "switch_barrier";
 /// Contract v4 §9 `wire` counter kind (sender/relay delivery timeouts).
 pub const WIRE_COUNTER_KIND: &str = "delivery_timeout_counter";
 /// S1 slot that was admitted but neither released nor dropped by H and whose
-/// due is not after H (or unknown): none of the contract §4 states applies, so
-/// it is an explicit discard with this reason (WP3 interpretation, reported).
+/// due is not after H (or unknown). Registration §4-5: it is not submitted
+/// and its due is not after H, so its state is ④ `not_submitted` (an H
+/// cancellation is never an explicit discard); the row keeps the seal-drop
+/// form (`role: drop`, `seal_horizon_us = H`) because the exp2 roles have no
+/// `not_submitted` role — consumers classify seal drops by §4-5 ③/④.
 pub const S1_UNRELEASED_AT_HORIZON: &str = "unreleased_at_horizon";
+/// Registration §4-5 ("제출 ≤ H"; in L1-R the submission is the release row):
+/// an admitted slot whose release was DISPATCHED after H (core methods: the
+/// actual dispatch instant of a due <= H release; S1: a release action after
+/// H observed before the seal) is not submitted. No release row and no L2
+/// submit; the seal writes this seal drop (§4-5 ④ `not_submitted`, or a
+/// `pending_at_horizon` row when the due is after H) with the actual
+/// dispatch instant kept as the diagnostic `t_dispatch_us` (never clamped).
+pub const DISPATCH_AFTER_HORIZON: &str = "dispatch_after_horizon";
 /// B1/S1 (no core) seal execution delay after H.  Not a scientific parameter:
 /// every sealing row still carries `t_us == H` and the ledger is the state as
 /// of H; the delay only lets objects stamped `t_recv <= H` that are still
@@ -490,6 +501,10 @@ struct Slot {
     /// First transport (switch-gate) discard of a never-admitted copy:
     /// `(t_recv, reason)`.
     first_gate_discard: Option<(u64, &'static str)>,
+    /// Actual instant of a release dispatched after H (core: the dispatch of
+    /// a due <= H release; S1: a release action after H before the seal):
+    /// not a submission (§4-5), the seal writes [`DISPATCH_AFTER_HORIZON`].
+    dispatch_after_h_us: Option<u64>,
 }
 
 /// Counters written into the closing `wire` and `instrumentation_end` rows.
@@ -576,8 +591,11 @@ pub struct Exp2L2Stats {
     pub refused_after_close: u64,
     /// Attempts refused because the lane is gone (`sink_gone`).
     pub refused_sink_gone: u64,
-    /// Attempts whose release time was later than H (always 0: a release
-    /// row is written only for `t_release_us <= H`; counted, not assumed).
+    /// Release rows whose release time was later than H. Structurally 0:
+    /// every method writes a release row only for a release time <= H (core:
+    /// the actual dispatch; a dispatch after H is the seal drop
+    /// `dispatch_after_horizon`); a violation is counted, recorded as an L2
+    /// receiver fault and fails the recorder, and is never submitted.
     pub release_after_h: u64,
     /// Payloads disposed of by a non-release terminal row.
     pub disposed: u64,
@@ -847,6 +865,18 @@ impl<W: Write> Exp2Recorder<W> {
         if self.l2.is_none() || self.ended {
             return Ok(());
         }
+        if t_release_us > self.h {
+            // Unreachable by construction (every release row has its release
+            // time <= H, §4-5): counted and failed closed, never submitted.
+            self.l2.as_mut().expect("checked above").stats.release_after_h += 1;
+            let cause = format!(
+                "exp2 release {}[{index}] at {t_release_us} after H {}: not a submission",
+                m.as_str(),
+                self.h
+            );
+            self.l2_fault(cause.clone());
+            bail!(cause);
+        }
         let admitted_gen = self.slots[m.ix()][index as usize].admitted_gen;
         let link = self.l2.as_mut().expect("checked above");
         let Some(held) = link.held.remove(&(m.ix(), index)) else {
@@ -885,9 +915,6 @@ impl<W: Write> Exp2Recorder<W> {
             payload,
         );
         link.stats.submit_attempted += 1;
-        if t_release_us > self.h {
-            link.stats.release_after_h += 1;
-        }
         match outcome {
             L2SubmitOutcome::Submitted => link.stats.submit_accepted += 1,
             L2SubmitOutcome::QueueFull => link.stats.discarded_before_submit += 1,
@@ -1445,6 +1472,18 @@ impl<W: Write> Exp2Recorder<W> {
                     // Contract v4 §9: the release time is the ACTUAL dispatch
                     // instant (the scheduled due stays in the decision row).
                     let actual = (self.clock)().max(r.t_release_us);
+                    if actual > self.h {
+                        // Registration §4-5 "제출 ≤ H": a dispatch after H is
+                        // not a submission — no release row, no L2 submit; the
+                        // seal disposes of the slot by §4-5 ③/④ and keeps this
+                        // actual instant (never clamped to H).
+                        let slot = &mut self.slots[r.modality.ix()][r.index as usize];
+                        if slot.dispatch_after_h_us.is_none() {
+                            slot.dispatch_after_h_us = Some(actual);
+                        }
+                        self.stats.post_horizon_terminals_suppressed += 1;
+                        continue;
+                    }
                     let t_in = self.slots[r.modality.ix()][r.index as usize].t_in_us;
                     self.write_release(r.modality, r.index, actual, Some(r.grace), t_in)?;
                 }
@@ -1624,12 +1663,27 @@ impl<W: Write> Exp2Recorder<W> {
     /// A sealing row (contract v4 §9): `t_us` is the ACTUAL write instant
     /// (>= H) and `seal_horizon_us = H` names the horizon it seals.
     fn write_sealing(&mut self, m: Modality, index: u32, role: &str, due: Option<u64>) -> Result<()> {
+        self.write_sealing_with(m, index, role, due, Map::new())
+    }
+
+    /// [`Self::write_sealing`] with diagnostic fields (`t_dispatch_us`).
+    fn write_sealing_with(
+        &mut self,
+        m: Modality,
+        index: u32,
+        role: &str,
+        due: Option<u64>,
+        extra: Map<String, Value>,
+    ) -> Result<()> {
         let mut row = self.slot_fields(m, index);
         row.insert("role".into(), json!(role));
         row.insert("t_us".into(), json!((self.clock)()));
         row.insert("seal_horizon_us".into(), json!(self.h));
         if let Some(d) = due {
             row.insert("due_us".into(), json!(d));
+        }
+        for (k, v) in extra {
+            row.insert(k, v);
         }
         self.slots[m.ix()][index as usize].terminal = true;
         self.write_value(row, false)?;
@@ -1665,6 +1719,20 @@ impl<W: Write> Exp2Recorder<W> {
         self.write_value(row, true)?;
         self.l2_dispose(m, index);
         Ok(())
+    }
+
+    /// Registration §4-5 for a slot whose release was dispatched after H (not
+    /// a submission): ③ `pending_at_horizon` if its due is after H, else the
+    /// ④ seal drop [`DISPATCH_AFTER_HORIZON`]; the actual dispatch instant is
+    /// the diagnostic `t_dispatch_us`.
+    fn seal_dispatch_after_h(&mut self, m: Modality, index: u32, due: Option<u64>, t_dispatch_us: u64) -> Result<()> {
+        let mut extra = Map::new();
+        extra.insert("t_dispatch_us".into(), json!(t_dispatch_us));
+        if due.is_some_and(|d| d > self.h) {
+            self.write_sealing_with(m, index, "pending_at_horizon", due, extra)
+        } else {
+            self.write_seal_drop(m, index, DISPATCH_AFTER_HORIZON, due, extra)
+        }
     }
 
     /// Contract v4 §9 / registration §2-2: a slot never admitted but with an
@@ -1704,7 +1772,14 @@ impl<W: Write> Exp2Recorder<W> {
                 let written = self.slots[m.ix()][index as usize].terminal;
                 match entry.terminal {
                     SchedulerTerminal::Released { .. } => {
-                        ensure!(written, "core released {}[{index}] without a release row", m.as_str());
+                        if !written {
+                            // Only a dispatch after H leaves a core release
+                            // without its row (fail closed otherwise).
+                            let Some(t_dispatch) = self.slots[m.ix()][index as usize].dispatch_after_h_us else {
+                                bail!("core released {}[{index}] without a release row", m.as_str());
+                            };
+                            self.seal_dispatch_after_h(m, index, entry.committed.map(|c| c.due_us), t_dispatch)?;
+                        }
                     }
                     SchedulerTerminal::Dropped {
                         reason: crate::exp2_playout::DropReason::DeliveryTimeout,
@@ -1777,7 +1852,11 @@ impl<W: Write> Exp2Recorder<W> {
                     let due = slot
                         .s1_due_us
                         .or_else(|| deadline(self.pts[m.ix()][index as usize]));
-                    if due.is_some_and(|d| d > self.h) {
+                    if let Some(t_dispatch) = slot.dispatch_after_h_us {
+                        // A release action after H (before this seal): not a
+                        // submission, the same rule as the core methods.
+                        self.seal_dispatch_after_h(m, index, due, t_dispatch)?;
+                    } else if due.is_some_and(|d| d > self.h) {
                         self.write_sealing(m, index, "pending_at_horizon", due)?;
                     } else {
                         self.write_seal_drop(m, index, S1_UNRELEASED_AT_HORIZON, due, Map::new())?;
@@ -1821,8 +1900,16 @@ impl<W: Write> Exp2Recorder<W> {
         if self.sealed || at_us > self.h {
             // The ledger is the state as of H: a later S1 action is a
             // diagnostic only (its due still informs the seal if unsealed).
-            if !self.sealed && due_us.is_some() {
-                self.slots[m.ix()][index as usize].s1_due_us = due_us;
+            // A release dispatched after H is not a submission (§4-5); its
+            // actual instant goes on the seal row (`t_dispatch_us`).
+            if !self.sealed {
+                let slot = &mut self.slots[m.ix()][index as usize];
+                if due_us.is_some() {
+                    slot.s1_due_us = due_us;
+                }
+                if drop_reason.is_none() && !slot.terminal && slot.dispatch_after_h_us.is_none() {
+                    slot.dispatch_after_h_us = Some(at_us);
+                }
             }
             self.stats.post_horizon_terminals_suppressed += 1;
             return Ok(());
@@ -2303,13 +2390,19 @@ mod tests {
     }
 
     fn rig(method: Exp2Method) -> Rig {
+        rig_stepping(method, 1)
+    }
+
+    /// [`rig`] whose clock advances `step` µs per read (0: a frozen clock,
+    /// for exact-instant boundary tests).
+    fn rig_stepping(method: Exp2Method, step: u64) -> Rig {
         let sink = Sink::default();
         let clock = Arc::new(AtomicU64::new(T0 - 1_000_000));
         let c = clock.clone();
         let mut rec = Exp2Recorder::new(
             sink.clone(),
             // monotone and ticking 1 µs per read, like the real clock
-            Box::new(move || c.fetch_add(1, Ordering::SeqCst)),
+            Box::new(move || c.fetch_add(step, Ordering::SeqCst)),
             Exp2RecorderConfig {
                 method,
                 run_id: "run-1".into(),
@@ -3561,8 +3654,208 @@ mod tests {
         let slot = &terminals[&("pc".to_string(), pc_slot_identity(last as u64).0)];
         assert_ne!(slot["role"], json!("no_object"), "an arrived object is not no_object");
         assert_eq!(slot["role"], json!("drop"));
-        assert_eq!(slot["reason"], json!(S1_UNRELEASED_AT_HORIZON));
+        // Codex 156a: the S1 release dispatched after H is not a submission
+        // (§4-5); the seal keeps its actual instant, never clamped.
+        assert_eq!(slot["reason"], json!(DISPATCH_AFTER_HORIZON));
+        assert_eq!(slot["t_dispatch_us"], json!(h + eps + 10));
+        assert_eq!(slot["due_us"], json!(h - 50));
+        assert_eq!(slot["seal_horizon_us"], json!(h));
         assert_eq!(r.rec.stats().post_horizon_terminals_suppressed, 1);
+    }
+
+    // ------------------------------------------- Codex 156a: dispatch after H
+
+    const CORE_METHODS: [Exp2Method; 4] = [Exp2Method::S3npaPrime, Exp2Method::P0np, Exp2Method::P0, Exp2Method::P1];
+
+    /// Admit + feed `(m, i)` at its reference instant (the Codex 156a set-up).
+    fn arrive_at_ref(r: &mut Rig, m: Modality, i: u32, payload: bool) {
+        let t_recv = slot_ref(m, i);
+        r.set(t_recv - 1);
+        r.rec.advance(t_recv - 1).unwrap();
+        r.set(t_recv);
+        let rx = Exp2Rx { header: header(m, i, t_recv), route_generation: 0, t_recv_us: t_recv };
+        let p = payload.then(|| l2_payload(m, i, None));
+        let Admission::Admitted(mm, index) = r.rec.admit_with_payload(rx, p).unwrap() else {
+            panic!("admission expected")
+        };
+        r.rec.feed_arrival(mm, index, t_recv).unwrap();
+    }
+
+    fn slot_rows<'a>(rows: &'a [Value], m: Modality, i: u32) -> Vec<&'a Value> {
+        let pts = match m {
+            Modality::Pc => pc_slot_identity(i as u64).0,
+            Modality::Haptic => haptic_slot_identity(i as u64).0,
+        };
+        rows.iter()
+            .filter(|r| r["track"] == json!(m.as_str()) && r["pts_us"] == json!(pts))
+            .filter(|r| matches!(r["role"].as_str(), Some("release" | "drop" | "pending_at_horizon" | "no_object")))
+            .collect()
+    }
+
+    /// Codex 156a P1 (inverted): a due <= H core release whose actual
+    /// dispatch is after H (the recorder tick was descheduled past H) is not
+    /// a submission — no release row and no L2 submit, in L1-R and with L2;
+    /// the seal writes `dispatch_after_horizon` (§4-5 ④) with the actual
+    /// instant as `t_dispatch_us`, and `release_after_h` stays 0.
+    #[test]
+    fn exp2_core_dispatch_after_h_is_not_a_submission_codex156a() {
+        let h = horizon_us(T0);
+        let i = N_PC as u32 - 1;
+        for method in CORE_METHODS {
+            for with_l2 in [false, true] {
+                let mut r = rig(method);
+                let l2 = with_l2.then(|| l2_output("late-dispatch", L2SinkKind::Null));
+                if let Some((_, output)) = &l2 {
+                    r.rec.attach_l2(output.submitter()).unwrap();
+                }
+                arrive_at_ref(&mut r, Modality::Pc, i, with_l2);
+                r.set(h + 10);
+                r.rec.advance(h + 10).unwrap();
+                assert!(r.rec.is_sealed());
+                let rows = r.sink.rows();
+                let decision_due = rows
+                    .iter()
+                    .find(|row| row["role"] == "decision" && row["track"] == "pc" && row["pts_us"] == json!(pc_slot_identity(i as u64).0))
+                    .map(|row| row["due_us"].as_u64().unwrap())
+                    .expect("the core committed the slot");
+                assert!(decision_due <= h, "{method:?}: due {decision_due} <= H");
+                let terminal = slot_rows(&rows, Modality::Pc, i);
+                assert_eq!(terminal.len(), 1, "{method:?}: one terminal");
+                let t = terminal[0];
+                assert_eq!((t["role"].as_str(), t["reason"].as_str()), (Some("drop"), Some(DISPATCH_AFTER_HORIZON)), "{method:?}");
+                assert!(t["t_dispatch_us"].as_u64().unwrap() >= h + 10, "{method:?}: actual instant kept");
+                assert_eq!(t["due_us"], json!(decision_due));
+                assert_eq!(t["seal_horizon_us"], json!(h));
+                assert!(t["t_us"].as_u64().unwrap() >= h);
+                assert!(rows.iter().all(|row| row["role"] != "release"), "{method:?}: no release row");
+                if let Some((path, output)) = l2 {
+                    let link = r.rec.detach_l2().unwrap();
+                    assert_eq!(
+                        (link.held, link.submit_attempted, link.submit_accepted, link.release_after_h, link.disposed, link.held_at_seal),
+                        (1, 0, 0, 0, 1, 0),
+                        "{method:?}"
+                    );
+                    let summary = output.finish().unwrap();
+                    assert_eq!(summary.submitted, 0, "{method:?}: no L2 submit");
+                    assert!(file_rows(&path).iter().all(|row| row["role"] != "submit"));
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+    }
+
+    /// The H boundary is inclusive: an actual dispatch exactly at H is a
+    /// release (and its L2 submit); one microsecond later it is not.
+    #[test]
+    fn exp2_core_dispatch_exactly_at_h_is_a_release() {
+        let h = horizon_us(T0);
+        let i = N_PC as u32 - 1;
+        for method in CORE_METHODS {
+            for (at, released) in [(h, true), (h + 1, false)] {
+                let mut r = rig_stepping(method, 0);
+                let (path, output) = l2_output("exact-h", L2SinkKind::Null);
+                r.rec.attach_l2(output.submitter()).unwrap();
+                arrive_at_ref(&mut r, Modality::Pc, i, true);
+                r.set(at);
+                r.rec.advance(at).unwrap();
+                let rows = r.sink.rows();
+                let terminal = slot_rows(&rows, Modality::Pc, i);
+                assert_eq!(terminal.len(), 1);
+                let link = r.rec.detach_l2().unwrap();
+                if released {
+                    assert_eq!(terminal[0]["role"], json!("release"), "{method:?}");
+                    assert_eq!(terminal[0]["t_release_us"], json!(h), "{method:?}");
+                    assert_eq!((link.submit_attempted, link.submit_accepted, link.release_after_h), (1, 1, 0));
+                } else {
+                    assert_eq!(terminal[0]["reason"], json!(DISPATCH_AFTER_HORIZON), "{method:?}");
+                    assert_eq!(terminal[0]["t_dispatch_us"], json!(h + 1), "{method:?}");
+                    assert_eq!((link.submit_attempted, link.submit_accepted, link.release_after_h), (0, 0, 0));
+                }
+                output.finish().unwrap();
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+
+    /// One core batch whose dispatch instants cross H: every slot is either
+    /// a release with `t_release_us <= H` (and exactly one L2 submit) or a
+    /// `dispatch_after_horizon` seal drop with `t_dispatch_us > H`; some
+    /// start offset splits the batch (both kinds in one batch).
+    #[test]
+    fn exp2_core_batch_crossing_h_splits_release_and_dispatch_after_h() {
+        let h = horizon_us(T0);
+        let e = N_PC as u32 - 1;
+        let group = [(Modality::Pc, e), (Modality::Haptic, 3 * e), (Modality::Haptic, 3 * e + 1), (Modality::Haptic, 3 * e + 2)];
+        for method in CORE_METHODS {
+            let mut split = 0;
+            for d in 0..40u64 {
+                let mut r = rig(method);
+                let (path, output) = l2_output("batch-h", L2SinkKind::Null);
+                r.rec.attach_l2(output.submitter()).unwrap();
+                let mut order = group.to_vec();
+                order.sort_by_key(|(m, i)| slot_ref(*m, *i));
+                for (m, i) in order {
+                    arrive_at_ref(&mut r, m, i, true);
+                }
+                // every due of the group is <= h - 1 - d: one batch, whose
+                // clock reads start at h - 1 - d and tick 1 µs per read
+                r.set(h - 1 - d);
+                r.rec.advance(h - 1 - d).unwrap();
+                r.set(h + 5);
+                r.rec.advance(h + 5).unwrap();
+                let rows = r.sink.rows();
+                let (mut released, mut late) = (0, 0);
+                for (m, i) in group {
+                    let terminal = slot_rows(&rows, m, i);
+                    assert_eq!(terminal.len(), 1, "{method:?} d={d}");
+                    let t = terminal[0];
+                    match t["role"].as_str() {
+                        Some("release") => {
+                            assert!(t["t_release_us"].as_u64().unwrap() <= h);
+                            released += 1;
+                        }
+                        Some("drop") if t["reason"] == DISPATCH_AFTER_HORIZON => {
+                            assert!(t["t_dispatch_us"].as_u64().unwrap() > h);
+                            assert!(t["due_us"].as_u64().unwrap() <= h);
+                            late += 1;
+                        }
+                        other => panic!("{method:?} d={d}: unexpected terminal {other:?} {t}"),
+                    }
+                }
+                let link = r.rec.detach_l2().unwrap();
+                assert_eq!((link.submit_attempted, link.submit_accepted, link.release_after_h), (released, released, 0));
+                assert_eq!(link.disposed, late);
+                let summary = output.finish().unwrap();
+                assert_eq!(summary.submitted, released);
+                if released > 0 && late > 0 {
+                    split += 1;
+                }
+                let _ = std::fs::remove_file(&path);
+            }
+            assert!(split > 0, "{method:?}: no offset split the batch at H");
+        }
+    }
+
+    /// The structural guard: a release time after H never reaches L2 (it is
+    /// a recorded L2 fault and an error), whatever path asks for it.
+    #[test]
+    fn exp2_l2_release_after_h_is_refused_and_faulted() {
+        let h = horizon_us(T0);
+        let (path, output) = l2_output("guard", L2SinkKind::Null);
+        let mut r = rig(Exp2Method::B1);
+        r.rec.attach_l2(output.submitter()).unwrap();
+        r.set(T0 + 1_000);
+        r.rec.advance(T0 + 1_000).unwrap();
+        let rx = Exp2Rx { header: header(Modality::Pc, 0, T0), route_generation: 0, t_recv_us: T0 + 1_000 };
+        // admit without the B1 release: a core-less hold, then a direct call
+        r.rec.l2_hold(Modality::Pc, 0, rx.header, Some(l2_payload(Modality::Pc, 0, None))).unwrap();
+        assert!(r.rec.l2_release(Modality::Pc, 0, h + 1).is_err());
+        assert!(output.receiver_fault_noted());
+        let link = r.rec.detach_l2().unwrap();
+        assert_eq!((link.submit_attempted, link.release_after_h), (0, 1));
+        let summary = output.finish().unwrap();
+        assert_eq!(summary.submitted, 0);
+        let _ = std::fs::remove_file(&path);
     }
 
 }

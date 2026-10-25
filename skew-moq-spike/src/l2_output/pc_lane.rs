@@ -597,7 +597,12 @@ impl CommitLane {
                 let more_to_commit =
                     self.link.pending.has_frame() && !self.backend_lost && self.engine.failure().is_none();
                 let more_feedback = self.engine.awaiting_feedback() > 0 && !self.backend_lost;
-                if !more_to_commit && !more_feedback {
+                // Experiment 2 (`start_close_until`): an idle lane keeps
+                // dispatching the compositor until the deadline; only a
+                // device failure ends it earlier.
+                let device_failed = self.backend_lost || self.engine.failure().is_some();
+                let holds = self.out.shared.holds_until_deadline() && !device_failed;
+                if !more_to_commit && !more_feedback && !holds {
                     return Exit::Closed;
                 }
             }

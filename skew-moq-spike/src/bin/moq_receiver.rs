@@ -1863,9 +1863,10 @@ fn log_exp2_l2_link(
 /// exp2 + L2: start the L2 close with the absolute deadline `T_cut` (Codex
 /// 155 P1-1; `L2Output::start_close_until`) and record it in the rx log. The
 /// stage stays owned by the caller, so every later fault stamp still reaches
-/// the sentinel. A start after `T_cut` is not hidden: its rx row says so, and
-/// any terminal the lanes accepted in between fails the writer's receipt
-/// check (fail closed).
+/// the sentinel. A start after `T_cut` is not hidden: its rx row says so
+/// (`started_after_t_cut`). The writer does NOT re-check terminals it wrote
+/// before such a late start (Codex 156a), so a late start must be rejected
+/// from that row, not from the L2 file alone.
 fn exp2_l2_start_close(
     l2: Option<&mut skew_moq::l2_output::L2Output>,
     cut: Exp2L2Cut,
@@ -1896,6 +1897,189 @@ fn exp2_l2_start_close(
             output.receiver_fault(now_us(), &format!("exp2_l2_close rx row not written: {e:#}"));
         }
     }
+}
+
+/// exp2 + L2: after the L2 finish, the rx row `exp2_l2_finish` with each
+/// lane thread's end instant (Codex 156a P1-2: under `start_close_until`
+/// every lane observes its sink until the close deadline unless its device
+/// failed). Diagnostic only: the L2 file is already complete, so a failed
+/// write is reported on stderr.
+fn log_exp2_l2_finish(logger: &Arc<Mutex<JsonlLogger>>, summary: &skew_moq::l2_output::L2Summary) {
+    let opt = |v: Option<u64>| v.map(|t| t.to_string()).unwrap_or_else(|| "null".into());
+    let [pc, haptic] = summary.lane_end_us;
+    let held = summary
+        .close_deadline_us
+        .map(|d| summary.lane_end_us.iter().all(|end| end.is_some_and(|t| t >= d)));
+    let body = format!(
+        "\"event\":\"exp2_l2_finish\",\"finish_start_us\":{},\"close_deadline_us\":{},\"lane_end_us\":{{\"pc\":{},\"haptic\":{}}},\"lanes_ended_at_or_after_deadline\":{}",
+        opt(summary.finish_start_us),
+        opt(summary.close_deadline_us),
+        opt(pc),
+        opt(haptic),
+        held.map(|b| b.to_string()).unwrap_or_else(|| "null".into()),
+    );
+    let logged = logger
+        .lock()
+        .map_err(|_| anyhow::anyhow!("RX logger poisoned"))
+        .and_then(|mut l| l.try_log_info(&body).map_err(anyhow::Error::from));
+    if let Err(e) = logged {
+        eprintln!("[rx] exp2_l2_finish rx row not written: {e:#}");
+    }
+}
+
+/// exp2 + L2 (static path): the pending seal hand-over of `T_cut`. `rx` is
+/// `None` once the hand-over resolved (applied, or the sender went away).
+struct Exp2CutHandoff {
+    rx: Option<tokio::sync::oneshot::Receiver<Exp2L2Cut>>,
+}
+
+impl Exp2CutHandoff {
+    /// The hand-over resolved: apply the cut (if one was sent).
+    fn resolve(
+        &mut self,
+        got: std::result::Result<Exp2L2Cut, tokio::sync::oneshot::error::RecvError>,
+        l2: &mut Option<skew_moq::l2_output::L2Output>,
+        logger: &Arc<Mutex<JsonlLogger>>,
+    ) {
+        self.rx = None;
+        if let Ok(cut) = got {
+            exp2_l2_start_close(l2.as_mut(), cut, logger);
+        }
+    }
+
+    /// Apply a cut that is already waiting (no wait).
+    fn poll_now(&mut self, l2: &mut Option<skew_moq::l2_output::L2Output>, logger: &Arc<Mutex<JsonlLogger>>) {
+        use tokio::sync::oneshot::error::TryRecvError;
+        let Some(rx) = self.rx.as_mut() else { return };
+        match rx.try_recv() {
+            Ok(cut) => self.resolve(Ok(cut), l2, logger),
+            Err(TryRecvError::Closed) => self.rx = None,
+            Err(TryRecvError::Empty) => {}
+        }
+    }
+}
+
+/// The static path's wait for the end of reception: both drains finished,
+/// the session ended, or `--max-duration` — the historical three-branch
+/// `select!`, unchanged (Tokio's random start among exactly these three
+/// branches).
+async fn wait_rx_end_three<D, S>(
+    all_drains: D,
+    session_run: &mut S,
+    deadline: tokio::time::Instant,
+    l2_output: Option<&skew_moq::l2_output::L2Output>,
+) -> Drained
+where
+    D: std::future::Future<Output = Vec<(&'static str, TrackEnd, String)>>,
+    S: std::future::Future + Unpin,
+    S::Output: std::fmt::Debug,
+{
+    // L2 (registration §6-1; 1-D §11-7 M2 work order (7), Codex 107): the
+    // session/max-duration end is stamped inside its select arm at the
+    // moment it is decided, BEFORE the stderr write (a blocked stderr pipe
+    // would otherwise delay the recorded time). Inert without L2.
+    tokio::select! {
+        ends = all_drains => Drained::Ends(ends),
+        r = &mut *session_run => {
+            let detail = format!("{r:?}");
+            note_l2_fault(l2_output, || {
+                format!("session ended before tracks closed: {detail}")
+            });
+            eprintln!("[rx] session ended before tracks closed: {detail}");
+            Drained::SessionArm(detail)
+        }
+        _ = tokio::time::sleep_until(deadline) => {
+            note_l2_fault(l2_output, || {
+                "max-duration reached — reception is INCOMPLETE".to_string()
+            });
+            eprintln!("[rx] max-duration reached — reception is INCOMPLETE");
+            Drained::Timeout
+        }
+    }
+}
+
+/// [`wait_rx_end_three`], plus (exp2 + L2 only, `cut`) the seal hand-over of
+/// `T_cut`. Without `cut` (every other mode) it IS the three-branch wait
+/// (Codex 156a P2: a fourth branch, disabled or pending, moves Tokio's
+/// tie-break start point). With a pending hand-over, an outer `biased`
+/// select polls the hand-over first and otherwise the same three-branch
+/// wait, which alone decides the outcome (so ties among the three outcomes
+/// stay 1/3 each); a hand-over ready together with an outcome is applied
+/// first.
+async fn wait_rx_end<D, S>(
+    all_drains: D,
+    session_run: &mut S,
+    deadline: tokio::time::Instant,
+    l2_output: &mut Option<skew_moq::l2_output::L2Output>,
+    cut: Option<&mut Exp2CutHandoff>,
+    logger: &Arc<Mutex<JsonlLogger>>,
+) -> Drained
+where
+    D: std::future::Future<Output = Vec<(&'static str, TrackEnd, String)>>,
+    S: std::future::Future + Unpin,
+    S::Output: std::fmt::Debug,
+{
+    let Some(cut) = cut else {
+        return wait_rx_end_three(all_drains, session_run, deadline, l2_output.as_ref()).await;
+    };
+    tokio::pin!(all_drains);
+    loop {
+        let Some(rx) = cut.rx.as_mut() else {
+            return wait_rx_end_three(&mut all_drains, session_run, deadline, l2_output.as_ref()).await;
+        };
+        tokio::select! {
+            biased;
+            got = rx => cut.resolve(got, l2_output, logger),
+            d = wait_rx_end_three(&mut all_drains, &mut *session_run, deadline, l2_output.as_ref()) => return d,
+        }
+    }
+}
+
+/// The static path's wait for the exp2 recorder task (bounded by
+/// `--max-duration`). exp2 + L2: the seal hand-over is still served while
+/// waiting (Codex 156a P2: `wait_rx_end` may have ended first), and a cut
+/// sent in the task's last poll is applied before returning.
+async fn wait_exp2_task<T>(
+    task: &mut tokio::task::JoinHandle<T>,
+    deadline: tokio::time::Instant,
+    l2_output: &mut Option<skew_moq::l2_output::L2Output>,
+    cut: Option<&mut Exp2CutHandoff>,
+    logger: &Arc<Mutex<JsonlLogger>>,
+) -> std::result::Result<std::result::Result<T, tokio::task::JoinError>, tokio::time::error::Elapsed> {
+    let Some(cut) = cut else {
+        return tokio::time::timeout_at(deadline, task).await;
+    };
+    let result = loop {
+        let Some(rx) = cut.rx.as_mut() else {
+            break tokio::time::timeout_at(deadline, &mut *task).await;
+        };
+        tokio::select! {
+            biased;
+            got = rx => cut.resolve(got, l2_output, logger),
+            r = tokio::time::timeout_at(deadline, &mut *task) => break r,
+        }
+    };
+    cut.poll_now(l2_output, logger);
+    result
+}
+
+/// exp2 + L2, right before the L2 finish: a SEALED run must have started its
+/// close at the absolute `T_cut` (Codex 156a P2). Reaching `finish` without
+/// it would silently apply the 1-D relative deadline instead, so it is a
+/// recorded receiver fault (fail closed). An unsealed run keeps the relative
+/// fallback (it has failed through its exp2 outcome already). Returns
+/// whether the fault was raised.
+fn exp2_l2_require_close_at_cut(sealed: bool, l2: Option<&skew_moq::l2_output::L2Output>) -> bool {
+    let Some(output) = l2 else { return false };
+    if !sealed || output.close_started() {
+        return false;
+    }
+    note_l2_fault(Some(output), || {
+        "exp2 run sealed but its L2 close at T_cut never started: finish would apply the relative deadline"
+            .to_string()
+    });
+    eprintln!("[rx] exp2 run sealed but its L2 close at T_cut never started");
+    true
 }
 
 /// Static-path drain hook: offer a received (non-warm-up) object to the exp2
@@ -7006,6 +7190,8 @@ where
                 )
             });
         }
+        // A sealed run must have started its close at T_cut (Codex 156a P2).
+        exp2_l2_require_close_at_cut(state.recorder.as_ref().is_some_and(|r| r.is_sealed()), Some(output));
         // Normally detached at the seal; this catches a run that never
         // sealed (its L2 close falls back to `finish`'s 1-D relative rule;
         // such a run has failed already).
@@ -7015,8 +7201,9 @@ where
         }
     }
     if let Some(output) = l2_output.take() {
-        if let Err(e) = finish_l2_output(output).await {
-            eprintln!("[rx] P1 L2 output stage failed to close: {e:#}");
+        match finish_l2_output(output).await {
+            Ok(summary) => log_exp2_l2_finish(&logger, &summary),
+            Err(e) => eprintln!("[rx] P1 L2 output stage failed to close: {e:#}"),
         }
     }
     {
@@ -8986,52 +9173,18 @@ async fn receiver_main() -> Result<()> {
     // rx side. Each outcome is now classified and reported.
     let drain_fault = l2_output.as_ref().map(|output| output.fault_stamp());
     // exp2 + L2 only: the seal hand-over (T_cut). `None` in every other mode,
-    // where its select branch is disabled and never polled, so the wait
-    // below ends on the first of the three historical branches exactly as
-    // before (the loop runs once).
-    let mut exp2_l2_cut_rx = exp2_l2_cut_rx;
-    let mut exp2_l2_cut_done = false;
-    // L2 (registration §6-1; 1-D §11-7 M2 work order (7), Codex 107): the
-    // session/max-duration end is stamped inside its select arm at the
-    // moment it is decided, BEFORE the stderr write (a blocked stderr pipe
-    // would otherwise delay the recorded time). Inert without L2.
-    let drained = {
-        let all_drains = join_rx_drains(&mut drains, &drain_fault);
-        tokio::pin!(all_drains);
-        loop {
-            let cut_armed = exp2_l2_cut_rx.is_some() && !exp2_l2_cut_done;
-            let cut_wait = async {
-                match exp2_l2_cut_rx.as_mut() {
-                    Some(rx) => rx.await.ok(),
-                    None => std::future::pending().await,
-                }
-            };
-            tokio::select! {
-                ends = &mut all_drains => break Drained::Ends(ends),
-                r = &mut session_run => {
-                    let detail = format!("{r:?}");
-                    note_l2_fault(l2_output.as_ref(), || {
-                        format!("session ended before tracks closed: {detail}")
-                    });
-                    eprintln!("[rx] session ended before tracks closed: {detail}");
-                    break Drained::SessionArm(detail);
-                }
-                _ = tokio::time::sleep_until(deadline) => {
-                    note_l2_fault(l2_output.as_ref(), || {
-                        "max-duration reached — reception is INCOMPLETE".to_string()
-                    });
-                    eprintln!("[rx] max-duration reached — reception is INCOMPLETE");
-                    break Drained::Timeout;
-                }
-                cut = cut_wait, if cut_armed => {
-                    exp2_l2_cut_done = true;
-                    if let Some(cut) = cut {
-                        exp2_l2_start_close(l2_output.as_mut(), cut, &logger);
-                    }
-                }
-            }
-        }
-    };
+    // where `wait_rx_end` is exactly the historical three-branch `select!`
+    // (Codex 156a P2: no disabled fourth branch, same tie-break).
+    let mut exp2_cut = exp2_l2_cut_rx.map(|rx| Exp2CutHandoff { rx: Some(rx) });
+    let drained = wait_rx_end(
+        join_rx_drains(&mut drains, &drain_fault),
+        &mut session_run,
+        deadline,
+        &mut l2_output,
+        exp2_cut.as_mut(),
+        &logger,
+    )
+    .await;
 
     // A cancelled select branch must not detach receiver tasks. Abort and join
     // any outstanding producer before closing the scheduler input.
@@ -9085,7 +9238,9 @@ async fn receiver_main() -> Result<()> {
     drop(exp2_tx);
     let mut exp2_outcome: Option<String> = None;
     if let Some(mut task) = exp2_task.take() {
-        let result = tokio::time::timeout_at(deadline, &mut task).await;
+        // exp2 + L2: the seal hand-over is still served here (the reception
+        // wait above may have ended before the seal, Codex 156a P2).
+        let result = wait_exp2_task(&mut task, deadline, &mut l2_output, exp2_cut.as_mut(), &logger).await;
         let failed = match result {
             Ok(Ok(Ok(()))) => None,
             Ok(Ok(Err(e))) => Some(format!("exp2 recorder failed: {e:#}")),
@@ -9116,10 +9271,21 @@ async fn receiver_main() -> Result<()> {
     // producer); its counters go to the rx log (the exp2 JSONL schema stays
     // pinned).
     if exp2_l2 {
+        // A cut sent before an abort/timeout of the task is still applied;
+        // then a SEALED run without its T_cut close is a receiver fault
+        // (fail closed) instead of a silent relative close (Codex 156a P2).
+        if let Some(cut) = exp2_cut.as_mut() {
+            cut.poll_now(&mut l2_output, &logger);
+        }
+        let sealed = exp2_shared.as_ref().is_some_and(|shared| {
+            shared.lock().ok().is_some_and(|guard| guard.as_ref().is_some_and(|r| r.is_sealed()))
+        });
+        exp2_l2_require_close_at_cut(sealed, l2_output.as_ref());
         // Normally the exp2 task detached the link at the seal; this only
         // catches a run that never sealed (the L2 close then falls back to
         // `finish` below, with the 1-D relative deadline — such a run has
-        // already failed through its exp2 outcome).
+        // already failed through its exp2 outcome) or a sealed run whose
+        // hand-over failed (a receiver fault just above).
         let detached = exp2_shared
             .as_ref()
             .and_then(|shared| shared.lock().ok().and_then(|mut guard| guard.as_mut().and_then(|r| r.detach_l2())));
@@ -9215,8 +9381,11 @@ async fn receiver_main() -> Result<()> {
     // it changes neither the rx log nor the exit code, whose meaning the
     // batch driver owns. Without L2 nothing here runs.
     if let Some(output) = l2_output.take() {
-        if let Err(e) = finish_l2_output(output).await {
-            eprintln!("[rx] L2 output stage failed to close: {e:#}");
+        match finish_l2_output(output).await {
+            // exp2 + L2 only: the lane end instants (Codex 156a P1-2).
+            Ok(summary) if exp2_l2 => log_exp2_l2_finish(&logger, &summary),
+            Ok(_) => {}
+            Err(e) => eprintln!("[rx] L2 output stage failed to close: {e:#}"),
         }
     }
 
@@ -14288,6 +14457,13 @@ mod s3_control_loop_tests {
         for r in l2.iter().filter(|r| matches!(r["role"].as_str(), Some("submit" | "output"))) {
             assert!(r["t_submit_us"].as_u64().unwrap() < t_cut);
         }
+        // Codex 156a P1-2: the idle fake lanes observed until T_cut.
+        let finish = legacy.iter().find(|r| r["event"] == "exp2_l2_finish").expect("exp2_l2_finish row");
+        assert_eq!(finish["close_deadline_us"].as_u64(), Some(t_cut));
+        for lane in ["pc", "haptic"] {
+            assert!(finish["lane_end_us"][lane].as_u64().unwrap() >= t_cut, "{lane}: {finish}");
+        }
+        assert_eq!(finish["lanes_ended_at_or_after_deadline"], true);
     }
 
     /// Codex 85: a switch requested late in the window whose SUBSCRIBEs are
@@ -17808,6 +17984,132 @@ mod l2_hook_tests {
 
     /// An L2 fake stage whose terminals never come back: a submission is an
     /// unresolved integrity failure OCCURRING at its own `t_submit_us`.
+    /// Which of the three reception outcomes `wait_rx_end` returned.
+    fn drained_index(d: &Drained) -> usize {
+        match d {
+            Drained::Ends(_) => 0,
+            Drained::SessionArm(_) => 1,
+            Drained::Timeout => 2,
+        }
+    }
+
+    /// Codex 156a P2 (ported to the production wait): with all three
+    /// historical branches ready, each wins about 1/3 of 12,000 runs — in
+    /// every mode without the hand-over (the verbatim three-branch
+    /// `select!`), with a pending hand-over, and with a hand-over that is
+    /// ready too (it is served, then the same three-branch wait decides).
+    #[tokio::test]
+    async fn wait_rx_end_keeps_the_three_branch_tie_distribution() {
+        let logger = rx_logger(&tmp("tie-rx"));
+        let mut l2_output: Option<L2Output> = None;
+        // A deadline already processed by the timer driver: its sleep is
+        // ready on the first poll (a deadline of "now" is not).
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let deadline = tokio::time::Instant::now() - Duration::from_millis(10);
+        for mode in ["no_handover", "pending_handover", "ready_handover"] {
+            let mut counts = [0usize; 3];
+            let mut keep = Vec::new();
+            for _ in 0..12_000 {
+                let mut session = std::future::ready(());
+                let mut handoff = match mode {
+                    "no_handover" => None,
+                    _ => {
+                        let (tx, rx) = tokio::sync::oneshot::channel::<Exp2L2Cut>();
+                        if mode == "ready_handover" {
+                            tx.send(Exp2L2Cut { t_cut_us: 1, detached_at_us: 1 }).unwrap();
+                        } else {
+                            keep.push(tx);
+                        }
+                        Some(Exp2CutHandoff { rx: Some(rx) })
+                    }
+                };
+                let d = wait_rx_end(
+                    std::future::ready(Vec::new()),
+                    &mut session,
+                    deadline,
+                    &mut l2_output,
+                    handoff.as_mut(),
+                    &logger,
+                )
+                .await;
+                counts[drained_index(&d)] += 1;
+            }
+            println!("wait_rx_end ties ({mode}): drains/session/timeout = {counts:?}");
+            for c in counts {
+                assert!((3_600..=4_400).contains(&c), "{mode}: {counts:?} is not 1/3 each");
+            }
+        }
+    }
+
+    /// Codex 156a P2 (inverted): the reception wait ends first (drains
+    /// done, session still running), the recorder seals afterwards and sends
+    /// the cut while main waits for the task — the cut is applied there, so
+    /// the L2 close deadline is T_cut, not the relative fallback. Also when
+    /// the cut is sent in the task's very last poll.
+    #[tokio::test]
+    async fn exp2_cut_after_the_reception_wait_is_still_applied() {
+        for last_poll in [false, true] {
+            let path = tmp("early-drain");
+            let mut l2_output = Some(fake_output(&path, 0, 0));
+            let logger = rx_logger(&tmp("early-drain-rx"));
+            let (tx, rx) = tokio::sync::oneshot::channel::<Exp2L2Cut>();
+            let mut handoff = Some(Exp2CutHandoff { rx: Some(rx) });
+            let mut session_run = tokio::spawn(std::future::pending::<()>());
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            let drained = wait_rx_end(
+                std::future::ready(Vec::new()),
+                &mut session_run,
+                deadline,
+                &mut l2_output,
+                handoff.as_mut(),
+                &logger,
+            )
+            .await;
+            assert!(matches!(drained, Drained::Ends(_)));
+            assert!(!l2_output.as_ref().unwrap().close_started(), "no cut yet");
+            let cut = Exp2L2Cut { t_cut_us: now_us() + 100_000, detached_at_us: now_us() };
+            let mut task = tokio::spawn(async move {
+                if !last_poll {
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                }
+                tx.send(cut).unwrap();
+                if !last_poll {
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                }
+                Ok::<(), anyhow::Error>(())
+            });
+            let result = wait_exp2_task(&mut task, deadline, &mut l2_output, handoff.as_mut(), &logger).await;
+            assert!(matches!(result, Ok(Ok(Ok(())))));
+            assert!(handoff.as_ref().unwrap().rx.is_none(), "the hand-over resolved");
+            assert!(l2_output.as_ref().unwrap().close_started(), "last_poll={last_poll}");
+            assert!(!exp2_l2_require_close_at_cut(true, l2_output.as_ref()));
+            let summary = l2_output.take().unwrap().finish().unwrap();
+            assert_eq!(summary.close_deadline_us, Some(cut.t_cut_us), "last_poll={last_poll}");
+            assert!(summary.receiver_fault.is_none());
+            session_run.abort();
+            let _ = session_run.await;
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// Fail closed: a SEALED run that reaches the L2 finish without its T_cut
+    /// close is a receiver fault; an unsealed run keeps the relative
+    /// fallback without one.
+    #[test]
+    fn sealed_run_without_the_cut_close_is_a_receiver_fault() {
+        for sealed in [false, true] {
+            let path = tmp("sealed-no-close");
+            let output = fake_output(&path, 0, 0);
+            assert_eq!(exp2_l2_require_close_at_cut(sealed, Some(&output)), sealed);
+            assert_eq!(output.receiver_fault_noted(), sealed);
+            let summary = output.finish().unwrap();
+            assert_eq!(summary.receiver_fault.is_some(), sealed);
+            assert_eq!(summary.close_deadline_us, Some(summary.finish_start_us.unwrap() + 200_000), "relative fallback");
+            let _ = std::fs::remove_file(&path);
+        }
+        assert!(!exp2_l2_require_close_at_cut(true, None), "inert without L2");
+    }
+
     fn unresolved_stage(path: &std::path::Path) -> L2Output {
         let mut fake = FakeSinkConfig::offsets(0, 0);
         fake.drop_terminals = true;
