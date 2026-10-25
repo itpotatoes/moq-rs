@@ -1352,6 +1352,11 @@ fn l2_output_config(args: &Args) -> Result<Option<(PathBuf, skew_moq::l2_output:
             args.arm.as_str()
         );
     }
+    // exp2: the L2 close deadline is T_cut = H + G_report,L2, and G_report,L2
+    // is a §0-3 slot passed by the runner — never the 1-D default window.
+    if exp2 && args.l2_report_window_ms.is_none() {
+        bail!("--l2-sink with the exp2 recorder requires --l2-report-window-ms (= G_report,L2; no default)");
+    }
     if args.render || args.audio {
         bail!("--l2-sink replaces the Stage A bridge; do not combine it with --render/--audio");
     }
@@ -1819,12 +1824,25 @@ fn exp2_flush_side_rows(recorder: &mut Exp2Recorder<Exp2File>, logger: &Arc<Mute
 fn log_exp2_l2_link(
     logger: &Arc<Mutex<JsonlLogger>>,
     stats: Option<&skew_moq::exp2_recorder::Exp2L2Stats>,
+    cut: Option<Exp2L2Cut>,
 ) -> Result<()> {
+    let cut_fields = match cut {
+        Some(c) => format!(
+            ",\"t_cut_us\":{},\"detached_at_us\":{},\"detached\":\"after_seal\"",
+            c.t_cut_us, c.detached_at_us
+        ),
+        None => ",\"t_cut_us\":null,\"detached\":\"at_shutdown\"".to_string(),
+    };
     let body = match stats {
         Some(s) => format!(
-            "\"event\":\"exp2_l2_link\",\"attached\":true,\"rule\":\"one L2 submit per exp2 release row, same t_release_us\",\"held\":{},\"submitted\":{},\"disposed\":{},\"missing_payload\":{},\"cap_refused\":{},\"held_at_seal\":{},\"held_at_detach\":{},\"max_held_bytes\":{},\"held_bytes_cap\":{}",
+            "\"event\":\"exp2_l2_link\",\"attached\":true,\"rule\":\"one L2 submit attempt per exp2 release row (t_release_us <= H), same t_release_us\",\"held\":{},\"submit_attempted\":{},\"submit_accepted\":{},\"discarded_before_submit\":{},\"refused_after_close\":{},\"refused_sink_gone\":{},\"release_after_h\":{},\"disposed\":{},\"missing_payload\":{},\"cap_refused\":{},\"held_at_seal\":{},\"held_at_detach\":{},\"max_held_bytes\":{},\"held_bytes_cap\":{}{cut_fields}",
             s.held,
-            s.submitted,
+            s.submit_attempted,
+            s.submit_accepted,
+            s.discarded_before_submit,
+            s.refused_after_close,
+            s.refused_sink_gone,
+            s.release_after_h,
             s.disposed,
             s.missing_payload,
             s.cap_refused,
@@ -1833,13 +1851,51 @@ fn log_exp2_l2_link(
             s.max_held_bytes,
             skew_moq::exp2_recorder::EXP2_L2_HELD_BYTES_CAP,
         ),
-        None => "\"event\":\"exp2_l2_link\",\"attached\":false".to_string(),
+        None => format!("\"event\":\"exp2_l2_link\",\"attached\":false{cut_fields}"),
     };
     logger
         .lock()
         .map_err(|_| anyhow::anyhow!("RX logger poisoned"))?
         .try_log_info(&body)?;
     Ok(())
+}
+
+/// exp2 + L2: start the L2 close with the absolute deadline `T_cut` (Codex
+/// 155 P1-1; `L2Output::start_close_until`) and record it in the rx log. The
+/// stage stays owned by the caller, so every later fault stamp still reaches
+/// the sentinel. A start after `T_cut` is not hidden: its rx row says so, and
+/// any terminal the lanes accepted in between fails the writer's receipt
+/// check (fail closed).
+fn exp2_l2_start_close(
+    l2: Option<&mut skew_moq::l2_output::L2Output>,
+    cut: Exp2L2Cut,
+    logger: &Arc<Mutex<JsonlLogger>>,
+) {
+    let Some(output) = l2 else { return };
+    let started_us = now_us();
+    let result = output.start_close_until(cut.t_cut_us);
+    let error = result.as_ref().err().map(|e| format!("{e:#}"));
+    if let Some(error) = &error {
+        if !output.receiver_fault_noted() {
+            output.receiver_fault(now_us(), &format!("exp2 L2 close at T_cut failed: {error}"));
+        }
+    }
+    let body = format!(
+        "\"event\":\"exp2_l2_close\",\"rule\":\"absolute close deadline T_cut = H + G_report,L2\",\"t_cut_us\":{},\"detached_at_us\":{},\"close_started_us\":{started_us},\"started_after_t_cut\":{},\"error\":{}",
+        cut.t_cut_us,
+        cut.detached_at_us,
+        started_us >= cut.t_cut_us,
+        error.map(|e| format!("\"{}\"", json_escape(&e))).unwrap_or_else(|| "null".into()),
+    );
+    let logged = logger
+        .lock()
+        .map_err(|_| anyhow::anyhow!("RX logger poisoned"))
+        .and_then(|mut l| l.try_log_info(&body).map_err(anyhow::Error::from));
+    if let Err(e) = logged {
+        if !output.receiver_fault_noted() {
+            output.receiver_fault(now_us(), &format!("exp2_l2_close rx row not written: {e:#}"));
+        }
+    }
 }
 
 /// Static-path drain hook: offer a received (non-warm-up) object to the exp2
@@ -1854,20 +1910,23 @@ fn exp2_drain_admit(
     t_recv: u64,
     failures: &AtomicU64,
     payload: Option<skew_moq::exp2_recorder::Exp2L2Payload>,
+    l2_fault: Option<&skew_moq::l2_output::L2FaultStamp>,
 ) -> Option<(skew_moq::exp2_playout::Modality, u32)> {
     use skew_moq::exp2_recorder::{Admission, Exp2Rx};
     let mut guard = match exp2.lock() {
         Ok(guard) => guard,
         Err(_) => {
-            failures.fetch_add(1, Ordering::Relaxed);
+            exp2_drain_failure(failures, l2_fault, || "exp2 recorder poisoned (drain admit)".into());
             return None;
         }
     };
     let Some(recorder) = guard.as_mut() else {
         // A measurement object before t0 is known: the run cannot be
         // recorded faithfully.
+        exp2_drain_failure(failures, l2_fault, || {
+            "exp2: measurement object before the recorder was ready".into()
+        });
         eprintln!("[rx] exp2: measurement object before the recorder was ready");
-        failures.fetch_add(1, Ordering::Relaxed);
         return None;
     };
     match recorder.admit_with_payload(
@@ -1881,9 +1940,26 @@ fn exp2_drain_admit(
         Ok(Admission::Admitted(m, index)) => Some((m, index)),
         Ok(_) => None,
         Err(error) => {
+            exp2_drain_failure(failures, l2_fault, || format!("exp2 admit failed: {error:#}"));
             eprintln!("[rx] exp2 admit failed: {error:#}");
-            failures.fetch_add(1, Ordering::Relaxed);
             None
+        }
+    }
+}
+
+/// One exp2 drain-side failure: counted (it fails the run at shutdown) and,
+/// with L2, stamped NOW as the receiver fault (Codex 155 P2: the first error
+/// time is the time the drain saw it, not the later shutdown join), before
+/// any stderr write. Inert without L2 apart from the count.
+fn exp2_drain_failure(
+    failures: &AtomicU64,
+    l2_fault: Option<&skew_moq::l2_output::L2FaultStamp>,
+    cause: impl FnOnce() -> String,
+) {
+    failures.fetch_add(1, Ordering::Relaxed);
+    if let Some(stamp) = l2_fault {
+        if !stamp.receiver_fault_noted() {
+            stamp.receiver_fault(now_us(), &cause());
         }
     }
 }
@@ -1894,6 +1970,7 @@ fn exp2_drain_ingress_drop(
     at_us: u64,
     reason: &str,
     failures: &AtomicU64,
+    l2_fault: Option<&skew_moq::l2_output::L2FaultStamp>,
 ) {
     let ok = exp2
         .lock()
@@ -1901,7 +1978,7 @@ fn exp2_drain_ingress_drop(
         .and_then(|mut guard| guard.as_mut().map(|r| r.ingress_drop(slot.0, slot.1, at_us, reason)))
         .is_some_and(|result| result.is_ok());
     if !ok {
-        failures.fetch_add(1, Ordering::Relaxed);
+        exp2_drain_failure(failures, l2_fault, || format!("exp2 ingress drop ({reason}) not recorded"));
     }
 }
 
@@ -1961,20 +2038,78 @@ fn exp2_s1_action(
 /// recorder, then drives it — admitted arrivals (core methods), wall-clock
 /// ticks, the H seal and the closing sentinel at `H + G_report`.  Returns
 /// once the sentinel is written.
+/// The exp2 + L2 hand-over at the seal: what the static exp2 task gives the
+/// receiver's main task so that the L2 stage closes at `T_cut`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Exp2L2Cut {
+    /// `T_cut = H + G_report,L2` (= the recorder's `end_at_us`): the absolute
+    /// L2 close deadline, the same instant for every method of the run.
+    t_cut_us: u64,
+    /// When the link was detached (after the seal: no submit can follow).
+    detached_at_us: u64,
+}
+
+/// exp2 + L2: `--l2-report-window-ms` and the exp2 meta `g_report_us` are
+/// both G_report,L2 (a §0-3 slot passed by the runner); they must agree, and
+/// `T_cut = H + G_report,L2` is the recorder's `end_at_us`. No default.
+fn exp2_l2_window_matches(window_us: u64, horizon_us: u64, end_at_us: u64) -> Result<u64> {
+    let g_report_us = end_at_us.saturating_sub(horizon_us);
+    anyhow::ensure!(
+        window_us == g_report_us,
+        "--l2-report-window-ms ({window_us} us) must equal the exp2 meta g_report_us \
+         ({g_report_us} us): both are G_report,L2 and the L2 close deadline is T_cut = H + G_report,L2"
+    );
+    Ok(end_at_us)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_exp2_static_task(
+    cli: Arc<Exp2Cli>,
+    exp2: Exp2Shared,
+    input: Option<mpsc::Receiver<Exp2Input>>,
+    s1_done: Arc<AtomicBool>,
+    logger: Arc<Mutex<JsonlLogger>>,
+    // The L2 output stage's submitter, moved into the recorder (L2 link)
+    // before any object can be admitted; detached by this task right after
+    // the seal (no exp2 release can follow), before the L2 close starts.
+    l2: Option<skew_moq::l2_output::L2Submitter>,
+    // The L2 fault stamp (Codex 155 P2): a recorder error is stamped when
+    // this task returns it, not when `main` later joins the task.
+    l2_fault: Option<skew_moq::l2_output::L2FaultStamp>,
+    // G_report,L2 from `--l2-report-window-ms` (checked against the meta).
+    l2_window_us: Option<u64>,
+    // Where the seal hand-over goes (`main` starts the L2 close until T_cut).
+    l2_cut: Option<tokio::sync::oneshot::Sender<Exp2L2Cut>>,
+) -> Result<()> {
+    let result = run_exp2_static_task_body(
+        cli, exp2, input, s1_done, logger, l2, l2_window_us, l2_cut,
+    )
+    .await;
+    if let (Err(error), Some(stamp)) = (&result, &l2_fault) {
+        if !stamp.receiver_fault_noted() {
+            stamp.receiver_fault(now_us(), &format!("exp2 recorder failed: {error:#}"));
+        }
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_exp2_static_task_body(
     cli: Arc<Exp2Cli>,
     exp2: Exp2Shared,
     mut input: Option<mpsc::Receiver<Exp2Input>>,
     s1_done: Arc<AtomicBool>,
     logger: Arc<Mutex<JsonlLogger>>,
-    // The L2 output stage's submitter, moved into the recorder (L2 link)
-    // before any object can be admitted; the receiver detaches it after this
-    // task ends and before `L2Output::finish`.
     l2: Option<skew_moq::l2_output::L2Submitter>,
+    l2_window_us: Option<u64>,
+    mut l2_cut: Option<tokio::sync::oneshot::Sender<Exp2L2Cut>>,
 ) -> Result<()> {
     let phase = exp2_wait_t0(&cli).await?;
     let mut recorder = exp2_open_recorder(&cli, phase.t0_us)?;
     if let Some(l2) = l2 {
+        if let Some(window_us) = l2_window_us {
+            exp2_l2_window_matches(window_us, recorder.horizon_us(), recorder.end_at_us())?;
+        }
         recorder.attach_l2(l2).context("attach the exp2 L2 link")?;
     }
     let (horizon, end_at) = (recorder.horizon_us(), recorder.end_at_us());
@@ -2033,6 +2168,18 @@ async fn run_exp2_static_task(
         let now = now_us();
         recorder.advance(now)?;
         exp2_flush_side_rows(recorder, &logger)?;
+        // exp2 + L2: after the seal no release row (and so no L2 submit) can
+        // follow: detach the link now and hand T_cut to `main`, which starts
+        // the L2 close with that absolute deadline while the drains go on.
+        if recorder.is_sealed() && recorder.l2_stats().is_some() {
+            let t_cut_us = recorder.end_at_us();
+            let stats = recorder.detach_l2();
+            let cut = Exp2L2Cut { t_cut_us, detached_at_us: now_us() };
+            log_exp2_l2_link(&logger, stats.as_ref(), Some(cut))?;
+            if let Some(tx) = l2_cut.take() {
+                let _ = tx.send(cut);
+            }
+        }
         if recorder.is_sealed() && now >= recorder.end_at_us() {
             exp2_import_sender_wire(&cli, recorder)?;
             if recorder.finish(now, skew_moq::exp2_recorder::current_rss_bytes())? {
@@ -2206,16 +2353,21 @@ async fn run_playout_scheduler(
     audio: bool,
     exp2: Option<Exp2Shared>,
     // Owned by the task so releases in the post-FIN drain are submitted too;
-    // dropped when the task returns.
+    // dropped when the task returns. `None` with exp2 (the recorder submits).
     l2: Option<skew_moq::l2_output::L2Submitter>,
+    // The L2 fault stamp, independent of the submit hook (Codex 155 P2): with
+    // exp2 the hook is off but a scheduler error must still be stamped when
+    // it happens. `Some` exactly when an L2 stage exists (1-D: whenever `l2`
+    // is `Some`, so the 1-D stamp is unchanged).
+    l2_fault: Option<skew_moq::l2_output::L2FaultStamp>,
 ) -> Result<PlayoutStats> {
     let result =
         run_playout_scheduler_body(config, input, logger, bridge, render, audio, exp2, &l2).await;
     // Registration §6-1: the moment the scheduler error is recorded (the task
     // returning it), not when `main` later joins the task. Inert without L2.
-    if let (Err(error), Some(l2)) = (&result, &l2) {
-        if !l2.receiver_fault_noted() {
-            l2.receiver_fault(now_us(), &format!("S1 scheduler failed: {error:#}"));
+    if let (Err(error), Some(stamp)) = (&result, &l2_fault) {
+        if !stamp.receiver_fault_noted() {
+            stamp.receiver_fault(now_us(), &format!("S1 scheduler failed: {error:#}"));
         }
     }
     result
@@ -6406,6 +6558,13 @@ where
                     .and_then(|phase| {
                         let mut recorder = exp2_open_recorder(&cli, phase.t0_us)?;
                         if let Some(output) = l2_output.as_ref() {
+                            if let Some(ms) = args.l2_report_window_ms {
+                                exp2_l2_window_matches(
+                                    ms_to_us(ms, "l2-report-window-ms")?,
+                                    recorder.horizon_us(),
+                                    recorder.end_at_us(),
+                                )?;
+                            }
                             recorder
                                 .attach_l2(output.submitter())
                                 .context("attach the exp2 L2 link")?;
@@ -6578,6 +6737,18 @@ where
             if let Err(error) = step {
                 keep_first_cause(&mut state.outcome_error, error);
                 continue;
+            }
+            // exp2 + L2 (Codex 155 P1-1), exactly as the static path: after
+            // the seal no release (and so no L2 submit) can follow: detach the
+            // link and start the L2 close with the absolute deadline T_cut.
+            if recorder.is_sealed() && recorder.l2_stats().is_some() {
+                let t_cut_us = recorder.end_at_us();
+                let stats = recorder.detach_l2();
+                let cut = Exp2L2Cut { t_cut_us, detached_at_us: now_us() };
+                if let Err(error) = log_exp2_l2_link(&logger, stats.as_ref(), Some(cut)) {
+                    keep_first_cause(&mut state.outcome_error, error);
+                }
+                exp2_l2_start_close(l2_output.as_mut(), cut, &logger);
             }
         }
         // FSM requests: every decision is logged; the latest one is the
@@ -6835,8 +7006,13 @@ where
                 )
             });
         }
+        // Normally detached at the seal; this catches a run that never
+        // sealed (its L2 close falls back to `finish`'s 1-D relative rule;
+        // such a run has failed already).
         let detached = state.recorder.as_mut().and_then(|r| r.detach_l2());
-        log_exp2_l2_link(&logger, detached.as_ref())?;
+        if detached.is_some() {
+            log_exp2_l2_link(&logger, detached.as_ref(), None)?;
+        }
     }
     if let Some(output) = l2_output.take() {
         if let Err(e) = finish_l2_output(output).await {
@@ -8221,11 +8397,30 @@ async fn receiver_main() -> Result<()> {
     } else {
         (None, None)
     };
-    // Experiment 2 with L2: the submits come from the recorder's release rows
-    // (one per exp2 release row, same time; exp2_recorder L2 link) for every
-    // method, so the 1-D release hooks (B1 drain, S1 dispatch) stay off and
-    // the drains hand each admitted object's bytes to the recorder instead.
+    // Experiment 2 with L2: the submit attempts come from the recorder's
+    // release rows (one per exp2 release row, same t_release_us; exp2_recorder
+    // L2 link) for every method, so the 1-D release hooks (B1 drain, S1
+    // dispatch) stay off and the drains hand each admitted object's bytes to
+    // the recorder instead. The fault stamps stay on (Codex 155 P2).
     let exp2_l2 = exp2_shared.is_some() && l2_submitter.is_some();
+    // exp2 + L2 (Codex 155 P1-1): the exp2 task hands T_cut = H + G_report,L2
+    // over right after the seal; `main` then starts the L2 close with that
+    // ABSOLUTE deadline while the drains go on (the sender's 30 s drain no
+    // longer keeps the L2 devices open), and keeps every fault stamp valid
+    // because it keeps owning the stage until `finish` joins it at shutdown.
+    let (exp2_l2_cut_tx, exp2_l2_cut_rx) = if exp2_l2 {
+        let (tx, rx) = tokio::sync::oneshot::channel::<Exp2L2Cut>();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+    let exp2_l2_window_us = if exp2_l2 {
+        args.l2_report_window_ms
+            .map(|ms| ms_to_us(ms, "l2-report-window-ms"))
+            .transpose()?
+    } else {
+        None
+    };
     let mut exp2_task = match (&exp2_cli, &exp2_shared) {
         (Some(cli), Some(shared)) => Some(tokio::spawn(run_exp2_static_task(
             cli.clone(),
@@ -8234,6 +8429,9 @@ async fn receiver_main() -> Result<()> {
             exp2_s1_done.clone(),
             logger.clone(),
             l2_submitter.clone(),
+            l2_output.as_ref().map(|output| output.fault_stamp()),
+            exp2_l2_window_us,
+            exp2_l2_cut_tx,
         ))),
         _ => None,
     };
@@ -8447,6 +8645,8 @@ async fn receiver_main() -> Result<()> {
             // `l2_output_config` admits only s1/s2/s3r among these arms; with
             // exp2 (S1) the recorder submits instead (`l2_release_hook` None).
             l2_release_hook.clone(),
+            // The fault stamp stays on in both modes (Codex 155 P2).
+            l2_output.as_ref().map(|output| output.fault_stamp()),
         ));
         println!(
             "[rx] S1 scheduler: D_play={}ms startup={}ms late={}ms policy={} objects/track={} span={}ms",
@@ -8671,17 +8871,17 @@ async fn receiver_main() -> Result<()> {
                             bytes: logical_obj.clone(),
                             wire_track: None,
                         });
-                        exp2_drain_admit(exp2, h, t, &exp2_failures, payload)
+                        exp2_drain_admit(exp2, h, t, &exp2_failures, payload, l2_fault.as_ref())
                     });
                     if let (Some(slot), Some(tx), Some(exp2)) = (exp2_slot, &exp2_tx, &exp2_shared) {
                         let input = Exp2Input { modality: slot.0, index: slot.1, t_recv_us: t };
                         match tx.try_send(input) {
                             Ok(()) => {}
                             Err(mpsc::error::TrySendError::Full(_)) => {
-                                exp2_drain_ingress_drop(exp2, slot, now_us().max(t), "ingress_queue_full", &exp2_failures);
+                                exp2_drain_ingress_drop(exp2, slot, now_us().max(t), "ingress_queue_full", &exp2_failures, l2_fault.as_ref());
                             }
                             Err(mpsc::error::TrySendError::Closed(_)) => {
-                                exp2_drain_ingress_drop(exp2, slot, now_us().max(t), "scheduler_closed", &exp2_failures);
+                                exp2_drain_ingress_drop(exp2, slot, now_us().max(t), "scheduler_closed", &exp2_failures, l2_fault.as_ref());
                                 exp2_failures.fetch_add(1, Ordering::Relaxed);
                             }
                         }
@@ -8698,7 +8898,7 @@ async fn receiver_main() -> Result<()> {
                                 ingress_drops.fetch_add(1, Ordering::Relaxed);
                                 let h = scheduled.header;
                                 if let (Some(slot), Some(exp2)) = (exp2_slot, &exp2_shared) {
-                                    exp2_drain_ingress_drop(exp2, slot, now_us().max(scheduled.t_recv), "ingress_queue_full", &exp2_failures);
+                                    exp2_drain_ingress_drop(exp2, slot, now_us().max(scheduled.t_recv), "ingress_queue_full", &exp2_failures, l2_fault.as_ref());
                                 }
                                 let logged = logger.lock().unwrap().try_log_drop(
                                     scheduled.track_name(), h.tier, h.seq, h.pts_us, h.event_id,
@@ -8720,7 +8920,7 @@ async fn receiver_main() -> Result<()> {
                                 ingress_drops.fetch_add(1, Ordering::Relaxed);
                                 let h = scheduled.header;
                                 if let (Some(slot), Some(exp2)) = (exp2_slot, &exp2_shared) {
-                                    exp2_drain_ingress_drop(exp2, slot, now_us().max(scheduled.t_recv), "scheduler_closed", &exp2_failures);
+                                    exp2_drain_ingress_drop(exp2, slot, now_us().max(scheduled.t_recv), "scheduler_closed", &exp2_failures, l2_fault.as_ref());
                                 }
                                 let _ = logger.lock().unwrap().try_log_drop(
                                     scheduled.track_name(), h.tier, h.seq, h.pts_us, h.event_id,
@@ -8785,27 +8985,51 @@ async fn receiver_main() -> Result<()> {
     // happened and a batch runner's "abort on non-zero exit" never fired on the
     // rx side. Each outcome is now classified and reported.
     let drain_fault = l2_output.as_ref().map(|output| output.fault_stamp());
-    let all_drains = join_rx_drains(&mut drains, &drain_fault);
+    // exp2 + L2 only: the seal hand-over (T_cut). `None` in every other mode,
+    // where its select branch is disabled and never polled, so the wait
+    // below ends on the first of the three historical branches exactly as
+    // before (the loop runs once).
+    let mut exp2_l2_cut_rx = exp2_l2_cut_rx;
+    let mut exp2_l2_cut_done = false;
     // L2 (registration §6-1; 1-D §11-7 M2 work order (7), Codex 107): the
     // session/max-duration end is stamped inside its select arm at the
     // moment it is decided, BEFORE the stderr write (a blocked stderr pipe
     // would otherwise delay the recorded time). Inert without L2.
-    let drained = tokio::select! {
-        ends = all_drains => Drained::Ends(ends),
-        r = &mut session_run => {
-            let detail = format!("{r:?}");
-            note_l2_fault(l2_output.as_ref(), || {
-                format!("session ended before tracks closed: {detail}")
-            });
-            eprintln!("[rx] session ended before tracks closed: {detail}");
-            Drained::SessionArm(detail)
-        }
-        _ = tokio::time::sleep_until(deadline) => {
-            note_l2_fault(l2_output.as_ref(), || {
-                "max-duration reached — reception is INCOMPLETE".to_string()
-            });
-            eprintln!("[rx] max-duration reached — reception is INCOMPLETE");
-            Drained::Timeout
+    let drained = {
+        let all_drains = join_rx_drains(&mut drains, &drain_fault);
+        tokio::pin!(all_drains);
+        loop {
+            let cut_armed = exp2_l2_cut_rx.is_some() && !exp2_l2_cut_done;
+            let cut_wait = async {
+                match exp2_l2_cut_rx.as_mut() {
+                    Some(rx) => rx.await.ok(),
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                ends = &mut all_drains => break Drained::Ends(ends),
+                r = &mut session_run => {
+                    let detail = format!("{r:?}");
+                    note_l2_fault(l2_output.as_ref(), || {
+                        format!("session ended before tracks closed: {detail}")
+                    });
+                    eprintln!("[rx] session ended before tracks closed: {detail}");
+                    break Drained::SessionArm(detail);
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    note_l2_fault(l2_output.as_ref(), || {
+                        "max-duration reached — reception is INCOMPLETE".to_string()
+                    });
+                    eprintln!("[rx] max-duration reached — reception is INCOMPLETE");
+                    break Drained::Timeout;
+                }
+                cut = cut_wait, if cut_armed => {
+                    exp2_l2_cut_done = true;
+                    if let Some(cut) = cut {
+                        exp2_l2_start_close(l2_output.as_mut(), cut, &logger);
+                    }
+                }
+            }
         }
     };
 
@@ -8887,15 +9111,21 @@ async fn receiver_main() -> Result<()> {
             scheduler_finalize_failed = true;
         }
     }
-    // Experiment 2 + L2: the recorder's L2 link holds a submitter clone;
-    // detach it now (every exp2 release is <= H, long before here) so that
-    // `L2Output::finish` below sees no live producer, and record its counters
-    // in the rx log (the exp2 JSONL schema stays pinned).
+    // Experiment 2 + L2: the recorder's L2 link holds a submitter clone until
+    // it is detached, which `L2Output::finish` below requires (no live
+    // producer); its counters go to the rx log (the exp2 JSONL schema stays
+    // pinned).
     if exp2_l2 {
+        // Normally the exp2 task detached the link at the seal; this only
+        // catches a run that never sealed (the L2 close then falls back to
+        // `finish` below, with the 1-D relative deadline — such a run has
+        // already failed through its exp2 outcome).
         let detached = exp2_shared
             .as_ref()
             .and_then(|shared| shared.lock().ok().and_then(|mut guard| guard.as_mut().and_then(|r| r.detach_l2())));
-        log_exp2_l2_link(&logger, detached.as_ref())?;
+        if detached.is_some() {
+            log_exp2_l2_link(&logger, detached.as_ref(), None)?;
+        }
     }
 
     let n_pc = counts[0].load(Ordering::Relaxed);
@@ -13852,7 +14082,8 @@ mod s3_control_loop_tests {
         if l2 {
             cli.extend(strings(&[
                 "--l2-sink", "fake", "--l2-fake-pc-offset-us", "1000",
-                "--l2-fake-haptic-offset-us", "2000", "--l2-log",
+                "--l2-fake-haptic-offset-us", "2000", "--l2-report-window-ms", "1000",
+                "--l2-log",
             ]));
             cli.push(l2_log.display().to_string());
         }
@@ -14021,8 +14252,42 @@ mod s3_control_loop_tests {
             .find(|r| r["event"] == "exp2_l2_link")
             .expect("exp2_l2_link rx row");
         assert_eq!(link["attached"], true);
-        assert_eq!(link["submitted"].as_u64().unwrap() as usize, releases.len());
+        assert_eq!(link["submit_attempted"].as_u64().unwrap() as usize, releases.len());
+        assert_eq!(link["submit_accepted"], link["submit_attempted"]);
+        assert_eq!(link["discarded_before_submit"], 0);
         assert_eq!(link["missing_payload"], 0);
+    }
+
+    /// Codex 155 P1-1 (P1): the ledger seals at H; the link is detached
+    /// right there and the L2 close starts with the ABSOLUTE deadline
+    /// T_cut = H + G_report,L2 = t0 + 41.4 s, which the L2 sentinel carries
+    /// to the microsecond; the run itself still fails closed (unresolved
+    /// switch at H + G_report), and its fault reaches the sentinel.
+    #[tokio::test]
+    async fn exp2_p1_l2_closes_at_the_absolute_t_cut() {
+        let t0 = now_us() - 39_550_000;
+        let t_cut = t0 + 40_000_000 + 400_000 + 1_000_000;
+        let (result, rows, l2) = p1_loop_case_with("p1-tcut", t0, 39_990, 2_500, false, true).await;
+        let error = format!("{:#}", result.expect_err("an unresolved switch fails the run"));
+        assert!(error.contains("unresolved at H + G_report"), "{error}");
+        assert!(rows.iter().any(|r| r["role"] == "no_object"), "the ledger sealed");
+        let (l2, legacy) = l2.expect("L2 rows");
+        let sentinel = l2.last().unwrap();
+        assert_eq!(sentinel["role"], "instrumentation_end");
+        assert_eq!(sentinel["close_deadline_us"].as_u64(), Some(t_cut), "µs-exact T_cut");
+        let start = sentinel["finish_start_us"].as_u64().unwrap();
+        assert!(start >= t0 + 40_400_000 && start < t_cut, "close started after the seal, before T_cut");
+        assert!(sentinel["receiver_fault_cause"].as_str().unwrap().contains("unresolved"), "{sentinel}");
+        let close = legacy.iter().find(|r| r["event"] == "exp2_l2_close").expect("exp2_l2_close row");
+        assert_eq!(close["t_cut_us"].as_u64(), Some(t_cut));
+        assert_eq!(close["started_after_t_cut"], false);
+        assert_eq!(close["error"], serde_json::Value::Null);
+        let link = legacy.iter().find(|r| r["event"] == "exp2_l2_link").expect("exp2_l2_link row");
+        assert_eq!(link["detached"], "after_seal");
+        assert_eq!(link["t_cut_us"].as_u64(), Some(t_cut));
+        for r in l2.iter().filter(|r| matches!(r["role"].as_str(), Some("submit" | "output"))) {
+            assert!(r["t_submit_us"].as_u64().unwrap() < t_cut);
+        }
     }
 
     /// Codex 85: a switch requested late in the window whose SUBSCRIBEs are
@@ -16445,12 +16710,17 @@ mod exp2_receiver_tests {
             .map(|s| s.to_string())
             .chain(std::iter::once(log.display().to_string()))
             .collect();
+        let window: Vec<String> = vec!["--l2-report-window-ms".into(), "1500".into()];
         for arm in ["b1", "s1", "s3npa-prime", "p0np", "p0", "p1"] {
             let mut extra = exp2_flags(&meta, "345000");
             extra.extend(l2.clone());
+            // exp2: G_report,L2 must be passed explicitly (no default)
+            assert!(l2_output_config(&parse(arm, &extra)).is_err(), "{arm} without --l2-report-window-ms");
+            extra.extend(window.clone());
             let (path, config) = l2_output_config(&parse(arm, &extra)).unwrap().unwrap();
             assert_eq!(path, log);
             assert_eq!(config.method, arm);
+            assert_eq!(config.report_window_us, 1_500_000);
         }
         for arm in ["s3npa-prime", "p0np", "p0", "p1"] {
             assert!(l2_output_config(&parse(arm, &l2)).is_err(), "{arm} without the recorder");
@@ -16720,7 +16990,7 @@ mod exp2_receiver_tests {
         let header = pack_header(TRACK_PC, 2, 0, 0, 1, t0, 4);
         let header = unpack_header(&header).unwrap();
         let t_recv = now_us();
-        let slot = exp2_drain_admit(&shared, header, t_recv, &failures, None);
+        let slot = exp2_drain_admit(&shared, header, t_recv, &failures, None, None);
         assert_eq!(slot, Some((Modality::Pc, 0)));
         let legacy_path = tmp("s1-legacy.jsonl");
         let logger = Arc::new(Mutex::new(
@@ -16759,6 +17029,121 @@ mod exp2_receiver_tests {
         assert_eq!(rows.iter().filter(|r| r["role"] == "rx").count(), 1);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&legacy_path);
+    }
+
+    /// exp2 + L2, static task: `--l2-report-window-ms` must equal the meta
+    /// `g_report_us` (both G_report,L2; T_cut = H + G_report,L2); a mismatch
+    /// is a recorder error, stamped as the L2 receiver fault when the task
+    /// returns it (Codex 155 P2: not at the later main join).
+    #[tokio::test]
+    async fn exp2_static_task_refuses_a_g_report_mismatch_and_stamps_it_at_once() {
+        use skew_moq::exp2_recorder::{canonical_json_bytes, haptic_slot_identity, pc_slot_identity};
+        use skew_moq::l2_output::{FakeSinkConfig, L2Config, L2Output, L2SinkKind, L2Sinks};
+        let dir = tmp("static-window");
+        std::fs::create_dir_all(&dir).unwrap();
+        let created = now_us();
+        let warmup = created + 300_000;
+        let t0 = warmup + 3_000_000;
+        let phase = dir.join("phase_control.json");
+        std::fs::write(
+            &phase,
+            format!(
+                "{{\"schema_version\":1,\"batch_id\":\"b\",\"run_id\":\"t\",\"arm\":\"M\",\"created_us\":{created},\"warmup_start_us\":{warmup},\"t0_us\":{t0}}}\n"
+            ),
+        )
+        .unwrap();
+        let pc: Vec<serde_json::Value> = (0..1200u64)
+            .map(|i| {
+                let (pts, e) = pc_slot_identity(i);
+                serde_json::json!({"i": i, "pts_us": pts, "event_id": e, "ref_us": t0 + pts})
+            })
+            .collect();
+        let hap: Vec<serde_json::Value> = (0..3600u64)
+            .map(|k| {
+                let (pts, e) = haptic_slot_identity(k);
+                serde_json::json!({"k": k, "pts_us": pts, "event_id": e,
+                    "anchor_i": if k % 3 == 0 { serde_json::json!(k / 3) } else { serde_json::Value::Null }})
+            })
+            .collect();
+        let ledger = dir.join("opportunities.exp2.json");
+        std::fs::write(
+            &ledger,
+            canonical_json_bytes(&serde_json::json!({"contract": "exp2-contract-v4",
+                "run_id": "t", "t0_us": t0, "pc": pc, "haptic": hap})),
+        )
+        .unwrap();
+        let meta = dir.join("meta.json");
+        std::fs::write(
+            &meta,
+            serde_json::json!({"batch_id": "b", "campaign": "L1-R", "condition": "c",
+                "block_id": "k", "trajectory_seed": 1, "attempt": 1,
+                "planned_predecessor": null, "actual_predecessor": null,
+                "epsilon_output_us": 40000, "g_report_us": 1000000,
+                "threshold_profile": "middle", "thresh_pos_ms": 77.0, "thresh_neg_ms": -118.0,
+                "threshold_citation_id": "di_luca_2019", "threshold_verified": true})
+            .to_string(),
+        )
+        .unwrap();
+        let flags: Vec<String> = [
+            ("--exp2-out", dir.join("exp2.jsonl")),
+            ("--opportunities", ledger),
+            ("--exp2-meta", meta),
+            ("--phase-control", phase),
+        ]
+        .into_iter()
+        .flat_map(|(f, p)| [f.to_string(), p.display().to_string()])
+        .chain(["--batch-id".into(), "b".into(), "--delta-max-us".into(), "345000".into()])
+        .collect();
+        let args = parse("b1", &flags);
+        let cli = Arc::new(exp2_cli_config(&args).unwrap().unwrap());
+        let l2_path = dir.join("l2.jsonl");
+        let output = L2Output::start(
+            &l2_path,
+            L2Config {
+                run_id: "t".into(),
+                method: "b1".into(),
+                sinks: L2Sinks::both(L2SinkKind::Fake),
+                fake: Some(FakeSinkConfig::offsets(0, 0)),
+                alsa: None,
+                wayland: None,
+                queue_capacity: 8,
+                row_capacity: 64,
+                report_window_us: 2_000_000,
+                max_tracked_objects: 64,
+            },
+        )
+        .unwrap();
+        let logger = Arc::new(Mutex::new(
+            JsonlLogger::new(
+                &dir.join("rx.jsonl"), "t", "moq", "rx", None, 0.0, 0.0, 0.0, 1, 30, 90, 1, None,
+                None, Some("both"), Some(TERM_PROTOCOL_V), None, None, None,
+            )
+            .unwrap(),
+        ));
+        let shared: Exp2Shared = Arc::new(Mutex::new(None));
+        let result = run_exp2_static_task(
+            cli,
+            shared.clone(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+            logger,
+            Some(output.submitter()),
+            Some(output.fault_stamp()),
+            Some(2_000_000),
+            None,
+        )
+        .await;
+        let returned = now_us();
+        let error = format!("{:#}", result.expect_err("G_report mismatch"));
+        assert!(error.contains("--l2-report-window-ms"), "{error}");
+        assert!(shared.lock().unwrap().is_none(), "the recorder never went live");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        note_l2_fault(Some(&output), || "main join fallback".into());
+        let summary = output.finish().unwrap();
+        let (t, cause) = summary.receiver_fault.expect("a receiver fault");
+        assert!(t <= returned, "stamped when the task returned the error");
+        assert!(cause.starts_with("exp2 recorder failed:"), "{cause}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Experiment 2 + L2, static path (drain admit -> recorder -> L2 link):
@@ -16830,7 +17215,7 @@ mod exp2_receiver_tests {
             for i in 0..2u32 {
                 let (header, bytes) = object(i);
                 let payload = Exp2L2Payload { bytes: bytes.clone(), wire_track: None };
-                let slot = exp2_drain_admit(&shared, header, t_recv, &failures, Some(payload));
+                let slot = exp2_drain_admit(&shared, header, t_recv, &failures, Some(payload), None);
                 assert_eq!(slot, Some((Modality::Pc, i)));
                 objects.push(PlayoutObject { header, t_recv, bytes });
             }
@@ -16882,7 +17267,7 @@ mod exp2_receiver_tests {
             if method == Exp2Method::B1 {
                 assert!(releases.iter().all(|k| k.3 == t_recv), "B1 release := t_recv");
             }
-            assert_eq!((link.submitted, link.missing_payload), (expected as u64, 0));
+            assert_eq!((link.submit_attempted, link.submit_accepted, link.missing_payload), (expected as u64, expected as u64, 0));
             assert_eq!(link.held_at_detach, 2 - expected as u64 - u64::from(method == Exp2Method::S1));
             assert!(summary.integrity_ok(L2Sinks::both(L2SinkKind::Fake)), "{summary:?}");
             for p in [&path, &l2_path, &legacy_path] {
@@ -16934,6 +17319,55 @@ mod l2_hook_tests {
     fn object(track_id: u8, tier: u16, seq: u32, pts_us: u64, event_id: u32, t_recv: u64) -> PlayoutObject {
         let header = unpack_header(&pack_header(track_id, tier, seq, pts_us, event_id, t_recv, 4)).unwrap();
         PlayoutObject { header, t_recv, bytes: Bytes::from(vec![0u8; HDR + 4]) }
+    }
+
+    /// Codex 155 P2: the S1 scheduler's error is stamped AT the error by the
+    /// independent fault stamp, both with the 1-D submit hook (unchanged) and
+    /// with exp2's hook off (`l2 = None`); the later main-join fallback never
+    /// becomes the first cause. Error injected: a poisoned exp2 recorder.
+    #[tokio::test]
+    async fn s1_scheduler_error_is_stamped_at_the_error_with_or_without_the_submit_hook() {
+        for with_hook in [false, true] {
+            let path = tmp("s1-fault-stamp");
+            let output = fake_output(&path, 0, 0);
+            let logger = rx_logger(&tmp("s1-fault-stamp-rx"));
+            let shared: Exp2Shared = Arc::new(Mutex::new(None));
+            let poison = shared.clone();
+            let _ = std::thread::spawn(move || {
+                let _guard = poison.lock().unwrap();
+                panic!("injected recorder poison (test)");
+            })
+            .join();
+            let (tx, rx) = mpsc::channel(4);
+            tx.send(object(TRACK_PC, 2, 0, 0, 1, now_us())).await.unwrap();
+            drop(tx);
+            let config = PlayoutConfig {
+                d_play_us: 100_000,
+                startup_timeout_us: 1_000_000,
+                startup_rearm_limit: 1,
+                late_tolerance_us: 10_000,
+                max_objects_per_track: 10,
+                max_span_us: 1_000_000,
+                late_policy: skew_moq::playout::LatePolicy::DropLate,
+            };
+            let before = now_us();
+            let result = run_playout_scheduler(
+                config, rx, logger, None, false, false, Some(shared),
+                with_hook.then(|| output.submitter()),
+                Some(output.fault_stamp()),
+            )
+            .await;
+            let returned = now_us();
+            assert!(result.is_err(), "the poisoned recorder fails the scheduler");
+            assert!(output.receiver_fault_noted(), "hook={with_hook}: stamped by the task");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            note_l2_fault(Some(&output), || "main join fallback".into());
+            let summary = output.finish().unwrap();
+            let (t, cause) = summary.receiver_fault.expect("a receiver fault");
+            assert!(before <= t && t <= returned, "hook={with_hook}: fault at the error, not the join");
+            assert!(cause.contains("S1 scheduler failed"), "{cause}");
+            let _ = std::fs::remove_file(&path);
+        }
     }
 
     /// Release, release, drop. `t_recv` is far in the future so

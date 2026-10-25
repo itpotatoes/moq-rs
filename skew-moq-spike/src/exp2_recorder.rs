@@ -38,7 +38,7 @@ use crate::exp2_playout::{
     CommittedDue, Exp2Decision, Exp2Mode, Exp2OpportunityLedger, Exp2Params, Exp2Playout,
     Exp2SchedulerLedger, Modality, SchedulerTerminal,
 };
-use crate::l2_output::{L2Identity, L2Modality, L2Submitter};
+use crate::l2_output::{L2Identity, L2Modality, L2SubmitOutcome, L2Submitter};
 use crate::s3_controller::HapticMode;
 use crate::{is_warmup_seq, Header, HDR, TRACK_HAPTIC, TRACK_PC};
 
@@ -525,13 +525,20 @@ pub struct Exp2RecorderStats {
 //
 // Rule: while an L2 output stage is attached, every exp2 `release` row is
 // followed (after its write completed, no await in between) by exactly one
-// L2 submit of the same object with the same `t_release_us`; nothing else is
-// ever submitted. So the L2 ledger and the exp2 release ledger share one
-// release definition for all six methods, and "submitted <= H" holds by
-// construction (registration §4-5). The admitted copy's bytes are held from
-// admission until the slot's terminal row: a release submits them, any other
-// terminal (drop, sealing, seal drop) disposes of them, and the seal disposes
-// of whatever is left.
+// L2 SUBMIT ATTEMPT (`submit_payload`) of the same object with the same
+// `t_release_us`; nothing else is ever handed to the L2 stage. So the L2
+// ledger and the exp2 release ledger share one release definition for all six
+// methods. The inclusion rule is the LOGICAL release time: a release row
+// exists only for `t_release_us <= H` (the release decision). The actual
+// `t_submit_us` the L2 stage stamps is recorded as is and CAN be later than H
+// (a delayed row write, a busy lock): nothing here bounds it. An attempt ends
+// as an accepted submit (the lane writes its `submit` row), an
+// `explicit_discard(output_queue_full)` before submit (a performance outcome
+// of a full bounded queue), or a refused submit (after close / sink gone, an
+// L2 integrity failure); the link counts each outcome separately. The
+// admitted copy's bytes are held from admission until the slot's terminal
+// row: a release hands them over, any other terminal (drop, sealing, seal
+// drop) disposes of them, and the seal disposes of whatever is left.
 
 /// Upper bound on the payload bytes held between admission and terminal. An
 /// implementation bound (memory safety), not an experimental parameter: a held
@@ -557,8 +564,21 @@ pub struct Exp2L2Payload {
 pub struct Exp2L2Stats {
     /// Payloads taken into the store at admission.
     pub held: u64,
-    /// L2 submits, one per release row written while attached.
-    pub submitted: u64,
+    /// `submit_payload` calls, one per release row written while attached.
+    pub submit_attempted: u64,
+    /// Attempts the L2 stage accepted (its lane writes the `submit` row).
+    pub submit_accepted: u64,
+    /// Attempts recorded as `explicit_discard(output_queue_full)` before
+    /// submit (the bounded submission queue was full).
+    pub discarded_before_submit: u64,
+    /// Attempts refused because the L2 close had already started (an L2
+    /// integrity failure `submit_after_close`).
+    pub refused_after_close: u64,
+    /// Attempts refused because the lane is gone (`sink_gone`).
+    pub refused_sink_gone: u64,
+    /// Attempts whose release time was later than H (always 0: a release
+    /// row is written only for `t_release_us <= H`; counted, not assumed).
+    pub release_after_h: u64,
     /// Payloads disposed of by a non-release terminal row.
     pub disposed: u64,
     /// Release rows without a held payload (a recorded receiver fault).
@@ -852,7 +872,7 @@ impl<W: Write> Exp2Recorder<W> {
         let h = held.header;
         let bytes = held.payload.bytes;
         let payload = (bytes.len() >= HDR).then(|| bytes.slice(HDR..));
-        link.submitter.submit_payload(
+        let outcome = link.submitter.submit_payload(
             L2Identity {
                 modality: l2_modality(m),
                 tier: h.tier,
@@ -864,7 +884,16 @@ impl<W: Write> Exp2Recorder<W> {
             t_release_us,
             payload,
         );
-        link.stats.submitted += 1;
+        link.stats.submit_attempted += 1;
+        if t_release_us > self.h {
+            link.stats.release_after_h += 1;
+        }
+        match outcome {
+            L2SubmitOutcome::Submitted => link.stats.submit_accepted += 1,
+            L2SubmitOutcome::QueueFull => link.stats.discarded_before_submit += 1,
+            L2SubmitOutcome::AfterClose => link.stats.refused_after_close += 1,
+            L2SubmitOutcome::SinkGone => link.stats.refused_sink_gone += 1,
+        }
         Ok(())
     }
 
@@ -2877,9 +2906,11 @@ mod tests {
             assert!(!releases.is_empty(), "{method:?}");
             assert_eq!(l2_submits(&l2, "submit"), releases, "{method:?}: submits == release rows");
             assert_eq!(l2_submits(&l2, "output"), releases, "{method:?}: fake outputs == release rows");
-            assert_eq!(stats.submitted as usize, releases.len(), "{method:?}");
+            assert_eq!(stats.submit_attempted as usize, releases.len(), "{method:?}");
+            assert_eq!(stats.submit_accepted, stats.submit_attempted, "{method:?}: normal path accepts every attempt");
+            assert_eq!((stats.discarded_before_submit, stats.refused_after_close, stats.refused_sink_gone, stats.release_after_h), (0, 0, 0, 0), "{method:?}");
             assert_eq!((stats.missing_payload, stats.cap_refused, stats.held_at_seal, stats.held_at_detach), (0, 0, 0, 0), "{method:?}");
-            assert_eq!(stats.held, stats.submitted + stats.disposed, "{method:?}: every held payload left");
+            assert_eq!(stats.held, stats.submit_attempted + stats.disposed, "{method:?}: every held payload left");
             if p1 {
                 for row in l2.iter().filter(|r| r["role"] == json!("submit")) {
                     let wire = row["wire_track"].as_str().unwrap();
@@ -2932,7 +2963,7 @@ mod tests {
         assert_eq!(submits, exp2_releases(&r.sink.rows(), false));
         assert_eq!(submits.len(), 1, "only pc[0]");
         assert_eq!(submits.values().next(), Some(&(T0 + 101_000)), "L2 t_release == exp2 t_release");
-        assert_eq!((stats.held, stats.submitted, stats.disposed, stats.held_at_seal), (4, 1, 3, 0));
+        assert_eq!((stats.held, stats.submit_attempted, stats.submit_accepted, stats.disposed, stats.held_at_seal), (4, 1, 1, 3, 0));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2955,7 +2986,7 @@ mod tests {
             let expected = if capped { "bound" } else { "without a held L2 payload" };
             assert!(format!("{error:#}").contains(expected), "{error:#}");
             let stats = r.rec.detach_l2().unwrap();
-            assert_eq!(stats.submitted, 0);
+            assert_eq!((stats.submit_attempted, stats.submit_accepted), (0, 0));
             assert_eq!(stats.missing_payload, u64::from(!capped));
             assert_eq!(stats.cap_refused, u64::from(capped));
             let summary = output.finish().unwrap();
@@ -2969,6 +3000,118 @@ mod tests {
             assert!(!l2.iter().any(|r| r["role"] == json!("submit")));
             let _ = std::fs::remove_file(&path);
         }
+    }
+
+    /// Codex 155 P1-2 (queue saturation): a release whose submit attempt
+    /// meets a full bounded queue is ONE attempt, ZERO accepted submits and
+    /// ONE `explicit_discard(output_queue_full)` before submit — counted as
+    /// such, never as a submit.
+    #[test]
+    fn exp2_l2_link_counts_a_full_queue_as_a_discard_before_submit() {
+        let path = std::env::temp_dir().join(format!(
+            "skew-exp2-l2-queue-full-{}-{}.jsonl",
+            std::process::id(),
+            crate::now_us()
+        ));
+        let mut fake = FakeSinkConfig::offsets(1_000, 2_000);
+        fake.force_queue_full = true;
+        let output = L2Output::start(
+            &path,
+            L2Config {
+                run_id: "run-1".into(),
+                method: "b1".into(),
+                sinks: L2Sinks::both(L2SinkKind::Fake),
+                fake: Some(fake),
+                alsa: None,
+                wayland: None,
+                queue_capacity: 8,
+                row_capacity: 64,
+                report_window_us: 1_000,
+                max_tracked_objects: 64,
+            },
+        )
+        .unwrap();
+        let mut r = rig(Exp2Method::B1);
+        r.rec.attach_l2(output.submitter()).unwrap();
+        r.set(T0 + 1_000);
+        let rx = Exp2Rx { header: header(Modality::Pc, 0, T0), route_generation: 0, t_recv_us: T0 + 1_000 };
+        r.rec.admit_with_payload(rx, Some(l2_payload(Modality::Pc, 0, None))).unwrap();
+        let link = r.rec.detach_l2().unwrap();
+        let summary = output.finish().unwrap();
+        assert_eq!(exp2_releases(&r.sink.rows(), false).len(), 1);
+        assert_eq!(
+            (link.submit_attempted, link.submit_accepted, link.discarded_before_submit),
+            (1, 0, 1)
+        );
+        assert_eq!((summary.submitted, summary.discarded_before_submit), (0, 1));
+        let rows = file_rows(&path);
+        let discard = rows.iter().find(|r| r["role"] == json!("explicit_discard")).unwrap();
+        assert_eq!(discard["reason"], json!("output_queue_full"));
+        assert_eq!(discard["t_submit_us"], Value::Null, "discarded before submit");
+        assert_eq!(discard["t_release_us"], json!(T0 + 1_000), "same t_release_us");
+        assert!(!rows.iter().any(|r| r["role"] == json!("submit")));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Codex 155 P1-2 (H boundary): the inclusion rule is the LOGICAL
+    /// release time `t_release_us <= H`; the actual `t_submit_us` is recorded
+    /// as is and can be later than H (here the release row write is stalled
+    /// across H). Nothing hides it.
+    #[test]
+    fn exp2_l2_link_records_a_submit_after_h_of_a_release_inside_h() {
+        struct StallRelease {
+            sink: Sink,
+            until: u64,
+        }
+        impl Write for StallRelease {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if String::from_utf8_lossy(buf).contains("\"role\":\"release\"") {
+                    let wait = self.until.saturating_sub(crate::now_us());
+                    std::thread::sleep(std::time::Duration::from_micros(wait));
+                }
+                self.sink.write(buf)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let (path, output) = l2_output("h-boundary", L2SinkKind::Fake);
+        let h = crate::now_us() + 50_000;
+        let t0 = h - RUN_DURATION_US - B_PLAY_US;
+        let sink = Sink::default();
+        let mut r = Exp2Recorder::new(
+            StallRelease { sink: sink.clone(), until: h + 2_000 },
+            Box::new(crate::now_us),
+            Exp2RecorderConfig {
+                method: Exp2Method::B1,
+                run_id: "run-1".into(),
+                ledger: ledger(t0),
+                delta_max_us: DMAX,
+                g_report_us: G_REPORT_R_US,
+            },
+        )
+        .unwrap();
+        let mut meta = Map::new();
+        meta.insert("run_id".into(), json!("run-1"));
+        meta.insert("method".into(), json!("B1"));
+        meta.insert("t0_us".into(), json!(t0));
+        r.write_meta(meta).unwrap();
+        r.attach_l2(output.submitter()).unwrap();
+        let t_recv = crate::now_us();
+        assert!(t_recv < h);
+        r.admit_with_payload(
+            Exp2Rx { header: header(Modality::Pc, 0, t0), route_generation: 0, t_recv_us: t_recv },
+            Some(l2_payload(Modality::Pc, 0, None)),
+        )
+        .unwrap();
+        let link = r.detach_l2().unwrap();
+        output.finish().unwrap();
+        assert_eq!((link.submit_attempted, link.submit_accepted, link.release_after_h), (1, 1, 0));
+        let rows = file_rows(&path);
+        let submit = rows.iter().find(|r| r["role"] == json!("submit")).unwrap();
+        assert_eq!(submit["t_release_us"], json!(t_recv), "logical release <= H");
+        assert!(submit["t_submit_us"].as_u64().unwrap() > h, "actual submit after H, recorded as is");
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Route copies: only the first ADMITTED copy is held and submitted, with
@@ -2993,7 +3136,7 @@ mod tests {
         assert_eq!(second, Admission::CopyDiscarded);
         r.rec.discard_route_copy(Exp2Rx { header: header(Modality::Pc, 1, T0), route_generation: 1, t_recv_us: T0 + 40_000 }, SWITCH_BARRIER).unwrap();
         let stats = r.rec.detach_l2().unwrap();
-        assert_eq!((stats.held, stats.submitted), (1, 1));
+        assert_eq!((stats.held, stats.submit_attempted, stats.submit_accepted), (1, 1, 1));
         output.finish().unwrap();
         let l2 = file_rows(&path);
         let submits: Vec<_> = l2.iter().filter(|r| r["role"] == json!("submit")).collect();

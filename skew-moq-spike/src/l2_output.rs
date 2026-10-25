@@ -1194,6 +1194,9 @@ pub struct L2Output {
     /// One sink thread per modality, in lane order.
     lanes: Vec<JoinHandle<()>>,
     writer: Option<JoinHandle<std::io::Result<L2Summary>>>,
+    /// The close sequence's first phase ran (`start_close_until`); `finish`
+    /// then only joins.
+    close_started: bool,
 }
 
 /// The declared contract of one modality's sink (meta `sink_contracts`):
@@ -1642,11 +1645,66 @@ impl L2Output {
             shared,
             lanes,
             writer: Some(writer),
+            close_started: false,
         })
     }
 
     pub fn submitter(&self) -> L2Submitter {
         self.submitter.clone().expect("the stage handle lives until finish")
+    }
+
+    /// Experiment 2: start the close NOW with an ABSOLUTE close deadline
+    /// (`T_cut`, the same instant for every method of a run) instead of
+    /// `finish_start + report_window`. Exactly the first phase of `finish`:
+    /// the deadline is published, further submits are refused
+    /// (`submit_after_close`), the stage's own producer handle is dropped and
+    /// the lanes are woken with `Closing`; the lanes then close at the
+    /// deadline on their own (devices released), while the writer stays alive
+    /// until `finish` joins it and writes the sentinel (`finish_start_us` =
+    /// this call, `close_deadline_us` = the given deadline). Every receiver
+    /// fault noted before `finish` still reaches the sentinel. Like `finish`,
+    /// it may block briefly on a lane's control queue. Without this call
+    /// `finish` keeps the 1-D rule unchanged.
+    pub fn start_close_until(&mut self, close_deadline_us: u64) -> Result<()> {
+        if self.close_started {
+            bail!("the L2 close has already started");
+        }
+        self.begin_close(Some(close_deadline_us));
+        Ok(())
+    }
+
+    /// Whether `start_close_until` ran.
+    pub fn close_started(&self) -> bool {
+        self.close_started
+    }
+
+    /// Phase 1 of the close (shared by `finish` and `start_close_until`).
+    fn begin_close(&mut self, absolute_deadline_us: Option<u64>) {
+        // The deadline goes first and is independent of the message queue, so
+        // a callback a lane handles before it sees `Closing` is still held to
+        // it. `CLOSE_PENDING` covers the instant before the clock read.
+        self.shared.close_deadline_us.store(CLOSE_PENDING, Ordering::SeqCst);
+        let finish_start_us = now_us();
+        let deadline_us = match absolute_deadline_us {
+            None => finish_start_us.saturating_add(self.config.report_window_us),
+            Some(deadline_us) => deadline_us,
+        }
+        .clamp(1, CLOSE_PENDING - 1);
+        self.shared.finish_start_us.store(finish_start_us.max(1), Ordering::SeqCst);
+        self.shared.close_deadline_us.store(deadline_us, Ordering::SeqCst);
+        self.shared.closed.store(true, Ordering::Release);
+        // Our own producer handle goes next, so the count the lanes check can
+        // reach zero; then the non-producer control senders wake the lanes.
+        // Blocking send: a lane is consuming, so space appears; a dead lane
+        // makes this fail immediately instead of hanging.
+        drop(self.submitter.take().expect("the close starts once"));
+        for control in &self.controls {
+            if control.send(SinkMsg::Closing).is_err() {
+                self.shared.sink_gone.fetch_add(1, Ordering::Relaxed);
+                self.shared.fail(FAIL_SINK_GONE);
+            }
+        }
+        self.close_started = true;
     }
 
     /// A fault-only handle (not a producer).
@@ -1684,27 +1742,9 @@ impl L2Output {
     /// -> `instrumentation_end` -> flush/close. Blocking; call from
     /// `spawn_blocking` in async code.
     pub fn finish(mut self) -> Result<L2Summary> {
-        // The deadline goes first and is independent of the message queue, so
-        // a callback a lane handles before it sees `Closing` is still held to
-        // it. `CLOSE_PENDING` covers the instant before the clock read.
-        self.shared.close_deadline_us.store(CLOSE_PENDING, Ordering::SeqCst);
-        let finish_start_us = now_us();
-        let deadline_us = finish_start_us
-            .saturating_add(self.config.report_window_us)
-            .clamp(1, CLOSE_PENDING - 1);
-        self.shared.finish_start_us.store(finish_start_us.max(1), Ordering::SeqCst);
-        self.shared.close_deadline_us.store(deadline_us, Ordering::SeqCst);
-        self.shared.closed.store(true, Ordering::Release);
-        // Our own producer handle goes next, so the count the lanes check can
-        // reach zero; then the non-producer control senders wake the lanes.
-        // Blocking send: a lane is consuming, so space appears; a dead lane
-        // makes this fail immediately instead of hanging.
-        drop(self.submitter.take().expect("finish runs once"));
-        for control in &self.controls {
-            if control.send(SinkMsg::Closing).is_err() {
-                self.shared.sink_gone.fetch_add(1, Ordering::Relaxed);
-                self.shared.fail(FAIL_SINK_GONE);
-            }
+        if !self.close_started {
+            // The 1-D rule: deadline = finish_start + report window.
+            self.begin_close(None);
         }
         let mut panicked = false;
         for lane in self.lanes.drain(..) {
@@ -3132,6 +3172,87 @@ mod tests {
         drop(s);
         let summary = out.finish().unwrap();
         assert_eq!((summary.submitted, summary.output, summary.submitted_unresolved), (2, 1, 1));
+        assert!(!summary.integrity_ok(L2Sinks::both(L2SinkKind::Fake)));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The 1-D close rule is unchanged: without `start_close_until`, `finish`
+    /// publishes `close_deadline = finish_start + report_window` exactly.
+    #[test]
+    fn finish_alone_keeps_the_relative_close_deadline() {
+        let path = tmp("relative-close");
+        let out = L2Output::start(&path, config(L2SinkKind::Fake, Some(FakeSinkConfig::offsets(0, 0)), 8)).unwrap();
+        assert!(!out.close_started());
+        let s = out.submitter();
+        s.submit(id(L2Modality::Pc, 0), now_us());
+        drop(s);
+        let summary = out.finish().unwrap();
+        let (start, deadline) = (summary.finish_start_us.unwrap(), summary.close_deadline_us.unwrap());
+        assert_eq!(deadline, start + 500_000, "1-D: finish_start + report_window_us");
+        assert!(summary.integrity_ok(L2Sinks::both(L2SinkKind::Fake)), "{summary:?}");
+        let rows = rows(&path);
+        assert_eq!(sentinel(&rows)["close_deadline_us"], deadline);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Experiment 2 (Codex 155 P1-1): `start_close_until(T_cut)` closes with
+    /// the ABSOLUTE deadline: the sentinel's `close_deadline_us` is T_cut to
+    /// the microsecond and `finish_start_us` the call; a submit after it is
+    /// refused (`submit_after_close`); an output that would come at or after
+    /// T_cut is not accepted (it stays unresolved); a receiver fault noted
+    /// after the close started, while the caller still owns the stage, still
+    /// reaches the sentinel; `finish` long after T_cut only joins.
+    #[test]
+    fn start_close_until_closes_at_the_absolute_deadline() {
+        let path = tmp("absolute-close");
+        // PC outputs 20 ms after submit, haptic 400 ms after (past T_cut).
+        let mut out = L2Output::start(
+            &path,
+            config(L2SinkKind::Fake, Some(FakeSinkConfig::offsets(20_000, 400_000)), 8),
+        )
+        .unwrap();
+        let s = out.submitter();
+        assert_eq!(s.submit(id(L2Modality::Pc, 0), now_us()), L2SubmitOutcome::Submitted);
+        assert_eq!(s.submit(id(L2Modality::Haptic, 0), now_us()), L2SubmitOutcome::Submitted);
+        drop(s);
+        let t_cut = now_us() + 150_000;
+        let before = now_us();
+        out.start_close_until(t_cut).unwrap();
+        let after = now_us();
+        assert!(out.close_started());
+        assert!(out.start_close_until(t_cut).is_err(), "the close starts once");
+        // the caller still owns the stage: a fault noted now is kept
+        std::thread::sleep(Duration::from_millis(300));
+        let fault_us = now_us();
+        out.receiver_fault(fault_us, "late receiver fault after the cut");
+        let summary = out.finish().unwrap();
+        assert_eq!(summary.close_deadline_us, Some(t_cut), "absolute deadline, µs exact");
+        let start = summary.finish_start_us.unwrap();
+        assert!(before <= start && start <= after, "finish_start = the start_close_until call");
+        assert_eq!(summary.output, 1, "the PC output before T_cut is accepted");
+        assert_eq!(summary.submitted_unresolved, 1, "the haptic output due after T_cut is not");
+        assert_eq!(summary.terminal_at_or_after_deadline, 0);
+        assert_eq!(summary.receiver_fault, Some((fault_us, "late receiver fault after the cut".into())));
+        let rows = rows(&path);
+        let sent = sentinel(&rows);
+        assert_eq!(sent["close_deadline_us"], t_cut);
+        for r in rows.iter().filter(|r| r["role"] == "output") {
+            assert!(r["t_callback_us"].as_u64().unwrap() < t_cut, "no receipt at or after T_cut");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// After `start_close_until` no submit is accepted.
+    #[test]
+    fn submit_after_start_close_is_refused() {
+        let path = tmp("absolute-close-submit");
+        let mut out = L2Output::start(&path, config(L2SinkKind::Fake, Some(FakeSinkConfig::offsets(0, 0)), 8)).unwrap();
+        let s = out.submitter();
+        out.start_close_until(now_us() + 50_000).unwrap();
+        assert_eq!(s.submit(id(L2Modality::Pc, 0), now_us()), L2SubmitOutcome::AfterClose);
+        drop(s);
+        let summary = out.finish().unwrap();
+        assert_eq!(summary.submit_after_close, 1);
         assert!(!summary.integrity_ok(L2Sinks::both(L2SinkKind::Fake)));
         let _ = std::fs::remove_file(&path);
     }
