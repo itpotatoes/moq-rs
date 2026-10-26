@@ -666,4 +666,34 @@ mod tests {
         assert!(gate.pending_request().is_some());
         assert_eq!(gate.abandon_pending(10 + 1_000_000 + 2), Err(SwitchError::GateFailed));
     }
+
+    /// The P1 call order on a virtual clock (diag 2026-10-26): a gate tick
+    /// between two SUBSCRIBE_OKs observed in different loop iterations moves
+    /// the gate clock past the earlier recorded `t_ok`, which step 3 then
+    /// cannot record (NonMonotonicTime, the gate not poisoned). Without the
+    /// tick (the 1-D S3 order, and P1 since the tick is skipped during an
+    /// opening) both recorded instants are accepted in ascending order.
+    #[test]
+    fn a_tick_between_split_subscribe_oks_refuses_the_earlier_t_ok() {
+        let request = |gate: &mut S3SwitchGate| {
+            let r = gate
+                .request(transition(900, S3State::Normal, S3State::HapticCritical), 1_000)
+                .unwrap();
+            assert!(r.pc_changed && r.haptic_changed);
+        };
+        let mut g = gate();
+        request(&mut g);
+        assert_eq!(g.check_timeout(2_000), Ok(()), "a loop tick during the opening");
+        assert_eq!(g.check_timeout(1_500), Err(SwitchError::NonMonotonicTime));
+        assert_eq!(g.subscribe_ok(TrackRole::Pc, 1_500), Err(SwitchError::NonMonotonicTime));
+        assert!(!g.is_failed(), "check_ready does not poison");
+        assert!(g.pending_request().is_some());
+
+        let mut g = gate();
+        request(&mut g);
+        assert_eq!(g.check_timeout(1_500), Ok(()));
+        assert_eq!(g.subscribe_ok(TrackRole::Pc, 1_500), Ok(()));
+        assert_eq!(g.check_timeout(2_500), Ok(()));
+        assert_eq!(g.subscribe_ok(TrackRole::Haptic, 2_500), Ok(()));
+    }
 }

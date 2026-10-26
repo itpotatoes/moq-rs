@@ -4428,9 +4428,7 @@ async fn finish_s3_switch<H>(
     while let Some((role, route, subscription, t_ok, retries)) = apply.take_next() {
         let key = (role, route.generation);
         let checks: Result<()> = if let Err(error) = ingress.check_timeout(t_ok) {
-            Err(anyhow::anyhow!(
-                "S3 switch timed out while subscribing: {error:?}"
-            ))
+            Err(subscribe_ok_gate_error(error))
         } else if live.contains_key(&key) {
             Err(anyhow::anyhow!(
                 "duplicate live S3 subscription {} generation {}",
@@ -4466,6 +4464,19 @@ async fn finish_s3_switch<H>(
         }
     }
     Ok(SwitchOutcome::Requested)
+}
+
+/// The error of a refused SUBSCRIBE_OK gate check in step 3: only an effect
+/// timeout is "timed out" (the unchanged text); any other gate refusal
+/// (`NonMonotonicTime`, `GateFailed`) is named as such instead of being
+/// reported as a timeout.
+fn subscribe_ok_gate_error(error: skew_moq::s3_switch::SwitchError) -> anyhow::Error {
+    match error {
+        skew_moq::s3_switch::SwitchError::SwitchTimedOut => {
+            anyhow::anyhow!("S3 switch timed out while subscribing: {error:?}")
+        }
+        _ => anyhow::anyhow!("S3 switch SUBSCRIBE_OK refused by the gate: {error:?}"),
+    }
 }
 
 /// The stage-9 S3 switch: the three steps back to back (unchanged
@@ -7017,7 +7028,17 @@ where
                 continue;
             }
         }
-        if let Err(error) = state.ingress.check_timeout(now) {
+        // The gate tick (effect timeout + monotonic time) runs only while no
+        // target SUBSCRIBE is in flight. During an opening the open future
+        // itself enforces the effect deadline (`sleep(effect_remaining)` ->
+        // `check_timeout(now_us())` in `finish_s3_switch`, which poisons the
+        // gate), and a tick here would move the gate clock past a SUBSCRIBE_OK
+        // already observed in an earlier iteration, so step 3 would refuse
+        // that recorded `t_ok` as NonMonotonicTime (diag 2026-10-26). After
+        // step 3 the tick resumes and guards the SUBSCRIBE_OK -> exact-pair
+        // window as before. Recorded instants are unchanged.
+        let gate_tick = if opening.is_none() { state.ingress.check_timeout(now) } else { Ok(()) };
+        if let Err(error) = gate_tick {
             // Fail closed: an effect timeout poisons the gate and ends the
             // run before H + G_report, so the exp2 JSONL gets no sentinel
             // (analyzer: instrumentation_ended_early -> run INVALID), the
@@ -15111,6 +15132,21 @@ mod s3_control_loop_tests {
         publish: bool,
         l2: bool,
     ) -> (Result<()>, Vec<serde_json::Value>, Option<(Vec<serde_json::Value>, Vec<serde_json::Value>)>) {
+        p1_loop_case_holds(name, t0, force_ms, hold_ms, hold_ms, publish, l2).await
+    }
+
+    /// [`p1_loop_case_with`] with a separate SUBSCRIBE_OK hold per target
+    /// role (`pc_hold_ms` for the PC target, `hap_hold_ms` for the haptic).
+    #[allow(clippy::too_many_arguments)]
+    async fn p1_loop_case_holds(
+        name: &str,
+        t0: u64,
+        force_ms: u64,
+        pc_hold_ms: u64,
+        hap_hold_ms: u64,
+        publish: bool,
+        l2: bool,
+    ) -> (Result<()>, Vec<serde_json::Value>, Option<(Vec<serde_json::Value>, Vec<serde_json::Value>)>) {
         let force_ms = force_ms.to_string();
         use skew_moq::exp2_recorder::{canonical_json_bytes, haptic_slot_identity, pc_slot_identity};
         let dir = test_log_path(name);
@@ -15199,8 +15235,8 @@ mod s3_control_loop_tests {
         let script = vec![
             Call { track: PC_NORMAL, before: Vec::new(), answer: Answer::Accept(Vec::new()) },
             Call { track: HAPTIC_FULL, before: Vec::new(), answer: Answer::Accept(Vec::new()) },
-            Call { track: PC_CRITICAL, before: vec![Step::Sleep(hold_ms)], answer: Answer::Accept(Vec::new()) },
-            Call { track: HAPTIC_ESSENTIAL, before: vec![Step::Sleep(hold_ms)], answer: Answer::Accept(Vec::new()) },
+            Call { track: PC_CRITICAL, before: vec![Step::Sleep(pc_hold_ms)], answer: Answer::Accept(Vec::new()) },
+            Call { track: HAPTIC_ESSENTIAL, before: vec![Step::Sleep(hap_hold_ms)], answer: Answer::Accept(Vec::new()) },
         ];
         let seam = ScriptedSeam::new(script);
         // Current-route objects of events 0..12 arrive while the switch is
@@ -15300,6 +15336,83 @@ mod s3_control_loop_tests {
         assert!(rows.iter().any(|r| r["role"] == "integrity_warning"
             && r["kind"] == "p1_switch_effect_timeout"));
         assert!(!rows.iter().any(|r| r["role"] == "instrumentation_end"), "fail closed: no sentinel");
+    }
+
+    /// diag 2026-10-26 (`NonMonotonicTime`): the two target SUBSCRIBE_OKs are
+    /// observed in DIFFERENT loop iterations (PC 100 ms / haptic 300 ms and
+    /// the reverse) while current-route objects keep the loop running. The
+    /// gate tick is skipped during the opening, so step 3 accepts both
+    /// recorded `t_ok` (subscribed row with both instants) instead of
+    /// refusing the earlier one; after step 3 the tick resumes and guards the
+    /// SUBSCRIBE_OK -> exact-pair window: no target object arrives here, so
+    /// the registered effect timeout ends the run at request + 2 s.
+    #[tokio::test]
+    async fn exp2_p1_split_subscribe_oks_are_applied_and_the_tick_resumes_after() {
+        for (pc_hold, hap_hold) in [(100u64, 300u64), (300, 100)] {
+            let (result, rows, _) =
+                p1_loop_case_holds("p1-split-ok", now_us() + 300_000, 100, pc_hold, hap_hold, true, false).await;
+            let error = format!("{:#}", result.expect_err("no target object: the effect timeout ends the run"));
+            assert!(!error.contains("NonMonotonicTime") && !error.contains("refused by the gate"), "{error}");
+            assert!(error.contains("P1 switch effect timeout: SwitchTimedOut"), "the resumed tick: {error}");
+            let requested = rows.iter().find(|r| r["role"] == "tier_switch" && r["phase"] == "requested").unwrap();
+            let subscribed = rows
+                .iter()
+                .find(|r| r["role"] == "tier_switch" && r["phase"] == "subscribed")
+                .expect("both SUBSCRIBE_OKs accepted by step 3");
+            let t_req = requested["request_at_us"].as_u64().unwrap();
+            let (t_pc, t_hap) = (
+                subscribed["t_subscribe_ok_pc_us"].as_u64().unwrap(),
+                subscribed["t_subscribe_ok_haptic_us"].as_u64().unwrap(),
+            );
+            assert!(t_pc.abs_diff(t_hap) >= 150_000, "split across loop iterations: {t_pc} vs {t_hap}");
+            assert!(t_pc.min(t_hap) >= t_req, "recorded instants unchanged");
+            let warning = rows
+                .iter()
+                .find(|r| r["role"] == "integrity_warning" && r["kind"] == "p1_switch_effect_timeout")
+                .expect("the resumed tick enforced the effect timeout");
+            let t_warn = warning["t_us"].as_u64().unwrap();
+            assert!(t_warn >= t_req + 2_000_000 && t_warn < t_req + 2_500_000, "timeout at request + 2 s: {}", t_warn - t_req);
+            assert!(!rows.iter().any(|r| r["role"] == "instrumentation_end"), "fail closed");
+        }
+    }
+
+    /// The effect timeout while the target SUBSCRIBEs are still in flight
+    /// (both held 2.5 s > the 2 s effect timeout) is still enforced without
+    /// the loop tick: the open future's own deadline fires, step 3 poisons
+    /// the gate (`check_timeout(now)` -> SwitchTimedOut) and the run fails at
+    /// request + 2 s.
+    #[tokio::test]
+    async fn exp2_p1_effect_timeout_during_the_opening_still_poisons_the_gate() {
+        let (result, rows, _) =
+            p1_loop_case_holds("p1-open-timeout", now_us() + 300_000, 100, 2_500, 2_500, true, false).await;
+        let error = format!("{:#}", result.expect_err("the effect timeout fails the run"));
+        assert!(error.contains("did not complete before the effect timeout"), "{error}");
+        assert!(error.contains("gate: Err(SwitchTimedOut)"), "the gate is poisoned: {error}");
+        let requested = rows.iter().find(|r| r["role"] == "tier_switch" && r["phase"] == "requested").unwrap();
+        let t_req = requested["request_at_us"].as_u64().unwrap();
+        assert!(!rows.iter().any(|r| r["role"] == "tier_switch" && r["phase"] == "subscribed"));
+        let warning = rows
+            .iter()
+            .find(|r| r["role"] == "integrity_warning" && r["kind"] == "p1_switch_failed")
+            .expect("the failed switch is named");
+        let t_warn = warning["t_us"].as_u64().unwrap();
+        assert!(t_warn >= t_req + 2_000_000 && t_warn < t_req + 2_400_000, "at the effect deadline: {}", t_warn - t_req);
+    }
+
+    /// The step-3 gate error text: only an effect timeout says "timed out".
+    #[test]
+    fn subscribe_ok_gate_errors_name_the_refusal() {
+        use skew_moq::s3_switch::SwitchError;
+        assert_eq!(
+            format!("{}", subscribe_ok_gate_error(SwitchError::SwitchTimedOut)),
+            "S3 switch timed out while subscribing: SwitchTimedOut"
+        );
+        for error in [SwitchError::NonMonotonicTime, SwitchError::GateFailed] {
+            assert_eq!(
+                format!("{}", subscribe_ok_gate_error(error)),
+                format!("S3 switch SUBSCRIBE_OK refused by the gate: {error:?}")
+            );
+        }
     }
 
     /// Experiment 2 + L2 (P1, fake sink, the real P1 loop): every exp2
