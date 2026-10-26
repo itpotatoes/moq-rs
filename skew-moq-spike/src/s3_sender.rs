@@ -1885,3 +1885,272 @@ mod tests {
     }
 
 }
+
+/// The REAL accept loop (`run_namespace`) over a REAL in-process QUIC session:
+/// a test peer (standing where the receiver or the relay stands) subscribes
+/// through moq-transport, and the producers' group ids are read back from the
+/// wire. Uses the test-only self-signed localhost certificate committed under
+/// `moq-relay-ietf/tests/fixtures/` (pinned as the only root; verification is
+/// also disabled, so the platform trust store is never read).
+#[cfg(test)]
+mod accept_loop_quic_tests {
+    use super::*;
+    use moq_native_ietf::{quic, tls};
+    use moq_transport::coding::KeyValuePairs;
+    use moq_transport::serve::{ServeError, Track, TrackReaderMode};
+    use moq_transport::session::{DataPriorityMapping, Session, SessionConfig, Subscriber};
+
+    const STEP: Duration = Duration::from_secs(10);
+    const T_PC_MS: u64 = 345;
+
+    fn fixture(name: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../moq-relay-ietf/tests/fixtures")
+            .join(name)
+    }
+
+    fn tls_config(server: bool) -> tls::Config {
+        let mut args = tls::Args {
+            root: vec![fixture("localhost-test-only.crt")],
+            disable_verify: true,
+            ..Default::default()
+        };
+        if server {
+            args.cert = vec![fixture("localhost-test-only.crt")];
+            args.key = vec![fixture("localhost-test-only.key")];
+        }
+        args.load().expect("test TLS config")
+    }
+
+    fn session_config() -> SessionConfig {
+        SessionConfig { max_request_id: 100, data_priority_mapping: DataPriorityMapping::MoqtV2 }
+    }
+
+    /// Wire-visible groups of a subscription, read in order: (group_id,
+    /// payload header seq, payload header gen_ts_us), one object per group.
+    struct Groups(moq_transport::serve::SubgroupsReader);
+
+    impl Groups {
+        async fn of(reader: moq_transport::serve::TrackReader) -> Self {
+            let mode = tokio::time::timeout(STEP, reader.mode()).await.expect("mode in time");
+            let TrackReaderMode::Subgroups(subgroups) = mode.expect("mode") else {
+                panic!("subgroups expected");
+            };
+            Self(subgroups)
+        }
+
+        async fn next(&mut self, n: usize) -> Vec<(u64, u32, u64)> {
+            tokio::time::timeout(STEP, async {
+                let mut out = Vec::new();
+                while out.len() < n {
+                    let mut subgroup = self.0.next().await.expect("subgroup").expect("open");
+                    let object = subgroup.read_next().await.expect("object").expect("an object");
+                    let header = crate::unpack_header(&object).expect("v5 header");
+                    out.push((subgroup.group_id, header.seq, header.gen_ts_us));
+                }
+                out
+            })
+            .await
+            .expect("objects in time")
+        }
+    }
+
+    async fn read_groups(reader: moq_transport::serve::TrackReader, n: usize) -> Vec<(u64, u32, u64)> {
+        Groups::of(reader).await.next(n).await
+    }
+
+    async fn subscribe(
+        subscriber: &mut Subscriber,
+        namespace: &TrackNamespace,
+        name: &str,
+        timeout_ms: Option<u64>,
+    ) -> (Result<moq_transport::session::Subscribe, ServeError>, moq_transport::serve::TrackReader) {
+        let (writer, reader) = Track::new(namespace.clone(), name).produce();
+        let mut params = KeyValuePairs::default();
+        if let Some(ms) = timeout_ms {
+            params.set_delivery_timeout(ms);
+        }
+        let result = tokio::time::timeout(STEP, subscriber.subscribe_open_with_params(writer, params))
+            .await
+            .expect("SUBSCRIBE answered in time");
+        (result, reader)
+    }
+
+    struct Harness {
+        peer: Subscriber,
+        namespace: TrackNamespace,
+        tx_path: std::path::PathBuf,
+        stop: watch::Sender<bool>,
+        _keep: Vec<Box<dyn std::any::Any + Send>>,
+    }
+
+    /// Sender = QUIC client running `run_namespace` (the production entry);
+    /// peer = QUIC server accepting the namespace and subscribing.
+    async fn start(name: &str) -> Harness {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        let mut server_endpoint =
+            quic::Endpoint::new(quic::Config::with_socket(socket, None, tls_config(true))).unwrap();
+        let mut server = server_endpoint.server.take().expect("server");
+        let accept = tokio::spawn(async move {
+            let (session, _path, transport) = server.accept().await.expect("an inbound session");
+            let (session, _publisher, subscriber) =
+                Session::accept_with_config(session, None, transport, session_config()).await.expect("setup");
+            (session, subscriber.expect("subscriber role"), server)
+        });
+        let client_endpoint = quic::Endpoint::new(
+            quic::Config::new("127.0.0.1:0".parse().unwrap(), None, tls_config(false)).unwrap(),
+        )
+        .unwrap();
+        let url = url::Url::parse(&format!("https://{addr}")).unwrap();
+        let (session, _cid, transport) = client_endpoint.client.connect(&url, None).await.expect("connect");
+        let (sender_session, publisher, _subscriber) =
+            Session::connect_with_config(session, None, transport, session_config()).await.expect("setup");
+        let (peer_session, mut peer, server) = tokio::time::timeout(STEP, accept).await.unwrap().unwrap();
+        let sender_run = tokio::spawn(sender_session.run());
+        let peer_run = tokio::spawn(peer_session.run());
+
+        let namespace = TrackNamespace::from_utf8_path(&format!("accept-loop-{name}"));
+        let tx_path = std::env::temp_dir().join(format!("skew-accept-loop-{name}-{}-{}.jsonl", std::process::id(), now_us()));
+        let logger = Arc::new(Mutex::new(
+            crate::JsonlLogger::new(
+                &tx_path, "run", "moq", "tx", None, 0.0, 0.0, 0.0, 1, 30, 90, 1, None, None,
+                Some("both"), Some(crate::TERM_PROTOCOL_V), None, None, None,
+            )
+            .unwrap(),
+        ));
+        let start = now_us() + 200_000;
+        let (schedule_tx, schedule_rx) = watch::channel(Some(SourceSchedule {
+            warmup_start_us: None,
+            measurement_start_us: start,
+            end_us: start + 8_000_000,
+        }));
+        let (gate_tx, gate_rx) = watch::channel(true);
+        let frames = Arc::new(vec![vec![7u8; 16]]);
+        let context = Arc::new(SenderContext {
+            schedule: schedule_rx,
+            measurement_gate: gate_rx,
+            pc_rate_hz: 30,
+            haptic_rate_hz: 90,
+            normal_frames: frames.clone(),
+            recovery_frames: frames.clone(),
+            critical_frames: frames,
+            haptic_pcm: Arc::new(vec![0u8; 16_000]),
+            logger,
+            shutdown_timeout: Duration::from_millis(2_000),
+            pc_delivery_timeout_ms: T_PC_MS,
+            generation_group_base: true, // exp2 P1
+        });
+        let registry = Arc::new(Mutex::new(SubscriptionProducerRegistry::new()));
+        let (stop, stop_rx) = watch::channel(false);
+        let ns_task = tokio::spawn(run_namespace(
+            publisher, namespace.clone(), context, registry, AcceptRouteMap::default(), stop_rx,
+        ));
+        // The peer accepts the PUBLISH_NAMESPACE.
+        let mut announced = tokio::time::timeout(STEP, peer.published_namespace())
+            .await
+            .expect("PUBLISH_NAMESPACE in time")
+            .expect("a namespace");
+        announced.ok().expect("REQUEST_OK");
+        Harness {
+            peer,
+            namespace,
+            tx_path,
+            stop,
+            _keep: vec![
+                Box::new(announced), Box::new(sender_run), Box::new(peer_run), Box::new(ns_task),
+                Box::new(schedule_tx), Box::new(gate_tx), Box::new(server), Box::new(server_endpoint),
+                Box::new(client_endpoint),
+            ],
+        }
+    }
+
+    fn producer_rows(path: &std::path::Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|r| r["role"] == "s3_producer")
+            .collect()
+    }
+
+    /// Spec (9), sender side, through the real accept loop: a refused
+    /// SUBSCRIBE (wrong DELIVERY_TIMEOUT: validity refusal) consumes NO route
+    /// generation, so the retry (same target, new request id) is allocated
+    /// generation 1 and every object it carries is in generation 1's group
+    /// range (`group_id >> 32 == 1`). The next accepted PC SUBSCRIBE (the
+    /// make-before-break target pc-d7) gets the NEXT generation (one per
+    /// accepted SUBSCRIBE, the registered rule); generation 1 is released only
+    /// after generation 2 started, so its producer completes LATE, and
+    /// generation 2 keeps producing in its own group range after that.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_real_accept_loop_allocates_one_generation_per_accepted_subscribe_and_none_per_refusal() {
+        let mut h = start("generations").await;
+        let ns = h.namespace.clone();
+        // Initial routes (generation 0), in the registered order.
+        let (pc, pc_reader) = subscribe(&mut h.peer, &ns, "pc", Some(T_PC_MS)).await;
+        let _pc = pc.expect("pc accepted");
+        let (hap, _hap_reader) = subscribe(&mut h.peer, &ns, "haptic", None).await;
+        let _hap = hap.expect("haptic accepted");
+        let initial = read_groups(pc_reader, 2).await;
+        assert!(initial.iter().all(|(g, _, _)| exp2_route_generation_of_group(*g) == 0), "{initial:?}");
+
+        // Attempt 1 of the switch target: refused by request validity.
+        let (refused, _r) = subscribe(&mut h.peer, &ns, "pc-d6", Some(S3_PC_DELIVERY_TIMEOUT_MS)).await;
+        let Err(refused) = refused else { panic!("a wrong DELIVERY_TIMEOUT is refused") };
+        assert!(matches!(refused, ServeError::Closed(_)), "{refused:?}");
+        // Attempt 2 (the retry): accepted, generation 1 on the wire.
+        let (retry, retry_reader) = subscribe(&mut h.peer, &ns, "pc-d6", Some(T_PC_MS)).await;
+        let retry = retry.expect("the retry is accepted");
+        let groups = read_groups(retry_reader, 3).await;
+        assert!(groups.iter().all(|(g, _, _)| exp2_route_generation_of_group(*g) == 1),
+                "a refused attempt consumed no generation: {groups:?}");
+
+        // Make-before-break to the next PC target (generation 2) while
+        // generation 1 is still producing; THEN generation 1 is released, so
+        // its producer completes AFTER generation 2 started.
+        let (next, next_reader) = subscribe(&mut h.peer, &ns, "pc-d7", Some(T_PC_MS)).await;
+        let _next = next.expect("pc-d7 accepted");
+        let mut next_groups = Groups::of(next_reader).await;
+        let before = next_groups.next(2).await;
+        assert!(before.iter().all(|(g, _, _)| exp2_route_generation_of_group(*g) == 2), "{before:?}");
+        drop(retry);
+        let deadline = tokio::time::Instant::now() + STEP;
+        let stop_row = loop {
+            let rows = producer_rows(&h.tx_path);
+            if let Some(stop) = rows.iter().find(|r| r["event"] == "stop" && r["route_generation"] == 1) {
+                break stop.clone();
+            }
+            assert!(tokio::time::Instant::now() < deadline, "generation 1 stopped in time");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let rows = producer_rows(&h.tx_path);
+        let start2 = rows.iter()
+            .find(|r| r["event"] == "start" && r["route_generation"] == 2)
+            .expect("generation 2 started");
+        assert!(stop_row["t_stop"].as_u64().unwrap() > start2["t_start"].as_u64().unwrap(),
+                "the previous attempt completed LATE, after the new generation started");
+        // Generation 2 keeps producing in its own range after the late
+        // completion: read on until three objects GENERATED after the stop.
+        let t_stop = stop_row["t_stop"].as_u64().unwrap();
+        let mut after = Vec::new();
+        while after.iter().filter(|(_, _, t_gen): &&(u64, u32, u64)| *t_gen > t_stop).count() < 3 {
+            after.extend(next_groups.next(1).await);
+            assert!(after.len() < 300, "objects after the late completion");
+        }
+        assert!(after.iter().all(|(g, _, _)| exp2_route_generation_of_group(*g) == 2), "{after:?}");
+
+        // TX producer rows: one start per ACCEPTED subscription, none for the refusal.
+        let rows = producer_rows(&h.tx_path);
+        let starts: Vec<_> = rows.iter()
+            .filter(|r| r["event"] == "start")
+            .map(|r| (r["wire_track"].as_str().unwrap_or_default().to_string(), r["route_generation"].clone()))
+            .collect();
+        assert_eq!(starts, vec![
+            ("pc".to_string(), serde_json::json!(0)), ("haptic".to_string(), serde_json::json!(0)),
+            ("pc-d6".to_string(), serde_json::json!(1)), ("pc-d7".to_string(), serde_json::json!(2)),
+        ], "{rows:?}");
+        let _ = h.stop.send(true);
+        std::fs::remove_file(&h.tx_path).ok();
+    }
+}
