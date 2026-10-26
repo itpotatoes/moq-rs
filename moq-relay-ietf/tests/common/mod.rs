@@ -219,66 +219,6 @@ pub struct Probe {
     pub control: Mutex<Vec<ControlRow>>,
     pub links: Mutex<Vec<LinkRow>>,
     pub forwards: Mutex<Vec<ForwardRow>>,
-    /// Fault injection (Codex 175a): after recording a row of this boundary,
-    /// block the recording task for this long — a preemption between the
-    /// pre-dispatch control hook and the dispatch of that message.
-    pub hold_after: Mutex<Option<(&'static str, Duration)>>,
-    /// A test-chosen gate: every row of this boundary blocks its recording
-    /// task (the session's control send or receive loop) until opened, so the
-    /// message is not dispatched before the test allows it.
-    gate: Mutex<Option<(&'static str, Arc<HookGate>)>>,
-}
-
-/// A blocking gate for a control hook (the hook runs on a transport task).
-#[derive(Default)]
-pub struct HookGate {
-    open: Mutex<bool>,
-    changed: std::sync::Condvar,
-}
-
-impl HookGate {
-    pub fn open(&self) {
-        *self.open.lock().unwrap() = true;
-        self.changed.notify_all();
-    }
-
-    fn wait(&self) {
-        let open = self.open.lock().unwrap();
-        let (open, timeout) = self.changed.wait_timeout_while(open, STEP, |open| !*open).unwrap();
-        assert!(*open && !timeout.timed_out(), "a hook gate was never opened");
-    }
-}
-
-/// Fault-injection profile of this test process, from `SKEW_RELAY_TEST_INJECT`
-/// (Codex 176a's conditions as harness options; default none):
-///   `hold`        every harness open / closed waiter is held 50 ms after a
-///                 Pending first poll (a Ready first poll is returned as is);
-///   `late`        every harness open runs on its own task and the
-///                 application looks at it only 50 ms later (it may have
-///                 completed meanwhile); closed waits start 50 ms late;
-///   `hook:<b>`    the Probe stalls the recording task 50 ms after every
-///                 control row of boundary `<b>` (one of the eight).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Inject {
-    None,
-    HoldWaiters,
-    LateObserver,
-    HookStall(String),
-}
-
-pub const INJECT_DELAY: Duration = Duration::from_millis(50);
-
-pub fn inject() -> &'static Inject {
-    static INJECT: OnceLock<Inject> = OnceLock::new();
-    INJECT.get_or_init(|| match std::env::var("SKEW_RELAY_TEST_INJECT").ok().as_deref() {
-        None | Some("") => Inject::None,
-        Some("hold") => Inject::HoldWaiters,
-        Some("late") => Inject::LateObserver,
-        Some(other) => match other.strip_prefix("hook:") {
-            Some(boundary) => Inject::HookStall(boundary.to_string()),
-            None => panic!("unknown SKEW_RELAY_TEST_INJECT={other}"),
-        },
-    })
 }
 
 /// Hold the application's waiter: poll once; a Ready result is returned AS
@@ -339,24 +279,6 @@ impl Observer for Probe {
             status_code,
             send_begin: send_begin_us,
         });
-        let boundary = message.boundary(direction);
-        if let Inject::HookStall(stall) = inject() {
-            if stall == boundary {
-                std::thread::sleep(INJECT_DELAY);
-            }
-        }
-        let hold = *self.hold_after.lock().unwrap();
-        if let Some((held, delay)) = hold {
-            if held == boundary {
-                std::thread::sleep(delay);
-            }
-        }
-        let gate = self.gate.lock().unwrap().clone();
-        if let Some((gated, gate)) = gate {
-            if gated == boundary {
-                gate.wait();
-            }
-        }
     }
 
     fn record_link(
@@ -391,13 +313,6 @@ pub fn probe() -> Arc<Probe> {
 }
 
 impl Probe {
-    /// Gate every control row of `boundary` (see the `gate` field).
-    pub fn gate_boundary(&self, boundary: &'static str) -> Arc<HookGate> {
-        let gate = Arc::new(HookGate::default());
-        *self.gate.lock().unwrap() = Some((boundary, gate.clone()));
-        gate
-    }
-
     pub fn controls(&self) -> Vec<ControlRow> {
         self.control.lock().unwrap().clone()
     }
@@ -476,14 +391,38 @@ impl PublisherTask {
         Self { main, children }
     }
 
+    /// Abort the publisher and ALL its children first, then join each within
+    /// `STEP`; a panic or a join past the bound fails the test. (The bound is
+    /// the helper's own; a worker blocked inside a poll can still delay the
+    /// runtime's shutdown, so the cargo record applies its own per-process
+    /// deadline.)
     pub async fn stop(self) {
-        self.main.abort();
-        expect_no_panic("the publisher task", self.main.await);
-        let children = std::mem::take(&mut *self.children.lock().unwrap());
-        for child in children {
-            child.abort();
-            expect_no_panic("a publisher child task", child.await);
+        if let Err(error) = self.stop_within(STEP).await {
+            panic!("{error}");
         }
+    }
+
+    pub async fn stop_within(self, bound: Duration) -> Result<(), String> {
+        let children = std::mem::take(&mut *self.children.lock().unwrap());
+        self.main.abort();
+        for child in &children {
+            child.abort();
+        }
+        let tasks = std::iter::once(("the publisher task", self.main))
+            .chain(children.into_iter().map(|child| ("a publisher child task", child)));
+        for (what, task) in tasks {
+            match tokio::time::timeout(bound, task).await {
+                Err(_) => return Err(format!("{what} did not finish within {bound:?} after abort")),
+                Ok(joined) => {
+                    if let Err(error) = joined {
+                        if error.is_panic() {
+                            return Err(format!("{what} panicked: {error}"));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -578,32 +517,13 @@ pub async fn subscribe(
     moq_transport::serve::TrackReader,
 ) {
     let (writer, reader) = Track::new(TrackNamespace::from_utf8_path(namespace), track).produce();
-    let mut subscriber = client.subscriber.clone();
-    let open = async move { subscriber.subscribe_open(writer).await };
-    let result = match inject() {
-        Inject::HoldWaiters => tokio::time::timeout(STEP, hold_waiter(open, INJECT_DELAY)).await,
-        Inject::LateObserver => {
-            let task = tokio::spawn(open);
-            tokio::time::sleep(INJECT_DELAY).await;
-            tokio::time::timeout(STEP, async { task.await.expect("the open task") }).await
-        }
-        _ => tokio::time::timeout(STEP, open).await,
-    };
+    let result = tokio::time::timeout(STEP, client.subscriber.subscribe_open(writer)).await;
     (result.expect("SUBSCRIBE answered in time"), reader)
 }
 
-/// Wait (bounded) for a subscription's terminal, under the injection profile.
+/// Wait (bounded) for a subscription's terminal.
 pub async fn closed(subscribe: &moq_transport::session::Subscribe) -> Result<(), moq_transport::serve::ServeError> {
-    let wait = subscribe.closed();
-    let result = match inject() {
-        Inject::HoldWaiters => tokio::time::timeout(STEP, hold_waiter(wait, INJECT_DELAY)).await,
-        Inject::LateObserver => {
-            tokio::time::sleep(INJECT_DELAY).await;
-            tokio::time::timeout(STEP, wait).await
-        }
-        _ => tokio::time::timeout(STEP, wait).await,
-    };
-    result.expect("a terminal in time")
+    tokio::time::timeout(STEP, subscribe.closed()).await.expect("a terminal in time")
 }
 
 /// [`subscribe`] with the APPLICATION's open waiter held for `delay` after

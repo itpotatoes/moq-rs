@@ -47,7 +47,10 @@ async fn the_end_of_the_upstream_session_ends_downstream_routes_and_the_namespac
     let done = probe.row("publish_done_sent", down[0].session, down[0].request_id).unwrap();
     assert_eq!(done.status_code, Some(0x2), "PUBLISH_DONE TrackEnded");
 
-    // The namespace route is gone: a new SUBSCRIBE is refused, never bound.
+    // The namespace route is gone: route removal is asynchronous, so a later
+    // SUBSCRIBE is retried (up to 200 x 20 ms) and must EVENTUALLY be refused,
+    // never bound to the dead incarnation. The first follow-up is not required
+    // to be the refused one.
     let mut refused = None;
     for _ in 0..200 {
         let (result, _r) = subscribe(&mut receiver, "run-d", "haptic").await;

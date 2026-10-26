@@ -27,21 +27,17 @@ async fn an_upstream_end_during_a_partial_object_ends_the_downstream_route_with_
     let ns = TrackNamespace::from_utf8_path("run-p");
     let announced = sender.publisher.publish_namespace_open(ns.clone()).expect("PUBLISH_NAMESPACE");
     tokio::time::timeout(STEP, announced.ok()).await.expect("in time").expect("namespace OK");
+    // ONE publisher task: it holds the writer and the partial object and
+    // serves the subscription inline, so joining it joins the serve as well.
     let publisher = tokio::spawn(async move {
         let subscribed = announced.subscribed().await.expect("subscribed").expect("a SUBSCRIBE");
         let (writer, reader) = Track::new(ns, "pc").produce();
-        let serving = tokio::spawn(async move { let _ = subscribed.serve(reader).await; });
         let mut subgroups = writer.subgroups().expect("subgroups");
         let mut subgroup = subgroups.append(1).expect("subgroup");
         let mut object = subgroup.create(1024, None).expect("object");
         object.write(vec![1u8; 8].into()).expect("first 8 bytes");
         let _hold = (announced, subgroups, subgroup, object);
-        // Joined here; aborting this task cancels the serve task with it.
-        struct AbortOnDrop(tokio::task::JoinHandle<()>);
-        impl Drop for AbortOnDrop {
-            fn drop(&mut self) { self.0.abort(); }
-        }
-        let _serving = AbortOnDrop(serving);
+        let _ = subscribed.serve(reader).await; // ends when the session ends
         std::future::pending::<()>().await;
     });
     let mut receiver = connect(&url).await;

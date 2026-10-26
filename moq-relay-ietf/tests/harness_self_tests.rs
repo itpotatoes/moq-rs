@@ -49,3 +49,42 @@ async fn stopping_a_publisher_cancels_and_joins_running_children() {
     PublisherTask::from_parts(main, children.clone()).stop().await;
     assert!(children.lock().unwrap().is_empty(), "every child was taken and joined");
 }
+
+/// Codex 177a P2: `stop()` aborts EVERY child before joining any, and a join
+/// is bounded: a child stuck inside a poll makes `stop_within` fail at the
+/// bound instead of hanging, and the children after it were still aborted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stopping_a_publisher_is_bounded_and_aborts_every_child_first() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct SetOnDrop(Arc<AtomicBool>);
+    impl Drop for SetOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let started = Arc::new(AtomicBool::new(false));
+    let flag = started.clone();
+    // Blocks its worker inside one poll for 1 s: abort cannot interrupt it.
+    let stuck = tokio::spawn(async move {
+        flag.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(1_000));
+    });
+    while !started.load(Ordering::SeqCst) {
+        tokio::task::yield_now().await;
+    }
+    let dropped = Arc::new(AtomicBool::new(false));
+    let guard = SetOnDrop(dropped.clone());
+    let later = tokio::spawn(async move {
+        let _guard = guard;
+        std::future::pending::<()>().await;
+    });
+    let children = Arc::new(Mutex::new(vec![stuck, later]));
+    let main = tokio::spawn(std::future::pending::<()>());
+    let begin = Instant::now();
+    let result = PublisherTask::from_parts(main, children).stop_within(Duration::from_millis(200)).await;
+    let error = result.expect_err("a stuck child fails the stop");
+    assert!(error.contains("did not finish within"), "{error}");
+    assert!(begin.elapsed() < Duration::from_millis(900), "bounded, not waiting for the stuck child");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(dropped.load(Ordering::SeqCst), "the later child was aborted before the stuck one was joined");
+}

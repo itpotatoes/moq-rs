@@ -14,8 +14,8 @@
 //! The upstream refusal is HELD (publisher gate) until the application has
 //! observed `subscribe_open` == Ok; without the gate the transport may process
 //! OK and DONE before the application waiter wakes, and `subscribe_open` then
-//! returns the terminal itself (Codex 174a). That merged shape is its own
-//! test: `relay_refusal_merged_before_the_open_returns`.
+//! returns the terminal itself (Codex 174a); how a P1 receiver treats that
+//! open-error is covered by `exp2_p1_a_retried_target_subscribe_keeps_the_route_generation`.
 mod common;
 
 use common::*;
