@@ -7037,7 +7037,13 @@ where
         // that recorded `t_ok` as NonMonotonicTime (diag 2026-10-26). After
         // step 3 the tick resumes and guards the SUBSCRIBE_OK -> exact-pair
         // window as before. Recorded instants are unchanged.
-        let gate_tick = if opening.is_none() { state.ingress.check_timeout(now) } else { Ok(()) };
+        //
+        // The tick reads the clock NOW, not the iteration's `now`: earlier in
+        // this iteration the parked-event replay (and step 3's refusal /
+        // timeout branches) call the gate with fresh `now_us()` instants
+        // (`abandon_pending` of a run-ended refusal, an exact-pair apply), so
+        // the iteration's `now` can be behind the gate clock (Codex 165a).
+        let gate_tick = if opening.is_none() { state.ingress.check_timeout(now_us()) } else { Ok(()) };
         if let Err(error) = gate_tick {
             // Fail closed: an effect timeout poisons the gate and ends the
             // run before H + G_report, so the exp2 JSONL gets no sentinel
@@ -15147,6 +15153,23 @@ mod s3_control_loop_tests {
         publish: bool,
         l2: bool,
     ) -> (Result<()>, Vec<serde_json::Value>, Option<(Vec<serde_json::Value>, Vec<serde_json::Value>)>) {
+        p1_loop_case_script(name, t0, force_ms, pc_hold_ms, hap_hold_ms, Vec::new(), SessionEnding::Never, publish, l2).await
+    }
+
+    /// [`p1_loop_case_holds`] plus the steps the PC target runs right after
+    /// its accept (e.g. a run-ended close) and the session's own ending.
+    #[allow(clippy::too_many_arguments)]
+    async fn p1_loop_case_script(
+        name: &str,
+        t0: u64,
+        force_ms: u64,
+        pc_hold_ms: u64,
+        hap_hold_ms: u64,
+        pc_after_accept: Vec<Step>,
+        session: SessionEnding,
+        publish: bool,
+        l2: bool,
+    ) -> (Result<()>, Vec<serde_json::Value>, Option<(Vec<serde_json::Value>, Vec<serde_json::Value>)>) {
         let force_ms = force_ms.to_string();
         use skew_moq::exp2_recorder::{canonical_json_bytes, haptic_slot_identity, pc_slot_identity};
         let dir = test_log_path(name);
@@ -15235,7 +15258,7 @@ mod s3_control_loop_tests {
         let script = vec![
             Call { track: PC_NORMAL, before: Vec::new(), answer: Answer::Accept(Vec::new()) },
             Call { track: HAPTIC_FULL, before: Vec::new(), answer: Answer::Accept(Vec::new()) },
-            Call { track: PC_CRITICAL, before: vec![Step::Sleep(pc_hold_ms)], answer: Answer::Accept(Vec::new()) },
+            Call { track: PC_CRITICAL, before: vec![Step::Sleep(pc_hold_ms)], answer: Answer::Accept(pc_after_accept) },
             Call { track: HAPTIC_ESSENTIAL, before: vec![Step::Sleep(hap_hold_ms)], answer: Answer::Accept(Vec::new()) },
         ];
         let seam = ScriptedSeam::new(script);
@@ -15275,7 +15298,7 @@ mod s3_control_loop_tests {
             logger,
             TrackNamespace::from_utf8_path(run_id),
             seam.clone(),
-            SessionEnding::Never.spawn(),
+            session.spawn(),
             phase_task,
         )
         .await;
@@ -15397,6 +15420,65 @@ mod s3_control_loop_tests {
             .expect("the failed switch is named");
         let t_warn = warning["t_us"].as_u64().unwrap();
         assert!(t_warn >= t_req + 2_000_000 && t_warn < t_req + 2_400_000, "at the effect deadline: {}", t_warn - t_req);
+    }
+
+    /// Codex 165a: split SUBSCRIBE_OKs (100 / 300 ms) and the PC target,
+    /// opened first, ends with the sender's run-ended code while the haptic
+    /// SUBSCRIBE is still in flight (a parked target end). After step 3 the
+    /// parked replay abandons the request at a fresh instant; the gate tick
+    /// of the same iteration then must not use the iteration's older `now`:
+    /// the refusal stays non-fatal and the run ends normally with its
+    /// sentinel (before: `P1 switch effect timeout: NonMonotonicTime` at
+    /// request + ~300 ms).
+    #[tokio::test]
+    async fn exp2_p1_parked_run_ended_refusal_does_not_regress_the_gate_clock() {
+        let (result, rows, _) = p1_loop_case_script(
+            "p1-parked-refusal",
+            now_us() - 39_000_000,
+            39_200,
+            100,
+            300,
+            vec![Step::CloseError(PC_CRITICAL, S3_RUN_ENDED_REQUEST_ERROR_CODE)],
+            SessionEnding::Never,
+            false,
+            false,
+        )
+        .await;
+        let error = result.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default();
+        assert!(result.is_ok(), "a run-ended refusal is non-fatal: {error}");
+        assert!(rows.iter().any(|r| r["role"] == "tier_switch" && r["phase"] == "subscribed"));
+        assert!(!rows.iter().any(|r| r["role"] == "tier_switch" && r["phase"] == "applied"));
+        let warnings: Vec<_> = rows.iter().filter(|r| r["role"] == "integrity_warning").collect();
+        eprintln!("warnings: {warnings:?}");
+        assert!(!warnings.iter().any(|r| r["kind"].as_str().is_some_and(|k| k.starts_with("p1_switch"))), "no switch failure: {warnings:?}");
+        assert!(rows.iter().any(|r| r["role"] == "instrumentation_end"), "the sentinel");
+    }
+
+    /// Codex 165a (regression guard): the session dies while a split opening
+    /// is in flight — the original error is kept, the opening is settled and
+    /// its targets released, and the shutdown is bounded.
+    #[tokio::test]
+    async fn exp2_p1_session_death_during_an_opening_is_bounded() {
+        let started = now_us();
+        let (result, rows, l2) = p1_loop_case_script(
+            "p1-session-dies",
+            started + 300_000,
+            100,
+            100,
+            2_500,
+            Vec::new(),
+            SessionEnding::ErrorAfterMs(650),
+            true,
+            true,
+        )
+        .await;
+        let error = format!("{:#}", result.expect_err("the session failed"));
+        let elapsed = now_us() - started;
+        assert!(error.contains("P1 session ended early") && error.contains("scripted session failure"), "{error}");
+        assert!(elapsed < 3_000_000, "the opening shutdown is bounded: {elapsed}");
+        assert!(!rows.iter().any(|r| r["role"] == "instrumentation_end"));
+        let (_, legacy) = l2.expect("L2 rows");
+        assert!(legacy.iter().any(|r| r["event"] == "p1_switch_open_at_exit" && r["action"] == "targets_released"));
     }
 
     /// The step-3 gate error text: only an effect timeout says "timed out".

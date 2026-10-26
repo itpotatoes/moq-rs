@@ -696,4 +696,27 @@ mod tests {
         assert_eq!(g.check_timeout(2_500), Ok(()));
         assert_eq!(g.subscribe_ok(TrackRole::Haptic, 2_500), Ok(()));
     }
+
+    /// The P1 loop order after an opening settles (Codex 165a), on a virtual
+    /// clock: step 3 records both SUBSCRIBE_OKs, the parked replay calls the
+    /// gate at a FRESH instant (an exact-pair apply or a run-ended
+    /// abandon), and the iteration's tick follows. A tick at the iteration's
+    /// older `now` is NonMonotonicTime; a tick at the current instant is not.
+    #[test]
+    fn a_tick_after_a_fresh_replay_call_must_read_the_clock_again() {
+        for replay_abandons in [true, false] {
+            let mut g = gate();
+            g.request(transition(900, S3State::Normal, S3State::HapticCritical), 1_000).unwrap();
+            let iteration_now = 2_600;
+            assert_eq!(g.subscribe_ok(TrackRole::Pc, 1_500), Ok(()));
+            assert_eq!(g.subscribe_ok(TrackRole::Haptic, 2_500), Ok(()));
+            if replay_abandons {
+                g.abandon_pending(2_700).unwrap();
+            } else {
+                g.exact_pair_first_effect(13_900_000, 418, 2_700).unwrap();
+            }
+            assert_eq!(g.check_timeout(iteration_now), Err(SwitchError::NonMonotonicTime));
+            assert_eq!(g.check_timeout(2_710), Ok(()), "the tick at the current instant");
+        }
+    }
 }
