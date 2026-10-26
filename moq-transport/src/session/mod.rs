@@ -553,20 +553,28 @@ impl Session {
         // Wrap mlog in Arc<Mutex<>> for sharing across tasks
         let mlog_shared = mlog.map(|m| Arc::new(Mutex::new(m)));
 
-        let publisher = Some(Publisher::new(
+        // One ordinal per session, shared by its control rows and by the
+        // binding observations of its publisher and subscriber roles. Set
+        // before any clone, so every clone (e.g. a Subscribed's) carries it.
+        let trace_session = crate::object_trace::next_session_ordinal();
+        let mut publisher = Publisher::new(
             outgoing.0.clone(),
             webtransport.clone(),
             mlog_shared.clone(),
             request_id.clone(),
             pending_requests.clone(),
             data_priority_mapping,
-        ));
-        let subscriber = Some(Subscriber::new(
+        );
+        publisher.set_trace_session(trace_session);
+        let mut subscriber = Subscriber::new(
             outgoing.0,
             mlog_shared.clone(),
             request_id.clone(),
             pending_requests.clone(),
-        ));
+        );
+        subscriber.set_trace_session(trace_session);
+        let publisher = Some(publisher);
+        let subscriber = Some(subscriber);
 
         let session = Self {
             webtransport,
@@ -580,7 +588,7 @@ impl Session {
             mlog: mlog_shared,
             transport,
             connection_path,
-            trace_session: crate::object_trace::next_session_ordinal(),
+            trace_session,
         };
 
         (session, publisher, subscriber)
@@ -866,9 +874,10 @@ impl Session {
                 }
             }
 
+            let send_begin = crate::object_trace::control_begin(&msg);
             sender.encode(&msg).await?;
             crate::object_trace::control(
-                crate::object_trace::ControlDirection::Sent, &msg, trace_session,
+                crate::object_trace::ControlDirection::Sent, &msg, trace_session, send_begin,
             );
         }
 
@@ -895,7 +904,7 @@ impl Session {
         loop {
             let msg: message::Message = recver.decode().await?;
             crate::object_trace::control(
-                crate::object_trace::ControlDirection::Received, &msg, trace_session,
+                crate::object_trace::ControlDirection::Received, &msg, trace_session, None,
             );
 
             // Emit structured tracing log for received control messages

@@ -131,6 +131,10 @@ pub struct Publisher {
 
     /// Local mapping from MoQT publisher priority to quinn stream priority.
     data_priority_mapping: DataPriorityMapping,
+
+    /// The owning session's `object_trace` ordinal (0 outside a `Session`);
+    /// observation identity only, never sent on the wire.
+    trace_session: u64,
 }
 
 impl Publisher {
@@ -156,7 +160,16 @@ impl Publisher {
             pending_requests,
             mlog,
             data_priority_mapping,
+            trace_session: 0,
         }
+    }
+
+    pub(super) fn set_trace_session(&mut self, trace_session: u64) {
+        self.trace_session = trace_session;
+    }
+
+    pub(super) fn trace_session(&self) -> u64 {
+        self.trace_session
     }
 
     pub(super) fn data_priority_mapping(&self) -> DataPriorityMapping {

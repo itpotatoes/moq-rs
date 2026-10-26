@@ -3,6 +3,7 @@
 
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::{
+    object_trace::{self, TrackBinding},
     serve::{FullTrackName, ServeError, TracksReader},
     session::{Publisher, SessionError, Subscribed, TrackStatusRequested},
 };
@@ -120,6 +121,15 @@ impl Producer {
             .await
         {
             let ns = namespace.to_utf8_path();
+            // Observation only: bind this downstream request to the track
+            // incarnation it is served from, and say whether this lookup
+            // created it (and so sent the upstream request) or reused it.
+            let binding = match track.kind {
+                crate::local::LocalTrackKind::Created => TrackBinding::DownstreamCreated,
+                crate::local::LocalTrackKind::Reused => TrackBinding::DownstreamReused,
+                crate::local::LocalTrackKind::Published => TrackBinding::DownstreamPublished,
+            };
+            object_trace::link(binding, subscribed.trace_session(), subscribed.id, &track.reader.info);
             tracing::info!(namespace = %ns, track = %track_name, source = "local", "serving subscribe from local: {:?}", track.reader.info);
             timing_guard.set_label("source", "local");
             let _track_guard = GaugeGuard::new("moq_relay_active_tracks");
@@ -134,6 +144,8 @@ impl Producer {
         {
             Ok(track) => {
                 if let Some(track) = track {
+                    object_trace::link(TrackBinding::DownstreamRemote, subscribed.trace_session(),
+                                       subscribed.id, &track.info);
                     let ns = namespace.to_utf8_path();
                     tracing::info!(namespace = %ns, track = %track_name, source = "remote", "serving subscribe from remote: {:?}", track.info);
                     // Update label to indicate remote source, timing recorded on drop

@@ -408,6 +408,13 @@ impl Subscribed {
             .await
     }
 
+    /// The owning session's `object_trace` ordinal (0 outside a `Session`),
+    /// for binding this request (peer-issued `self.id`) to a track
+    /// incarnation in an observer.
+    pub fn trace_session(&self) -> u64 {
+        self.forwarder.publisher.trace_session()
+    }
+
     pub fn close(self, err: ServeError) -> Result<(), ServeError> {
         self.forwarder.close(err)
     }

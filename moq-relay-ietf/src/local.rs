@@ -72,6 +72,19 @@ impl ops::Deref for NamespaceTrackRequest {
 pub(crate) struct LocalTrack {
     pub reader: TrackReader,
     _lease: Option<LocalTrackLease>,
+    /// How this lookup obtained `reader` (observation only).
+    pub kind: LocalTrackKind,
+}
+
+/// How `get_or_request_track` served a lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalTrackKind {
+    /// A new namespace incarnation whose creation sent the upstream request.
+    Created,
+    /// An existing namespace incarnation (lease reuse, no new request).
+    Reused,
+    /// An exact track registered from an inbound PUBLISH.
+    Published,
 }
 
 impl ops::Deref for LocalTrack {
@@ -293,6 +306,7 @@ impl Locals {
                                 full_name: full_name.clone(),
                                 identity,
                             }),
+                            kind: LocalTrackKind::Created,
                         },
                         Some(cancelled),
                     )
@@ -320,6 +334,7 @@ impl Locals {
                                 full_name: full_name.clone(),
                                 identity,
                             }),
+                            kind: LocalTrackKind::Created,
                         },
                         Some(cancelled),
                     )
@@ -374,6 +389,7 @@ fn acquire_entry(
         TrackEntry::Published(reader) => Some(LocalTrack {
             reader: reader.clone(),
             _lease: None,
+            kind: LocalTrackKind::Published,
         }),
         TrackEntry::Namespace {
             reader,
@@ -390,6 +406,7 @@ fn acquire_entry(
                     full_name,
                     identity: identity.clone(),
                 }),
+                kind: LocalTrackKind::Reused,
             })
         }
     }

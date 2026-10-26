@@ -112,6 +112,10 @@ pub struct Subscriber {
 
     /// Optional mlog writer for logging transport events
     mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+
+    /// The owning session's `object_trace` ordinal (0 outside a `Session`);
+    /// observation identity only, never sent on the wire.
+    trace_session: u64,
 }
 
 /// Which subscription owns a given Track Alias (draft-16 §10.1).
@@ -221,7 +225,12 @@ impl Subscriber {
             request_id,
             pending_requests,
             mlog,
+            trace_session: 0,
         }
+    }
+
+    pub(super) fn set_trace_session(&mut self, trace_session: u64) {
+        self.trace_session = trace_session;
     }
 
     /// Create an inbound/server QUIC connection, by accepting a bi-directional QUIC stream for control messages.
@@ -435,6 +444,9 @@ impl Subscriber {
             )));
         }
 
+        // Bind this request to its track incarnation for an opted-in observer
+        // only (no Arc clone otherwise); bound before the SUBSCRIBE is queued.
+        let trace_track = crate::object_trace::observing_control().then(|| track.info.clone());
         let (mut send, recv) =
             match Subscribe::new_with_params(self.clone(), request_id, track, params) {
                 Ok(pair) => pair,
@@ -457,6 +469,12 @@ impl Subscriber {
                 }
                 return Err(ServeError::internal_ctx("subscribe lock poisoned"));
             }
+        }
+        if let Some(track) = &trace_track {
+            crate::object_trace::link(
+                crate::object_trace::TrackBinding::UpstreamSubscribe,
+                self.trace_session, request_id, track,
+            );
         }
         send.send_request();
         send.ok().await?;
