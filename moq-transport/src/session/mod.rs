@@ -194,6 +194,10 @@ pub struct Session {
     /// (takes precedence) or the CLIENT_SETUP PATH parameter (key 0x1).
     /// For outgoing connections: auto-extracted from the session URL in connect().
     connection_path: Option<String>,
+
+    /// Process-local ordinal for optional control-stream observations
+    /// (`object_trace::control`); never sent on the wire.
+    trace_session: u64,
 }
 
 impl Session {
@@ -576,6 +580,7 @@ impl Session {
             mlog: mlog_shared,
             transport,
             connection_path,
+            trace_session: crate::object_trace::next_session_ordinal(),
         };
 
         (session, publisher, subscriber)
@@ -810,8 +815,8 @@ impl Session {
     /// and receiving and processing QUIC datagrams received
     pub async fn run(self) -> Result<(), SessionError> {
         tokio::select! {
-            res = Self::run_recv(self.recver, self.publisher.clone(), self.subscriber.clone(), self.mlog.clone(), self.request_id.clone(), self.pending_requests.clone()) => res,
-            res = Self::run_send(self.sender, self.outgoing, self.mlog.clone()) => res,
+            res = Self::run_recv(self.recver, self.publisher.clone(), self.subscriber.clone(), self.mlog.clone(), self.request_id.clone(), self.pending_requests.clone(), self.trace_session) => res,
+            res = Self::run_send(self.sender, self.outgoing, self.mlog.clone(), self.trace_session) => res,
             res = Self::run_streams(self.webtransport.clone(), self.subscriber.clone()) => res,
             res = Self::run_datagrams(self.webtransport, self.subscriber.clone()) => res,
             res = Self::run_pending_timeouts(self.publisher, self.subscriber, self.pending_requests) => res,
@@ -823,6 +828,7 @@ impl Session {
         mut sender: Writer,
         mut outgoing: Queue<message::Message>,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+        trace_session: u64,
     ) -> Result<(), SessionError> {
         while let Some(msg) = outgoing.pop().await {
             // Emit structured tracing log for sent control messages
@@ -861,6 +867,9 @@ impl Session {
             }
 
             sender.encode(&msg).await?;
+            crate::object_trace::control(
+                crate::object_trace::ControlDirection::Sent, &msg, trace_session,
+            );
         }
 
         Ok(())
@@ -879,11 +888,15 @@ impl Session {
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
         request_id: RequestId,
         pending_requests: PendingRequests,
+        trace_session: u64,
     ) -> Result<(), SessionError> {
         let mut goaway_received = false;
 
         loop {
             let msg: message::Message = recver.decode().await?;
+            crate::object_trace::control(
+                crate::object_trace::ControlDirection::Received, &msg, trace_session,
+            );
 
             // Emit structured tracing log for received control messages
             Self::log_control_message(&msg, "recv");

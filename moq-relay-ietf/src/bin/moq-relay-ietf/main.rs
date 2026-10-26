@@ -239,7 +239,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(path) = &cli.object_trace {
         // Only the opt-in verification mode intercepts SIGTERM. The harness
         // sends it after endpoints finish, then checks the sealed trace footer.
-        let trace = object_trace::Trace::start(path, cli.object_trace_run_id.as_deref().unwrap(), cli.object_trace_capacity)?;
+        let trace = object_trace::Trace::start(path, cli.object_trace_run_id.as_deref().unwrap(), cli.object_trace_capacity, cli.data_priority_mapping)?;
         let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         let (ending, result) = tokio::select! {
             result = relay.run() => ("relay_returned", result),
