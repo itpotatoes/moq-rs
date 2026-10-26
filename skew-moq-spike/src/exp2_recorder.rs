@@ -1,5 +1,6 @@
 //! Experiment-2 WP3 recorder: the receiver-side producer of the L1-R output
-//! ledger (contract `md/20260929_실험2_계약.md`, exp2-contract-v4 (§9, §10)).
+//! ledger (contract `md/20260929_실험2_계약.md`, exp2-contract-v5; section
+//! references "contract v4 §N" below name the rule's origin, unchanged in v5).
 //!
 //! The recorder owns the run's exp2 JSONL file and, for the core methods, the
 //! WP1 core (`Exp2Playout` for S3NPA'/P0-NP/P0, `Exp2P1` for P1).  B1 and S1
@@ -42,8 +43,28 @@ use crate::l2_output::{L2Identity, L2Modality, L2SubmitOutcome, L2Submitter};
 use crate::s3_controller::HapticMode;
 use crate::{is_warmup_seq, Header, HDR, TRACK_HAPTIC, TRACK_PC};
 
-pub const EXP2_CONTRACT_VERSION: &str = "exp2-contract-v4";
-pub const EXP2_METRIC_SCHEMA_VERSION: &str = "exp2-v3";
+/// The contract generation this recorder writes (exp2 meta `contract`) and
+/// requires of the runner's opportunities file (`contract`). v5 (stage-2
+/// decision E1, `md/20261025_실험2_2단계_등록변경안.md`) = v4 plus, as
+/// written by this code generation:
+/// * the seal drop `dispatch_after_horizon` with `t_dispatch_us` (a release
+///   dispatched after H is not a submission; registration §4-5 ④, or ③ as
+///   `pending_at_horizon` + `t_dispatch_us` when its due is after H), the S1
+///   rule the same; `unreleased_at_horizon` = an H cancellation (④);
+/// * `post_horizon_terminals_suppressed` also counts core dispatches after H;
+/// * rx `info` rows `exp2_l2_link` (two-stage submit accounting keys
+///   `submit_attempted`, `submit_accepted`, `discarded_before_submit`,
+///   `refused_after_close`, `refused_sink_gone`, `release_after_h`, ...),
+///   `exp2_l2_close` (absolute T_cut = H + G_report,L2) and `exp2_l2_finish`
+///   (lane end instants);
+/// * the §7-1 calibration mode: rx `cal_*` rows (`cal_meta` carries this
+///   contract and the metric schema below), L2 meta method `"calibration"`.
+/// A v4 opportunities file is refused ([`load_opportunities`]).
+pub const EXP2_CONTRACT_VERSION: &str = "exp2-contract-v5";
+/// The exp2 JSONL / summary schema generation (exp2 meta
+/// `metric_schema_version`): `exp2-v4` = the rows and meanings of contract
+/// v5 above (stage-2 decision E2; v3 files are non-evidence only).
+pub const EXP2_METRIC_SCHEMA_VERSION: &str = "exp2-v4";
 /// Registration §1: run length, B_play, ε_ref, G_report,R (integer µs).
 pub const RUN_DURATION_US: u64 = 40_000_000;
 pub const B_PLAY_US: u64 = 400_000;
@@ -3858,4 +3879,33 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+
+    /// Stage-2 E1/E2: the generation tags are pinned, written into the exp2
+    /// meta, and a previous-generation opportunities file is refused.
+    #[test]
+    fn the_generation_tags_are_contract_v5_and_exp2_v4() {
+        assert_eq!(EXP2_CONTRACT_VERSION, "exp2-contract-v5");
+        assert_eq!(EXP2_METRIC_SCHEMA_VERSION, "exp2-v4");
+        let opp = |contract: &str| {
+            let pc: Vec<Value> = (0..N_PC as u64)
+                .map(|i| {
+                    let (pts, e) = pc_slot_identity(i);
+                    json!({"i": i, "pts_us": pts, "event_id": e, "ref_us": T0 + pts})
+                })
+                .collect();
+            let hap: Vec<Value> = (0..N_HAPTIC as u64)
+                .map(|k| {
+                    let (pts, e) = haptic_slot_identity(k);
+                    json!({"k": k, "pts_us": pts, "event_id": e,
+                        "anchor_i": if k % 3 == 0 { json!(k / 3) } else { Value::Null }})
+                })
+                .collect();
+            canonical_json_bytes(&json!({"contract": contract, "run_id": "run-1", "t0_us": T0, "pc": pc, "haptic": hap}))
+        };
+        assert!(load_opportunities(&opp("exp2-contract-v5"), "run-1", T0).is_ok());
+        for old in ["exp2-contract-v4", "exp2-contract-v3"] {
+            let error = load_opportunities(&opp(old), "run-1", T0).unwrap_err();
+            assert!(format!("{error:#}").contains("exp2-contract-v5"), "{error:#}");
+        }
+    }
 }

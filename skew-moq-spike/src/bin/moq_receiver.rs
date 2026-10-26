@@ -9758,9 +9758,11 @@ fn cal_meta_body(cal: &CalCli) -> String {
     use skew_moq::cal_playout::{
         CAL_H_RULE, CAL_LATE_RULE, CAL_PLAN_SOURCE, CAL_RELEASE_TIE_RULE, CAL_SEAL_EXECUTION_DELAY_US,
     };
-    use skew_moq::exp2_recorder::{N_HAPTIC, N_PC};
+    use skew_moq::exp2_recorder::{EXP2_CONTRACT_VERSION, EXP2_METRIC_SCHEMA_VERSION, N_HAPTIC, N_PC};
+    // The generation tags bind the calibration rows to the same contract /
+    // schema generation as the exp2 runs (stage-2 E4: one frozen generation).
     format!(
-        "\"event\":\"cal_meta\",\"mode\":\"calibration\",\"registration\":\"§7-1 L2 equipment calibration (no method)\",\"d_cal_us\":{},\"w_cal_us\":{},\"w_cal_is_slot\":false,\"representation\":\"{}\",\"topology\":\"{}\",\"n_pc\":{N_PC},\"n_haptic\":{N_HAPTIC},\"plan\":\"{}\",\"release_rule\":\"due_us = t0 + pts + D_cal; t_release_us = the actual dispatch instant (>= due_us), the L2 submit's t_release_us\",\"tie_rule\":\"{}\",\"late_rule\":\"{}\",\"h_rule\":\"{}\",\"seal_execution_delay_us\":{CAL_SEAL_EXECUTION_DELAY_US},\"close_rule\":\"absolute close deadline H_cal + W_cal (start_close_until)\",\"exp2_jsonl\":false,\"cal_test_mode\":{},\"scientific_eligible\":{}",
+        "\"event\":\"cal_meta\",\"contract\":\"{EXP2_CONTRACT_VERSION}\",\"metric_schema_version\":\"{EXP2_METRIC_SCHEMA_VERSION}\",\"mode\":\"calibration\",\"registration\":\"§7-1 L2 equipment calibration (no method)\",\"d_cal_us\":{},\"w_cal_us\":{},\"w_cal_is_slot\":false,\"representation\":\"{}\",\"topology\":\"{}\",\"n_pc\":{N_PC},\"n_haptic\":{N_HAPTIC},\"plan\":\"{}\",\"release_rule\":\"due_us = t0 + pts + D_cal; t_release_us = the actual dispatch instant (>= due_us), the L2 submit's t_release_us\",\"tie_rule\":\"{}\",\"late_rule\":\"{}\",\"h_rule\":\"{}\",\"seal_execution_delay_us\":{CAL_SEAL_EXECUTION_DELAY_US},\"close_rule\":\"absolute close deadline H_cal + W_cal (start_close_until)\",\"exp2_jsonl\":false,\"cal_test_mode\":{},\"scientific_eligible\":{}",
         cal.d_cal_us,
         cal.w_cal_us,
         cal.representation.as_str(),
@@ -15192,7 +15194,7 @@ mod s3_control_loop_tests {
         let ledger = dir.join("opportunities.exp2.json");
         std::fs::write(
             &ledger,
-            canonical_json_bytes(&serde_json::json!({"contract": "exp2-contract-v4",
+            canonical_json_bytes(&serde_json::json!({"contract": skew_moq::exp2_recorder::EXP2_CONTRACT_VERSION,
                 "run_id": run_id, "t0_us": t0, "pc": pc, "haptic": hap})),
         )
         .unwrap();
@@ -18367,7 +18369,7 @@ mod exp2_receiver_tests {
         let ledger = dir.join("opportunities.exp2.json");
         std::fs::write(
             &ledger,
-            canonical_json_bytes(&serde_json::json!({"contract": "exp2-contract-v4",
+            canonical_json_bytes(&serde_json::json!({"contract": skew_moq::exp2_recorder::EXP2_CONTRACT_VERSION,
                 "run_id": "t", "t0_us": t0, "pc": pc, "haptic": hap})),
         )
         .unwrap();
@@ -19234,6 +19236,21 @@ mod l2_hook_tests {
     }
 
     // ------------------------------------------- §7-1 calibration receiver
+
+    /// Stage-2 E4: the calibration declaration carries the same generation
+    /// tags as the exp2 meta (contract v5, exp2-v4).
+    #[test]
+    fn calibration_meta_carries_the_generation_tags() {
+        let log = tmp("cal-meta-tags").display().to_string();
+        let args = cal_cli(&[], &log).unwrap();
+        let cal = validate_receiver(&args).unwrap().unwrap();
+        let row: serde_json::Value = serde_json::from_str(&format!("{{{}}}", cal_meta_body(&cal))).unwrap();
+        assert_eq!(row["event"], "cal_meta");
+        assert_eq!(row["contract"], "exp2-contract-v5");
+        assert_eq!(row["metric_schema_version"], "exp2-v4");
+        assert_eq!(row["contract"], skew_moq::exp2_recorder::EXP2_CONTRACT_VERSION);
+        assert_eq!(row["metric_schema_version"], skew_moq::exp2_recorder::EXP2_METRIC_SCHEMA_VERSION);
+    }
 
     /// Codex 158a P2 (inverted): two equal-due objects already queued in
     /// the ingress channel, the scheduler waking ~1 ms after the due — both
