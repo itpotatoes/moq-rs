@@ -21,11 +21,11 @@ async fn a_second_downstream_subscribe_reuses_the_first_incarnation_without_an_u
     let mut first = connect(&url).await;
     let (a, reader_a) = subscribe(&mut first, "run-c", "pc").await;
     let _a = a.expect("first subscriber accepted");
-    read_objects(reader_a, 1).await; // the first lease is live and flowing
+    read_objects(&reader_a, 1).await; // the first lease is live and flowing
     let mut second = connect(&url).await;
     let (b, reader_b) = subscribe(&mut second, "run-c", "pc").await;
     let _b = b.expect("second subscriber accepted");
-    read_objects(reader_b, 1).await;
+    read_objects(&reader_b, 1).await;
     assert_eq!(seen.load(Ordering::SeqCst), 1, "the publisher saw ONE SUBSCRIBE");
 
     let down = probe.downstream_links("pc");
@@ -42,6 +42,6 @@ async fn a_second_downstream_subscribe_reuses_the_first_incarnation_without_an_u
         assert!(probe.row("subscribe_ok_sent", d.session, d.request_id).is_some(), "{d:?}");
     }
 
-    publisher.abort();
+    publisher.stop().await;
     relay.stop();
 }

@@ -30,13 +30,19 @@ async fn an_upstream_end_during_a_partial_object_ends_the_downstream_route_with_
     let publisher = tokio::spawn(async move {
         let subscribed = announced.subscribed().await.expect("subscribed").expect("a SUBSCRIBE");
         let (writer, reader) = Track::new(ns, "pc").produce();
-        let serving = tokio::spawn(subscribed.serve(reader));
+        let serving = tokio::spawn(async move { let _ = subscribed.serve(reader).await; });
         let mut subgroups = writer.subgroups().expect("subgroups");
         let mut subgroup = subgroups.append(1).expect("subgroup");
         let mut object = subgroup.create(1024, None).expect("object");
         object.write(vec![1u8; 8].into()).expect("first 8 bytes");
+        let _hold = (announced, subgroups, subgroup, object);
+        // Joined here; aborting this task cancels the serve task with it.
+        struct AbortOnDrop(tokio::task::JoinHandle<()>);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) { self.0.abort(); }
+        }
+        let _serving = AbortOnDrop(serving);
         std::future::pending::<()>().await;
-        drop((announced, serving, subgroups, subgroup, object));
     });
     let mut receiver = connect(&url).await;
     let (live, _reader) = subscribe(&mut receiver, "run-p", "pc").await;
@@ -50,11 +56,12 @@ async fn an_upstream_end_during_a_partial_object_ends_the_downstream_route_with_
     })
     .await;
 
-    publisher.abort();
+    // The publisher's SESSION ends; its task (still holding the partial
+    // object's writer) is stopped and joined only after the terminal.
     sender.session.abort();
     drop(sender);
 
-    let terminal = tokio::time::timeout(STEP, live.closed()).await.expect("a terminal in bounded time");
+    let terminal = closed(&live).await;
     assert_eq!(terminal, Err(ServeError::Closed(0)), "an error terminal, not TrackEnded");
     let down = probe.downstream_links("pc");
     eventually("the relay's PUBLISH_DONE", || {
@@ -63,5 +70,7 @@ async fn an_upstream_end_during_a_partial_object_ends_the_downstream_route_with_
     .await;
     let done = probe.row("publish_done_sent", down[0].session, down[0].request_id).unwrap();
     assert_eq!(done.status_code, Some(0x0), "PUBLISH_DONE InternalError");
+    publisher.abort();
+    expect_no_panic("the partial-object publisher", publisher.await);
     relay.stop();
 }

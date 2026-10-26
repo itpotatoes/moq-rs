@@ -42,9 +42,7 @@ async fn the_upstream_refusal_after_the_relays_local_subscribe_ok_reaches_the_su
     let subscribe = subscribe.expect("the relay accepts locally before the upstream answer");
     gate.notify_one(); // only now may the publisher refuse
     // ... then the upstream refusal arrives as the subscription's terminal.
-    let terminal = tokio::time::timeout(STEP, subscribe.closed())
-        .await
-        .expect("the refusal reaches the subscriber in time");
+    let terminal = closed(&subscribe).await;
     assert_eq!(terminal, Err(ServeError::Closed(DOES_NOT_EXIST)), "{terminal:?}");
     assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1, "one SUBSCRIBE reached the publisher");
 
@@ -85,6 +83,6 @@ async fn the_upstream_refusal_after_the_relays_local_subscribe_ok_reaches_the_su
         d_ok.seq, u_sent.seq, u_refused.seq
     );
 
-    publisher.abort();
+    publisher.stop().await;
     relay.stop();
 }

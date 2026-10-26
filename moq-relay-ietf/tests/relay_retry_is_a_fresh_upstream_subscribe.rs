@@ -28,13 +28,13 @@ async fn a_retry_after_an_upstream_refusal_reaches_the_publisher_as_a_fresh_subs
         subscribe_with_held_waiter(&mut receiver, "run-b", "pc-d6", Duration::from_millis(50)).await;
     let first = first.expect("local OK");
     gate.notify_one(); // the refusal is held until the local OK was observed
-    let terminal = tokio::time::timeout(STEP, first.closed()).await.expect("terminal in time");
+    let terminal = closed(&first).await;
     assert_eq!(terminal, Err(ServeError::Closed(0x10)));
     drop(first);
     // Attempt 2 (the retry): accepted end to end, objects flow.
     let (second, reader) = subscribe(&mut receiver, "run-b", "pc-d6").await;
     let _second = second.expect("the retry is accepted");
-    let objects = read_objects(reader, 3).await;
+    let objects = read_objects(&reader, 3).await;
     assert_eq!(objects.len(), 3);
     assert_eq!(seen.load(Ordering::SeqCst), 2, "one publisher SUBSCRIBE per subscriber attempt");
 
@@ -63,6 +63,6 @@ async fn a_retry_after_an_upstream_refusal_reaches_the_publisher_as_a_fresh_subs
     assert!(!forwarded.is_empty());
     assert!(forwarded.iter().all(|f| Arc::ptr_eq(&f.track, &down[1].track)), "{forwarded:?}");
 
-    publisher.abort();
+    publisher.stop().await;
     relay.stop();
 }

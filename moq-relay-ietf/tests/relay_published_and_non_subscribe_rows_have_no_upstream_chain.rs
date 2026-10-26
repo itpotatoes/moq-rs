@@ -30,7 +30,7 @@ async fn published_tracks_and_non_subscribe_errors_have_no_upstream_subscribe_ch
         .expect("PUBLISH answered in time")
         .expect("PUBLISH accepted");
     tokio::time::timeout(STEP, published.ok()).await.expect("PUBLISH_OK in time").expect("PUBLISH_OK");
-    let serving = tokio::spawn(published.serve());
+    let serving = tokio::spawn(async move { let _ = published.serve().await; });
     let mut subgroups = writer.subgroups().expect("subgroups");
     let producer = tokio::spawn(async move {
         for i in 0..200u64 {
@@ -44,7 +44,7 @@ async fn published_tracks_and_non_subscribe_errors_have_no_upstream_subscribe_ch
     let mut receiver = connect(&url).await;
     let (sub, reader) = subscribe(&mut receiver, "run-pub", "pc").await;
     let _sub = sub.expect("served from the published track");
-    read_objects(reader, 1).await;
+    read_objects(&reader, 1).await;
     let down = probe.downstream_links("pc");
     assert_eq!(down.len(), 1, "{down:?}");
     assert_eq!(down[0].binding.as_str(), "published");
@@ -70,7 +70,9 @@ async fn published_tracks_and_non_subscribe_errors_have_no_upstream_subscribe_ch
 
     // The inbound PUBLISH ends: its PUBLISH_DONE reaches the relay unbound.
     producer.abort();
+    expect_no_panic("the PUBLISH producer", producer.await.map(drop));
     serving.abort();
+    expect_no_panic("the PUBLISH serve task", serving.await);
     drop(sender);
     eventually("the relay's PUBLISH_DONE for the inbound PUBLISH", || {
         probe.controls().iter().any(|r| r.boundary == "publish_done_received" && r.session != down[0].session)

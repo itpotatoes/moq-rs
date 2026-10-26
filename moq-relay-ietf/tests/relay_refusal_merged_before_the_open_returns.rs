@@ -6,6 +6,11 @@
 //! retryable 0x10 refusal). Real relay, real QUIC; the application waiter is
 //! held, never the transport.
 //!
+//! The FIRST poll must see the SUBSCRIBE in flight: the subscriber's dispatch
+//! of the SUBSCRIBE_OK is gated (its control hook blocks) until that Pending
+//! was observed (Codex 176a: a stall inside the first poll could otherwise
+//! make it Ready).
+//!
 //! "Processed" means DISPATCHED: the control hook runs before dispatch, so the
 //! test fences on a LATER response on the same incoming control stream (a
 //! TRACK_STATUS refusal), and a 50 ms stall injected right after the DONE's
@@ -30,9 +35,11 @@ async fn ok_and_refusal_processed_before_the_waiter_runs_make_the_open_return_th
     let mut fence = receiver.subscriber.clone();
     *probe.hold_after.lock().unwrap() =
         Some(("publish_done_received", std::time::Duration::from_millis(50)));
+    let ok_gate = probe.gate_boundary("subscribe_ok_received");
     let (writer, _reader) = Track::new(TrackNamespace::from_utf8_path("run-m"), "pc-d6").produce();
     let mut open = Box::pin(receiver.subscriber.subscribe_open(writer));
     assert!(matches!(futures::poll!(open.as_mut()), Poll::Pending), "the SUBSCRIBE is in flight");
+    ok_gate.open(); // only now may the subscriber dispatch the SUBSCRIBE_OK
     // Hold only the application waiter until the subscriber's transport has
     // processed both the SUBSCRIBE_OK and the PUBLISH_DONE.
     eventually("the subscriber received OK and the propagated refusal", || {
@@ -49,9 +56,18 @@ async fn ok_and_refusal_processed_before_the_waiter_runs_make_the_open_return_th
         .find(|r| r.boundary == "publish_done_received" && r.status_code == Some(0x10))
         .expect("the subscriber's DONE")
         .session;
+    // Match the fence's OWN reply: a REQUEST_ERROR on that session whose
+    // request id was not seen before the fence was sent.
+    let refusals_before = |probe: &Probe| -> Vec<u64> {
+        probe.controls().iter()
+            .filter(|r| r.boundary == "request_error_received" && r.session == client)
+            .map(|r| r.request_id)
+            .collect()
+    };
+    let before = refusals_before(&probe);
     fence.track_status(&TrackNamespace::from_utf8_path("run-m"), "dispatch-fence");
-    eventually("a later response on the subscriber's control stream", || {
-        probe.controls().iter().any(|r| r.boundary == "request_error_received" && r.session == client)
+    eventually("the fence's reply on the subscriber's control stream", || {
+        refusals_before(&probe).iter().any(|id| !before.contains(id))
     })
     .await;
     *probe.hold_after.lock().unwrap() = None;
@@ -72,6 +88,6 @@ async fn ok_and_refusal_processed_before_the_waiter_runs_make_the_open_return_th
     assert!(ok.seq < done.seq, "OK left before the DONE on the wire");
     eprintln!("observed (not guaranteed): OK seq {} / upstream refusal seq {} / DONE seq {}",
               ok.seq, refusal.seq, done.seq);
-    publisher.abort();
+    publisher.stop().await;
     relay.stop();
 }

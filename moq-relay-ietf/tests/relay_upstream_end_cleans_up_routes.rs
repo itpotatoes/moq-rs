@@ -29,14 +29,14 @@ async fn the_end_of_the_upstream_session_ends_downstream_routes_and_the_namespac
     let mut receiver = connect(&url).await;
     let (live, reader) = subscribe(&mut receiver, "run-d", "pc").await;
     let live = live.expect("accepted");
-    read_objects(reader, 2).await;
+    read_objects(&reader, 2).await; // `reader` stays alive to the end (Codex 176a)
 
-    // The publisher's session ends (its task and endpoint go away).
-    publisher.abort();
+    // The publisher's SESSION ends (its task and endpoint go away); its
+    // producer tasks are stopped and joined afterwards.
     sender.session.abort();
     drop(sender);
 
-    let terminal = tokio::time::timeout(STEP, live.closed()).await.expect("a terminal in bounded time");
+    let terminal = closed(&live).await;
     assert_eq!(terminal, Ok(()), "observed: a normal end at the subscriber");
     let down = probe.downstream_links("pc");
     assert_eq!(down.len(), 1);
@@ -67,5 +67,7 @@ async fn the_end_of_the_upstream_session_ends_downstream_routes_and_the_namespac
     assert_eq!(refused, moq_transport::serve::ServeError::Closed(0x10), "not found");
     assert!(probe.downstream_links("haptic").iter().all(|l| l.binding.as_str() != "reused"));
 
+    publisher.stop().await;
+    drop(reader);
     relay.stop();
 }

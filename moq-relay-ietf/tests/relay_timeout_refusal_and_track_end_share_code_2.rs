@@ -33,11 +33,11 @@ async fn a_timeout_refusal_and_a_normal_track_end_look_the_same_downstream_but_n
     let (refused, _r1) = subscribe_with_held_waiter(&mut receiver, "run-t", "pc-d6", held).await;
     let refused = refused.expect("local OK");
     gate.notify_one();
-    let refused_end = tokio::time::timeout(STEP, refused.closed()).await.expect("terminal in time");
+    let refused_end = closed(&refused).await;
     let (ended, _r2) = subscribe_with_held_waiter(&mut receiver, "run-t", "pc-d7", held).await;
     let ended = ended.expect("accepted");
     end_gate.notify_one();
-    let normal_end = tokio::time::timeout(STEP, ended.closed()).await.expect("terminal in time");
+    let normal_end = closed(&ended).await;
     // Downstream: the SAME terminal for both.
     assert_eq!(refused_end, Ok(()), "a code-2 refusal reads as TrackEnded at the subscriber");
     assert_eq!(normal_end, Ok(()));
@@ -69,6 +69,6 @@ async fn a_timeout_refusal_and_a_normal_track_end_look_the_same_downstream_but_n
     let upstream_done = probe.row("publish_done_received", u_end.session, u_end.request_id)
         .expect("the publisher's own normal end");
     assert_eq!(upstream_done.status_code, Some(0x2));
-    publisher.abort();
+    publisher.stop().await;
     relay.stop();
 }
