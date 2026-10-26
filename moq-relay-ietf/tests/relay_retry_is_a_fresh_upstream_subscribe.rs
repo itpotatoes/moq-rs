@@ -17,12 +17,16 @@ async fn a_retry_after_an_upstream_refusal_reaches_the_publisher_as_a_fresh_subs
     let url = relay.url.clone();
     let mut sender = connect(&url).await;
     let accept = Answer::Accept { objects: 3, gap: Duration::from_millis(5) };
-    let (publisher, seen) = publish(&mut sender, "run-b", vec![Answer::Refuse, accept]).await;
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let refuse = Answer::RefuseAfter { code: 0x10, gate: gate.clone() };
+    let (publisher, seen) = publish(&mut sender, "run-b", vec![refuse, accept]).await;
     let mut receiver = connect(&url).await;
 
     // Attempt 1: local OK, then the upstream refusal.
-    let (first, _reader) = subscribe(&mut receiver, "run-b", "pc-d6").await;
+    let (first, _reader) =
+        subscribe_with_held_waiter(&mut receiver, "run-b", "pc-d6", Duration::from_millis(50)).await;
     let first = first.expect("local OK");
+    gate.notify_one(); // the refusal is held until the local OK was observed
     let terminal = tokio::time::timeout(STEP, first.closed()).await.expect("terminal in time");
     assert_eq!(terminal, Err(ServeError::Closed(0x10)));
     drop(first);

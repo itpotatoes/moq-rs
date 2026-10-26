@@ -3,20 +3,20 @@
 //! Schema `relay-object-trace-v3` = v1 rows and fields unchanged, plus:
 //! * `relay_object`: `publisher_priority`, `quinn_priority_mapped`,
 //!   `track_incarnation`;
-//! * `relay_control` rows (SUBSCRIBE / SUBSCRIBE_OK / REQUEST_ERROR /
-//!   PUBLISH_DONE at each session's control stream) in their own bounded
-//!   buffer, with `t_send_begin_us` on sent rows and the request's
-//!   `track_incarnation` / `track_binding` joined from the relay's own
-//!   subscription-to-track bindings (also bounded and loss-accounted);
+//! * `relay_control` rows (SUBSCRIBE / SUBSCRIBE_OK / REQUEST_ERROR / PUBLISH_DONE
+//!   per session control stream), own bounded buffer, `t_send_begin_us` on sent
+//!   rows; `track_incarnation`/`track_binding` only on rows of an observed, bound
+//!   SUBSCRIBE chain (null: SUBSCRIBE refused before binding, REQUEST_ERROR of
+//!   another request kind, PUBLISH_DONE of an inbound PUBLISH — all normal);
 //! * relay RSS (`/proc/self/status` VmRSS, sampled on a separate OS thread)
 //!   on `trace_meta` (start) and `trace_end` (sampled maximum and end).
 //!   Kernel VmHWM is not exported: on this host it read below an earlier
 //!   VmRSS sample.
 //!
-//! v2 -> v3: control rows gained PUBLISH_DONE boundaries and the fields
-//! above, `trace_end` gained link and control-clock counters, and `intact`
-//! also requires no link loss, no duplicate binding and no control clock
-//! failure. `clock_errors` again counts object-boundary clock failures only.
+//! v2 -> v3: control rows gained PUBLISH_DONE boundaries and the fields above,
+//! `trace_end` gained link and control-clock counters; `intact` also requires no
+//! control/link loss (overflow or a poisoned lock), no duplicate binding and no
+//! control clock failure. `clock_errors` again counts object clock failures only.
 use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
@@ -351,9 +351,9 @@ impl RssStats {
 ///
 /// Spacing: the next periodic sample is due one full `period` after the
 /// previous sample COMPLETED, so a slow read is never followed by a
-/// catch-up sample. `finish` unparks the thread, but a read already in
-/// progress is not interruptible: teardown waits for at most that one read
-/// (normally microseconds; as long as the read itself if procfs stalls).
+/// catch-up sample. `finish` unparks the thread, waits for a read already in
+/// progress (not interruptible), then takes the end sample itself: NOT an
+/// absolute wall-time bound (each /proc read is normally microseconds).
 struct RssSampler {
     stats: Arc<RssStats>,
     stop: Arc<AtomicBool>,
@@ -1117,5 +1117,42 @@ mod tests {
         sampler.finish().unwrap();
         let waited = begin.elapsed();
         assert!(waited < Duration::from_millis(400), "bounded by the one read: {waited:?}");
+    }
+
+    /// Codex 174a P3: bindings exist for SUBSCRIBE chains only. A downstream
+    /// SUBSCRIBE served from an inbound PUBLISH is bound `published` with no
+    /// upstream SUBSCRIBE; a REQUEST_ERROR for a non-SUBSCRIBE request and the
+    /// PUBLISH_DONE of an inbound PUBLISH have no binding and serialize with
+    /// a null incarnation — and none of that breaks `intact`.
+    #[test]
+    fn non_subscribe_rows_and_published_tracks_serialize_without_an_upstream_chain() {
+        let (path, file) = new_test_file();
+        let recorder = Arc::new(Recorder::new(4));
+        let published = track("pc");
+        recorder.record_link(TrackBinding::DownstreamPublished, 2, 0, &published, 1);
+        recorder.record_control(ControlDirection::Received,
+            ControlMessage::Subscribe(&subscribe(0, "pc", None)), 2, 2, None);
+        recorder.record_control(ControlDirection::Sent,
+            ControlMessage::SubscribeOk(&subscribe_ok(0, 0, None)), 2, 3, Some(3));
+        // TRACK_STATUS (peer id 2) refused: a REQUEST_ERROR with no binding.
+        recorder.record_control(ControlDirection::Sent,
+            ControlMessage::RequestError(&request_error(2, 16)), 2, 4, Some(4));
+        // PUBLISH_NAMESPACE (own id 9) refused by the peer: no binding.
+        recorder.record_control(ControlDirection::Received,
+            ControlMessage::RequestError(&request_error(9, 16)), 1, 5, None);
+        // The inbound PUBLISH (publisher's id 0 on session 1) ends.
+        recorder.record_control(ControlDirection::Received,
+            ControlMessage::PublishDone(&publish_done(0, 2)), 1, 6, None);
+        test_trace(recorder, file).finish("sigterm").unwrap();
+        let rows = rows(&path);
+        let control: Vec<_> = rows.iter().filter(|r| r["role"] == "relay_control").collect();
+        assert_eq!(control[0]["track_binding"], "published");
+        assert_eq!(control[1]["track_binding"], "published");
+        assert!(control.iter().all(|r| r["boundary"] != "subscribe_sent"), "no upstream SUBSCRIBE");
+        for r in &control[2..] {
+            assert!(r["track_incarnation"].is_null() && r["track_binding"].is_null(), "{r}");
+        }
+        assert_eq!(rows.last().unwrap()["intact"], true);
+        std::fs::remove_file(path).unwrap();
     }
 }

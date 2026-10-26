@@ -341,14 +341,22 @@ pub async fn eventually(what: &str, mut cond: impl FnMut() -> bool) {
 }
 
 /// How the scripted publisher answers one SUBSCRIBE that reaches it.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum Answer {
-    /// REQUEST_ERROR `DoesNotExist` (0x10), the code a sender's unsupported
-    /// or unknown track produces.
+    /// REQUEST_ERROR `DoesNotExist` (0x10) at once, the code a sender's
+    /// unsupported or unknown track produces.
     Refuse,
+    /// REQUEST_ERROR `code`, but only after `gate` is released: the test
+    /// holds the upstream answer until the subscriber has OBSERVED the relay's
+    /// local SUBSCRIBE_OK, so the "OK, then refusal" shape is deterministic
+    /// at the application, not only on the wire (Codex 174a P2).
+    RefuseAfter { code: u64, gate: Arc<tokio::sync::Notify> },
     /// SUBSCRIBE_OK, then `objects` one-object subgroups, `gap` apart; the
     /// track stays open until the publisher task ends.
     Accept { objects: u64, gap: Duration },
+    /// SUBSCRIBE_OK, `objects` one-object subgroups, then the publisher ENDS
+    /// the track (writer dropped): a normal end, PUBLISH_DONE TrackEnded.
+    AcceptThenEnd { objects: u64 },
 }
 
 /// A scripted publisher on `client`: publishes `namespace`, waits for the
@@ -375,6 +383,27 @@ pub async fn publish(
                 Answer::Refuse => {
                     let _ = subscribed.close(ServeError::not_found_ctx("test publisher refuses"));
                 }
+                Answer::RefuseAfter { code, gate } => {
+                    keep.push(tokio::spawn(async move {
+                        gate.notified().await;
+                        let _ = subscribed.close(ServeError::Closed(code));
+                        None
+                    }));
+                }
+                Answer::AcceptThenEnd { objects } => {
+                    let (writer, reader) = Track::new(ns.clone(), name).produce();
+                    let serving = tokio::spawn(subscribed.serve(reader));
+                    let mut subgroups = writer.subgroups().expect("subgroups");
+                    for i in 0..objects {
+                        let mut subgroup = subgroups.append(1).expect("subgroup");
+                        subgroup.write(i.to_le_bytes().to_vec().into()).expect("object");
+                    }
+                    drop(subgroups); // the publisher ends the track normally
+                    keep.push(tokio::spawn(async move {
+                        let _ = serving.await;
+                        None
+                    }));
+                }
                 Answer::Accept { objects, gap } => {
                     let (writer, reader) = Track::new(ns.clone(), name).produce();
                     tokio::spawn(subscribed.serve(reader));
@@ -385,7 +414,7 @@ pub async fn publish(
                             subgroup.write(i.to_le_bytes().to_vec().into()).expect("object");
                             tokio::time::sleep(gap).await;
                         }
-                        subgroups // keep the track open
+                        Some(subgroups) // keep the track open
                     });
                     keep.push(producer);
                 }
@@ -410,6 +439,28 @@ pub async fn subscribe(
     let result = tokio::time::timeout(STEP, client.subscriber.subscribe_open(writer))
         .await
         .expect("SUBSCRIBE answered in time");
+    (result, reader)
+}
+
+/// [`subscribe`] with the APPLICATION's open waiter held for `delay` after
+/// the SUBSCRIBE went out (the transport keeps running): the condition under
+/// which Codex 174a made the ungated refusal tests fail. With the publisher
+/// gate the open must still return Ok.
+pub async fn subscribe_with_held_waiter(
+    client: &mut Client,
+    namespace: &str,
+    track: &str,
+    delay: Duration,
+) -> (
+    Result<moq_transport::session::Subscribe, moq_transport::serve::ServeError>,
+    moq_transport::serve::TrackReader,
+) {
+    let (writer, reader) = Track::new(TrackNamespace::from_utf8_path(namespace), track).produce();
+    let mut waiting = Box::pin(client.subscriber.subscribe_open(writer));
+    if futures::poll!(waiting.as_mut()).is_pending() {
+        tokio::time::sleep(delay).await;
+    }
+    let result = tokio::time::timeout(STEP, waiting).await.expect("SUBSCRIBE answered in time");
     (result, reader)
 }
 

@@ -8,6 +8,12 @@
 //! `closed()` returns `Closed(0x10)`; on the wire the relay sends PUBLISH_DONE
 //! with status 0x10, not a REQUEST_ERROR, because the request was already
 //! accepted.
+//!
+//! The upstream refusal is HELD (publisher gate) until the application has
+//! observed `subscribe_open` == Ok; without the gate the transport may process
+//! OK and DONE before the application waiter wakes, and `subscribe_open` then
+//! returns the terminal itself (Codex 174a). That merged shape is its own
+//! test: `relay_refusal_merged_before_the_open_returns`.
 mod common;
 
 use common::*;
@@ -21,12 +27,18 @@ async fn the_upstream_refusal_after_the_relays_local_subscribe_ok_reaches_the_su
     let relay = start_relay();
     let url = relay.url.clone();
     let mut sender = connect(&url).await;
-    let (publisher, seen) = publish(&mut sender, "run-a", vec![Answer::Refuse]).await;
+    let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+    let refuse = Answer::RefuseAfter { code: DOES_NOT_EXIST, gate: gate.clone() };
+    let (publisher, seen) = publish(&mut sender, "run-a", vec![refuse]).await;
     let mut receiver = connect(&url).await;
 
     // The relay's local SUBSCRIBE_OK: subscribe_open returns Ok ...
-    let (subscribe, _reader) = subscribe(&mut receiver, "run-a", "pc-d6").await;
+    // The application waiter is also held 50 ms (Codex 174a's injection):
+    // the gate keeps the open's answer Ok regardless.
+    let (subscribe, _reader) =
+        subscribe_with_held_waiter(&mut receiver, "run-a", "pc-d6", std::time::Duration::from_millis(50)).await;
     let subscribe = subscribe.expect("the relay accepts locally before the upstream answer");
+    gate.notify_one(); // only now may the publisher refuse
     // ... then the upstream refusal arrives as the subscription's terminal.
     let terminal = tokio::time::timeout(STEP, subscribe.closed())
         .await

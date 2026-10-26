@@ -4,11 +4,14 @@
 //! namespace route, so a later SUBSCRIBE for the namespace is refused instead
 //! of being bound to a dead incarnation. Real relay, real QUIC sessions.
 //!
-//! Pinned observation: the downstream terminal of an upstream session END is
-//! a NORMAL track end — PUBLISH_DONE status TrackEnded (0x2) and `closed()`
-//! == Ok — indistinguishable at the subscriber from a publisher's own normal
-//! end. A receiver therefore cannot fail closed on it; run validity has to
-//! come from the sender's own exit status.
+//! Pinned observation, LIMITED to an upstream end with no forwarding in
+//! progress (only complete objects in flight): the downstream terminal is a
+//! NORMAL track end — PUBLISH_DONE status TrackEnded (0x2), `closed()` == Ok —
+//! indistinguishable at the subscriber from a publisher's own normal end.
+//! With an object still being forwarded the terminal is an ERROR instead
+//! (`relay_upstream_end_during_a_partial_object`). Either way the terminal
+//! does not tell a sender crash from a normal end: run validity has to come
+//! from the sender's own exit status.
 mod common;
 
 use std::time::Duration;
