@@ -5,7 +5,8 @@
 //! `relay_control` rows (SUBSCRIBE / SUBSCRIBE_OK / REQUEST_ERROR at each
 //! session's control stream) in their own bounded buffer, and relay RSS
 //! (`/proc/self/status` VmRSS, sampled on a separate OS thread) on
-//! `trace_meta` (start) and `trace_end` (maximum, end, kernel VmHWM).
+//! `trace_meta` (start) and `trace_end` (sampled maximum and end). Kernel
+//! VmHWM is not exported: on this host it read below an earlier VmRSS sample.
 use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
@@ -209,14 +210,15 @@ impl Observer for Recorder {
     }
 }
 
-/// VmRSS and VmHWM of this process in kB, as `/proc/self/status` reports them.
-fn read_rss_kb() -> Option<(u64, u64)> {
+/// VmRSS of this process in kB, as `/proc/self/status` reports it (the
+/// kernel's approximate per-CPU-batched counter, not an exact page count).
+fn read_rss_kb() -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     let field = |name: &str| status.lines()
         .find_map(|line| line.strip_prefix(name))
         .and_then(|rest| rest.trim().strip_suffix("kB"))
         .and_then(|value| value.trim().parse::<u64>().ok());
-    Some((field("VmRSS:")?, field("VmHWM:")?))
+    field("VmRSS:")
 }
 
 #[derive(Default)]
@@ -227,16 +229,16 @@ struct RssStats {
     max_t_us: AtomicU64,
 }
 
-/// A sample: (VmRSS kB, VmHWM kB, t_us).
-type RssSample = (u64, u64, u64);
+/// A sample: (VmRSS kB, t_us).
+type RssSample = (u64, u64);
 
 impl RssStats {
     /// Only one writer at a time: `start`, then the sampler thread, then
     /// `finish` after the thread was joined.
     fn sample(&self) -> Option<RssSample> {
-        let sample = monotonic_us().and_then(|t| read_rss_kb().map(|(rss, hwm)| (rss, hwm, t)));
+        let sample = monotonic_us().and_then(|t| read_rss_kb().map(|rss| (rss, t)));
         match sample {
-            Some((rss, _, t)) => {
+            Some((rss, t)) => {
                 if self.samples.fetch_add(1, Ordering::SeqCst) == 0
                     || rss > self.max_kb.load(Ordering::SeqCst) {
                     self.max_kb.store(rss, Ordering::SeqCst);
@@ -314,7 +316,7 @@ fn meta_row(run_id: &str, capacity: usize, mapping: DataPriorityMapping,
         "rss_source":"/proc/self/status VmRSS kB",
         "rss_sample_period_us":RSS_SAMPLE_PERIOD.as_micros() as u64,
         "rss_start_kb":rss_start.map(|s| s.0),
-        "rss_start_t_us":rss_start.map(|s| s.2)})
+        "rss_start_t_us":rss_start.map(|s| s.1)})
 }
 
 fn is_forward(boundary: Boundary) -> bool {
@@ -406,8 +408,7 @@ impl Trace {
             "rss_samples":samples, "rss_sample_errors":stats.errors.load(Ordering::SeqCst),
             "rss_max_kb":(samples > 0).then(|| stats.max_kb.load(Ordering::SeqCst)),
             "rss_max_t_us":(samples > 0).then(|| stats.max_t_us.load(Ordering::SeqCst)),
-            "rss_end_kb":rss_end.map(|s| s.0), "rss_end_t_us":rss_end.map(|s| s.2),
-            "rss_hwm_kb":rss_end.map(|s| s.1)}))?;
+            "rss_end_kb":rss_end.map(|s| s.0), "rss_end_t_us":rss_end.map(|s| s.1)}))?;
         self.writer.flush()?;
         self.writer.get_ref().sync_all()?;
         anyhow::ensure!(intact, "object trace integrity failure");
@@ -584,7 +585,7 @@ mod tests {
 
     #[test]
     fn schema_is_v2_and_meta_adds_control_mapping_and_rss_start_only() {
-        let meta = meta_row("run", 99_232, DataPriorityMapping::MoqtV2, Some((2048, 2100, 77)));
+        let meta = meta_row("run", 99_232, DataPriorityMapping::MoqtV2, Some((2048, 77)));
         assert_eq!(SCHEMA, "relay-object-trace-v2");
         assert_eq!(meta["schema"], "relay-object-trace-v2");
         // v1 fields unchanged.
@@ -740,9 +741,8 @@ mod tests {
     }
 
     #[test]
-    fn rss_maximum_end_and_hwm_are_recorded_from_proc_status() {
-        let (rss, hwm) = read_rss_kb().unwrap();
-        assert!(rss > 0 && hwm >= rss);
+    fn rss_maximum_and_end_are_recorded_from_proc_status() {
+        assert!(read_rss_kb().unwrap() > 0);
         let (path, file) = new_test_file();
         let trace = test_trace(Arc::new(Recorder::new(1)), file);
         let start = trace.rss.start.unwrap();
@@ -752,11 +752,11 @@ mod tests {
         let samples = end["rss_samples"].as_u64().unwrap();
         assert!(samples >= 3, "start + periodic + end samples: {samples}");
         assert_eq!(end["rss_sample_errors"], 0);
-        let (max, end_kb, hwm) = (end["rss_max_kb"].as_u64().unwrap(),
-                                  end["rss_end_kb"].as_u64().unwrap(),
-                                  end["rss_hwm_kb"].as_u64().unwrap());
-        assert!(max >= start.0 && max >= end_kb && hwm >= end_kb);
-        assert!(end["rss_max_t_us"].as_u64().unwrap() >= start.2);
+        let (max, end_kb) = (end["rss_max_kb"].as_u64().unwrap(),
+                             end["rss_end_kb"].as_u64().unwrap());
+        assert!(max >= start.0 && max >= end_kb);
+        assert!(end.get("rss_hwm_kb").is_none());
+        assert!(end["rss_max_t_us"].as_u64().unwrap() >= start.1);
         assert!(end["rss_end_t_us"].as_u64().unwrap() >= end["rss_max_t_us"].as_u64().unwrap());
         std::fs::remove_file(path).unwrap();
     }
