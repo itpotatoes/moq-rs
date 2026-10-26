@@ -15172,6 +15172,60 @@ mod s3_control_loop_tests {
         publish: bool,
         l2: bool,
     ) -> (Result<()>, Vec<serde_json::Value>, Option<(Vec<serde_json::Value>, Vec<serde_json::Value>)>) {
+        let switch_calls = vec![
+            Call { track: PC_CRITICAL, before: vec![Step::Sleep(pc_hold_ms)], answer: Answer::Accept(pc_after_accept) },
+            Call { track: HAPTIC_ESSENTIAL, before: vec![Step::Sleep(hap_hold_ms)], answer: Answer::Accept(Vec::new()) },
+        ];
+        let case = p1_loop_case_calls(name, t0, force_ms, switch_calls, Vec::new(), session, publish, l2).await;
+        let l2_rows = case.l2.map(|l2| (l2, case.rx));
+        (case.result, case.rows, l2_rows)
+    }
+
+    /// The outcome of one real P1 loop run against the scripted seam.
+    struct P1Case {
+        result: Result<()>,
+        /// exp2.jsonl rows.
+        rows: Vec<serde_json::Value>,
+        /// Legacy rx.jsonl rows (S3/P1 info rows, shutdown).
+        rx: Vec<serde_json::Value>,
+        /// L2 rows when the fake L2 sink was on.
+        l2: Option<Vec<serde_json::Value>>,
+        /// Track names the seam was asked to subscribe, in call order.
+        calls: Vec<String>,
+    }
+
+    impl P1Case {
+        fn rx_events(&self, event: &str) -> Vec<&serde_json::Value> {
+            self.rx.iter().filter(|r| r["event"] == event).collect()
+        }
+
+        fn rows_of(&self, role: &str) -> Vec<&serde_json::Value> {
+            self.rows.iter().filter(|r| r["role"] == role).collect()
+        }
+
+        fn has_sentinel(&self) -> bool {
+            self.rows.iter().any(|r| r["role"] == "instrumentation_end")
+        }
+
+        fn error(&self) -> String {
+            self.result.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default()
+        }
+    }
+
+    /// The real P1 loop with an arbitrary script after the two initial
+    /// subscriptions (`switch_calls`, answered in call order) and `delayed`
+    /// steps run from a side task `after_ms` after the loop starts.
+    #[allow(clippy::too_many_arguments)]
+    async fn p1_loop_case_calls(
+        name: &str,
+        t0: u64,
+        force_ms: u64,
+        switch_calls: Vec<Call>,
+        delayed: Vec<(u64, Vec<Step>)>,
+        session: SessionEnding,
+        publish: bool,
+        l2: bool,
+    ) -> P1Case {
         let force_ms = force_ms.to_string();
         use skew_moq::exp2_recorder::{canonical_json_bytes, haptic_slot_identity, pc_slot_identity};
         let dir = test_log_path(name);
@@ -15255,15 +15309,22 @@ mod s3_control_loop_tests {
             )
             .unwrap(),
         ));
-        // The forced switch is requested at t0 + 100 ms; both target
-        // SUBSCRIBEs answer only after 1.5 s.
-        let script = vec![
+        // The two initial subscriptions, then the switch script.
+        let mut script = vec![
             Call { track: PC_NORMAL, before: Vec::new(), answer: Answer::Accept(Vec::new()) },
             Call { track: HAPTIC_FULL, before: Vec::new(), answer: Answer::Accept(Vec::new()) },
-            Call { track: PC_CRITICAL, before: vec![Step::Sleep(pc_hold_ms)], answer: Answer::Accept(pc_after_accept) },
-            Call { track: HAPTIC_ESSENTIAL, before: vec![Step::Sleep(hap_hold_ms)], answer: Answer::Accept(Vec::new()) },
         ];
+        script.extend(switch_calls);
         let seam = ScriptedSeam::new(script);
+        let delayed_task = {
+            let seam = seam.clone();
+            tokio::spawn(async move {
+                for (after_ms, steps) in delayed {
+                    tokio::time::sleep(Duration::from_millis(after_ms)).await;
+                    seam.run(&steps).await;
+                }
+            })
+        };
         // Current-route objects of events 0..12 arrive while the switch is
         // pending; their dues (ref + 345 ms) fall inside the 1.5 s window.
         let side = {
@@ -15306,6 +15367,8 @@ mod s3_control_loop_tests {
         .await;
         side.abort();
         let _ = side.await;
+        delayed_task.abort();
+        let _ = delayed_task.await;
         let read = |path: &std::path::Path| -> Vec<serde_json::Value> {
             std::fs::read_to_string(path)
                 .unwrap()
@@ -15314,9 +15377,10 @@ mod s3_control_loop_tests {
                 .collect()
         };
         let rows = read(&exp2_out);
-        let l2_rows = l2.then(|| (read(&l2_log), read(&legacy)));
+        let rx = read(&legacy);
+        let l2_rows = l2.then(|| read(&l2_log));
         std::fs::remove_dir_all(&dir).ok();
-        (result, rows, l2_rows)
+        P1Case { result, rows, rx, l2: l2_rows, calls: seam.calls() }
     }
 
     /// Contract v4 follow-up J: while a P1 switch's target SUBSCRIBEs are in
@@ -15454,6 +15518,244 @@ mod s3_control_loop_tests {
         eprintln!("warnings: {warnings:?}");
         assert!(!warnings.iter().any(|r| r["kind"].as_str().is_some_and(|k| k.starts_with("p1_switch"))), "no switch failure: {warnings:?}");
         assert!(rows.iter().any(|r| r["role"] == "instrumentation_end"), "the sentinel");
+    }
+
+    /// Dump a P1 case's non-bulk rows when `SKEW_TEST_DUMP` is set.
+    fn dump_p1_case(case: &P1Case) {
+        if std::env::var_os("SKEW_TEST_DUMP").is_none() {
+            return;
+        }
+        eprintln!("result: {:?}\ncalls: {:?}", case.result.as_ref().err(), case.calls);
+        for r in case.rows.iter().filter(|r| !matches!(r["role"].as_str(), Some("decision" | "no_object" | "controller" | "release" | "drop"))) {
+            eprintln!("exp2 {r}");
+        }
+        for r in case.rx.iter().filter(|r| r["role"] != "rx" && r["role"] != "drop") {
+            eprintln!("rx {r}");
+        }
+    }
+
+    /// The target exact pair of anchor event `i` on the switch targets
+    /// (PC Haptic-Critical tier 4, haptic essential tier 0, seq = slot).
+    fn p1_target_pair(i: u64) -> Vec<Step> {
+        use skew_moq::exp2_recorder::{haptic_slot_identity, pc_slot_identity};
+        let (pts, e) = pc_slot_identity(i);
+        let (hpts, he) = haptic_slot_identity(3 * i);
+        assert_eq!((pts, e), (hpts, he), "an anchor slot");
+        vec![
+            Step::Publish(PC_CRITICAL, vec![(4, i as u32, pts, e as u32)]),
+            Step::Publish(HAPTIC_ESSENTIAL, vec![(0, 3 * i as u32, pts, e as u32)]),
+            Step::Yield(50),
+        ]
+    }
+
+    /// Spec (2) on the real P1 loop, in the exact shape the relay
+    /// integration test `relay_refusal_after_subscribe_ok` observes: the PC
+    /// target is ACCEPTED (the relay's local SUBSCRIBE_OK) and then ends with
+    /// the upstream code `Closed(0x10)` (PUBLISH_DONE 0x10). Registered rule:
+    /// a general terminal on a target of an unapplied switch is a run fault —
+    /// `s3_switch_target_terminal_fault` (pending, code 16), no non-fatal
+    /// refusal row, the run fails closed without a sentinel.
+    #[tokio::test]
+    async fn exp2_p1_target_refused_upstream_after_the_relays_subscribe_ok_fails_closed() {
+        let case = p1_loop_case_calls(
+            "p1-relay-refusal-0x10",
+            now_us() - 39_000_000,
+            39_200,
+            vec![
+                Call { track: PC_CRITICAL, before: vec![Step::Sleep(100)],
+                       answer: Answer::Accept(vec![Step::CloseError(PC_CRITICAL, REQUEST_ERROR_DOES_NOT_EXIST)]) },
+                Call { track: HAPTIC_ESSENTIAL, before: vec![Step::Sleep(300)], answer: Answer::Accept(Vec::new()) },
+            ],
+            Vec::new(),
+            SessionEnding::Never,
+            false,
+            false,
+        )
+        .await;
+        dump_p1_case(&case);
+        assert!(case.result.is_err(), "a 0x10 terminal after SUBSCRIBE_OK is fatal");
+        let fault = case.rx_events("s3_switch_target_terminal_fault");
+        assert_eq!(fault.len(), 1, "{fault:?}");
+        assert_eq!(fault[0]["wire_track"], PC_CRITICAL);
+        assert_eq!(fault[0]["error_code"], REQUEST_ERROR_DOES_NOT_EXIST);
+        assert_eq!(fault[0]["pending"], true);
+        assert!(case.rx_events("s3_switch_refused_after_subscribe_ok").is_empty(), "not the non-fatal path");
+        assert!(!case.has_sentinel(), "fail closed: no sentinel");
+        // The fault is recorded when the terminal is seen; the run then ends at
+        // the registered effect timeout (first cause), never normally.
+        let warning = case.rows.iter()
+            .find(|r| r["role"] == "integrity_warning" && r["kind"] == "p1_switch_effect_timeout")
+            .expect("the effect timeout ends the run");
+        assert!(fault[0]["t_ended"].as_u64().unwrap() < warning["t_us"].as_u64().unwrap());
+        let shutdown = case.rx_events("shutdown");
+        assert_eq!(shutdown[0]["ending"], "error");
+        assert_eq!(shutdown[0]["drains_unjoined"], 0);
+    }
+
+    /// Spec (2), the registered NON-fatal twin: the same relay shape with the
+    /// sender's run-ended code. `s3_switch_refused_after_subscribe_ok`
+    /// (code 0x5343), the switch is abandoned, the run ends with its
+    /// sentinel. (Complements the clock regression guard below, which pins
+    /// the gate clock, not these rows.)
+    #[tokio::test]
+    async fn exp2_p1_target_refused_after_subscribe_ok_with_the_run_ended_code_is_non_fatal() {
+        let case = p1_loop_case_calls(
+            "p1-relay-refusal-run-ended",
+            now_us() - 39_000_000,
+            39_200,
+            vec![
+                Call { track: PC_CRITICAL, before: vec![Step::Sleep(100)],
+                       answer: Answer::Accept(vec![Step::CloseError(PC_CRITICAL, S3_RUN_ENDED_REQUEST_ERROR_CODE)]) },
+                Call { track: HAPTIC_ESSENTIAL, before: vec![Step::Sleep(300)], answer: Answer::Accept(Vec::new()) },
+            ],
+            Vec::new(),
+            SessionEnding::Never,
+            false,
+            false,
+        )
+        .await;
+        dump_p1_case(&case);
+        assert!(case.result.is_ok(), "{}", case.error());
+        let refused = case.rx_events("s3_switch_refused_after_subscribe_ok");
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(refused[0]["wire_track"], PC_CRITICAL);
+        assert_eq!(refused[0]["error_code"], S3_RUN_ENDED_REQUEST_ERROR_CODE);
+        assert!(case.rx_events("s3_switch_target_terminal_fault").is_empty());
+        assert!(case.rows_of("tier_switch").iter().all(|r| r["phase"] != "applied"));
+        assert!(case.has_sentinel(), "the run ends with its sentinel");
+    }
+
+    /// Spec (10) partial success on the real P1 loop: the PC target is
+    /// accepted, the haptic target is refused with 0x10 on every attempt (the
+    /// first try plus `--s3-switch-retry-limit 2` retries). The switch fails
+    /// as a whole: the run fails closed, the failure names the refused role,
+    /// and the accepted PC target is released at exit (no live target left).
+    #[tokio::test]
+    async fn exp2_p1_one_target_accepted_and_the_other_refused_fails_the_switch_closed() {
+        let refuse = || Call {
+            track: HAPTIC_ESSENTIAL,
+            before: Vec::new(),
+            answer: Answer::Refuse(ServeError::Closed(REQUEST_ERROR_DOES_NOT_EXIST)),
+        };
+        let case = p1_loop_case_calls(
+            "p1-partial",
+            now_us() - 39_000_000,
+            39_200,
+            vec![
+                Call { track: PC_CRITICAL, before: Vec::new(), answer: Answer::Accept(Vec::new()) },
+                refuse(),
+                refuse(),
+                refuse(),
+            ],
+            Vec::new(),
+            SessionEnding::Never,
+            false,
+            false,
+        )
+        .await;
+        dump_p1_case(&case);
+        let error = case.error();
+        assert!(error.contains("haptic-essential") && error.contains("failed after 2 retries"), "{error}");
+        assert_eq!(case.calls, vec![PC_NORMAL, HAPTIC_FULL, PC_CRITICAL, HAPTIC_ESSENTIAL,
+                                    HAPTIC_ESSENTIAL, HAPTIC_ESSENTIAL]);
+        assert!(case.rows.iter().any(|r| r["role"] == "integrity_warning" && r["kind"] == "p1_switch_failed"));
+        assert!(case.rows_of("tier_switch").iter().all(|r| r["phase"] != "applied"));
+        assert!(!case.has_sentinel(), "fail closed");
+        // The accepted PC target was released with the failed switch: every
+        // drain (initial and target) is joined at shutdown.
+        let shutdown = case.rx_events("shutdown");
+        assert_eq!(shutdown[0]["ending"], "error");
+        assert_eq!(shutdown[0]["drains_unjoined"], 0);
+    }
+
+    /// Spec (10) relay/session termination AFTER a switch applied: active
+    /// (new) routes and the retiring (old) routes exist when the session
+    /// dies. The run fails closed (first cause kept), the shutdown is
+    /// bounded, and no route is left behind.
+    #[tokio::test]
+    async fn exp2_p1_session_death_after_an_applied_switch_fails_closed_and_is_bounded() {
+        let started = now_us();
+        let case = p1_loop_case_calls(
+            "p1-dies-after-apply",
+            started - 39_000_000,
+            39_200,
+            vec![
+                Call { track: PC_CRITICAL, before: Vec::new(), answer: Answer::Accept(Vec::new()) },
+                Call { track: HAPTIC_ESSENTIAL, before: Vec::new(), answer: Answer::Accept(p1_target_pair(1185)) },
+            ],
+            Vec::new(),
+            SessionEnding::ErrorAfterMs(900),
+            false,
+            false,
+        )
+        .await;
+        dump_p1_case(&case);
+        let error = case.error();
+        assert!(error.contains("P1 session ended early") && error.contains("scripted session failure"), "{error}");
+        assert!(now_us() - started < 4_000_000, "bounded: {}", now_us() - started);
+        let applied: Vec<_> = case.rows_of("tier_switch").into_iter().filter(|r| r["phase"] == "applied").collect();
+        assert_eq!(applied.len(), 1, "the switch applied before the session died");
+        assert_eq!(applied[0]["pc_route_generation"], 1);
+        assert_eq!(applied[0]["haptic_route_generation"], 1);
+        assert!(!case.has_sentinel(), "fail closed");
+        // Both old routes were cancelled (retiring) by the apply, and every
+        // drain — active targets and retired routes — is joined at shutdown.
+        let cancelled: Vec<_> = case.rx.iter()
+            .filter(|r| r["role"] == "s3_switch" && r["event"] == "cancel")
+            .map(|r| (r["wire_track"].as_str().unwrap().to_string(), r["route_generation"].clone()))
+            .collect();
+        assert_eq!(cancelled, vec![("pc".to_string(), serde_json::json!(0)),
+                                   ("haptic".to_string(), serde_json::json!(0))]);
+        let shutdown = case.rx_events("shutdown");
+        assert_eq!(shutdown[0]["ending"], "error");
+        assert_eq!(shutdown[0]["drains_unjoined"], 0);
+    }
+
+    /// Spec (9) on the real P1 loop: the PC target is refused once with the
+    /// retryable 0x10 and accepted on the retry. The retry keeps the switch's
+    /// route generation (one generation per switch, not per attempt), the
+    /// switch applies on generation 1 for both roles, and the target objects
+    /// are recorded with generation 1. (Sender side: a refused SUBSCRIBE
+    /// never allocates a generation; relay side: a retry is a fresh upstream
+    /// SUBSCRIBE — see the moq-relay-ietf integration test.)
+    #[tokio::test]
+    async fn exp2_p1_a_retried_target_subscribe_keeps_the_route_generation() {
+        let case = p1_loop_case_calls(
+            "p1-retry",
+            now_us() - 39_000_000,
+            39_200,
+            vec![
+                Call { track: PC_CRITICAL, before: Vec::new(),
+                       answer: Answer::Refuse(ServeError::Closed(REQUEST_ERROR_DOES_NOT_EXIST)) },
+                Call { track: HAPTIC_ESSENTIAL, before: Vec::new(), answer: Answer::Accept(Vec::new()) },
+                Call { track: PC_CRITICAL, before: Vec::new(), answer: Answer::Accept(p1_target_pair(1185)) },
+            ],
+            Vec::new(),
+            SessionEnding::Never,
+            false,
+            false,
+        )
+        .await;
+        dump_p1_case(&case);
+        assert!(case.result.is_ok(), "{}", case.error());
+        assert_eq!(case.calls, vec![PC_NORMAL, HAPTIC_FULL, PC_CRITICAL, HAPTIC_ESSENTIAL, PC_CRITICAL]);
+        let subscribes = case.rx_events("s3_subscribe");
+        let pc = subscribes.iter().find(|r| r["track"] == "pc").expect("pc s3_subscribe row");
+        assert_eq!((pc["route_generation"].clone(), pc["retries"].clone()),
+                   (serde_json::json!(1), serde_json::json!(1)));
+        let hap = subscribes.iter().find(|r| r["track"] == "haptic").expect("haptic s3_subscribe row");
+        assert_eq!((hap["route_generation"].clone(), hap["retries"].clone()),
+                   (serde_json::json!(1), serde_json::json!(0)));
+        let applied: Vec<_> = case.rows_of("tier_switch").into_iter().filter(|r| r["phase"] == "applied").collect();
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0]["pc_route_generation"], 1);
+        assert_eq!(applied[0]["haptic_route_generation"], 1);
+        // The only objects of this run are the target pair (event 1186).
+        let rx = case.rows_of("rx");
+        assert_eq!(rx.len(), 2, "{rx:?}");
+        assert!(rx.iter().all(|r| r["route_generation"] == 1 && r["event_id"] == 1186), "{rx:?}");
+        assert!(rx.iter().any(|r| r["track"] == "pc" && r["tier"] == 4));
+        assert!(case.has_sentinel(), "{}", case.error());
     }
 
     /// Codex 165a (regression guard): the session dies while a split opening
