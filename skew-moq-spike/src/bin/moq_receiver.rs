@@ -15668,10 +15668,13 @@ mod s3_control_loop_tests {
         assert_eq!(shutdown[0]["drains_unjoined"], 0);
     }
 
-    /// Spec (10) relay/session termination AFTER a switch applied: active
-    /// (new) routes and the retiring (old) routes exist when the session
-    /// dies. The run fails closed (first cause kept), the shutdown is
-    /// bounded, and no route is left behind.
+    /// Spec (10) relay/session termination AFTER a switch applied, while the
+    /// old routes are still RETIRING: the session dies ~200 ms after the
+    /// apply, before the T_pc (345 ms) retirement deadline, so the active
+    /// (new) routes and both retiring (old) routes exist at that moment. The
+    /// run fails closed (first cause kept), the shutdown is bounded, the
+    /// retiring routes are discarded by the exit path (no deadline
+    /// `s3_retired_unsubscribe` row) and every drain is joined.
     #[tokio::test]
     async fn exp2_p1_session_death_after_an_applied_switch_fails_closed_and_is_bounded() {
         let started = now_us();
@@ -15684,7 +15687,7 @@ mod s3_control_loop_tests {
                 Call { track: HAPTIC_ESSENTIAL, before: Vec::new(), answer: Answer::Accept(p1_target_pair(1185)) },
             ],
             Vec::new(),
-            SessionEnding::ErrorAfterMs(900),
+            SessionEnding::ErrorAfterMs(400),
             false,
             false,
         )
@@ -15706,6 +15709,16 @@ mod s3_control_loop_tests {
             .collect();
         assert_eq!(cancelled, vec![("pc".to_string(), serde_json::json!(0)),
                                    ("haptic".to_string(), serde_json::json!(0))]);
+        // The precondition: the session died between the apply and the
+        // retirement deadline, so the old routes were still retiring.
+        let t_apply = case.rx.iter()
+            .find(|r| r["role"] == "s3_switch" && r["event"] == "apply")
+            .and_then(|r| r["t_apply"].as_u64()).unwrap();
+        let t_death = case.rows.iter()
+            .find(|r| r["role"] == "integrity_warning" && r["kind"] == "p1_run_error")
+            .and_then(|r| r["t_us"].as_u64()).expect("the session error is recorded");
+        assert!(t_death > t_apply && t_death < t_apply + 345_000, "death {} us after apply", t_death - t_apply);
+        assert!(case.rx_events("s3_retired_unsubscribe").is_empty(), "no retirement completed before the death");
         let shutdown = case.rx_events("shutdown");
         assert_eq!(shutdown[0]["ending"], "error");
         assert_eq!(shutdown[0]["drains_unjoined"], 0);
