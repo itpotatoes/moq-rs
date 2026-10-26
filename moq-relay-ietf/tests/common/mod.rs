@@ -219,6 +219,10 @@ pub struct Probe {
     pub control: Mutex<Vec<ControlRow>>,
     pub links: Mutex<Vec<LinkRow>>,
     pub forwards: Mutex<Vec<ForwardRow>>,
+    /// Fault injection (Codex 175a): after recording a row of this boundary,
+    /// block the recording task for this long — a preemption between the
+    /// pre-dispatch control hook and the dispatch of that message.
+    pub hold_after: Mutex<Option<(&'static str, Duration)>>,
 }
 
 impl Observer for Probe {
@@ -265,6 +269,12 @@ impl Observer for Probe {
             status_code,
             send_begin: send_begin_us,
         });
+        let hold = *self.hold_after.lock().unwrap();
+        if let Some((boundary, delay)) = hold {
+            if boundary == message.boundary(direction) {
+                std::thread::sleep(delay);
+            }
+        }
     }
 
     fn record_link(
@@ -354,9 +364,11 @@ pub enum Answer {
     /// SUBSCRIBE_OK, then `objects` one-object subgroups, `gap` apart; the
     /// track stays open until the publisher task ends.
     Accept { objects: u64, gap: Duration },
-    /// SUBSCRIBE_OK, `objects` one-object subgroups, then the publisher ENDS
-    /// the track (writer dropped): a normal end, PUBLISH_DONE TrackEnded.
-    AcceptThenEnd { objects: u64 },
+    /// SUBSCRIBE_OK, `objects` one-object subgroups, then — only after `gate`
+    /// is released, i.e. after the application observed the OK — the
+    /// publisher ENDS the track (writer dropped): a normal end, PUBLISH_DONE
+    /// TrackEnded (Codex 175a: without the gate a held open waiter sees Done).
+    AcceptThenEnd { objects: u64, gate: Arc<tokio::sync::Notify> },
 }
 
 /// A scripted publisher on `client`: publishes `namespace`, waits for the
@@ -390,7 +402,7 @@ pub async fn publish(
                         None
                     }));
                 }
-                Answer::AcceptThenEnd { objects } => {
+                Answer::AcceptThenEnd { objects, gate } => {
                     let (writer, reader) = Track::new(ns.clone(), name).produce();
                     let serving = tokio::spawn(subscribed.serve(reader));
                     let mut subgroups = writer.subgroups().expect("subgroups");
@@ -398,8 +410,9 @@ pub async fn publish(
                         let mut subgroup = subgroups.append(1).expect("subgroup");
                         subgroup.write(i.to_le_bytes().to_vec().into()).expect("object");
                     }
-                    drop(subgroups); // the publisher ends the track normally
                     keep.push(tokio::spawn(async move {
+                        gate.notified().await;
+                        drop(subgroups); // the publisher ends the track normally
                         let _ = serving.await;
                         None
                     }));

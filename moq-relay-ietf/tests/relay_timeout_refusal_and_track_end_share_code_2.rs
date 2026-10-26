@@ -19,19 +19,24 @@ async fn a_timeout_refusal_and_a_normal_track_end_look_the_same_downstream_but_n
     let url = relay.url.clone();
     let mut sender = connect(&url).await;
     let gate = Arc::new(tokio::sync::Notify::new());
+    let end_gate = Arc::new(tokio::sync::Notify::new());
     let answers = vec![
         Answer::RefuseAfter { code: 0x2, gate: gate.clone() },
-        Answer::AcceptThenEnd { objects: 2 },
+        Answer::AcceptThenEnd { objects: 2, gate: end_gate.clone() },
     ];
+    // Both opens are taken with the application waiter held 50 ms (Codex
+    // 175a's injection); both publisher answers are gated on the observed OK.
+    let held = std::time::Duration::from_millis(50);
     let (publisher, _seen) = publish(&mut sender, "run-t", answers).await;
     let mut receiver = connect(&url).await;
 
-    let (refused, _r1) = subscribe(&mut receiver, "run-t", "pc-d6").await;
+    let (refused, _r1) = subscribe_with_held_waiter(&mut receiver, "run-t", "pc-d6", held).await;
     let refused = refused.expect("local OK");
     gate.notify_one();
     let refused_end = tokio::time::timeout(STEP, refused.closed()).await.expect("terminal in time");
-    let (ended, _r2) = subscribe(&mut receiver, "run-t", "pc-d7").await;
+    let (ended, _r2) = subscribe_with_held_waiter(&mut receiver, "run-t", "pc-d7", held).await;
     let ended = ended.expect("accepted");
+    end_gate.notify_one();
     let normal_end = tokio::time::timeout(STEP, ended.closed()).await.expect("terminal in time");
     // Downstream: the SAME terminal for both.
     assert_eq!(refused_end, Ok(()), "a code-2 refusal reads as TrackEnded at the subscriber");

@@ -1,7 +1,9 @@
-//! Spec item (2): the relay answers a downstream SUBSCRIBE with its local
-//! SUBSCRIBE_OK before the upstream publisher has answered; the upstream
-//! REFUSAL then reaches the downstream subscriber as a terminal carrying the
-//! upstream code. Real relay, real QUIC sessions, one process.
+//! Spec item (2): after the relay's local SUBSCRIBE_OK, an upstream REFUSAL
+//! reaches the downstream subscriber as a terminal carrying the upstream code.
+//! The OK-before-refusal order is a PRECONDITION the harness builds (the
+//! publisher's answer is held until the subscriber observed the OK); it shows
+//! the relay CAN accept before the upstream answers, not that it always does.
+//! What the test proves is the propagation after it. Real relay, real QUIC.
 //!
 //! Observed shape (what the receiver's scripted `Step::CloseError(track,
 //! 0x10)` reproduces): `subscribe_open` returns Ok (SUBSCRIBE_OK), then

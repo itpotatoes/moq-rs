@@ -3,6 +3,7 @@
 //! one is never reused), so the publisher sees exactly one SUBSCRIBE per
 //! subscriber attempt and every object the subscriber then receives belongs
 //! to the retry's incarnation. Real relay, real QUIC sessions, one process.
+//! (The first attempt's OK-then-refusal order is built by the harness gate.)
 mod common;
 
 use std::{sync::{atomic::Ordering, Arc}, time::Duration};
