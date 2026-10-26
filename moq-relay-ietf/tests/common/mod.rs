@@ -391,9 +391,12 @@ impl PublisherTask {
         Self { main, children }
     }
 
-    /// Abort the publisher and ALL its children first, then join each within
-    /// `STEP`; a panic or a join past the bound fails the test. (The bound is
-    /// the helper's own; a worker blocked inside a poll can still delay the
+    /// Abort the publisher and ALL its children first, then join each; the
+    /// whole stop is bounded by `STEP`, and a panic or a join past the bound
+    /// fails the test. The parent's poll that was running at abort time can
+    /// still register a child, so after the parent is joined the child list
+    /// is taken again until it stays empty (Codex 178a). (The bound is the
+    /// helper's own; a worker blocked inside a poll can still delay the
     /// runtime's shutdown, so the cargo record applies its own per-process
     /// deadline.)
     pub async fn stop(self) {
@@ -403,26 +406,41 @@ impl PublisherTask {
     }
 
     pub async fn stop_within(self, bound: Duration) -> Result<(), String> {
-        let children = std::mem::take(&mut *self.children.lock().unwrap());
+        let deadline = tokio::time::Instant::now() + bound;
+        let take = |children: &Mutex<Vec<tokio::task::JoinHandle<()>>>| {
+            let taken = std::mem::take(&mut *children.lock().unwrap());
+            for child in &taken {
+                child.abort();
+            }
+            taken
+        };
         self.main.abort();
-        for child in &children {
-            child.abort();
-        }
-        let tasks = std::iter::once(("the publisher task", self.main))
-            .chain(children.into_iter().map(|child| ("a publisher child task", child)));
-        for (what, task) in tasks {
-            match tokio::time::timeout(bound, task).await {
-                Err(_) => return Err(format!("{what} did not finish within {bound:?} after abort")),
-                Ok(joined) => {
-                    if let Err(error) = joined {
-                        if error.is_panic() {
-                            return Err(format!("{what} panicked: {error}"));
-                        }
-                    }
-                }
+        let first = take(&self.children);
+        join_within(deadline, bound, "the publisher task", self.main).await?;
+        let mut batch = first;
+        loop {
+            for child in batch {
+                join_within(deadline, bound, "a publisher child task", child).await?;
+            }
+            batch = take(&self.children); // late registrations of the parent's last poll
+            if batch.is_empty() {
+                return Ok(());
             }
         }
-        Ok(())
+    }
+}
+
+/// Join an aborted task by `deadline`; a panic or the deadline is an error.
+async fn join_within(
+    deadline: tokio::time::Instant,
+    bound: Duration,
+    what: &str,
+    task: tokio::task::JoinHandle<()>,
+) -> Result<(), String> {
+    match tokio::time::timeout_at(deadline, task).await {
+        Err(_) => Err(format!("{what} did not finish within {bound:?} after abort")),
+        Ok(Err(error)) if error.is_panic() => Err(format!("{what} panicked: {error}")),
+        Ok(_) => Ok(()),
     }
 }
 

@@ -88,3 +88,63 @@ async fn stopping_a_publisher_is_bounded_and_aborts_every_child_first() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(dropped.load(Ordering::SeqCst), "the later child was aborted before the stuck one was joined");
 }
+
+/// Codex 178a (its reproduction, moved here): the parent's poll that is
+/// running when `stop` aborts it registers one more child; `stop` must reap
+/// that late child too (abort and join it) instead of returning Ok with the
+/// child still running. An independent thread releases the parent's poll
+/// only after `stop` has taken the first child list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stopping_a_publisher_reaps_children_registered_by_the_parents_last_poll() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let children = Arc::new(Mutex::new(vec![tokio::spawn(std::future::pending::<()>())]));
+    let main_started = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let dropped = Arc::new(AtomicBool::new(false));
+    struct OnDrop(Arc<AtomicBool>);
+    impl Drop for OnDrop {
+        fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); }
+    }
+    let main = tokio::spawn({
+        let children = children.clone();
+        let main_started = main_started.clone();
+        let release = release.clone();
+        let guard = OnDrop(dropped.clone());
+        async move {
+            main_started.store(true, Ordering::SeqCst);
+            while !release.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            // This is still the same poll. abort() cannot stop it here.
+            children.lock().unwrap().push(tokio::spawn(async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+            }));
+        }
+    });
+    while !main_started.load(Ordering::SeqCst) { tokio::task::yield_now().await; }
+    let releaser = std::thread::spawn({
+        let children = children.clone();
+        let release = release.clone();
+        move || {
+            let begin = Instant::now();
+            // New implementation drains before the parent settles. The
+            // deadline also lets the original 177a implementation progress.
+            while !children.lock().unwrap().is_empty() && begin.elapsed() < Duration::from_millis(300) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            release.store(true, Ordering::SeqCst);
+        }
+    });
+    let result = PublisherTask::from_parts(main, children.clone()).stop_within(Duration::from_secs(2)).await;
+    releaser.join().unwrap();
+    let leftovers = std::mem::take(&mut *children.lock().unwrap());
+    let missed = leftovers.len();
+    let was_dropped = dropped.load(Ordering::SeqCst);
+    eprintln!("stop result={result:?} missed_children={missed} late_child_dropped={was_dropped}");
+    // Clean up the rig even when the helper failed to do so.
+    for child in leftovers { child.abort(); let _ = child.await; }
+    assert!(result.is_ok());
+    assert_eq!(missed, 0, "stop returned Ok but skipped the parent's last child");
+    assert!(was_dropped, "the late child must be cancelled and joined");
+}
