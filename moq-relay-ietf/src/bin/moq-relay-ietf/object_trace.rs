@@ -146,7 +146,7 @@ struct LinkRecord {
 }
 
 /// Same OS clock and epoch as the Skew sender/receiver. Linux only.
-fn monotonic_us() -> Option<u64> {
+pub(crate) fn monotonic_us() -> Option<u64> {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     if rc != 0 || ts.tv_sec < 0 || !(0..1_000_000_000).contains(&ts.tv_nsec) {
@@ -176,6 +176,12 @@ pub struct Recorder {
     link_capacity: usize,
     /// Clock of control and binding observations (injectable in tests).
     control_clock: fn() -> Option<u64>,
+    /// False when only the live counters are on: no trace rows are kept and
+    /// control/binding observations are not requested.
+    trace_on: bool,
+    /// The live counters (`--live-counters-out`), counted inside the same
+    /// admission gate as the trace rows.
+    live: Option<Arc<crate::live_counters::Registry>>,
 }
 
 impl Recorder {
@@ -195,19 +201,43 @@ impl Recorder {
             link_callbacks: AtomicU64::new(0), link_dropped: AtomicU64::new(0),
             link_records: Mutex::new(Vec::with_capacity(link_capacity)), link_capacity,
             control_clock: monotonic_us,
+            trace_on: true,
+            live: None,
         }
     }
 
-    #[allow(clippy::type_complexity)]
-    fn seal(&self) -> anyhow::Result<(Vec<Record>, Vec<ControlRecord>, Vec<LinkRecord>)> {
-        // Only callbacks admitted before this cutoff belong to the snapshot.
-        // This is NOT a proof that the relay's producer tasks were all joined.
+    /// The relay's recorder for the opted-in observations: the object trace
+    /// (`trace_on`), the live counters (`live`), or both.
+    pub fn for_relay(capacity: usize, trace_on: bool,
+                     live: Option<Arc<crate::live_counters::Registry>>) -> Self {
+        let mut recorder = if trace_on {
+            Self::new(capacity)
+        } else {
+            Self::with_capacities(0, 0, 0)
+        };
+        recorder.trace_on = trace_on;
+        recorder.live = live;
+        recorder
+    }
+
+    /// Stop admitting callbacks and wait until none is in flight. After this
+    /// the trace buffers and the live counters hold exactly the same set of
+    /// observations. Idempotent.
+    pub fn close_admission(&self) -> anyhow::Result<()> {
         self.enabled.store(false, Ordering::SeqCst);
         let deadline = Instant::now() + Duration::from_millis(100);
         while self.active.load(Ordering::SeqCst) != 0 {
             anyhow::ensure!(Instant::now() < deadline, "object trace seal timeout");
             std::thread::yield_now();
         }
+        Ok(())
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn seal(&self) -> anyhow::Result<(Vec<Record>, Vec<ControlRecord>, Vec<LinkRecord>)> {
+        // Only callbacks admitted before this cutoff belong to the snapshot.
+        // This is NOT a proof that the relay's producer tasks were all joined.
+        self.close_admission()?;
         let mut records = self.records.lock().map_err(|_| anyhow::anyhow!("trace poisoned"))?;
         let mut control = self.control_records.lock()
             .map_err(|_| anyhow::anyhow!("control trace poisoned"))?;
@@ -267,21 +297,27 @@ impl Observer for Recorder {
                        track_alias: u64, timestamp_us: u64, received_bytes: Option<usize>) {
         self.active.fetch_add(1, Ordering::SeqCst);
         if self.enabled.load(Ordering::SeqCst) {
-            self.callbacks.fetch_add(1, Ordering::SeqCst);
-            // Never wait for another callback. Any contention/overflow/poison
-            // invalidates the snapshot rather than hiding missing observations.
-            match self.records.try_lock() {
-                Ok(mut records) if records.len() < self.capacity => records.push(Record {
-                    boundary, object: object.clone(), track_alias, timestamp_us, received_bytes,
-                }),
-                _ => { self.dropped.fetch_add(1, Ordering::SeqCst); }
+            // Live counters: lock-free, never lost, same admission as the rows.
+            if let Some(live) = &self.live {
+                live.count(boundary, &object.group.track, timestamp_us);
+            }
+            if self.trace_on {
+                self.callbacks.fetch_add(1, Ordering::SeqCst);
+                // Never wait for another callback. Any contention/overflow/poison
+                // invalidates the snapshot rather than hiding missing observations.
+                match self.records.try_lock() {
+                    Ok(mut records) if records.len() < self.capacity => records.push(Record {
+                        boundary, object: object.clone(), track_alias, timestamp_us, received_bytes,
+                    }),
+                    _ => { self.dropped.fetch_add(1, Ordering::SeqCst); }
+                }
             }
         }
         self.active.fetch_sub(1, Ordering::SeqCst);
     }
 
     fn observes_control(&self) -> bool {
-        true
+        self.trace_on
     }
 
     fn record_control(&self, direction: ControlDirection, message: ControlMessage<'_>,
@@ -295,7 +331,14 @@ impl Observer for Recorder {
                    track: &Arc<Track>, timestamp_us: u64) {
         self.admit(&self.link_records, self.link_capacity, &self.link_callbacks,
                    &self.link_dropped,
-                   || LinkRecord { binding, session, request_id, track: track.clone(), timestamp_us });
+                   || {
+                       // With live counters on, ids are assigned at first
+                       // observation (binding or object) in their registry.
+                       if let Some(live) = &self.live {
+                           live.register(track);
+                       }
+                       LinkRecord { binding, session, request_id, track: track.clone(), timestamp_us }
+                   });
     }
 }
 
@@ -429,15 +472,44 @@ fn is_forward(boundary: Boundary) -> bool {
         | Boundary::ForwardTimeout | Boundary::ForwardInterrupted)
 }
 
-/// Small opaque ids for track incarnations, first-seen order.
+/// Small opaque ids for track incarnations. Without live counters: first
+/// seen at serialization (bindings first, then objects) — unchanged. With
+/// live counters: the live registry's ids (first observed during the run),
+/// so the trace and the sidecar name an incarnation by the same id; an
+/// incarnation the full registry could not hold gets an id above its range.
 #[derive(Default)]
-struct Incarnations(HashMap<usize, usize>);
+struct Incarnations {
+    ids: HashMap<usize, usize>,
+    registry: Option<Arc<crate::live_counters::Registry>>,
+    next_overflow: usize,
+}
 
 impl Incarnations {
-    fn id(&mut self, track: &Arc<Track>) -> usize {
-        let next = self.0.len() + 1;
-        *self.0.entry(Arc::as_ptr(track) as usize).or_insert(next)
+    fn with_registry(registry: Option<Arc<crate::live_counters::Registry>>) -> Self {
+        Self { ids: HashMap::new(), registry, next_overflow: crate::live_counters::REGISTRY_CAPACITY }
     }
+
+    fn id(&mut self, track: &Arc<Track>) -> usize {
+        let key = Arc::as_ptr(track) as usize;
+        if let Some(id) = self.ids.get(&key) {
+            return *id;
+        }
+        let id = match &self.registry {
+            None => self.ids.len() + 1,
+            Some(registry) => registry.id_of(track).unwrap_or_else(|| {
+                self.next_overflow += 1;
+                self.next_overflow
+            }),
+        };
+        self.ids.insert(key, id);
+        id
+    }
+}
+
+/// Install the relay's one observer (trace, live counters, or both).
+pub fn install(recorder: Arc<Recorder>) -> anyhow::Result<()> {
+    moq_transport::object_trace::install(recorder)
+        .map_err(|_| anyhow::anyhow!("object trace already installed"))
 }
 
 pub struct Trace {
@@ -448,8 +520,19 @@ pub struct Trace {
 }
 
 impl Trace {
+    /// Trace-only start (tests): a fresh recorder, installed.
+    #[cfg(test)]
     pub fn start(path: &Path, run_id: &str, capacity: usize,
                  mapping: DataPriorityMapping) -> anyhow::Result<Self> {
+        let trace = Self::open(path, run_id, capacity, mapping, Arc::new(Recorder::new(capacity)))?;
+        install(trace.recorder.clone())?;
+        Ok(trace)
+    }
+
+    /// Create the trace file (create-only) for `recorder`, which the caller
+    /// installs (alone, or shared with the live counters).
+    pub fn open(path: &Path, run_id: &str, capacity: usize, mapping: DataPriorityMapping,
+                recorder: Arc<Recorder>) -> anyhow::Result<Self> {
         anyhow::ensure!(capacity > 0, "object trace capacity must be positive");
         anyhow::ensure!(cfg!(target_os = "linux"), "object trace requires Linux CLOCK_MONOTONIC");
         let file = OpenOptions::new().write(true).create_new(true).open(path)?;
@@ -457,9 +540,6 @@ impl Trace {
         let rss = RssSampler::start(RSS_SAMPLE_PERIOD)?;
         writeln!(writer, "{}", meta_row(run_id, capacity, mapping, rss.start))?;
         writer.flush()?;
-        let recorder = Arc::new(Recorder::new(capacity));
-        moq_transport::object_trace::install(recorder.clone())
-            .map_err(|_| anyhow::anyhow!("object trace already installed"))?;
         Ok(Self { recorder, writer, mapping, rss })
     }
 
@@ -467,7 +547,7 @@ impl Trace {
         let (records, control, links) = self.recorder.seal()?;
         let rss_end = self.rss.finish()?;
         // Bindings first, so incarnation ids follow binding order.
-        let mut incarnations = Incarnations::default();
+        let mut incarnations = Incarnations::with_registry(self.recorder.live.clone());
         let mut by_request: HashMap<(u64, bool, u64), (usize, TrackBinding, u64)> = HashMap::new();
         let mut duplicate_keys = 0u64;
         for link in &links {
@@ -1154,5 +1234,155 @@ mod tests {
         }
         assert_eq!(rows.last().unwrap()["intact"], true);
         std::fs::remove_file(path).unwrap();
+    }
+
+    fn live_final(sink: &crate::live_counters::tests::SharedSink) -> serde_json::Value {
+        let (lines, bad) = sink.lines();
+        assert_eq!(bad, 0);
+        let last = lines.last().unwrap().clone();
+        assert_eq!(last["final"], true);
+        last
+    }
+
+    fn trace_counts(rows: &[serde_json::Value]) -> HashMap<(u64, String), u64> {
+        let mut counts = HashMap::new();
+        for r in rows.iter().filter(|r| r["role"] == "relay_object") {
+            let name = match r["boundary"].as_str().unwrap() {
+                "receive_registered" => "registered",
+                "forward_start" => "forward_started",
+                other => other,
+            };
+            *counts.entry((r["track_incarnation"].as_u64().unwrap(), name.to_string())).or_insert(0) += 1;
+        }
+        counts
+    }
+
+    fn live_counts(line: &serde_json::Value) -> HashMap<(u64, String), u64> {
+        let mut counts = HashMap::new();
+        for t in line["tracks"].as_array().unwrap() {
+            for name in crate::live_counters::COUNT_NAMES {
+                let v = t[name].as_u64().unwrap();
+                if v > 0 {
+                    counts.insert((t["track_incarnation"].as_u64().unwrap(), name.to_string()), v);
+                }
+            }
+        }
+        counts
+    }
+
+    /// The sidecar's final line counts exactly the trace's relay_object rows,
+    /// per incarnation and boundary, under one admission cut; callbacks after
+    /// the cut are in neither. Ids agree (first observed: binding or object).
+    #[test]
+    fn live_final_counts_equal_the_trace_rows_per_incarnation_and_boundary() {
+        use crate::live_counters::{tests::SharedSink, LiveWriter, Registry};
+        let (path, file) = new_test_file();
+        let registry = Arc::new(Registry::new(64));
+        let recorder = Arc::new(Recorder::for_relay(64, true, Some(registry.clone())));
+        let sink = SharedSink::default();
+        let writer = LiveWriter::start_with(Box::new(sink.clone()), Duration::from_secs(60),
+                                            registry).unwrap();
+        let (pc, haptic) = (track("pc"), track("haptic"));
+        recorder.record_link(TrackBinding::DownstreamCreated, 2, 0, &haptic, 1);
+        let (o1, o2, h1) = (object_of(&pc, 1), object_of(&pc, 1), object_of(&haptic, 0));
+        for (b, o, t) in [
+            (Boundary::ReceiveRegistered, &o1, 10), (Boundary::ReceiveComplete, &o1, 11),
+            (Boundary::ForwardStart, &o1, 12), (Boundary::ForwardTimeout, &o1, 13),
+            (Boundary::ReceiveRegistered, &o2, 20), (Boundary::ReceiveInterrupted, &o2, 21),
+            (Boundary::ReceiveRegistered, &h1, 30), (Boundary::ReceiveTimeout, &h1, 31),
+            (Boundary::ForwardStart, &h1, 32), (Boundary::ForwardAccepted, &h1, 33),
+            (Boundary::ForwardInterrupted, &o1, 34),
+        ] {
+            recorder.record(b, o, 3, t);
+        }
+        recorder.close_admission().unwrap();
+        recorder.record(Boundary::ForwardStart, &o2, 3, 99); // after the cut: in neither
+        writer.finish().unwrap();
+        test_trace(recorder, file).finish("sigterm").unwrap();
+        let rows = rows(&path);
+        let final_line = live_final(&sink);
+        assert_eq!(live_counts(&final_line), trace_counts(&rows));
+        assert_eq!(rows.iter().filter(|r| r["role"] == "relay_object").count(), 11);
+        // the binding was observed first, so haptic is incarnation 1 in both
+        let tracks = final_line["tracks"].as_array().unwrap();
+        assert_eq!((tracks[0]["track"].clone(), tracks[0]["track_incarnation"].clone()),
+                   (json!("haptic"), json!(1)));
+        let haptic_rows: Vec<_> = rows.iter().filter(|r| r["role"] == "relay_object" && r["track"] == "haptic").collect();
+        assert!(haptic_rows.iter().all(|r| r["track_incarnation"] == 1));
+        assert_eq!(tracks[1]["first_registered_t_us"], 10);
+        assert_eq!(tracks[1]["last_registered_t_us"], 20);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// The asymmetry: a trace row lost to try_lock contention is still a live
+    /// count (atomics cannot drop), and the trace says it is not intact.
+    #[test]
+    fn a_dropped_trace_row_is_still_counted_live_and_the_trace_is_not_intact() {
+        use crate::live_counters::{tests::SharedSink, LiveWriter, Registry};
+        let (path, file) = new_test_file();
+        let registry = Arc::new(Registry::new(8));
+        let recorder = Arc::new(Recorder::for_relay(8, true, Some(registry.clone())));
+        let sink = SharedSink::default();
+        let writer = LiveWriter::start_with(Box::new(sink.clone()), Duration::from_secs(60), registry).unwrap();
+        let o = object();
+        recorder.record(Boundary::ReceiveRegistered, &o, 1, 1);
+        {
+            let _held = recorder.records.lock().unwrap();
+            recorder.record(Boundary::ReceiveComplete, &o, 1, 2); // dropped from the trace
+        }
+        recorder.close_admission().unwrap();
+        writer.finish().unwrap();
+        assert!(test_trace(recorder, file).finish("sigterm").is_err());
+        let rows = rows(&path);
+        let end = rows.last().unwrap();
+        assert_eq!((end["dropped"].clone(), end["intact"].clone()), (json!(1), json!(false)));
+        let live = live_counts(&live_final(&sink));
+        let trace = trace_counts(&rows);
+        assert_eq!(live.get(&(1, "receive_complete".into())), Some(&1));
+        assert_eq!(trace.get(&(1, "receive_complete".into())), None, "exactly the dropped row differs");
+        assert_eq!(live.get(&(1, "registered".into())), trace.get(&(1, "registered".into())));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// Off path: without live counters, ids are numbered at serialization,
+    /// bindings first (unchanged); with them, by first observation.
+    #[test]
+    fn trace_ids_follow_first_observation_only_with_live_counters() {
+        for live in [false, true] {
+            let (path, file) = new_test_file();
+            let registry = live.then(|| Arc::new(crate::live_counters::Registry::new(8)));
+            let recorder = Arc::new(Recorder::for_relay(8, true, registry));
+            let (seen_first, bound_later) = (track("pc"), track("haptic"));
+            recorder.record(Boundary::ReceiveRegistered, &object_of(&seen_first, 1), 1, 1);
+            recorder.record_link(TrackBinding::DownstreamCreated, 2, 0, &bound_later, 2);
+            recorder.record(Boundary::ReceiveRegistered, &object_of(&bound_later, 0), 1, 3);
+            test_trace(recorder, file).finish("sigterm").unwrap();
+            let rows = rows(&path);
+            let id = |name: &str| rows.iter()
+                .find(|r| r["role"] == "relay_object" && r["track"] == name).unwrap()["track_incarnation"].clone();
+            if live {
+                assert_eq!((id("pc"), id("haptic")), (json!(1), json!(2)), "first observed");
+            } else {
+                assert_eq!((id("pc"), id("haptic")), (json!(2), json!(1)), "bindings first (unchanged)");
+            }
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    /// Live-only mode: no trace rows kept, no control/binding observations
+    /// requested, counts still taken.
+    #[test]
+    fn live_only_recorder_counts_without_keeping_trace_rows() {
+        let registry = Arc::new(crate::live_counters::Registry::new(8));
+        let recorder = Recorder::for_relay(4096, false, Some(registry.clone()));
+        assert!(!recorder.observes_control());
+        let o = object();
+        recorder.record(Boundary::ReceiveRegistered, &o, 1, 5);
+        recorder.record(Boundary::ForwardStart, &o, 1, 6);
+        assert_eq!(recorder.callbacks.load(Ordering::SeqCst), 0);
+        assert_eq!(recorder.dropped.load(Ordering::SeqCst), 0);
+        assert!(recorder.records.lock().unwrap().is_empty());
+        let snapshot = registry.snapshot();
+        assert_eq!((snapshot[0].counts[0], snapshot[0].counts[4]), (1, 1));
     }
 }

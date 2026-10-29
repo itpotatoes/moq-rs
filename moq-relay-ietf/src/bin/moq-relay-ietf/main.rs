@@ -3,6 +3,7 @@
 
 mod api_coordinator;
 mod file_coordinator;
+mod live_counters;
 mod object_trace;
 
 use std::sync::Arc;
@@ -45,6 +46,16 @@ pub struct Cli {
     /// forwarded object). Sized by the runner from the planned object count.
     #[arg(long, default_value_t = 4096)]
     pub object_trace_capacity: usize,
+
+    /// Live per-track object-boundary counters (JSONL sidecar, create-only):
+    /// one cumulative snapshot line per period and a final line at shutdown.
+    /// Off when absent.
+    #[arg(long)]
+    pub live_counters_out: Option<PathBuf>,
+
+    /// Live counter snapshot period in milliseconds.
+    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u64).range(1..))]
+    pub live_counters_period_ms: u64,
 
     /// Maximum request ID plus one advertised in MoQT setup.
     #[arg(long, default_value_t = 100)]
@@ -236,20 +247,42 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    if let Some(path) = &cli.object_trace {
-        // Only the opt-in verification mode intercepts SIGTERM. The harness
-        // sends it after endpoints finish, then checks the sealed trace footer.
-        let trace = object_trace::Trace::start(path, cli.object_trace_run_id.as_deref().unwrap(), cli.object_trace_capacity, cli.data_priority_mapping)?;
-        let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        let (ending, result) = tokio::select! {
-            result = relay.run() => ("relay_returned", result),
-            _ = terminate.recv() => ("sigterm", Ok(())),
-        };
-        trace.finish(ending)?;
-        result
-    } else {
-        relay.run().await
+    if cli.object_trace.is_none() && cli.live_counters_out.is_none() {
+        return relay.run().await;
     }
+    // Only the opt-in verification modes intercept SIGTERM. The harness
+    // sends it after endpoints finish, then checks the sealed trace footer
+    // and/or the live counters' final line.
+    let live = cli.live_counters_out.as_ref()
+        .map(|_| Arc::new(live_counters::Registry::new(live_counters::REGISTRY_CAPACITY)));
+    let recorder = Arc::new(object_trace::Recorder::for_relay(
+        cli.object_trace_capacity, cli.object_trace.is_some(), live.clone()));
+    let trace = match &cli.object_trace {
+        Some(path) => Some(object_trace::Trace::open(path, cli.object_trace_run_id.as_deref().unwrap(),
+            cli.object_trace_capacity, cli.data_priority_mapping, recorder.clone())?),
+        None => None,
+    };
+    let writer = match (&cli.live_counters_out, live) {
+        (Some(path), Some(registry)) => Some(live_counters::LiveWriter::start(
+            path, std::time::Duration::from_millis(cli.live_counters_period_ms), registry)?),
+        _ => None,
+    };
+    object_trace::install(recorder.clone())?;
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let (ending, result) = tokio::select! {
+        result = relay.run() => ("relay_returned", result),
+        _ = terminate.recv() => ("sigterm", Ok(())),
+    };
+    // One admission cut for both: the final counters and the trace rows
+    // cover exactly the same callbacks.
+    recorder.close_admission()?;
+    if let Some(writer) = writer {
+        writer.finish()?;
+    }
+    if let Some(trace) = trace {
+        trace.finish(ending)?;
+    }
+    result
 }
 
 #[cfg(test)]
@@ -270,6 +303,19 @@ mod tests {
         let cli = Cli::try_parse_from(["moq-relay-ietf", "--max-request-id", "7"]).unwrap();
 
         assert_eq!(cli.max_request_id, 7);
+    }
+
+    #[test]
+    fn live_counters_are_opt_in_with_a_positive_period() {
+        let default_cli = Cli::try_parse_from(["moq-relay-ietf"]).unwrap();
+        assert!(default_cli.live_counters_out.is_none(), "off by default");
+        assert_eq!(default_cli.live_counters_period_ms, 100);
+        let on = Cli::try_parse_from(["moq-relay-ietf", "--live-counters-out", "/tmp/live.jsonl",
+                                      "--live-counters-period-ms", "250"]).unwrap();
+        assert_eq!(on.live_counters_out.as_deref(), Some(std::path::Path::new("/tmp/live.jsonl")));
+        assert_eq!(on.live_counters_period_ms, 250);
+        assert!(on.object_trace.is_none(), "independent of the object trace");
+        assert!(Cli::try_parse_from(["moq-relay-ietf", "--live-counters-period-ms", "0"]).is_err());
     }
 
     #[test]
