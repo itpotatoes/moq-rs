@@ -25,7 +25,31 @@
 //! whenever the queued fill drops below the target `F`. Silence frames are
 //! never an output of any tick. `Q` bounds every frame not yet written to
 //! the device: the waiting queue PLUS the unwritten remainder of the tick
-//! being written (§3-3a "상한", Codex 109).
+//! being written (§3-3a "상한", Codex 109). Without a latency bound
+//! (below) a queued tick only ever leaves the write queue by being written
+//! (or abandoned after a device failure).
+//!
+//! Latency bound, sink mode A (experiment 3, optional
+//! [`PlacementConfig::latency_bound_frames`] `B`; `None` = off = the
+//! placement above, unchanged): `B` bounds the SAME count `Q` bounds
+//! ([`HapticPlacement::unwritten_tick_frames`]: the waiting queue plus the
+//! unwritten remainder of the tick being written; the frames already in the
+//! device buffer are NOT part of it). When a playable tick of `frames` is
+//! offered and `unwritten + frames > B`, the OLDEST waiting tick (the front
+//! of the write queue) is dropped, repeatedly, until it fits or the waiting
+//! queue is empty. The tick being written (its `n_k` is fixed, possibly
+//! partly written) and the offered tick itself are never dropped for `B`;
+//! if the in-progress remainder alone still leaves `unwritten + frames > B`,
+//! the offered tick is queued anyway (`B` bounds only waiting ticks). The
+//! `Q` rule then applies to the offered tick exactly as without `B` (it can
+//! refuse the offered tick after drops only if the in-progress remainder
+//! plus the offered tick exceeds `Q`, i.e. never for regular ticks with
+//! `Q >= 1,068`). The configured `B` (or null) is recorded in meta
+//! `alsa.latency_bound_frames`. A dropped tick was already submitted: it ends with ONE terminal,
+//! `explicit_discard(latency_bound)` after submit, written by the lane
+//! before the offered tick's own row ([`Offered`]). The drop is by queue
+//! position only — the engine never looks at a tick's identity (event id,
+//! slot, pts) — so anchor ticks are not protected.
 //!
 //! Output time (§3-3): from ONE `snd_pcm_status` snapshot, `appl_pos` is the
 //! lane's own `w` at that call and `hw_pos = appl_pos − delay`. A written
@@ -311,6 +335,12 @@ pub struct PlacementConfig {
     /// `Q`: a tick that would make the write queue exceed this is discarded
     /// before submit (`output_queue_full`).
     pub queue_limit_frames: u64,
+    /// `B` (sink mode A, experiment 3): `None` = off. Otherwise, before a
+    /// playable tick is queued, the oldest WAITING ticks are dropped
+    /// (`explicit_discard(latency_bound)` after submit) while the `Q` count
+    /// plus the offered tick exceeds `B` (module doc "Latency bound").
+    /// `REGULAR_TICK_MAX_FRAMES <= B <= queue_limit_frames`.
+    pub latency_bound_frames: Option<u64>,
 }
 
 impl PlacementConfig {
@@ -340,6 +370,14 @@ impl PlacementConfig {
                 c.queue_limit_frames
             ));
         }
+        if let Some(bound) = c.latency_bound_frames {
+            if bound < REGULAR_TICK_MAX_FRAMES || bound > c.queue_limit_frames {
+                return Err(format!(
+                    "ALSA latency bound {bound} frames must be in {REGULAR_TICK_MAX_FRAMES}..=queue limit {}",
+                    c.queue_limit_frames
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -360,6 +398,28 @@ pub enum Admission {
     /// Not a playable PCM tick: `submit` + `explicit_discard(payload_invalid)`
     /// after submit, and the integrity failure `haptic_payload_invalid`.
     PayloadInvalid,
+}
+
+/// What offering one haptic submission did ([`HapticPlacement::offer`]).
+#[must_use = "every latency-bound drop needs its explicit_discard(latency_bound) row"]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Offered {
+    /// Waiting ticks the latency bound dropped to make room, oldest first
+    /// (always empty without a bound). Each was already submitted: the lane
+    /// writes ONE `explicit_discard(latency_bound)` after submit for each,
+    /// in this order, BEFORE it writes the row(s) of `admission`.
+    pub latency_dropped: Vec<L2Submission>,
+    /// The offered submission's own outcome (the `Q` rule after the drops).
+    pub admission: Admission,
+}
+
+/// Latency-bound counters (present only with a bound; [`LaneStats`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LatencyBoundStats {
+    /// Waiting ticks dropped for `B` (each: `explicit_discard(latency_bound)`).
+    pub ticks_dropped: u64,
+    /// Their 48 kHz frames (6 × 8 kHz samples each).
+    pub frames_dropped: u64,
 }
 
 /// A device failure (registration §6-1, Codex 109 P1). No occurrence time
@@ -621,6 +681,9 @@ pub struct LaneStats {
     pub last_tick_end_frame: Option<u64>,
     /// `hw_pos` of the last healthy snapshot.
     pub last_hw_pos: Option<i64>,
+    /// `Some` iff a latency bound `B` is configured; its keys are emitted
+    /// only then, so without `B` the counters are exactly the former ones.
+    pub latency_bound: Option<LatencyBoundStats>,
 }
 
 /// Upper bounds (exclusive, µs) of the status-gap histogram buckets.
@@ -634,7 +697,7 @@ impl LaneStats {
     }
 
     pub fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut json = serde_json::json!({
             "prefill_frames": self.prefill_frames,
             "frames_written": self.frames_written,
             "tick_frames_written": self.tick_frames_written,
@@ -657,7 +720,13 @@ impl LaneStats {
             "max_unwritten_tick_frames": self.max_unwritten_tick_frames,
             "last_tick_end_frame": self.last_tick_end_frame,
             "last_hw_pos": self.last_hw_pos,
-        })
+        });
+        if let Some(bound) = &self.latency_bound {
+            let map = json.as_object_mut().expect("lane stats are an object");
+            map.insert("ticks_latency_bound".into(), bound.ticks_dropped.into());
+            map.insert("latency_bound_frames_dropped".into(), bound.frames_dropped.into());
+        }
+        json
     }
 }
 
@@ -753,7 +822,10 @@ impl HapticPlacement {
             last_hw_ptr_pos: 0,
             last_htstamp_ns: 0,
             last_status_t0_us: None,
-            stats: LaneStats::default(),
+            stats: LaneStats {
+                latency_bound: cfg.latency_bound_frames.map(|_| LatencyBoundStats::default()),
+                ..LaneStats::default()
+            },
         })
     }
 
@@ -876,8 +948,35 @@ impl HapticPlacement {
         Ok(())
     }
 
-    /// Offer one released haptic submission (its payload: 8 kHz S16_LE mono).
+    /// Offer one released haptic submission (its payload: 8 kHz S16_LE
+    /// mono): payload validation first (an unplayable payload drops
+    /// nothing), then — only with a latency bound `B` — the oldest WAITING
+    /// ticks are dropped while `unwritten_tick_frames() + frames > B` (never
+    /// the tick being written, never the offered tick; by queue position
+    /// only, blind to identity), then the unchanged `Q` rule decides the
+    /// offered tick. Without `B` this is exactly the former admission.
+    pub fn offer(&mut self, submission: L2Submission, payload: Option<&[u8]>) -> Offered {
+        let mut latency_dropped = Vec::new();
+        let admission = self.admit_after_bound(submission, payload, &mut latency_dropped);
+        Offered { latency_dropped, admission }
+    }
+
+    /// [`Self::offer`] reduced to the offered submission's own outcome, for
+    /// tests of a placement without a latency bound. Panics if the bound
+    /// dropped a waiting tick (its terminal would be lost): use `offer`.
+    #[cfg(test)]
     pub fn admit(&mut self, submission: L2Submission, payload: Option<&[u8]>) -> Admission {
+        let offered = self.offer(submission, payload);
+        assert!(offered.latency_dropped.is_empty(), "admit() cannot report latency-bound drops: use offer()");
+        offered.admission
+    }
+
+    fn admit_after_bound(
+        &mut self,
+        submission: L2Submission,
+        payload: Option<&[u8]>,
+        latency_dropped: &mut Vec<L2Submission>,
+    ) -> Admission {
         let Some(payload) = payload else {
             self.stats.ticks_payload_invalid += 1;
             return Admission::PayloadInvalid;
@@ -891,6 +990,19 @@ impl HapticPlacement {
         if frames > self.cfg.max_tick_frames() {
             self.stats.ticks_payload_invalid += 1;
             return Admission::PayloadInvalid;
+        }
+        if let Some(bound) = self.cfg.latency_bound_frames {
+            // Sink mode A: drop the oldest waiting tick (front of the write
+            // queue) until the offered tick fits under B or nothing waits.
+            // `current` (n_k fixed) and `in_flight` (written) are untouched.
+            while self.unwritten_tick_frames() + frames > bound {
+                let Some(oldest) = self.pending.pop_front() else { break };
+                self.pending_frames -= oldest.frames;
+                let counters = self.stats.latency_bound.get_or_insert_with(LatencyBoundStats::default);
+                counters.ticks_dropped += 1;
+                counters.frames_dropped += oldest.frames;
+                latency_dropped.push(oldest.submission);
+            }
         }
         if self.unwritten_tick_frames() + frames > self.cfg.queue_limit_frames {
             self.stats.ticks_queue_full += 1;
@@ -1482,6 +1594,7 @@ mod tests {
             target_fill_frames: 512,
             prefill_frames: 512,
             queue_limit_frames: 48_000,
+            latency_bound_frames: None,
         }
     }
 
@@ -2043,5 +2156,278 @@ mod tests {
         assert!(texts[AUDIO_TSTAMP_TYPE_LINK_ESTIMATED as usize].contains("estimated indirectly"));
         assert!(texts[AUDIO_TSTAMP_TYPE_LINK_SYNCHRONIZED as usize].contains("synchronized with system time"));
         assert!(texts[6].starts_with("UNKNOWN"));
+    }
+
+    // ---- latency bound B (sink mode A, experiment 3) -------------------------
+
+    /// Two regular ticks: the bound the experiment-3 tests use.
+    const B2: u64 = 2 * REGULAR_TICK_MAX_FRAMES;
+
+    fn bounded(bound: Option<u64>) -> PlacementConfig {
+        PlacementConfig { latency_bound_frames: bound, ..cfg() }
+    }
+
+    /// Seqs of the waiting ticks, front (oldest) first.
+    fn pending_seqs(engine: &HapticPlacement) -> Vec<u32> {
+        engine.pending.iter().map(|t| t.submission.identity.seq).collect()
+    }
+
+    /// The tick being written and the written ticks awaiting their output.
+    fn placed_seqs(engine: &HapticPlacement) -> Vec<u32> {
+        let mut out: Vec<u32> = engine.in_flight.iter().map(|t| t.submission.identity.seq).collect();
+        if let Some(Current { kind: ChunkKind::Tick { submission, .. }, .. }) = &engine.current {
+            out.push(submission.identity.seq);
+        }
+        out
+    }
+
+    #[test]
+    fn the_latency_bound_must_lie_between_one_regular_tick_and_q() {
+        let q = PlacementConfig { queue_limit_frames: B2, ..cfg() };
+        for bound in [REGULAR_TICK_MAX_FRAMES, B2] {
+            PlacementConfig { latency_bound_frames: Some(bound), ..q }.validate().unwrap();
+        }
+        for bound in [0, REGULAR_TICK_MAX_FRAMES - 1, B2 + 1] {
+            let err = PlacementConfig { latency_bound_frames: Some(bound), ..q }.validate().unwrap_err();
+            assert!(err.contains("latency bound"), "{bound}: {err}");
+        }
+        bounded(None).validate().unwrap();
+        bounded(Some(48_000)).validate().unwrap();
+        assert!(bounded(Some(48_001)).validate().is_err(), "above the default Q");
+    }
+
+    /// The outcome of one simulated offering schedule, by OFFER INDEX (never
+    /// by identity): which earlier offers each offer dropped, every output
+    /// with its lag `t_output_us − t_submit_us`, and the engine's counters.
+    struct Run {
+        dropped_by: Vec<(usize, Vec<usize>)>,
+        outputs: Vec<(usize, u64)>,
+        queue_full: Vec<usize>,
+        stats: LaneStats,
+    }
+
+    /// Offer `n` regular ticks every `gap_us` of virtual time (1 ms lane
+    /// steps), each built by `make(index, t)`, then drain until idle. After
+    /// every offer it checks the mode-A rules: the drops are exactly the
+    /// oldest waiting ticks, never a placed (being written / written) tick,
+    /// and with a bound `unwritten <= B` unless nothing else waits.
+    fn offer_schedule(c: PlacementConfig, n: usize, gap_us: u64, make: impl Fn(usize, u64) -> L2Submission) -> Run {
+        let t0 = 1_000_000;
+        let (mut engine, mut pcm) = started(c, SimPcmConfig::new(PERIOD, BUFFER), t0);
+        let mut offered: Vec<L2Submission> = Vec::new();
+        let index_of = |offered: &[L2Submission], s: &L2Submission| offered.iter().position(|o| o == s).expect("offered");
+        let mut run = Run { dropped_by: Vec::new(), outputs: Vec::new(), queue_full: Vec::new(), stats: LaneStats::default() };
+        let mut t = t0;
+        let collect = |placed: Vec<Placed>, offered: &[L2Submission], run: &mut Run| {
+            for p in placed {
+                run.outputs.push((index_of(offered, &p.submission), p.t_output_us - p.submission.t_submit_us));
+            }
+        };
+        for k in 0..n {
+            let due = t0 + k as u64 * gap_us;
+            while t + 1_000 <= due {
+                t += 1_000;
+                let placed = step(&mut engine, &mut pcm, t).unwrap();
+                collect(placed, &offered, &mut run);
+            }
+            let s = make(k, t);
+            offered.push(s);
+            let before = pending_seqs(&engine);
+            let placed_before = placed_seqs(&engine);
+            let samples = if k % 9 == 0 { 88 } else { 89 };
+            let Offered { latency_dropped, admission } = engine.offer(s, Some(&payload(samples, 0)));
+            let dropped: Vec<u32> = latency_dropped.iter().map(|d| d.identity.seq).collect();
+            assert_eq!(dropped[..], before[..dropped.len()], "offer {k}: the oldest waiting ticks, in order");
+            assert!(dropped.iter().all(|seq| !placed_before.contains(seq)), "offer {k}: a placed tick was dropped");
+            assert_eq!(placed_seqs(&engine), placed_before, "offer {k}: placed ticks untouched");
+            match admission {
+                Admission::Queued => {}
+                Admission::QueueFull => run.queue_full.push(k),
+                Admission::PayloadInvalid => panic!("offer {k}: a regular tick is playable"),
+            }
+            if let Some(bound) = c.latency_bound_frames {
+                assert!(
+                    engine.unwritten_tick_frames() <= bound || engine.pending.len() <= 1,
+                    "offer {k}: {} unwritten > B {bound} with other ticks still waiting",
+                    engine.unwritten_tick_frames()
+                );
+            } else {
+                assert!(dropped.is_empty(), "no bound, no drop");
+            }
+            if !latency_dropped.is_empty() {
+                run.dropped_by.push((k, latency_dropped.iter().map(|d| index_of(&offered, d)).collect()));
+            }
+        }
+        for _ in 0..20_000 {
+            if engine.idle() {
+                break;
+            }
+            t += 1_000;
+            let placed = step(&mut engine, &mut pcm, t).unwrap();
+            collect(placed, &offered, &mut run);
+        }
+        assert!(engine.idle(), "drained");
+        run.stats = engine.stats().clone();
+        run
+    }
+
+    fn regular(k: usize, t: u64) -> L2Submission {
+        submission(k as u32, t)
+    }
+
+    /// Compression-like burst (two ticks per 90 Hz slot, twice real time):
+    /// without B the write queue grows and so does output − submit (the
+    /// experiment-2 sink); with B = 2 ticks the oldest waiting ticks are
+    /// dropped, every tick ends exactly once (output or drop), and the lag
+    /// stays within (buffer + B) frames.
+    #[test]
+    fn a_compression_burst_drops_the_oldest_waiting_ticks_and_bounds_the_lag() {
+        // 150 ticks at twice real time: the unbounded backlog (~40,000
+        // frames) stays under Q = 48,000, so no tick is refused before submit.
+        let n = 150;
+        let gap = 11_111 / 2;
+        let unbounded = offer_schedule(bounded(None), n, gap, regular);
+        assert!(unbounded.dropped_by.is_empty() && unbounded.queue_full.is_empty());
+        assert_eq!(unbounded.outputs.len(), n, "every tick is output without a bound");
+        let first = unbounded.outputs[..20].iter().map(|o| o.1).max().unwrap();
+        let last = unbounded.outputs[n - 20..].iter().map(|o| o.1).min().unwrap();
+        assert!(last > 500_000 && last > first + 400_000, "the FIFO lag grows: {first} -> {last} us");
+        assert!(unbounded.stats.latency_bound.is_none());
+
+        let bound = offer_schedule(bounded(Some(B2)), n, gap, regular);
+        assert!(bound.queue_full.is_empty());
+        let dropped: Vec<usize> = bound.dropped_by.iter().flat_map(|(_, d)| d.iter().copied()).collect();
+        let output: Vec<usize> = bound.outputs.iter().map(|o| o.0).collect();
+        assert!(dropped.len() > n / 4, "a 2x burst must drop ticks: {}", dropped.len());
+        let mut all: Vec<usize> = dropped.iter().chain(output.iter()).copied().collect();
+        all.sort_unstable();
+        assert_eq!(all, (0..n).collect::<Vec<_>>(), "exactly one end per offered tick");
+        assert!(output.windows(2).all(|w| w[0] < w[1]), "outputs stay in release order");
+        for (k, d) in &bound.dropped_by {
+            assert!(d.iter().all(|i| i < k), "offer {k} dropped only earlier offers {d:?}");
+        }
+        let max_lag = bound.outputs.iter().map(|o| o.1).max().unwrap();
+        let ceiling = ((BUFFER + B2) * 1_000_000 / PCM_RATE_HZ) + 2_000;
+        assert!(max_lag <= ceiling, "lag {max_lag} us above the (buffer + B) ceiling {ceiling} us");
+        eprintln!(
+            "2x burst of {n}: unbounded lag {first} -> {last} us; B = {B2}: {} dropped, max lag {max_lag} us (ceiling {ceiling})",
+            dropped.len()
+        );
+        let counters = bound.stats.latency_bound.expect("bound counters");
+        assert_eq!(counters.ticks_dropped as usize, dropped.len());
+        let frames: u64 = dropped.iter().map(|&k| if k % 9 == 0 { 528 } else { 534 }).sum();
+        assert_eq!(counters.frames_dropped, frames);
+        assert_eq!(bound.stats.ticks_written as usize, output.len());
+        assert_eq!(bound.stats.ticks_admitted as usize, n, "a dropped tick was admitted first");
+        assert!(bound.stats.max_unwritten_tick_frames <= B2, "two regular ticks never exceed B = 2 ticks");
+    }
+
+    /// Regular 90 Hz offering (no compression) never reaches B = 1,068.
+    #[test]
+    fn regular_90_hz_offering_with_b_1068_drops_nothing() {
+        let run = offer_schedule(bounded(Some(B2)), 900, 11_111, regular);
+        assert!(run.dropped_by.is_empty(), "dropped {:?}", run.dropped_by);
+        assert_eq!(run.outputs.len(), 900);
+        assert_eq!(run.stats.latency_bound, Some(LatencyBoundStats::default()));
+        let baseline = offer_schedule(bounded(None), 900, 11_111, regular);
+        assert_eq!(run.outputs, baseline.outputs, "same outputs, same lags as without the bound");
+    }
+
+    /// The drop is blind to identity: other seqs, pts and event ids (every
+    /// tick an anchor, or none) give the same drop and output positions.
+    #[test]
+    fn latency_drops_depend_only_on_queue_position_not_on_identity() {
+        let n = 120;
+        let gap = 11_111 / 3;
+        let reference = offer_schedule(bounded(Some(B2)), n, gap, regular);
+        assert!(!reference.dropped_by.is_empty());
+        let events: [fn(usize) -> u32; 3] = [|k| k as u32 + 1, |_| 0, |k| if k % 3 == 1 { 9 } else { 0 }];
+        for event in events {
+            let relabelled = move |k: usize, t: u64| {
+                let mut s = submission(1_000 + k as u32, t);
+                s.identity.pts_us = 777 + k as u64 * 3_333;
+                s.identity.event_id = event(k);
+                s
+            };
+            let other = offer_schedule(bounded(Some(B2)), n, gap, relabelled);
+            assert_eq!(other.dropped_by, reference.dropped_by);
+            assert_eq!(other.outputs, reference.outputs);
+        }
+    }
+
+    /// The tick being written (partly written, n_k fixed) is never dropped:
+    /// with B = one tick the offered tick is queued behind it anyway, and a
+    /// later offer drops that waiting tick, not the one in progress.
+    #[test]
+    fn the_tick_in_progress_is_never_dropped_for_the_bound() {
+        let t0 = 1_000_000;
+        let mut sim = SimPcmConfig::new(PERIOD, BUFFER);
+        sim.max_frames_per_write = Some(64);
+        let (mut engine, mut pcm) = started(bounded(Some(REGULAR_TICK_MAX_FRAMES)), sim, t0);
+        assert_eq!(engine.admit(submission(0, t0), Some(&payload(89, 0))), Admission::Queued);
+        step(&mut engine, &mut pcm, t0).unwrap();
+        assert_eq!(engine.unwritten_tick_frames(), 534 - 64, "tick 0 partly written");
+        let one = engine.offer(submission(1, t0), Some(&payload(89, 0)));
+        assert_eq!(one, Offered { latency_dropped: Vec::new(), admission: Admission::Queued });
+        assert_eq!(engine.unwritten_tick_frames(), 470 + 534, "queued above B: nothing else waits");
+        let two = engine.offer(submission(2, t0), Some(&payload(89, 0)));
+        assert_eq!(two.latency_dropped, vec![submission(1, t0)], "the waiting tick, not the tick in progress");
+        assert_eq!(two.admission, Admission::Queued);
+        assert_eq!(placed_seqs(&engine), vec![0]);
+        assert_eq!(pending_seqs(&engine), vec![2]);
+        // An unplayable offer drops nothing.
+        let bad = engine.offer(submission(3, t0), None);
+        assert_eq!(bad, Offered { latency_dropped: Vec::new(), admission: Admission::PayloadInvalid });
+        assert_eq!(pending_seqs(&engine), vec![2]);
+        let mut t = t0;
+        let mut out = Vec::new();
+        while !engine.idle() {
+            t += 1_000;
+            out.extend(step(&mut engine, &mut pcm, t).unwrap().into_iter().map(|p| p.submission.identity.seq));
+        }
+        assert_eq!(out, vec![0, 2]);
+        let counters = engine.stats().latency_bound.unwrap();
+        assert_eq!((counters.ticks_dropped, counters.frames_dropped), (1, 534));
+    }
+
+    /// The Q rule applies after the drops exactly as without B: when the
+    /// in-progress remainder plus the offered tick exceeds Q, the offered
+    /// tick is refused even though a waiting tick was just dropped (both
+    /// get their terminal). Only possible with Q < remainder + tick.
+    #[test]
+    fn q_still_decides_the_offered_tick_after_the_drops() {
+        let t0 = 1_000_000;
+        let mut sim = SimPcmConfig::new(PERIOD, BUFFER);
+        sim.max_frames_per_write = Some(64);
+        let c = PlacementConfig { queue_limit_frames: 600, latency_bound_frames: Some(600), ..cfg() };
+        let (mut engine, mut pcm) = started(c, sim, t0);
+        assert_eq!(engine.admit(submission(0, t0), Some(&payload(89, 0))), Admission::Queued);
+        step(&mut engine, &mut pcm, t0).unwrap();
+        assert_eq!(engine.unwritten_tick_frames(), 470);
+        assert_eq!(engine.admit(submission(1, t0), Some(&payload(10, 0))), Admission::Queued, "60 frames fit");
+        let offered = engine.offer(submission(2, t0), Some(&payload(89, 0)));
+        assert_eq!(offered.latency_dropped, vec![submission(1, t0)]);
+        assert_eq!(offered.admission, Admission::QueueFull, "470 + 534 > Q = 600");
+        assert_eq!(engine.stats().ticks_queue_full, 1);
+        assert_eq!(pending_seqs(&engine), Vec::<u32>::new());
+    }
+
+    /// Without B the counters JSON is exactly the former key set; with B it
+    /// gains the two latency-bound keys.
+    #[test]
+    fn latency_bound_counters_appear_only_with_a_bound() {
+        let (off, _) = started(bounded(None), SimPcmConfig::new(PERIOD, BUFFER), 1_000_000);
+        let json = off.stats().to_json();
+        assert!(json.get("ticks_latency_bound").is_none() && json.get("latency_bound_frames_dropped").is_none());
+        let (on, _) = started(bounded(Some(B2)), SimPcmConfig::new(PERIOD, BUFFER), 1_000_000);
+        let json = on.stats().to_json();
+        assert_eq!(json["ticks_latency_bound"], 0);
+        assert_eq!(json["latency_bound_frames_dropped"], 0);
+        let mut keys_on: Vec<String> = json.as_object().unwrap().keys().cloned().collect();
+        let mut keys_off: Vec<String> = off.stats().to_json().as_object().unwrap().keys().cloned().collect();
+        keys_on.sort();
+        keys_off.extend(["latency_bound_frames_dropped".to_string(), "ticks_latency_bound".to_string()]);
+        keys_off.sort();
+        assert_eq!(keys_on, keys_off);
     }
 }

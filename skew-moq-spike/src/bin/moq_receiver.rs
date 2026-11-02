@@ -332,6 +332,13 @@ struct Args {
     /// `explicit_discard(output_queue_full)` before submit (default 48000).
     #[arg(long)]
     l2_alsa_queue_frames: Option<u64>,
+    /// Latency bound B in frames (haptic sink mode A; absent = off, the
+    /// unbounded back-to-back sink): before a tick is queued, the OLDEST
+    /// waiting ticks are dropped while the Q count plus that tick exceeds B,
+    /// each `explicit_discard(latency_bound)` after submit. Must be in
+    /// 534..=Q. Recorded in meta `alsa.latency_bound_frames` (null when off).
+    #[arg(long)]
+    l2_alsa_latency_bound_frames: Option<u64>,
     /// Status snapshot cadence in µs (the lane also wakes on arrivals;
     /// default 1000).
     #[arg(long)]
@@ -1296,6 +1303,7 @@ fn l2_output_config(args: &Args) -> Result<Option<(PathBuf, skew_moq::l2_output:
         || args.l2_alsa_target_fill_frames.is_some()
         || args.l2_alsa_prefill_frames.is_some()
         || args.l2_alsa_queue_frames.is_some()
+        || args.l2_alsa_latency_bound_frames.is_some()
         || args.l2_alsa_status_interval_us.is_some();
     let wayland_given = args.l2_wayland_tiers_meta.is_some() || args.l2_wayland_buffers.is_some();
     let sinks = match args.l2_sink {
@@ -1351,6 +1359,7 @@ fn l2_output_config(args: &Args) -> Result<Option<(PathBuf, skew_moq::l2_output:
                     .unwrap_or(ALSA_DEFAULT_TARGET_FILL_FRAMES),
                 prefill_frames: args.l2_alsa_prefill_frames.unwrap_or(ALSA_DEFAULT_PREFILL_FRAMES),
                 queue_limit_frames: args.l2_alsa_queue_frames.unwrap_or(ALSA_DEFAULT_QUEUE_FRAMES),
+                latency_bound_frames: args.l2_alsa_latency_bound_frames,
             },
             status_interval_us: args
                 .l2_alsa_status_interval_us
@@ -10873,6 +10882,7 @@ mod rx_ending_tests {
             l2_alsa_target_fill_frames: None,
             l2_alsa_prefill_frames: None,
             l2_alsa_queue_frames: None,
+            l2_alsa_latency_bound_frames: None,
             l2_alsa_status_interval_us: None,
             l2_wayland_tiers_meta: None,
             l2_wayland_buffers: None,
@@ -11179,6 +11189,7 @@ mod rx_ending_tests {
             l2_alsa_target_fill_frames: None,
             l2_alsa_prefill_frames: None,
             l2_alsa_queue_frames: None,
+            l2_alsa_latency_bound_frames: None,
             l2_alsa_status_interval_us: None,
             l2_wayland_tiers_meta: None,
             l2_wayland_buffers: None,
@@ -11296,6 +11307,7 @@ mod rx_ending_tests {
             l2_alsa_target_fill_frames: None,
             l2_alsa_prefill_frames: None,
             l2_alsa_queue_frames: None,
+            l2_alsa_latency_bound_frames: None,
             l2_alsa_status_interval_us: None,
             l2_wayland_tiers_meta: None,
             l2_wayland_buffers: None,
@@ -19277,6 +19289,44 @@ mod l2_hook_tests {
             assert!(l2_output_config(&args).is_err(), "{extra:?}");
         }
         assert!(b1_cli(&["--l2-sink", "pc=alsa,haptic=alsa", "--l2-log", &fresh_s]).is_err());
+        assert!(!fresh.exists(), "validation never creates the L2 log");
+    }
+
+    /// Experiment 3 sink mode A: `--l2-alsa-latency-bound-frames` sets
+    /// `PlacementConfig::latency_bound_frames` (absent = None = the
+    /// unbounded sink, every other default unchanged); a bound outside
+    /// 534..=Q, or the flag without `haptic=alsa`, is refused before any log
+    /// is opened.
+    #[test]
+    fn the_latency_bound_flag_is_optional_validated_and_alsa_only() {
+        let fresh = tmp("cli-alsa-latency-bound");
+        let fresh_s = fresh.display().to_string();
+        let base = ["--l2-sink", "pc=fake,haptic=alsa", "--l2-log", &fresh_s,
+                    "--l2-fake-pc-offset-us", "1000", "--l2-fake-haptic-offset-us", "200"];
+        let (_, config) = l2_output_config(&b1_cli(&base).unwrap()).unwrap().unwrap();
+        let p = config.alsa.unwrap().placement;
+        assert_eq!(p.latency_bound_frames, None, "off unless asked");
+        assert_eq!(
+            (p.period_frames, p.buffer_frames, p.target_fill_frames, p.prefill_frames, p.queue_limit_frames),
+            (256, 2_048, 512, 512, 48_000)
+        );
+        let with = |extra: &[&str]| {
+            let mut argv: Vec<&str> = base.to_vec();
+            argv.extend_from_slice(extra);
+            b1_cli(&argv).unwrap()
+        };
+        let (_, config) = l2_output_config(&with(&["--l2-alsa-latency-bound-frames", "1068"])).unwrap().unwrap();
+        assert_eq!(config.alsa.unwrap().placement.latency_bound_frames, Some(1_068));
+        for bad in [&["--l2-alsa-latency-bound-frames", "533"][..],
+                    &["--l2-alsa-latency-bound-frames", "48001"][..],
+                    &["--l2-alsa-queue-frames", "1000", "--l2-alsa-latency-bound-frames", "1068"][..]] {
+            assert!(l2_output_config(&with(bad)).is_err(), "{bad:?}");
+        }
+        let elsewhere = b1_cli(&["--l2-sink", "pc=null,haptic=null", "--l2-log", &fresh_s,
+                                 "--l2-alsa-latency-bound-frames", "1068"]).unwrap();
+        assert!(l2_output_config(&elsewhere).is_err());
+        let none = b1_cli(&["--l2-alsa-latency-bound-frames", "1068"]).unwrap();
+        assert!(l2_output_config(&none).is_err());
         assert!(!fresh.exists(), "validation never creates the L2 log");
     }
 

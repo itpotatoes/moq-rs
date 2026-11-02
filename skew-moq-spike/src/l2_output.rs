@@ -87,8 +87,11 @@
 //! prefills and starts it BEFORE the meta row is written (which records what
 //! was negotiated), emits an `output` only when a status snapshot shows the
 //! hardware passed the tick's first frame, terminates everything it can no
-//! longer output after a device failure as `explicit_discard(device_failure)`
-//! and reports its counters in the sentinel (`lanes.haptic`). `wayland` (PC
+//! longer output after a device failure as `explicit_discard(device_failure)`,
+//! with a latency bound (sink mode A, meta `alsa.latency_bound_frames`)
+//! terminates the oldest waiting ticks it drops as
+//! `explicit_discard(latency_bound)` after submit, and reports its counters
+//! in the sentinel (`lanes.haptic`). `wayland` (PC
 //! only, M3) renders every released frame (Draco decoded first) in a
 //! worker thread into a one-frame pending slot and commits it from the
 //! compositor thread at the next commit opportunity; the
@@ -115,8 +118,8 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 
 use crate::l2_haptic::{
-    Admission, AlsaOutputDetail, DeviceFailure, EpochStart, HapticPcm, HapticPlacement, PcmParams,
-    PlacementConfig, RawSnapshot, SimPcm, SimPcmConfig, FAIL_HAPTIC_PAYLOAD_INVALID,
+    Admission, AlsaOutputDetail, DeviceFailure, EpochStart, HapticPcm, HapticPlacement, Offered,
+    PcmParams, PlacementConfig, RawSnapshot, SimPcm, SimPcmConfig, FAIL_HAPTIC_PAYLOAD_INVALID,
 };
 use crate::now_us;
 
@@ -188,7 +191,17 @@ mod pc_lane;
 /// meta `wayland.decoder` (draco) gains the required `compiler_command` and
 /// `compiler_resolved`. Still µs-only time fields: no `*_ns` field (no
 /// `refresh_ns`, registration 11-11).
-pub const L2_SCHEMA: &str = "event-pair-l2-v1.6";
+/// v1.7 (experiment 3, haptic sink mode A): optional latency bound `B`
+/// (`PlacementConfig::latency_bound_frames`, receiver
+/// `--l2-alsa-latency-bound-frames`). New after-submit ALSA terminal
+/// `explicit_discard(latency_bound)` (a waiting tick dropped oldest-first,
+/// [`DISCARD_LATENCY_BOUND`]); meta `alsa.latency_bound_frames` (null when
+/// off) and `alsa.latency_bound_policy`; the ALSA `sink_contracts` terminals
+/// text names `latency_bound`; the sentinel's `lanes.haptic` gains
+/// `ticks_latency_bound`, `latency_bound_frames_dropped` and
+/// `latency_bound_discards` ONLY when `B` is set. With `B` off every row
+/// except the meta row is what v1.6 writes for the same inputs.
+pub const L2_SCHEMA: &str = "event-pair-l2-v1.7";
 pub const L2_CLOCK: &str = "CLOCK_MONOTONIC";
 /// The M1 grace is anchored at `finish`, not at the registration's H.
 pub const REPORT_WINDOW_ANCHOR: &str = "close";
@@ -315,6 +328,12 @@ pub const DISCARD_DEVICE_FAILURE: &str = "device_failure";
 /// After submit: the payload is not a playable PCM tick (haptic ALSA lane)
 /// or not a drawable PC frame of a known tier (PC Wayland lane).
 pub const DISCARD_PAYLOAD_INVALID: &str = "payload_invalid";
+/// Haptic ALSA lane with a latency bound (sink mode A, v1.7), after submit:
+/// a WAITING tick dropped, oldest first, so that the unwritten tick frames
+/// plus a newly offered tick stay within `latency_bound_frames`. Not an
+/// integrity failure: the dropped audio is the mechanism of mode A (its
+/// cost is reported from these rows and `lanes.haptic`).
+pub const DISCARD_LATENCY_BOUND: &str = "latency_bound";
 /// PC Wayland lane, after submit: the Draco decoder refused the payload.
 pub use crate::l2_pc::DISCARD_DECODE_FAILED;
 
@@ -1250,7 +1269,7 @@ fn sink_contract(config: &L2Config, modality: L2Modality) -> serde_json::Value {
             "backend": config.alsa.as_ref().map(|a| alsa_backend_name(&a.backend)),
             "device_output": device_output,
             "resolves": true,
-            "terminals": "output once a status snapshot shows hw_pos > n_k (receipt strictly before close_deadline_us); explicit_discard before submit: output_queue_full (write queue would exceed queue_limit_frames); explicit_discard after submit: payload_invalid, device_failure",
+            "terminals": "output once a status snapshot shows hw_pos > n_k (receipt strictly before close_deadline_us); explicit_discard before submit: output_queue_full (write queue would exceed queue_limit_frames); explicit_discard after submit: payload_invalid, device_failure, latency_bound (only with a non-null meta alsa.latency_bound_frames: a waiting tick dropped oldest first, alsa.latency_bound_policy)",
             "t_output_us": "htstamp_us + round_half_away((n_k - hw_pos) * 1e6 / 48000), signed integer arithmetic, from the ONE snapshot that shows hw_pos > n_k (registration 3-3: PCM frame time back-computed from the ALSA-reported position and timestamp; not a physical DAC measurement)",
             "t_callback_us": "clock read immediately after that snd_pcm_status call",
             "output_detail": AlsaOutputDetail::schema(),
@@ -1321,6 +1340,7 @@ fn alsa_meta(alsa: &AlsaSinkConfig, ready: &LaneReady) -> serde_json::Value {
         "target_fill_frames": c.target_fill_frames,
         "prefill_frames": c.prefill_frames,
         "queue_limit_frames": c.queue_limit_frames,
+        "latency_bound_frames": c.latency_bound_frames,
         "status_interval_us": alsa.status_interval_us,
         "parameter_status": "provisional sink parameters, not registered experimental parameters; fixed in the freeze after the M2 device measurement (registration 3-3a)",
         "stream_epoch": stream_epoch,
@@ -1331,6 +1351,7 @@ fn alsa_meta(alsa: &AlsaSinkConfig, ready: &LaneReady) -> serde_json::Value {
         "placement_policy": "released ticks are appended in release order at the current write position (n_k = w), written only whole (avail >= frames); while a tick waits nothing else is written; never aligned to a planned slot",
         "silence_policy": "with an empty write queue, one period of silence when buffer_frames - avail < target_fill_frames; silence frames are never the output of any tick",
         "queue_policy": "Q counts every tick frame not yet written to the device (the waiting queue plus the unwritten remainder of the tick being written); a tick that would make it exceed queue_limit_frames is explicit_discard output_queue_full before submit",
+        "latency_bound_policy": "latency_bound_frames null: off, no tick is ever dropped for latency (the placement_policy alone). Otherwise B = latency_bound_frames bounds the same count as Q (the waiting queue plus the unwritten remainder of the tick being written; frames already in the device buffer are not counted): before a playable tick of `frames` is queued, while count + frames > B the OLDEST waiting tick (front of the write queue) is dropped; the tick being written and the offered tick are never dropped for B, and once nothing waits the offered tick is queued even if count + frames > B; then queue_policy applies unchanged; each dropped tick, already submitted, gets explicit_discard latency_bound after submit (receipt before close_deadline_us), written before the offered tick's own row; drops are by queue position only, blind to event identity; lanes.haptic ticks_latency_bound, latency_bound_frames_dropped (48 kHz frames) and latency_bound_discards exist only when B is set",
         "hw_pos_definition": "from ONE snd_pcm_status snapshot: hw_pos = appl_pos - delay, appl_pos = frames written by this lane at that call; hw_ptr_pos = appl_pos - (buffer_frames - avail) is the DMA pointer (must never decrease); driver_delay_frames = delay - (buffer_frames - avail) is recorded per row",
         "output_rule": "an output row only when hw_pos > n_k in that snapshot (strict); t_output_us = htstamp_us + round_half_away((n_k - hw_pos) * 1e6 / 48000); htstamp_us = sec*1e6 + floor(nsec/1000)",
         "htstamp_semantics": "inferred from the kernel source, to be confirmed on the device: with an audio timestamp of actual type LINK the status htstamp is the system time read next to the position read in that same status call; with DEFAULT it is the time the current position value was first observed",
@@ -2247,6 +2268,8 @@ struct AlsaLane {
     device_failure_discards: u64,
     payload_invalid_discards: u64,
     queue_full_discards: u64,
+    /// Sink mode A: waiting ticks dropped for the latency bound.
+    latency_bound_discards: u64,
     row_overflow: u64,
     writer_gone: bool,
     /// Probe-only raw diagnostics (never set by the receiver).
@@ -2272,6 +2295,7 @@ impl AlsaLane {
             device_failure_discards: 0,
             payload_invalid_discards: 0,
             queue_full_discards: 0,
+            latency_bound_discards: 0,
             row_overflow: 0,
             writer_gone: false,
             diagnostics: None,
@@ -2319,7 +2343,14 @@ impl AlsaLane {
             self.discard_after(s, DISCARD_DEVICE_FAILURE);
             return;
         }
-        match self.engine.admit(s, payload.as_deref()) {
+        let Offered { latency_dropped, admission } = self.engine.offer(s, payload.as_deref());
+        // Sink mode A: the waiting ticks dropped to make room end first, in
+        // queue order, each with its one after-submit terminal.
+        for dropped in latency_dropped {
+            self.latency_bound_discards += 1;
+            self.discard_after(dropped, DISCARD_LATENCY_BOUND);
+        }
+        match admission {
             Admission::Queued => self.row(Row::Submit(s), s.t_submit_us),
             Admission::QueueFull => {
                 let t_discard_us = now_us().max(s.t_release_us);
@@ -2473,6 +2504,9 @@ impl AlsaLane {
         map.insert("device_failure_discards".into(), self.device_failure_discards.into());
         map.insert("payload_invalid_discards".into(), self.payload_invalid_discards.into());
         map.insert("queue_full_discards".into(), self.queue_full_discards.into());
+        if self.engine.config().latency_bound_frames.is_some() {
+            map.insert("latency_bound_discards".into(), self.latency_bound_discards.into());
+        }
         map.insert("row_overflow".into(), self.row_overflow.into());
         map.insert(
             "device_failure".into(),
@@ -3985,7 +4019,7 @@ mod tests {
         out.finish().unwrap();
         let rows = rows(&path);
         let meta = &rows[0];
-        assert_eq!(meta["l2_schema"], "event-pair-l2-v1.6");
+        assert_eq!(meta["l2_schema"], "event-pair-l2-v1.7");
         assert_eq!(meta["report_window_anchor"], "close");
         for key in ["object_rows", "sentinel_row", "receiver_fault", "t_callback_us", "file_order"] {
             assert!(meta["row_time_semantics"][key].is_string(), "{key}");
@@ -4138,7 +4172,7 @@ mod tests {
         let meta = &rows[0];
         assert_eq!(meta["role"], "meta");
         assert_eq!(meta["l2_schema"], L2_SCHEMA);
-        assert_eq!(meta["l2_schema"], "event-pair-l2-v1.6");
+        assert_eq!(meta["l2_schema"], "event-pair-l2-v1.7");
         assert_eq!(meta["sinks"], serde_json::json!({ "pc": "fake", "haptic": "null" }));
         assert_eq!(meta["device_output"], false);
         assert!(meta["device_output_rule"].as_str().unwrap().contains("EVERY track"));
@@ -4314,6 +4348,7 @@ mod tests {
             target_fill_frames: 4_800,
             prefill_frames: 4_800,
             queue_limit_frames: 48_000,
+            latency_bound_frames: None,
         }
     }
 
@@ -4695,6 +4730,172 @@ mod tests {
         let failures = shared.failures();
         assert_eq!(failures.untimed.map(|(_, reason)| reason), Some(FAIL_ALSA_XRUN), "untimed device failure");
         assert_eq!(failures.timed.map(|(_, _, reason)| reason), Some(FAIL_HAPTIC_PAYLOAD_INVALID));
+    }
+
+    // ---- sink mode A: the latency bound (experiment 3, v1.7) ------------------
+
+    /// Lane level: every waiting tick the bound drops ends with ONE
+    /// after-submit `explicit_discard(latency_bound)`, oldest first, written
+    /// before the offered tick's own submit; an unplayable offer drops
+    /// nothing; the device-failure abandon still covers what waits. The
+    /// three latency-bound counters exist only with a bound.
+    #[test]
+    fn the_alsa_lane_ends_each_latency_drop_with_one_after_submit_discard() {
+        let lane_with = |bound: Option<u64>| {
+            let (rows_tx, rows_rx) = mpsc::sync_channel(64);
+            let shared = Arc::new(Shared::default());
+            let placement = PlacementConfig { latency_bound_frames: bound, ..sim_placement() };
+            let mut pcm = SimPcm::new(SimPcmConfig::new(512, 16_384));
+            let mut engine = HapticPlacement::new(placement, pcm.params()).unwrap();
+            let mut clock = now_us;
+            engine.prefill(&mut pcm, &mut clock).unwrap();
+            let t0 = now_us();
+            pcm.start(t0).unwrap();
+            let first = pcm.status(t0).unwrap();
+            engine.begin_epoch(t0, first, t0).unwrap();
+            (AlsaLane::new(Box::new(pcm), engine, rows_tx, shared), rows_rx, t0)
+        };
+        let sub = |seq: u32| {
+            let t = now_us();
+            L2Submission { identity: haptic(seq), t_release_us: t, t_submit_us: t }
+        };
+        let (mut lane, rows_rx, t0) = lane_with(Some(2 * 534));
+        // No poll, so nothing is written: the write queue only grows.
+        for seq in 0..5u32 {
+            lane.accept(sub(seq), Some(tick_payload(1))); // 89 samples = 534 frames
+        }
+        lane.accept(sub(5), None);
+        let stats = lane.stats();
+        assert_eq!(stats["latency_bound_discards"], 3);
+        assert_eq!(stats["ticks_latency_bound"], 3);
+        assert_eq!(stats["latency_bound_frames_dropped"], 3 * 534);
+        assert_eq!((stats["ticks_admitted"].as_u64(), stats["ticks_payload_invalid"].as_u64()), (Some(5), Some(1)));
+        assert_eq!(stats["max_unwritten_tick_frames"], 2 * 534);
+        let failure = DeviceFailure {
+            reason: FAIL_ALSA_XRUN,
+            last_good_status_t0_us: t0,
+            detected_us: now_us(),
+            kernel_trigger_us: None,
+            kernel_trigger_ns: None,
+            detail: "test".into(),
+            raw_ns: Vec::new(),
+        };
+        lane.fail(failure);
+        drop(lane);
+        let mut terminals: HashMap<u32, u32> = HashMap::new();
+        let got: Vec<String> = rows_rx
+            .try_iter()
+            .map(|row| match row {
+                Row::Submit(s) => format!("submit {}", s.identity.seq),
+                Row::Discard { identity, t_submit_us, reason, .. } => {
+                    *terminals.entry(identity.seq).or_default() += 1;
+                    format!("discard {} {} {reason}", identity.seq, if t_submit_us.is_some() { "after" } else { "before" })
+                }
+                Row::Output { .. } => "output".into(),
+                Row::LaneStats { .. } | Row::End => "other".into(),
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                "submit 0", "submit 1", "discard 0 after latency_bound", "submit 2",
+                "discard 1 after latency_bound", "submit 3", "discard 2 after latency_bound", "submit 4",
+                "submit 5", "discard 5 after payload_invalid", "discard 3 after device_failure",
+                "discard 4 after device_failure",
+            ]
+        );
+        assert!((0..6u32).all(|seq| terminals.get(&seq) == Some(&1)), "one terminal each: {terminals:?}");
+
+        let (off, _rows, _) = lane_with(None);
+        let stats = off.stats();
+        for key in ["latency_bound_discards", "ticks_latency_bound", "latency_bound_frames_dropped"] {
+            assert!(stats.get(key).is_none(), "{key} without a bound");
+        }
+    }
+
+    /// End to end on the simulated stream: a burst of 60 ticks submitted at
+    /// once. Without B every tick is output and the last waits ~0.7 s (the
+    /// experiment-2 FIFO); with B = 1,068 every tick has exactly one
+    /// terminal (output or after-submit `latency_bound`), the ledger stays
+    /// conserved and integrity-clean, the counters match the rows, and no
+    /// output waits longer than (buffer + B) frames. Meta records B (null
+    /// when off) under v1.7; the latency-bound lane keys exist only with B.
+    #[test]
+    fn a_burst_through_the_alsa_lane_with_and_without_the_latency_bound() {
+        for bound in [None, Some(2 * 534u64)] {
+            let path = tmp(&format!("alsa-sim-latency-bound-{}", bound.unwrap_or(0)));
+            let mut config = alsa_config(Vec::new());
+            config.alsa.as_mut().unwrap().placement.latency_bound_frames = bound;
+            let out = L2Output::start(&path, config).unwrap();
+            let s = out.submitter();
+            for seq in 0..60u32 {
+                assert_eq!(s.submit_payload(haptic(seq), now_us(), Some(tick_payload(seq))), L2SubmitOutcome::Submitted);
+            }
+            drop(s);
+            let summary = out.finish().unwrap();
+            assert!(summary.integrity_ok(PC_FAKE_HAPTIC_ALSA), "{bound:?}: {summary:?}");
+            let rows = rows(&path);
+            let meta = &rows[0];
+            assert_eq!(meta["l2_schema"], "event-pair-l2-v1.7");
+            assert_eq!(meta["alsa"]["latency_bound_frames"], serde_json::json!(bound));
+            assert!(meta["alsa"]["latency_bound_policy"].as_str().unwrap().contains("OLDEST waiting tick"));
+            assert!(meta["sink_contracts"]["haptic"]["terminals"].as_str().unwrap().contains("latency_bound"));
+            let mut ends: HashMap<u64, Vec<String>> = HashMap::new();
+            let mut submitted_at: HashMap<u64, usize> = HashMap::new();
+            let mut max_lag = 0u64;
+            for (line, r) in rows.iter().enumerate() {
+                if r["track"] != "haptic" {
+                    continue;
+                }
+                let seq = r["seq"].as_u64().unwrap();
+                match r["role"].as_str().unwrap() {
+                    "submit" => {
+                        assert!(submitted_at.insert(seq, line).is_none());
+                    }
+                    "output" => {
+                        max_lag = max_lag.max(r["t_output_us"].as_u64().unwrap() - r["t_submit_us"].as_u64().unwrap());
+                        ends.entry(seq).or_default().push("output".into());
+                    }
+                    "explicit_discard" => {
+                        assert_eq!((r["reason"].as_str(), r["discard_phase"].as_str()), (Some("latency_bound"), Some("after_submit")));
+                        assert!(submitted_at.get(&seq).is_some_and(|&at| at < line), "its submit comes first");
+                        ends.entry(seq).or_default().push("latency_bound".into());
+                    }
+                    other => panic!("unexpected haptic row {other}"),
+                }
+            }
+            assert!((0..60u64).all(|seq| ends.get(&seq).is_some_and(|e| e.len() == 1)), "{bound:?}: one terminal each");
+            let drops: Vec<u64> = (0..60u64).filter(|seq| ends[seq][0] == "latency_bound").collect();
+            assert_eq!(summary.discarded_after_submit, drops.len() as u64);
+            assert_eq!((summary.submitted, summary.output), (60, 60 - drops.len() as u64), "haptic only");
+            let lane = &sentinel(&rows)["lanes"]["haptic"];
+            match bound {
+                None => {
+                    assert!(drops.is_empty());
+                    for key in ["latency_bound_discards", "ticks_latency_bound", "latency_bound_frames_dropped"] {
+                        assert!(lane.get(key).is_none(), "{key} without a bound");
+                    }
+                    assert!(max_lag > 600_000, "the unbounded FIFO makes the last tick wait: {max_lag} us");
+                }
+                Some(b) => {
+                    assert!(!drops.is_empty(), "a 60-tick burst overruns a 16,384-frame buffer + B");
+                    assert_eq!(lane["latency_bound_discards"].as_u64(), Some(drops.len() as u64));
+                    assert_eq!(lane["ticks_latency_bound"].as_u64(), Some(drops.len() as u64));
+                    let frames: u64 = drops
+                        .iter()
+                        .map(|&seq| {
+                            let (start, end) = crate::pcm_sample_bounds(seq, 8_000, 90);
+                            6 * (end - start)
+                        })
+                        .sum();
+                    assert_eq!(lane["latency_bound_frames_dropped"].as_u64(), Some(frames));
+                    assert!(lane["max_unwritten_tick_frames"].as_u64().unwrap() <= b);
+                    let ceiling = (16_384 + b) * 1_000_000 / PCM_RATE_HZ + 50_000;
+                    assert!(max_lag <= ceiling, "lag {max_lag} us above (buffer + B) + 50 ms = {ceiling} us");
+                }
+            }
+            let _ = std::fs::remove_file(&path);
+        }
     }
 
     // ---- Codex 109 fix round ---------------------------------------------------
@@ -5136,7 +5337,7 @@ mod tests {
         assert!(summary.integrity_ok(PC_WAYLAND_HAPTIC_NULL), "{summary:?}");
         assert_eq!((summary.submitted, summary.output), (8, 8));
         let meta = &rows[0];
-        assert_eq!(meta["l2_schema"], "event-pair-l2-v1.6");
+        assert_eq!(meta["l2_schema"], "event-pair-l2-v1.7");
         assert_eq!(meta["sinks"]["pc"], "wayland");
         assert_eq!(meta["device_output"], false, "a simulated compositor is never a device output");
         let contract = &meta["sink_contracts"]["pc"];

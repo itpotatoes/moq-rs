@@ -254,6 +254,8 @@ fn run(args: &Args) -> Result<bool> {
                 target_fill_frames: args.target_fill_frames,
                 prefill_frames: args.prefill_frames,
                 queue_limit_frames: args.queue_frames,
+                // The probe measures the unbounded sink (mode A is off).
+                latency_bound_frames: None,
             },
             status_interval_us: args.status_interval_us,
             ready_timeout_us: ALSA_READY_TIMEOUT_US,
