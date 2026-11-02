@@ -330,9 +330,35 @@ pub const DISCARD_DEVICE_FAILURE: &str = "device_failure";
 pub const DISCARD_PAYLOAD_INVALID: &str = "payload_invalid";
 /// Haptic ALSA lane with a latency bound (sink mode A, v1.7), after submit:
 /// a WAITING tick dropped, oldest first, so that the unwritten tick frames
-/// plus a newly offered tick stay within `latency_bound_frames`. Not an
-/// integrity failure: the dropped audio is the mechanism of mode A (its
-/// cost is reported from these rows and `lanes.haptic`).
+/// plus a newly offered tick stay within `latency_bound_frames` (the exact
+/// bound and its exception: `l2_haptic` module doc). Not an integrity
+/// failure: the dropped audio is the mechanism of mode A (its cost is
+/// reported from these rows and `lanes.haptic`).
+///
+/// Counters versus rows. `lanes.haptic.ticks_latency_bound` (engine) and
+/// `latency_bound_discards` (lane) both count drop DECISIONS, one per
+/// dropped tick, before its row is attempted: they are always equal. The
+/// `latency_bound` rows in the file equal them only if no such row was
+/// lost, and a row is lost in exactly three ways, each already flagged:
+/// (i) the bounded row queue was full -> sentinel `row_overflow` (and
+/// `lanes.haptic.row_overflow`) > 0 and the timed integrity failure
+/// `row_queue_overflow` at its `t_discard_us` is recorded (the sentinel's
+/// `first_integrity_failure_*` is the EARLIEST failure, typically the
+/// dropped tick's own `submitted_unresolved` at its `t_submit_us`); (ii) its receipt time was at
+/// or after the close deadline -> not written, counted in
+/// `lanes.haptic.discards_not_emitted_after_deadline` (shared by every
+/// after-submit reason: device_failure, payload_invalid, latency_bound);
+/// (iii) the writer had already exited (an I/O error or a panic: it ends
+/// normally only on `End`, which `finish` sends after joining every lane)
+/// -> no `instrumentation_end` sentinel at all (fail closed, `finish`
+/// errs). In
+/// (i) and (ii) the dropped tick keeps its submit without a terminal, so it
+/// is also counted in `submitted_unresolved` (integrity failure
+/// `submitted_unresolved`). So the equality rows == counters holds for an
+/// integrity-clean, fully resolved ledger (sentinel present, `row_overflow
+/// == 0`, `submitted_unresolved == 0`, which implies
+/// `discards_not_emitted_after_deadline == 0`), and a ledger missing a
+/// `latency_bound` terminal is never integrity-clean.
 pub const DISCARD_LATENCY_BOUND: &str = "latency_bound";
 /// PC Wayland lane, after submit: the Draco decoder refused the payload.
 pub use crate::l2_pc::DISCARD_DECODE_FAILED;
@@ -1351,7 +1377,7 @@ fn alsa_meta(alsa: &AlsaSinkConfig, ready: &LaneReady) -> serde_json::Value {
         "placement_policy": "released ticks are appended in release order at the current write position (n_k = w), written only whole (avail >= frames); while a tick waits nothing else is written; never aligned to a planned slot",
         "silence_policy": "with an empty write queue, one period of silence when buffer_frames - avail < target_fill_frames; silence frames are never the output of any tick",
         "queue_policy": "Q counts every tick frame not yet written to the device (the waiting queue plus the unwritten remainder of the tick being written); a tick that would make it exceed queue_limit_frames is explicit_discard output_queue_full before submit",
-        "latency_bound_policy": "latency_bound_frames null: off, no tick is ever dropped for latency (the placement_policy alone). Otherwise B = latency_bound_frames bounds the same count as Q (the waiting queue plus the unwritten remainder of the tick being written; frames already in the device buffer are not counted): before a playable tick of `frames` is queued, while count + frames > B the OLDEST waiting tick (front of the write queue) is dropped; the tick being written and the offered tick are never dropped for B, and once nothing waits the offered tick is queued even if count + frames > B; then queue_policy applies unchanged; each dropped tick, already submitted, gets explicit_discard latency_bound after submit (receipt before close_deadline_us), written before the offered tick's own row; drops are by queue position only, blind to event identity; lanes.haptic ticks_latency_bound, latency_bound_frames_dropped (48 kHz frames) and latency_bound_discards exist only when B is set",
+        "latency_bound_policy": "latency_bound_frames null: off, no tick is ever dropped for latency (the placement_policy alone). Otherwise B = latency_bound_frames bounds the same count as Q (the waiting queue plus the unwritten remainder of the tick being written; frames already in the device buffer are not counted): before a playable tick of `frames` is queued, while count + frames > B the OLDEST waiting tick (front of the write queue) is dropped; the tick being written and the offered tick are never dropped for B, and once nothing waits the offered tick is queued even if count + frames > B; then queue_policy applies unchanged; each dropped tick, already submitted, gets explicit_discard latency_bound after submit (receipt before close_deadline_us), written before the offered tick's own row; drops are by queue position only, blind to event identity; lanes.haptic ticks_latency_bound, latency_bound_frames_dropped (48 kHz frames) and latency_bound_discards exist only when B is set. Bound: right after admitting a tick of f frames, the count <= min(queue_limit_frames, max(B, r + f)), r = unwritten remainder of the tick being written (0 if none), so max_unwritten_tick_frames <= min(queue_limit_frames, max(B, 2 x the largest admitted tick)): <= B only if no tick exceeds B/2 frames (528/534-frame ticks with B >= 1068); a larger playable tick offered while nothing waits is queued above B. Counters: ticks_latency_bound == latency_bound_discards count drop decisions; the latency_bound rows equal them only in an integrity-clean, fully resolved ledger: a row lost to the full row queue is flagged by row_overflow (failure row_queue_overflow recorded; the sentinel's first failure is the earliest one), a row not emitted at or after the close deadline by lanes.haptic.discards_not_emitted_after_deadline (all after-submit reasons), both also leave the submit unresolved (submitted_unresolved), and a writer that already exited (I/O error or panic) leaves no instrumentation_end",
         "hw_pos_definition": "from ONE snd_pcm_status snapshot: hw_pos = appl_pos - delay, appl_pos = frames written by this lane at that call; hw_ptr_pos = appl_pos - (buffer_frames - avail) is the DMA pointer (must never decrease); driver_delay_frames = delay - (buffer_frames - avail) is recorded per row",
         "output_rule": "an output row only when hw_pos > n_k in that snapshot (strict); t_output_us = htstamp_us + round_half_away((n_k - hw_pos) * 1e6 / 48000); htstamp_us = sec*1e6 + floor(nsec/1000)",
         "htstamp_semantics": "inferred from the kernel source, to be confirmed on the device: with an audio timestamp of actual type LINK the status htstamp is the system time read next to the position read in that same status call; with DEFAULT it is the time the current position value was first observed",
@@ -4896,6 +4922,124 @@ mod tests {
             }
             let _ = std::fs::remove_file(&path);
         }
+    }
+
+    /// A started bounded (B = 1,068) haptic lane on the real clock whose
+    /// rows go to `rows` (nothing is polled or written unless a test does).
+    fn latency_lane(rows: SyncSender<Row>, shared: Arc<Shared>) -> AlsaLane {
+        let placement = PlacementConfig { latency_bound_frames: Some(2 * 534), ..sim_placement() };
+        let mut pcm = SimPcm::new(SimPcmConfig::new(512, 16_384));
+        let mut engine = HapticPlacement::new(placement, pcm.params()).unwrap();
+        let mut clock = now_us;
+        engine.prefill(&mut pcm, &mut clock).unwrap();
+        let t0 = now_us();
+        pcm.start(t0).unwrap();
+        let first = pcm.status(t0).unwrap();
+        engine.begin_epoch(t0, first, t0).unwrap();
+        AlsaLane::new(Box::new(pcm), engine, rows, shared)
+    }
+
+    fn now_submission(seq: u32) -> L2Submission {
+        let t = now_us();
+        L2Submission { identity: haptic(seq), t_release_us: t, t_submit_us: t }
+    }
+
+    fn latency_rows(rows: &[serde_json::Value]) -> usize {
+        rows.iter().filter(|r| r["role"] == "explicit_discard" && r["reason"] == DISCARD_LATENCY_BOUND).count()
+    }
+
+    const NULL_PC_ALSA_HAPTIC: L2Sinks = L2Sinks { pc: L2SinkKind::Null, haptic: L2SinkKind::Alsa };
+
+    /// Codex 190a P2-1 (i): a `latency_bound` row lost to the full row queue
+    /// is counted by the lane but missing from the file; the ledger is not
+    /// integrity-clean (`row_overflow`, `row_queue_overflow`, and the dropped
+    /// tick's submit stays unresolved).
+    #[test]
+    fn a_latency_bound_row_lost_to_a_full_row_queue_fails_integrity() {
+        let shared = Arc::new(Shared::default());
+        let (rows_tx, rows_rx) = mpsc::sync_channel(2);
+        let mut lane = latency_lane(rows_tx, shared.clone());
+        for seq in 0..3u32 {
+            if seq == 2 {
+                // The drop (t_discard_us) strictly after tick 0's submit.
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            lane.accept(now_submission(seq), Some(tick_payload(1)));
+        }
+        // submit 0 and submit 1 fill the queue; offer 2 drops tick 0: its
+        // discard row and submit 2 overflow.
+        assert_eq!((lane.latency_bound_discards, lane.row_overflow), (1, 2));
+        let (summary, rows) = ledger_of(&lane, &rows_rx, shared, "lb-row-overflow");
+        assert_eq!(latency_rows(&rows), 0, "the latency_bound row was lost");
+        let lane_stats = &sentinel(&rows)["lanes"]["haptic"];
+        assert_eq!((lane_stats["latency_bound_discards"].as_u64(), lane_stats["ticks_latency_bound"].as_u64()), (Some(1), Some(1)));
+        assert_eq!(lane_stats["row_overflow"], 2);
+        assert_eq!(summary.row_overflow, 2);
+        // Both failures are recorded; the sentinel reports the EARLIEST
+        // occurrence: tick 0's unresolved submit precedes the lost row.
+        let submit_0 = rows.iter().find(|r| r["role"] == "submit" && r["seq"] == 0).unwrap();
+        assert_eq!(summary.first_integrity_failure_reason.as_deref(), Some(FAIL_SUBMITTED_UNRESOLVED));
+        assert_eq!(summary.first_integrity_failure_us, submit_0["t_submit_us"].as_u64());
+        assert_eq!(summary.submitted_unresolved, 2, "tick 0 (its terminal lost) and tick 1 (waiting)");
+        assert!(!summary.integrity_ok(NULL_PC_ALSA_HAPTIC));
+        assert!(!sentinel(&rows)["integrity_ok"].as_bool().unwrap_or(true));
+    }
+
+    /// Codex 190a P2-1 (ii): a drop decided at or after the close deadline
+    /// writes no row (deadline semantics unchanged); it is counted in
+    /// `discards_not_emitted_after_deadline` and its submit stays
+    /// unresolved, so the ledger is not integrity-clean.
+    #[test]
+    fn a_latency_bound_drop_after_the_close_deadline_leaves_its_submit_unresolved() {
+        let shared = Arc::new(Shared::default());
+        let (rows_tx, rows_rx) = mpsc::sync_channel(64);
+        let mut lane = latency_lane(rows_tx, shared.clone());
+        shared.close_deadline_us.store(now_us(), Ordering::SeqCst);
+        for seq in 0..3u32 {
+            lane.accept(now_submission(seq), Some(tick_payload(1)));
+        }
+        assert_eq!((lane.latency_bound_discards, lane.discards_not_emitted_after_deadline), (1, 1));
+        let (summary, rows) = ledger_of(&lane, &rows_rx, shared, "lb-after-deadline");
+        assert_eq!(latency_rows(&rows), 0, "not emitted at or after the deadline");
+        let lane_stats = &sentinel(&rows)["lanes"]["haptic"];
+        assert_eq!(lane_stats["latency_bound_discards"], 1);
+        assert_eq!(lane_stats["discards_not_emitted_after_deadline"], 1);
+        assert_eq!(summary.submitted, 3);
+        assert_eq!(summary.submitted_unresolved, 3, "tick 0 (no terminal) + ticks 1 and 2 (waiting)");
+        assert!(summary.conservation_ok);
+        assert_eq!(summary.first_integrity_failure_reason.as_deref(), Some(FAIL_SUBMITTED_UNRESOLVED));
+        assert!(!summary.integrity_ok(NULL_PC_ALSA_HAPTIC));
+    }
+
+    /// Codex 190a P2-1 (iii): the writer exits only on `End` (sent after
+    /// every lane is joined) or on an error. Here its first write fails (a
+    /// read-only file): the later `latency_bound` row cannot be sent
+    /// (`writer_gone`), and the file has no sentinel — fail closed; the lane
+    /// loop then stops at once without its counters.
+    #[test]
+    fn a_latency_bound_row_after_the_writer_died_leaves_no_sentinel() {
+        let path = tmp("lb-writer-dies");
+        std::fs::write(&path, b"").unwrap();
+        let read_only = File::open(&path).unwrap();
+        let shared = Arc::new(Shared::default());
+        let (rows_tx, rows_rx) = mpsc::sync_channel(64);
+        let writer = {
+            let shared = shared.clone();
+            std::thread::spawn(move || {
+                writer_loop(BufWriter::new(read_only), rows_rx, "l2-test".into(), NULL_PC_ALSA_HAPTIC, false, shared, 64)
+            })
+        };
+        let mut lane = latency_lane(rows_tx, shared);
+        lane.accept(now_submission(0), Some(tick_payload(1)));
+        assert!(writer.join().unwrap().is_err(), "the writer's first write fails");
+        lane.accept(now_submission(1), Some(tick_payload(1)));
+        lane.accept(now_submission(2), Some(tick_payload(1)));
+        assert!(lane.writer_gone);
+        assert_eq!(lane.latency_bound_discards, 1, "decided, but its row has no writer");
+        assert_eq!(std::fs::read(&path).unwrap(), b"", "no row and no instrumentation_end");
+        let (_items_tx, items_rx) = mpsc::sync_channel::<SinkMsg>(1);
+        lane.run(items_rx, 1_000); // returns at once: fail closed
+        let _ = std::fs::remove_file(&path);
     }
 
     // ---- Codex 109 fix round ---------------------------------------------------

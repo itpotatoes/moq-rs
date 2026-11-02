@@ -45,11 +45,25 @@
 //! refuse the offered tick after drops only if the in-progress remainder
 //! plus the offered tick exceeds `Q`, i.e. never for regular ticks with
 //! `Q >= 1,068`). The configured `B` (or null) is recorded in meta
-//! `alsa.latency_bound_frames`. A dropped tick was already submitted: it ends with ONE terminal,
-//! `explicit_discard(latency_bound)` after submit, written by the lane
-//! before the offered tick's own row ([`Offered`]). The drop is by queue
-//! position only — the engine never looks at a tick's identity (event id,
-//! slot, pts) — so anchor ticks are not protected.
+//! `alsa.latency_bound_frames`. A dropped tick was already submitted: the
+//! lane ends it with ONE terminal, `explicit_discard(latency_bound)` after
+//! submit, before the offered tick's own row ([`Offered`]; the row-level
+//! qualifications are in `l2_output::DISCARD_LATENCY_BOUND`). The drop is
+//! by queue position only — the engine never looks at a tick's identity
+//! (event id, slot, pts) — so anchor ticks are not protected.
+//!
+//! What `B` guarantees (provable from the rule; payload acceptance is the
+//! same with and without `B`, any playable tick up to `buffer − period`
+//! frames): right after an admission of a tick of `f` frames,
+//! `unwritten_tick_frames() <= min(Q, max(B, r + f))`, where `r` is the
+//! unwritten remainder of the tick being written at that admission (0 if
+//! none); between admissions the count only decreases. Hence
+//! `LaneStats::max_unwritten_tick_frames <= min(Q, max(B, r_max + f_max))
+//! <= min(Q, max(B, 2 × the largest admitted tick))`. It is `<= B` when no
+//! admitted tick exceeds `B / 2` frames — the registered 528/534-frame
+//! ticks with `B >= 1,068` — but NOT in general: a larger playable tick
+//! offered while nothing else waits is queued above `B` (only waiting ticks
+//! are ever dropped).
 //!
 //! Output time (§3-3): from ONE `snd_pcm_status` snapshot, `appl_pos` is the
 //! lane's own `w` at that call and `hw_pos = appl_pos − delay`. A written
@@ -2410,6 +2424,50 @@ mod tests {
         assert_eq!(offered.admission, Admission::QueueFull, "470 + 534 > Q = 600");
         assert_eq!(engine.stats().ticks_queue_full, 1);
         assert_eq!(pending_seqs(&engine), Vec::<u32>::new());
+    }
+
+    /// Codex 190a P2-2: B bounds only WAITING ticks, so the numerical bound
+    /// is `min(Q, max(B, r + f))` after each admission (module doc), not
+    /// `B`: a playable 200-sample (1,200-frame) tick is accepted exactly as
+    /// without B (acceptance unchanged) and queued above B = 1,068 when
+    /// nothing else waits, and a regular tick offered behind its unwritten
+    /// remainder lands at `r + f`.
+    #[test]
+    fn an_oversized_playable_tick_exceeds_b_only_as_the_documented_bound_allows() {
+        let t0 = 1_000_000;
+        for bound in [None, Some(B2)] {
+            let mut sim = SimPcmConfig::new(PERIOD, BUFFER);
+            sim.max_frames_per_write = Some(64);
+            let (mut engine, mut pcm) = started(bounded(bound), sim, t0);
+            assert!(1_200 <= engine.config().max_tick_frames(), "playable");
+            let big = engine.offer(submission(0, t0), Some(&payload(200, 0)));
+            assert_eq!(big, Offered { latency_dropped: Vec::new(), admission: Admission::Queued }, "{bound:?}");
+            assert_eq!(engine.unwritten_tick_frames(), 1_200, "r = 0, f = 1,200: max(B, 1,200)");
+            step(&mut engine, &mut pcm, t0).unwrap();
+            let r = engine.unwritten_tick_frames();
+            assert_eq!(r, 1_200 - 64, "the oversized tick is being written");
+            let second = engine.offer(submission(1, t0), Some(&payload(89, 0)));
+            assert_eq!(second, Offered { latency_dropped: Vec::new(), admission: Admission::Queued });
+            assert_eq!(engine.unwritten_tick_frames(), r + 534, "nothing waits: r + f");
+            let third = engine.offer(submission(2, t0), Some(&payload(89, 0)));
+            assert_eq!(third.admission, Admission::Queued);
+            let max_unwritten = engine.stats().max_unwritten_tick_frames;
+            match bound {
+                None => {
+                    assert!(third.latency_dropped.is_empty());
+                    assert_eq!(engine.unwritten_tick_frames(), r + 2 * 534);
+                    assert_eq!(max_unwritten, r + 2 * 534);
+                }
+                Some(b) => {
+                    assert_eq!(third.latency_dropped, vec![submission(1, t0)], "the waiting tick, never the one in progress");
+                    assert_eq!(engine.unwritten_tick_frames(), r + 534);
+                    assert_eq!(max_unwritten, r + 534);
+                    assert!(max_unwritten > b, "the documented exception: above B");
+                    assert!(max_unwritten <= b.max(r + 534).min(engine.config().queue_limit_frames));
+                    assert!(max_unwritten <= b.max(2 * 1_200), "max(B, 2 x the largest admitted tick)");
+                }
+            }
+        }
     }
 
     /// Without B the counters JSON is exactly the former key set; with B it
