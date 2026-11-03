@@ -529,7 +529,8 @@ struct Args {
     /// producing an unattributable run.
     #[arg(long)]
     tier_schedule: Option<PathBuf>,
-    /// Experiment 2 (contract exp2-contract-v3): the exp2 JSONL (L1-R output
+    /// Experiment 2/3 (contract `exp2_recorder::EXP2_CONTRACT_VERSION`, now
+    /// exp3-contract-v1): the exp2 JSONL (L1-R output
     /// ledger) written next to the legacy `--out` log. Create-only. The six
     /// exp2 options are all-or-none; required by the exp2 core arms and
     /// optional for B1/S1 (logging only — their behaviour is unchanged).
@@ -19603,7 +19604,7 @@ mod l2_hook_tests {
     // ------------------------------------------- §7-1 calibration receiver
 
     /// Stage-2 E4: the calibration declaration carries the same generation
-    /// tags as the exp2 meta (contract v5, exp2-v4).
+    /// tags as the exp2 meta (experiment 3: exp3-contract-v1, exp3-v1).
     #[test]
     fn calibration_meta_carries_the_generation_tags() {
         let log = tmp("cal-meta-tags").display().to_string();
@@ -19611,8 +19612,8 @@ mod l2_hook_tests {
         let cal = validate_receiver(&args).unwrap().unwrap();
         let row: serde_json::Value = serde_json::from_str(&format!("{{{}}}", cal_meta_body(&cal))).unwrap();
         assert_eq!(row["event"], "cal_meta");
-        assert_eq!(row["contract"], "exp2-contract-v5");
-        assert_eq!(row["metric_schema_version"], "exp2-v4");
+        assert_eq!(row["contract"], "exp3-contract-v1");
+        assert_eq!(row["metric_schema_version"], "exp3-v1");
         assert_eq!(row["contract"], skew_moq::exp2_recorder::EXP2_CONTRACT_VERSION);
         assert_eq!(row["metric_schema_version"], skew_moq::exp2_recorder::EXP2_METRIC_SCHEMA_VERSION);
     }
