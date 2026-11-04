@@ -91,7 +91,11 @@
 //! with a latency bound (sink mode A, meta `alsa.latency_bound_frames`)
 //! terminates the oldest waiting ticks it drops as
 //! `explicit_discard(latency_bound)` after submit, and reports its counters
-//! in the sentinel (`lanes.haptic`). `wayland` (PC
+//! in the sentinel (`lanes.haptic`). With an experiment-4 placement mode
+//! (`PlacementConfig::mode` fifo / aligned) the file is
+//! [`L2_SCHEMA_V1_8`]; aligned (R2) adds `placement` / `trim` rows and the
+//! after-submit terminals `occluded`, `too_late`, `placement_queue_full`
+//! ([`ALIGNED_PLACEMENT_POLICY`]). `wayland` (PC
 //! only, M3) renders every released frame (Draco decoded first) in a
 //! worker thread into a one-frame pending slot and commits it from the
 //! compositor thread at the next commit opportunity; the
@@ -118,8 +122,9 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 
 use crate::l2_haptic::{
-    Admission, AlsaOutputDetail, DeviceFailure, EpochStart, HapticPcm, HapticPlacement, Offered,
-    PcmParams, PlacementConfig, RawSnapshot, SimPcm, SimPcmConfig, FAIL_HAPTIC_PAYLOAD_INVALID,
+    Admission, AlignedAdmission, AlignedOffered, AlsaOutputDetail, DeviceFailure, EpochStart, HapticPcm,
+    HapticPlacement, Offered, PcmParams, PlacementConfig, PlacementMode, PlacementRecord, RawSnapshot, SimPcm,
+    SimPcmConfig, TrimRecord, FAIL_ALSA_XRUN, FAIL_HAPTIC_PAYLOAD_INVALID,
 };
 use crate::now_us;
 
@@ -202,6 +207,20 @@ mod pc_lane;
 /// `latency_bound_discards` ONLY when `B` is set. With `B` off every row
 /// except the meta row is what v1.6 writes for the same inputs.
 pub const L2_SCHEMA: &str = "event-pair-l2-v1.7";
+/// L2 JSONL schema tag of an experiment-4 ALSA placement (contract
+/// `md/20261104_실험4_계약.md` §2; [`L2Config::l2_schema`]): `alsa.placement`
+/// `fifo` or `aligned`. Additions to v1.7: meta `alsa.placement`,
+/// `alsa.align_offset_us`, `alsa.write_ahead_frames` and (aligned) the R2
+/// `alsa.placement_policy` ([`ALIGNED_PLACEMENT_POLICY`]), the aligned
+/// `silence_policy` / `queue_policy`, `alsa.placement_row` / `alsa.trim_row`,
+/// the aligned `sink_contracts.haptic.terminals` text and `output_detail`
+/// key `head_cut_frames`. Aligned only: one `placement` row per playable
+/// submission accepted before a device failure, `trim` rows, the after-submit
+/// terminals `occluded`, `too_late`, `placement_queue_full`, the counters of
+/// `lanes.haptic` (contract §2-5). `fifo` writes none of these: apart from
+/// the meta it equals the legacy FIFO with `B` off. A legacy configuration
+/// (`PlacementMode::None`) keeps writing [`L2_SCHEMA`] exactly as before.
+pub const L2_SCHEMA_V1_8: &str = "event-pair-l2-v1.8";
 pub const L2_CLOCK: &str = "CLOCK_MONOTONIC";
 /// The M1 grace is anchored at `finish`, not at the registration's H.
 pub const REPORT_WINDOW_ANCHOR: &str = "close";
@@ -360,6 +379,11 @@ pub const DISCARD_PAYLOAD_INVALID: &str = "payload_invalid";
 /// `discards_not_emitted_after_deadline == 0`), and a ledger missing a
 /// `latency_bound` terminal is never integrity-clean.
 pub const DISCARD_LATENCY_BOUND: &str = "latency_bound";
+/// Aligned placement (v1.8), after submit: `occluded` (a later placement
+/// removed the tick's first frame; pairs with `trim.start_removed = true`),
+/// `too_late` (design §5-3 (iv)), `placement_queue_full` (case (i) over `Q`;
+/// unlike `output_queue_full`, after submit).
+pub use crate::l2_haptic::{DISCARD_OCCLUDED, DISCARD_PLACEMENT_QUEUE_FULL, DISCARD_TOO_LATE};
 /// PC Wayland lane, after submit: the Draco decoder refused the payload.
 pub use crate::l2_pc::DISCARD_DECODE_FAILED;
 
@@ -780,6 +804,24 @@ impl L2Config {
     fn fake_lane(&self, modality: L2Modality) -> Option<FakeSinkConfig> {
         (self.sinks.of(modality) == L2SinkKind::Fake).then(|| self.fake.clone()).flatten()
     }
+
+    /// The haptic ALSA placement mode (`None` = legacy, also without an
+    /// ALSA lane).
+    pub fn placement_mode(&self) -> PlacementMode {
+        match (self.sinks.haptic, &self.alsa) {
+            (L2SinkKind::Alsa, Some(alsa)) => alsa.placement.mode,
+            _ => PlacementMode::None,
+        }
+    }
+
+    /// The meta `l2_schema` this configuration writes: [`L2_SCHEMA`] (v1.7)
+    /// for a legacy placement, [`L2_SCHEMA_V1_8`] for fifo / aligned.
+    pub fn l2_schema(&self) -> &'static str {
+        match self.placement_mode() {
+            PlacementMode::None => L2_SCHEMA,
+            PlacementMode::Fifo | PlacementMode::Aligned { .. } => L2_SCHEMA_V1_8,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1114,6 +1156,12 @@ enum Row {
     /// A device lane's counters, sent once before its thread exits; written
     /// into the sentinel (`lanes.<track>`), never as a row of its own.
     LaneStats { modality: L2Modality, stats: serde_json::Value },
+    /// Aligned placement (v1.8): one placement attempt (contract §2-2).
+    /// Neither a submit nor a terminal.
+    Placement(Box<PlacementRecord>),
+    /// Aligned placement (v1.8): a later placement removed frames of an
+    /// earlier tick (contract §2-3). Neither a submit nor a terminal.
+    Trim(Box<TrimRecord>),
     End,
 }
 
@@ -1385,6 +1433,93 @@ fn alsa_meta(alsa: &AlsaSinkConfig, ready: &LaneReady) -> serde_json::Value {
         "failure_policy": "XRUN, SUSPENDED, DISCONNECTED, an unexpected state, a moved trigger timestamp or a decreasing DMA pointer (epoch reset), an inconsistent snapshot, or a status/write error is an integrity failure (L2 invalid whatever its time, registration 6-1); the stream is stopped, never recovered, and every submission that can no longer be output gets explicit_discard device_failure (after submit, receipt before close_deadline_us). No occurrence time is claimed until the M2b verification: first_integrity_failure_us = null, first_failure_time_determinable = false; lanes.haptic.device_failure keeps observation_interval_us [last_good_status_t0_us, detected_us], detected_us and the raw kernel_trigger_us",
         "close_policy": "after finish starts the lane keeps writing (silence) and observing until the END of the last written tick (n_k + frames) passed hw_pos — not just its onset output, never waiting for trailing silence — or the close deadline, then drops the stream; lanes.haptic.tail_played_at_close / unplayed_tick_frames_at_close record which",
     })
+}
+
+/// Meta `alsa.placement_policy` of the aligned placement (v1.8): the
+/// coordinator's fixed R2 decisions as implemented (contract §2-1: the
+/// binary's own text), then the implementation choices.
+pub const ALIGNED_PLACEMENT_POLICY: &str = "aligned (R2; design md/20261104_실험4_설계초안.md §5, contract md/20261104_실험4_계약.md §2; c = alsa.align_offset_us, W = alsa.write_ahead_frames, Q = alsa.queue_limit_frames). \
+Inputs to a placement: hw_pos and htstamp_us come from the LAST HEALTHY snapshot; appl_pos = self.w AT PLACEMENT TIME (frames actually written so far); no fresh status call is made; if there is no healthy snapshot yet the lane cannot be offering: a programming error (asserted), no value is invented. \
+Rounding uses div_round_half_away, the same rule as t_output_us, in signed i128: n_star = hw_pos + round_half_away((t_release_us + c - htstamp_us) * 48000 / 1e6); floor_us = htstamp_us + round_half_away((appl_pos - hw_pos) * 1e6 / 48000) - t_release_us, signed; floor_us is computed and recorded for EVERY placement attempt, BEFORE any cut or discard (design §5-4). \
+Plan: a frame-indexed queue covering [appl_pos, planned_end), made of segments: a silence run, or a slice of a tick identified by seq and its frame offset; invariant planned_end >= appl_pos; writing silence past planned_end sets planned_end <- appl_pos. \
+Cases (design §5-3; the result is precomputed first and the plan is mutated only if not rejected; L = tick frames): \
+(i) gap, when n* >= planned_end: candidate = silence from planned_end to n*, then the tick; if the candidate waiting frames (silence included) exceed Q it is rejected: plan unchanged, after-submit explicit_discard(placement_queue_full); otherwise it is applied and planned_end <- n* + L. \
+(ii) queue_overlap, when appl_pos <= n* < planned_end: every planned frame at or after n* is removed, silence included; each affected tick gets one trim row with tail_cut_frames and start_removed; a tick whose start sample is removed gets explicit_discard(occluded); then the tick is placed at n* and planned_end <- n* + L. \
+(iii) device_overlap, when n* < appl_pos < n* + L: no rewind; first all planned frames at or after appl_pos are removed by the (ii) rule; then the head is cut: appl_pos - n* frames are dropped; the rest is placed at appl_pos and planned_end <- appl_pos + L - head_cut. \
+(iv) too_late, when n* + L <= appl_pos: the whole tick is discarded with explicit_discard(too_late); the plan is unchanged. \
+Trimming rules: start_removed = true implies NO frame of that tick was written (asserted); a tick whose start was written but whose tail is trimmed shrinks its recorded frames, the tick_extent end and stats.last_tick_end_frame (so idle() and tail_played_at_close stay true); its terminal stays output. \
+Head-cut tick: the recorded n_k = its first REMAINING frame (= appl_pos at placement), with output_detail.head_cut_frames > 0; its terminal is output; t_output_us comes from that frame by the unchanged formula; every other output_detail carries head_cut_frames: 0 in aligned mode only (legacy and fifo output_detail are unchanged). \
+Write-ahead fill (aligned only): fill_est = delay of the last snapshot + frames written since that snapshot (the design's appl_pos - hw_pos, NOT buffer - avail); while fill_est < W and avail >= period, ONE 256-frame chunk (one period) is written from the plan front; a chunk may span segments; if the plan runs out mid-chunk it is padded with silence; if the plan is empty one period of silence is written; fill_est and avail are updated by the frames actually written; short writes keep the remainder first, as in the existing engine; a tick enters in_flight (and gets its n_k and t_write_us) when its first remaining frame is written; the available space is NOT filled as FIFO does. \
+Row order per accepted submission: 1. submit row, 2. placement row, 3. trim rows, in plan order, 4. occluded discards, in plan order, 5. the offered tick's own too_late / placement_queue_full discard, if any; the placement row is written EVEN when the tick is then discarded (the c calibration V4a reads floor_us from it). \
+Placement-row exceptions: no placement row for payload_invalid (already an integrity failure) or for a submission accepted after a device failure. \
+Waiting silence never exceeds Q. \
+Implementation choices: (a) the case-(i) Q test counts every planned frame after the candidate, n* + L - appl_pos (tick frames and silence), and is the only Q rule: the engine never refuses before submit in aligned mode (output_queue_full is then only the bounded submission queue); (b) a rejected candidate records silence_inserted_frames 0, head_cut_frames 0 and planned_end_after = planned_end_before; (c) a tick's output row is emitted only once no planned frame of it remains (fully written, or its tail trimmed to what was written), so its frames and t_write_done_us are final, from the first snapshot after that which shows hw_pos > n_k; (d) the unwritten part of a short write's silence pad lies past planned_end and is not kept (only planned frames stay first); (e) the empty-plan silence period is one chunk of the same loop, repeated while fill_est < W; (f) a trim's tail_cut_frames counts every frame it removed, so an occluded tick's trim carries all its frames; (g) a plan slice's tick key is its placement index (unique even if a seq repeats); rows carry the seq; (h) placement and trim rows carry the row identity (run_id, track, tier, seq, pts_us, event_id) and are neither submits nor terminals; (i) c must be >= 0 and 1 <= W <= buffer_frames - period_frames; a latency bound is refused.";
+
+/// v1.8 meta (experiment 4): a legacy configuration's meta is returned
+/// unchanged (v1.7, byte for byte); fifo / aligned get the v1.8 tag and the
+/// contract §2-1 additions.
+fn exp4_meta(config: &L2Config, mut meta: serde_json::Value) -> serde_json::Value {
+    let mode = config.placement_mode();
+    let Some(placement) = mode.as_str() else { return meta };
+    meta["l2_schema"] = L2_SCHEMA_V1_8.into();
+    let aligned = mode.aligned();
+    if let Some(alsa) = meta.get_mut("alsa").and_then(|a| a.as_object_mut()) {
+        alsa.insert("placement".into(), placement.into());
+        alsa.insert("align_offset_us".into(), aligned.map(|(c, _)| c).into());
+        alsa.insert("write_ahead_frames".into(), aligned.map(|(_, w)| w).into());
+        if aligned.is_some() {
+            alsa.insert("placement_policy".into(), ALIGNED_PLACEMENT_POLICY.into());
+            alsa.insert(
+                "silence_policy".into(),
+                "planned silence exists only as the case-(i) gap runs of the plan (written as part of it); the write-ahead fill pads a chunk with silence when the plan runs out within it and writes one period of silence when the plan is empty (placement_policy); silence frames are never the output of any tick".into(),
+            );
+            alsa.insert(
+                "queue_policy".into(),
+                "Q = queue_limit_frames applies only in case (i): a candidate whose waiting frames (every planned frame after it, silence included: n* + L - appl_pos) would exceed Q is explicit_discard placement_queue_full after submit, the plan unchanged; the engine never refuses before submit (output_queue_full before submit is only the bounded submission queue); the planned (waiting) silence never exceeds Q, its maximum is lanes.haptic.max_waiting_silence_frames".into(),
+            );
+            alsa.insert(
+                "placement_row".into(),
+                serde_json::json!({
+                    "role": "placement: one per playable submission accepted before a device failure, right after its submit row; never a terminal",
+                    "identity": "run_id, track, tier, seq, pts_us, event_id of the offered submission",
+                    "t_release_us": "the submission's t_release_us (the release time n* aligns to)",
+                    "t_submit_us": "the submission's t_submit_us",
+                    "status_htstamp_us": "htstamp_us of the last healthy snapshot",
+                    "hw_pos": "hw_pos of the last healthy snapshot",
+                    "appl_pos": "frames actually written at placement time",
+                    "planned_end_before": "appl_pos + every planned frame before this placement",
+                    "n_star": "hw_pos + round_half_away((t_release_us + c - status_htstamp_us) * 48000 / 1e6), signed",
+                    "case": "gap | queue_overlap | device_overlap | too_late (design §5-3 (i)-(iv)), classified on n_star, appl_pos, planned_end_before and the tick's frames L",
+                    "floor_us": "status_htstamp_us + round_half_away((appl_pos - hw_pos) * 1e6 / 48000) - t_release_us, signed, before any cut or discard",
+                    "head_cut_frames": "appl_pos - n_star for device_overlap, else 0",
+                    "silence_inserted_frames": "n_star - planned_end_before for an applied gap, else 0",
+                    "planned_end_after": "appl_pos + every planned frame after this placement (>= appl_pos)",
+                    "rejected": "null, or placement_queue_full (case (i) over Q)",
+                }),
+            );
+            alsa.insert(
+                "trim_row".into(),
+                serde_json::json!({
+                    "role": "trim: a later placement removed planned frames of an earlier tick (cases ii, iii); written after the trimming tick's placement row, in plan order; never a terminal",
+                    "identity": "run_id, track, tier, seq, pts_us, event_id of the TRIMMED tick",
+                    "by_seq": "seq of the tick whose placement trimmed it",
+                    "tail_cut_frames": "frames removed from it (all of its frames when start_removed)",
+                    "start_removed": "its first frame was removed (none of it was written): it ends as explicit_discard occluded; false: its start was written or stays planned, its output row carries the shrunk frames",
+                }),
+            );
+        }
+    }
+    if aligned.is_some() {
+        let haptic = &mut meta["sink_contracts"]["haptic"];
+        haptic["terminals"] = "output once a status snapshot shows hw_pos > n_k and no planned frame of the tick remains (receipt strictly before close_deadline_us); n_k is its first remaining frame (a head-cut tick has output_detail.head_cut_frames > 0); explicit_discard before submit: output_queue_full (the bounded submission queue only); explicit_discard after submit: payload_invalid, device_failure, occluded (a later placement removed the tick's first frame; pairs with a trim row whose start_removed is true), too_late (design §5-3 (iv)), placement_queue_full (case (i) over queue_limit_frames); placement and trim rows (alsa.placement_row, alsa.trim_row) are not terminals".into();
+        haptic["output_detail"]["frames"] =
+            "48 kHz frames recorded for the tick: 6 x samples_8k - head_cut_frames - every frame later placements removed from its tail (trim rows)".into();
+        haptic["output_detail"]["head_cut_frames"] =
+            "aligned only: frames cut from the tick's head at placement (case device_overlap; n_k is then its first remaining frame), 0 for every other tick".into();
+        let counters = &mut meta["counter_semantics"];
+        counters["lanes.haptic.aligned"] = "aligned only (contract §2-5): ticks_occluded = occluded discards = start_removed trims; ticks_too_late = too_late discards = placement rows with case too_late; ticks_head_cut = placement rows with case device_overlap; ticks_placement_queue_full = placement_queue_full discards = placement rows with rejected set; frames_tail_cut = sum of trim tail_cut_frames; frames_head_cut = sum of placement head_cut_frames; frames_silence_inserted = sum of placement silence_inserted_frames; max_waiting_silence_frames <= queue_limit_frames; xrun = 1 iff the device failure is alsa_xrun; placement_rows, trim_rows and the *_discards count rows handed to the writer (equal to the rows in an integrity-clean, fully resolved ledger, as for latency_bound)".into();
+    }
+    meta
 }
 
 /// The meta `wayland` section: what the PC lane negotiated and how it works.
@@ -1667,7 +1802,7 @@ impl L2Output {
             lane_threads[lane_index] = Some(lane);
         }
 
-        writeln!(w, "{}", meta_row(&config, alsa_ready.as_ref(), pc_ready.as_ref()))?;
+        writeln!(w, "{}", exp4_meta(&config, meta_row(&config, alsa_ready.as_ref(), pc_ready.as_ref())))?;
         w.flush()?;
         let writer = {
             let run_id = config.run_id.clone();
@@ -2296,6 +2431,12 @@ struct AlsaLane {
     queue_full_discards: u64,
     /// Sink mode A: waiting ticks dropped for the latency bound.
     latency_bound_discards: u64,
+    /// Aligned placement (v1.8): rows and discards handed to the writer.
+    placement_rows: u64,
+    trim_rows: u64,
+    occluded_discards: u64,
+    too_late_discards: u64,
+    placement_queue_full_discards: u64,
     row_overflow: u64,
     writer_gone: bool,
     /// Probe-only raw diagnostics (never set by the receiver).
@@ -2322,6 +2463,11 @@ impl AlsaLane {
             payload_invalid_discards: 0,
             queue_full_discards: 0,
             latency_bound_discards: 0,
+            placement_rows: 0,
+            trim_rows: 0,
+            occluded_discards: 0,
+            too_late_discards: 0,
+            placement_queue_full_discards: 0,
             row_overflow: 0,
             writer_gone: false,
             diagnostics: None,
@@ -2362,6 +2508,9 @@ impl AlsaLane {
     }
 
     fn accept(&mut self, s: L2Submission, payload: Option<bytes::Bytes>) {
+        if self.engine.config().mode.aligned().is_some() {
+            return self.accept_aligned(s, payload);
+        }
         if self.failed.is_some() {
             // The device is gone: still a submission, terminated at once.
             self.row(Row::Submit(s), s.t_submit_us);
@@ -2397,6 +2546,53 @@ impl AlsaLane {
                 self.payload_invalid_discards += 1;
                 self.discard_after(s, DISCARD_PAYLOAD_INVALID);
             }
+        }
+    }
+
+    /// Aligned placement (v1.8). Rows, in order: submit, placement, every
+    /// trim (plan order), one `occluded` discard per occluded tick (plan
+    /// order), then the offered tick's own `too_late` / `placement_queue_full`
+    /// discard. No placement row for `payload_invalid` (already an integrity
+    /// failure) or after a device failure (exactly the legacy rows then).
+    /// The placement and trim rows' event time (only used for a
+    /// `row_queue_overflow`) is the offered submission's `t_submit_us`.
+    fn accept_aligned(&mut self, s: L2Submission, payload: Option<bytes::Bytes>) {
+        if self.failed.is_some() {
+            self.row(Row::Submit(s), s.t_submit_us);
+            self.device_failure_discards += 1;
+            self.discard_after(s, DISCARD_DEVICE_FAILURE);
+            return;
+        }
+        let AlignedOffered { placement, trims, occluded, admission } = self.engine.place(s, payload.as_deref());
+        self.row(Row::Submit(s), s.t_submit_us);
+        let Some(placement) = placement else {
+            assert_eq!(admission, AlignedAdmission::PayloadInvalid, "only an unplayable payload has no placement");
+            self.shared.fail_occurred(s.t_submit_us, FAIL_HAPTIC_PAYLOAD_INVALID);
+            self.payload_invalid_discards += 1;
+            self.discard_after(s, DISCARD_PAYLOAD_INVALID);
+            return;
+        };
+        self.placement_rows += 1;
+        self.row(Row::Placement(Box::new(placement)), s.t_submit_us);
+        for trim in trims {
+            self.trim_rows += 1;
+            self.row(Row::Trim(Box::new(trim)), s.t_submit_us);
+        }
+        for tick in occluded {
+            self.occluded_discards += 1;
+            self.discard_after(tick, DISCARD_OCCLUDED);
+        }
+        match admission {
+            AlignedAdmission::Placed => {}
+            AlignedAdmission::TooLate => {
+                self.too_late_discards += 1;
+                self.discard_after(s, DISCARD_TOO_LATE);
+            }
+            AlignedAdmission::PlacementQueueFull => {
+                self.placement_queue_full_discards += 1;
+                self.discard_after(s, DISCARD_PLACEMENT_QUEUE_FULL);
+            }
+            AlignedAdmission::PayloadInvalid => unreachable!("a playable payload has a placement row"),
         }
     }
 
@@ -2532,6 +2728,17 @@ impl AlsaLane {
         map.insert("queue_full_discards".into(), self.queue_full_discards.into());
         if self.engine.config().latency_bound_frames.is_some() {
             map.insert("latency_bound_discards".into(), self.latency_bound_discards.into());
+        }
+        if self.engine.config().mode.aligned().is_some() {
+            // Contract §2-5 `xrun`: the run's ALSA failure was alsa_xrun (0/1;
+            // the failure itself stays the v1.7 integrity failure).
+            let xrun = self.failed.as_ref().is_some_and(|f| f.reason == FAIL_ALSA_XRUN);
+            map.insert("xrun".into(), u64::from(xrun).into());
+            map.insert("placement_rows".into(), self.placement_rows.into());
+            map.insert("trim_rows".into(), self.trim_rows.into());
+            map.insert("occluded_discards".into(), self.occluded_discards.into());
+            map.insert("too_late_discards".into(), self.too_late_discards.into());
+            map.insert("placement_queue_full_discards".into(), self.placement_queue_full_discards.into());
         }
         map.insert("row_overflow".into(), self.row_overflow.into());
         map.insert(
@@ -2881,6 +3088,32 @@ fn writer_loop(
                 write_row(w, m, None, summary)?;
             }
             Row::LaneStats { modality, stats } => lane_stats[modality.index()] = Some(stats),
+            Row::Placement(p) => {
+                let mut m = identity_json(&run_id, &p.submission.identity);
+                m.insert("role".into(), "placement".into());
+                m.insert("t_release_us".into(), p.submission.t_release_us.into());
+                m.insert("t_submit_us".into(), p.submission.t_submit_us.into());
+                m.insert("status_htstamp_us".into(), p.status_htstamp_us.into());
+                m.insert("hw_pos".into(), p.hw_pos.into());
+                m.insert("appl_pos".into(), p.appl_pos.into());
+                m.insert("planned_end_before".into(), p.planned_end_before.into());
+                m.insert("n_star".into(), p.n_star.into());
+                m.insert("case".into(), p.case.as_str().into());
+                m.insert("floor_us".into(), p.floor_us.into());
+                m.insert("head_cut_frames".into(), p.head_cut_frames.into());
+                m.insert("silence_inserted_frames".into(), p.silence_inserted_frames.into());
+                m.insert("planned_end_after".into(), p.planned_end_after.into());
+                m.insert("rejected".into(), p.rejected.into());
+                write_row(w, m, None, summary)?;
+            }
+            Row::Trim(t) => {
+                let mut m = identity_json(&run_id, &t.submission.identity);
+                m.insert("role".into(), "trim".into());
+                m.insert("by_seq".into(), t.by.identity.seq.into());
+                m.insert("tail_cut_frames".into(), t.tail_cut_frames.into());
+                m.insert("start_removed".into(), t.start_removed.into());
+                write_row(w, m, None, summary)?;
+            }
             Row::End => unreachable!("End is handled by the loop"),
         }
         Ok(())
@@ -4743,7 +4976,7 @@ mod tests {
                     format!("discard {} {} {reason}", identity.seq, if t_submit_us.is_some() { "after" } else { "before" })
                 }
                 Row::Output { .. } => "output".into(),
-                Row::LaneStats { .. } | Row::End => "other".into(),
+                Row::LaneStats { .. } | Row::Placement(_) | Row::Trim(_) | Row::End => "other".into(),
             })
             .collect();
         assert_eq!(
@@ -4819,7 +5052,7 @@ mod tests {
                     format!("discard {} {} {reason}", identity.seq, if t_submit_us.is_some() { "after" } else { "before" })
                 }
                 Row::Output { .. } => "output".into(),
-                Row::LaneStats { .. } | Row::End => "other".into(),
+                Row::LaneStats { .. } | Row::Placement(_) | Row::Trim(_) | Row::End => "other".into(),
             })
             .collect();
         assert_eq!(
@@ -6147,5 +6380,285 @@ mod tests {
             }
             let _ = std::fs::remove_file(&path);
         }
+    }
+    // ---- v1.8: experiment-4 placement modes through the ALSA lane ----------
+
+    const PC_NULL_HAPTIC_ALSA: L2Sinks = L2Sinks { pc: L2SinkKind::Null, haptic: L2SinkKind::Alsa };
+
+    fn exp4_config(mode: PlacementMode) -> L2Config {
+        let mut c = config_sinks(PC_NULL_HAPTIC_ALSA, None, 64);
+        let mut alsa = sim_alsa(Vec::new());
+        alsa.placement.mode = mode;
+        c.alsa = Some(alsa);
+        c.report_window_us = 2_000_000;
+        c
+    }
+
+    /// Submit `n` regular ticks 11.1 ms apart (release = submit time), then
+    /// `extra(submitter)`, then finish; returns the rows.
+    fn exp4_run(name: &str, config: L2Config, n: u32, extra: impl FnOnce(&L2Submitter)) -> (L2Summary, Vec<serde_json::Value>) {
+        let path = tmp(name);
+        let out = L2Output::start(&path, config).unwrap();
+        let s = out.submitter();
+        let t_begin = now_us();
+        for seq in 0..n {
+            let due = t_begin + seq as u64 * 11_111;
+            while now_us() < due {
+                std::thread::sleep(Duration::from_micros(200));
+            }
+            assert_eq!(s.submit_payload(haptic(seq), now_us(), Some(tick_payload(seq))), L2SubmitOutcome::Submitted);
+        }
+        extra(&s);
+        drop(s);
+        let summary = out.finish().unwrap();
+        let rows = rows(&path);
+        let _ = std::fs::remove_file(&path);
+        (summary, rows)
+    }
+
+    /// The meta with the clock-dependent values masked.
+    fn masked(meta: &serde_json::Value) -> serde_json::Value {
+        let mut m = meta.clone();
+        m["t_us"] = "masked".into();
+        m["run_id"] = "masked".into();
+        for (_, v) in m["alsa"]["stream_epoch"].as_object_mut().unwrap().iter_mut() {
+            *v = "masked".into();
+        }
+        m
+    }
+
+    /// v1.8 `fifo`: the legacy engine path with B off. Apart from the meta
+    /// (v1.8 tag, alsa.placement "fifo", align_offset_us / write_ahead_frames
+    /// null) the ledger is the legacy one: no placement or trim row, no
+    /// aligned counter, no head_cut_frames, the same contract texts.
+    #[test]
+    fn the_fifo_placement_is_the_legacy_fifo_with_a_v1_8_meta() {
+        let (legacy_summary, legacy) = exp4_run("exp4-legacy", exp4_config(PlacementMode::None), 12, |_| {});
+        let (fifo_summary, fifo) = exp4_run("exp4-fifo", exp4_config(PlacementMode::Fifo), 12, |_| {});
+        for (summary, rows) in [(&legacy_summary, &legacy), (&fifo_summary, &fifo)] {
+            assert!(summary.integrity_ok(PC_NULL_HAPTIC_ALSA), "{summary:?}");
+            assert_eq!((summary.submitted, summary.output), (12, 12));
+            let roles: std::collections::BTreeSet<&str> = rows.iter().filter_map(|r| r["role"].as_str()).collect();
+            assert_eq!(roles, ["instrumentation_end", "meta", "output", "submit"].into_iter().collect());
+            assert!(rows.iter().filter(|r| r["role"] == "output").all(|r| r["output_detail"].get("head_cut_frames").is_none()));
+        }
+        assert_eq!(legacy[0]["l2_schema"], L2_SCHEMA);
+        assert!(legacy[0]["alsa"].get("placement").is_none(), "legacy meta gains no key");
+        let meta = &fifo[0];
+        assert_eq!(meta["l2_schema"], L2_SCHEMA_V1_8);
+        assert_eq!(meta["alsa"]["placement"], "fifo");
+        assert_eq!((meta["alsa"]["align_offset_us"].clone(), meta["alsa"]["write_ahead_frames"].clone()), (serde_json::Value::Null, serde_json::Value::Null));
+        assert_eq!(meta["alsa"]["latency_bound_frames"], serde_json::Value::Null);
+        let mut want = masked(&legacy[0]);
+        want["l2_schema"] = L2_SCHEMA_V1_8.into();
+        for key in ["placement", "align_offset_us", "write_ahead_frames"] {
+            want["alsa"][key] = meta["alsa"][key].clone();
+        }
+        assert_eq!(masked(meta), want, "only the tag and the three alsa keys differ");
+        let lane_keys = |rows: &[serde_json::Value]| -> Vec<String> {
+            sentinel(rows)["lanes"]["haptic"].as_object().unwrap().keys().cloned().collect()
+        };
+        assert_eq!(lane_keys(&fifo), lane_keys(&legacy), "no aligned counter in fifo");
+        // A latency bound is refused with fifo and aligned (experiment 4 has no sink A).
+        for mode in [PlacementMode::Fifo, PlacementMode::Aligned { align_offset_us: 40_000, write_ahead_frames: 512 }] {
+            let mut c = exp4_config(mode);
+            c.alsa.as_mut().unwrap().placement.latency_bound_frames = Some(1_068);
+            let err = L2Output::start(&tmp("exp4-refused"), c).err().expect("refused");
+            assert!(err.to_string().contains("no latency bound"), "{err}");
+        }
+    }
+
+    /// The aligned lane's row hand-off, driven directly (deterministic: no
+    /// status call happens, so every placement uses the epoch's first
+    /// snapshot: hw_pos 0, htstamp t0, appl_pos = prefill 4,800). c = 150 ms:
+    /// n* = round((t_release − t0 + 150,000) × 0.048). All ticks 534 frames.
+    #[test]
+    fn the_aligned_lane_writes_submit_placement_trim_and_discard_rows_in_order() {
+        let (rows_tx, rows_rx) = mpsc::sync_channel(256);
+        let shared = Arc::new(Shared::default());
+        let placement = PlacementConfig {
+            mode: PlacementMode::Aligned { align_offset_us: 150_000, write_ahead_frames: 4_800 },
+            ..sim_placement()
+        };
+        let mut pcm = SimPcm::new(SimPcmConfig::new(512, 16_384));
+        let mut engine = HapticPlacement::new(placement, pcm.params()).unwrap();
+        let mut clock = now_us;
+        engine.prefill(&mut pcm, &mut clock).unwrap();
+        let t0 = now_us();
+        pcm.start(t0).unwrap();
+        let first = pcm.status(t0).unwrap();
+        engine.begin_epoch(t0, first, t0).unwrap();
+        let mut lane = AlsaLane::new(Box::new(pcm), engine, rows_tx, shared.clone());
+        let sub = |seq: u32, rel: i64| {
+            let t = (t0 as i64 + rel) as u64;
+            L2Submission { identity: haptic(seq), t_release_us: t, t_submit_us: t.max(t0) }
+        };
+        let tick = || Some(tick_payload(1)); // 89 samples = 534 frames
+        lane.accept(sub(0, -52_084), tick()); // n* 4,700 < 4,800: head cut 100
+        lane.accept(sub(1, 0), tick()); // n* 7,200: gap, silence 1,966
+        lane.accept(sub(2, 11_111), tick()); // n* 7,733: cuts 1 frame of tick 1
+        lane.accept(sub(3, -1_000_000), tick()); // n* -40,800: too late
+        lane.accept(sub(4, 30_000), tick()); // n* 8,640: gap, silence 373
+        lane.accept(sub(5, 20_000), tick()); // n* 8,160: cuts tick 2 (107), occludes tick 4
+        lane.accept(sub(6, 0), None); // not playable: no placement row
+        lane.accept(sub(7, 2_000_000), tick()); // n* 103,200: waiting 98,934 > Q
+        let failure = DeviceFailure {
+            reason: FAIL_ALSA_XRUN,
+            last_good_status_t0_us: t0,
+            detected_us: now_us(),
+            kernel_trigger_us: None,
+            kernel_trigger_ns: None,
+            detail: "test".into(),
+            raw_ns: Vec::new(),
+        };
+        lane.fail(failure);
+        lane.accept(sub(8, 0), tick()); // after the failure: no placement row
+        let stats = lane.stats();
+        drop(lane);
+        let mut placements = Vec::new();
+        let got: Vec<String> = rows_rx
+            .try_iter()
+            .map(|row| match row {
+                Row::Submit(s) => format!("submit {}", s.identity.seq),
+                Row::Placement(p) => {
+                    let line = format!(
+                        "placement {} {} {} floor {} head {} silence {} end {}->{} {:?}",
+                        p.submission.identity.seq, p.case.as_str(), p.n_star, p.floor_us, p.head_cut_frames,
+                        p.silence_inserted_frames, p.planned_end_before, p.planned_end_after, p.rejected
+                    );
+                    placements.push(p);
+                    line
+                }
+                Row::Trim(t) => format!("trim {} by {} {} {}", t.submission.identity.seq, t.by.identity.seq, t.tail_cut_frames, t.start_removed),
+                Row::Discard { identity, t_submit_us, reason, .. } => {
+                    format!("discard {} {} {reason}", identity.seq, if t_submit_us.is_some() { "after" } else { "before" })
+                }
+                Row::Output { .. } => "output".into(),
+                Row::LaneStats { .. } | Row::End => "other".into(),
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                "submit 0", "placement 0 device_overlap 4700 floor 152084 head 100 silence 0 end 4800->5234 None",
+                "submit 1", "placement 1 gap 7200 floor 100000 head 0 silence 1966 end 5234->7734 None",
+                "submit 2", "placement 2 queue_overlap 7733 floor 88889 head 0 silence 0 end 7734->8267 None",
+                "trim 1 by 2 1 false",
+                "submit 3", "placement 3 too_late -40800 floor 1100000 head 0 silence 0 end 8267->8267 None",
+                "discard 3 after too_late",
+                "submit 4", "placement 4 gap 8640 floor 70000 head 0 silence 373 end 8267->9174 None",
+                "submit 5", "placement 5 queue_overlap 8160 floor 80000 head 0 silence 0 end 9174->8694 None",
+                "trim 2 by 5 107 false", "trim 4 by 5 534 true", "discard 4 after occluded",
+                "submit 6", "discard 6 after payload_invalid",
+                "submit 7", "placement 7 gap 103200 floor -1900000 head 0 silence 0 end 8694->8694 Some(\"placement_queue_full\")",
+                "discard 7 after placement_queue_full",
+                "discard 0 after device_failure", "discard 1 after device_failure", "discard 2 after device_failure",
+                "discard 5 after device_failure",
+                "submit 8", "discard 8 after device_failure",
+            ]
+        );
+        assert!(placements.iter().all(|p| p.appl_pos == 4_800 && p.hw_pos == 0 && p.status_htstamp_us == t0));
+        for (key, want) in [
+            ("ticks_occluded", 1u64), ("ticks_too_late", 1), ("ticks_head_cut", 1), ("ticks_placement_queue_full", 1),
+            ("frames_tail_cut", 1 + 107 + 534), ("frames_head_cut", 100), ("frames_silence_inserted", 1_966 + 373),
+            ("xrun", 1), ("placement_rows", 7), ("trim_rows", 3), ("occluded_discards", 1), ("too_late_discards", 1),
+            ("placement_queue_full_discards", 1), ("payload_invalid_discards", 1), ("device_failure_discards", 5),
+        ] {
+            assert_eq!(stats[key], want, "{key}");
+        }
+        assert!(stats["max_waiting_silence_frames"].as_u64().unwrap() <= 48_000);
+    }
+
+    /// A threaded aligned run on the simulated stream (W = 4,800 frames so a
+    /// busy test machine cannot starve it, c = 150 ms): v1.8 meta with the R2
+    /// policy text; per submission exactly one placement row right after its
+    /// submit; one terminal each; outputs at t_release + c within the
+    /// snapshot quantisation; an old tick ends too_late; a tick released
+    /// before a still-waiting later one occludes it (trim, then occluded).
+    #[test]
+    fn an_aligned_run_through_the_lane_writes_a_complete_v1_8_ledger() {
+        let c = 150_000i64;
+        let mode = PlacementMode::Aligned { align_offset_us: c, write_ahead_frames: 4_800 };
+        let (summary, rows) = exp4_run("exp4-aligned", exp4_config(mode), 12, |s| {
+            // 50 ms after tick 11 (which ends 11.1 ms after its release):
+            // tick 14, released 20 ms before tick 13, lands in the planned
+            // silence between 11 and 13 and removes all of 13 (never
+            // written: c = 150 ms is beyond the write-ahead).
+            std::thread::sleep(Duration::from_millis(50));
+            let now = now_us();
+            assert_eq!(s.submit_payload(haptic(12), now - 1_000_000, Some(tick_payload(12))), L2SubmitOutcome::Submitted);
+            assert_eq!(s.submit_payload(haptic(13), now, Some(tick_payload(13))), L2SubmitOutcome::Submitted);
+            assert_eq!(s.submit_payload(haptic(14), now - 20_000, Some(tick_payload(14))), L2SubmitOutcome::Submitted);
+            std::thread::sleep(Duration::from_millis(400));
+        });
+        assert!(summary.integrity_ok(PC_NULL_HAPTIC_ALSA), "{summary:?}");
+        let meta = &rows[0];
+        assert_eq!(meta["l2_schema"], L2_SCHEMA_V1_8);
+        let alsa = &meta["alsa"];
+        assert_eq!((alsa["placement"].as_str(), alsa["align_offset_us"].as_i64(), alsa["write_ahead_frames"].as_u64()), (Some("aligned"), Some(c), Some(4_800)));
+        assert_eq!(alsa["placement_policy"], ALIGNED_PLACEMENT_POLICY);
+        assert_eq!(alsa["latency_bound_frames"], serde_json::Value::Null);
+        assert!(alsa["placement_row"]["floor_us"].is_string() && alsa["trim_row"]["start_removed"].is_string());
+        let terminals_text = meta["sink_contracts"]["haptic"]["terminals"].as_str().unwrap();
+        for reason in [DISCARD_OCCLUDED, DISCARD_TOO_LATE, DISCARD_PLACEMENT_QUEUE_FULL] {
+            assert!(terminals_text.contains(reason), "{reason}");
+        }
+        assert!(meta["sink_contracts"]["haptic"]["output_detail"]["head_cut_frames"].is_string());
+        // Row order and one placement per submission.
+        let body = &rows[1..rows.len() - 1];
+        let submits: Vec<usize> = (0..body.len()).filter(|&i| body[i]["role"] == "submit").collect();
+        assert_eq!(submits.len(), 15);
+        for &i in &submits {
+            assert_eq!(body[i + 1]["role"], "placement", "row after submit {}", body[i]["seq"]);
+            assert_eq!(body[i + 1]["seq"], body[i]["seq"]);
+        }
+        let placements: Vec<&serde_json::Value> = body.iter().filter(|r| r["role"] == "placement").collect();
+        assert_eq!(placements.len(), 15);
+        let mut terminals: HashMap<u64, Vec<&serde_json::Value>> = HashMap::new();
+        for r in body.iter().filter(|r| r["role"] == "output" || r["role"] == "explicit_discard") {
+            assert_eq!(r["discard_phase"].as_str().unwrap_or("after_submit"), "after_submit");
+            terminals.entry(r["seq"].as_u64().unwrap()).or_default().push(r);
+        }
+        assert_eq!(terminals.len(), 15);
+        assert!(terminals.values().all(|t| t.len() == 1), "one terminal per submission");
+        let placement_of = |seq: u64| placements.iter().find(|p| p["seq"] == seq).unwrap();
+        for p in &placements {
+            assert!(p["planned_end_after"].as_u64() >= p["appl_pos"].as_u64());
+            let floor = p["status_htstamp_us"].as_i64().unwrap()
+                + frames_to_us_round_half_away(p["appl_pos"].as_i64().unwrap() - p["hw_pos"].as_i64().unwrap(), PCM_RATE_HZ)
+                - p["t_release_us"].as_i64().unwrap();
+            assert_eq!(p["floor_us"].as_i64(), Some(floor));
+        }
+        // The too-late tick, and the occlusion of 13 by 14.
+        assert_eq!(placement_of(12)["case"], "too_late");
+        assert_eq!(terminals[&12][0]["reason"], DISCARD_TOO_LATE);
+        assert_eq!(placement_of(14)["case"], "queue_overlap");
+        let i14 = submits.iter().copied().find(|&i| body[i]["seq"] == 14).unwrap();
+        assert_eq!(body[i14 + 2]["role"], "trim");
+        assert_eq!((body[i14 + 2]["seq"].as_u64(), body[i14 + 2]["by_seq"].as_u64(), body[i14 + 2]["start_removed"].as_bool()), (Some(13), Some(14), Some(true)));
+        assert_eq!((body[i14 + 3]["role"].as_str(), body[i14 + 3]["seq"].as_u64(), body[i14 + 3]["reason"].as_str()), (Some("explicit_discard"), Some(13), Some(DISCARD_OCCLUDED)));
+        // Outputs land at t_release + c (snapshot quantisation: 16 frames twice).
+        let outputs: Vec<&serde_json::Value> = body.iter().filter(|r| r["role"] == "output").collect();
+        assert_eq!(outputs.len(), 13);
+        for o in &outputs {
+            let d = &o["output_detail"];
+            assert_eq!(d["head_cut_frames"], 0);
+            let lag = o["t_output_us"].as_i64().unwrap() - o["t_release_us"].as_i64().unwrap();
+            assert!((lag - c).abs() <= 1_000, "seq {}: output − release {lag} us vs c {c}", o["seq"]);
+            let t = |k: &str| o[k].as_u64().unwrap();
+            assert!(t("t_release_us") <= t("t_submit_us") && t("t_submit_us") <= t("t_output_us") && t("t_output_us") <= t("t_callback_us"));
+        }
+        let lane = &sentinel(&rows)["lanes"]["haptic"];
+        let trims = body.iter().filter(|r| r["role"] == "trim").count() as u64;
+        assert_eq!(lane["placement_rows"], 15);
+        assert_eq!(lane["trim_rows"], trims);
+        assert_eq!((lane["ticks_occluded"].as_u64(), lane["occluded_discards"].as_u64()), (Some(1), Some(1)));
+        assert_eq!((lane["ticks_too_late"].as_u64(), lane["too_late_discards"].as_u64()), (Some(1), Some(1)));
+        assert_eq!(lane["xrun"], 0);
+        let sum = |role: &str, key: &str| body.iter().filter(|r| r["role"] == role).map(|r| r[key].as_u64().unwrap()).sum::<u64>();
+        assert_eq!(lane["frames_tail_cut"], sum("trim", "tail_cut_frames"));
+        assert_eq!(lane["frames_silence_inserted"], sum("placement", "silence_inserted_frames"));
+        assert_eq!(lane["tail_played_at_close"], true);
+        assert!(lane["device_failure"].is_null());
     }
 }
