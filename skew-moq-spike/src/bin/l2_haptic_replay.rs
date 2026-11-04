@@ -740,6 +740,7 @@ fn l2_config(p: &Prepared) -> L2Config {
                 prefill_frames: ALSA_DEFAULT_PREFILL_FRAMES,
                 queue_limit_frames: ALSA_DEFAULT_QUEUE_FRAMES,
                 latency_bound_frames: p.request.renderer.latency_bound_frames(),
+                mode: skew_moq::l2_haptic::PlacementMode::None,
             },
             status_interval_us: ALSA_DEFAULT_STATUS_INTERVAL_US,
             ready_timeout_us: ALSA_READY_TIMEOUT_US,

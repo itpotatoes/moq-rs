@@ -4375,6 +4375,7 @@ mod tests {
             prefill_frames: 4_800,
             queue_limit_frames: 48_000,
             latency_bound_frames: None,
+            mode: crate::l2_haptic::PlacementMode::None,
         }
     }
 

@@ -1361,6 +1361,8 @@ fn l2_output_config(args: &Args) -> Result<Option<(PathBuf, skew_moq::l2_output:
                 prefill_frames: args.l2_alsa_prefill_frames.unwrap_or(ALSA_DEFAULT_PREFILL_FRAMES),
                 queue_limit_frames: args.l2_alsa_queue_frames.unwrap_or(ALSA_DEFAULT_QUEUE_FRAMES),
                 latency_bound_frames: args.l2_alsa_latency_bound_frames,
+                // Experiment-4 placement flags are a later task: legacy.
+                mode: skew_moq::l2_haptic::PlacementMode::None,
             },
             status_interval_us: args
                 .l2_alsa_status_interval_us

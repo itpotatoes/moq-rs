@@ -92,8 +92,46 @@
 //! values and the audio-timestamp domain value (`LINK`: not
 //! CLOCK_MONOTONIC) are kept in [`RawSnapshot`] for the probe-only
 //! diagnostics file and never enter the L2 JSONL.
+//!
+//! Placement modes (experiment 4, [`PlacementConfig::mode`]): `None` is the
+//! legacy engine above (experiments 2/3, L2 v1.7), `Fifo` is the same engine
+//! path with `B` refused (only the L2 meta differs, v1.8), `Aligned` is R2
+//! below. Every rule above applies unchanged to `None` and `Fifo`.
+//!
+//! Aligned placement R2 (design `md/20261104_실험4_설계초안.md` §5, contract
+//! `md/20261104_실험4_계약.md` §2; [`HapticPlacement::place`]). The plan is a
+//! frame-indexed queue covering `[appl_pos, planned_end)` of segments — a
+//! silence run, or a slice of a tick (identified by its placement index and
+//! carrying its seq) and its frame offset — with `appl_pos = w` (frames
+//! actually written) and `planned_end = w + planned frames >= appl_pos` by
+//! construction (writing silence past `planned_end` leaves it at `w`). A
+//! placement takes `hw_pos` and `htstamp_us` from the LAST HEALTHY snapshot
+//! and `appl_pos = w` at placement time (no status call of its own) and, in
+//! signed i128 with [`div_round_half_away`]:
+//! `n* = hw_pos + round_half_away((t_release_us + c − htstamp_us) × 48000 / 1e6)`,
+//! `floor_us = htstamp_us + round_half_away((appl_pos − hw_pos) × 1e6 / 48000) − t_release_us`
+//! (recorded for every attempt, before any cut or discard). With L the
+//! tick's frames: (i) gap, `n* >= planned_end`: silence `planned_end..n*`
+//! then the tick, refused (plan untouched, `placement_queue_full` after
+//! submit) if the plan's waiting frames would exceed `Q`
+//! (`n* + L − appl_pos > queue_limit_frames`); (ii) queue_overlap,
+//! `appl_pos <= n* < planned_end`: every planned frame at or after `n*` is
+//! removed (silence included; one trim per affected tick; a tick whose start
+//! is removed — never written — is `occluded`), then the tick goes at `n*`;
+//! (iii) device_overlap, `n* < appl_pos < n* + L`: no rewind; the whole plan
+//! is removed by the (ii) rule, the head `appl_pos − n*` is cut and the rest
+//! goes at `appl_pos` (its `n_k`, `head_cut_frames > 0`); (iv) too_late,
+//! `n* + L <= appl_pos`: discarded, plan untouched. A tick trimmed after its
+//! start was written shrinks its `frames`, the `tick_extent` end and
+//! `last_tick_end_frame` (so `idle` and the close statistics stay true). The
+//! write-ahead fill writes one period-sized chunk at a time from the plan
+//! front while `w − hw_pos < W` (padding with silence when the plan runs
+//! out), never all available space. A tick enters `in_flight` at its first
+//! written frame and is output once no planned frame of it remains and a
+//! snapshot shows `hw_pos > n_k` (the formula below, unchanged). Waiting
+//! silence never exceeds `Q`. The latency bound `B` does not exist here.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use crate::l2_output::L2Submission;
 
@@ -140,6 +178,16 @@ pub const FAIL_ALSA_STATUS_ERROR: &str = "alsa_status_error";
 pub const FAIL_ALSA_WRITE_ERROR: &str = "alsa_write_error";
 /// A haptic submission that is not a playable PCM tick.
 pub const FAIL_HAPTIC_PAYLOAD_INVALID: &str = "haptic_payload_invalid";
+
+/// Aligned placement terminals, `explicit_discard` after submit (contract
+/// §2-4; re-exported by `l2_output`). A later placement removed the tick's
+/// first frame (`trim.start_removed = true`).
+pub const DISCARD_OCCLUDED: &str = "occluded";
+/// Case (iv): the whole tick lies before `appl_pos`.
+pub const DISCARD_TOO_LATE: &str = "too_late";
+/// Case (i): the candidate would make the plan exceed `Q` (unlike the FIFO
+/// `output_queue_full`, which is before submit).
+pub const DISCARD_PLACEMENT_QUEUE_FULL: &str = "placement_queue_full";
 /// Every device-failure reason (their occurrence time is undeterminable).
 pub const ALSA_DEVICE_FAILURE_REASONS: [&str; 8] = [
     FAIL_ALSA_XRUN,
@@ -355,6 +403,44 @@ pub struct PlacementConfig {
     /// plus the offered tick exceeds `B` (module doc "Latency bound").
     /// `REGULAR_TICK_MAX_FRAMES <= B <= queue_limit_frames`.
     pub latency_bound_frames: Option<u64>,
+    /// Experiment-4 placement mode ([`PlacementMode`]); `None` = legacy.
+    pub mode: PlacementMode,
+}
+
+/// Placement mode (experiment 4, contract `md/20261104_실험4_계약.md` §2;
+/// design `md/20261104_실험4_설계초안.md` §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlacementMode {
+    /// Legacy (experiments 2 and 3, L2 `event-pair-l2-v1.7`): the FIFO
+    /// placement of the module doc, and sink mode A when
+    /// `latency_bound_frames` is set. Rows and meta are exactly the former.
+    None,
+    /// Experiment-4 FIFO (L2 `event-pair-l2-v1.8` meta): the legacy FIFO
+    /// engine path with `B` off (a bound is refused). No placement or trim
+    /// row, no aligned counter, no new terminal.
+    Fifo,
+    /// Experiment-4 time-aligned placement R2 (module doc "Aligned
+    /// placement"): `align_offset_us` = c (µs), `write_ahead_frames` = W.
+    Aligned { align_offset_us: i64, write_ahead_frames: u64 },
+}
+
+impl PlacementMode {
+    /// Meta `alsa.placement` (`None` for legacy, which has no such key).
+    pub fn as_str(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::Fifo => Some("fifo"),
+            Self::Aligned { .. } => Some("aligned"),
+        }
+    }
+
+    /// `(c, W)` in aligned mode.
+    pub fn aligned(self) -> Option<(i64, u64)> {
+        match self {
+            Self::Aligned { align_offset_us, write_ahead_frames } => Some((align_offset_us, write_ahead_frames)),
+            _ => None,
+        }
+    }
 }
 
 impl PlacementConfig {
@@ -389,6 +475,23 @@ impl PlacementConfig {
                 return Err(format!(
                     "ALSA latency bound {bound} frames must be in {REGULAR_TICK_MAX_FRAMES}..=queue limit {}",
                     c.queue_limit_frames
+                ));
+            }
+        }
+        if c.mode != PlacementMode::None && c.latency_bound_frames.is_some() {
+            return Err(format!(
+                "the {} placement has no latency bound (experiment 4 has no sink mode A)",
+                c.mode.as_str().unwrap_or("?")
+            ));
+        }
+        if let Some((align_offset_us, write_ahead_frames)) = c.mode.aligned() {
+            if align_offset_us < 0 {
+                return Err(format!("aligned placement offset c = {align_offset_us} us must be >= 0"));
+            }
+            if write_ahead_frames == 0 || write_ahead_frames + c.period_frames > c.buffer_frames {
+                return Err(format!(
+                    "aligned write-ahead W = {write_ahead_frames} frames must be in 1..=buffer {} - period {}",
+                    c.buffer_frames, c.period_frames
                 ));
             }
         }
@@ -434,6 +537,119 @@ pub struct LatencyBoundStats {
     pub ticks_dropped: u64,
     /// Their 48 kHz frames (6 × 8 kHz samples each).
     pub frames_dropped: u64,
+}
+
+/// The case of one aligned placement (design §5-3 (i)–(iv)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlacementCase {
+    /// (i) `n* >= planned_end`.
+    Gap,
+    /// (ii) `appl_pos <= n* < planned_end`.
+    QueueOverlap,
+    /// (iii) `n* < appl_pos < n* + L`.
+    DeviceOverlap,
+    /// (iv) `n* + L <= appl_pos`.
+    TooLate,
+}
+
+impl PlacementCase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Gap => "gap",
+            Self::QueueOverlap => "queue_overlap",
+            Self::DeviceOverlap => "device_overlap",
+            Self::TooLate => "too_late",
+        }
+    }
+}
+
+/// The `placement` row of one aligned placement attempt (contract §2-2),
+/// computed BEFORE any cut or discard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacementRecord {
+    pub submission: L2Submission,
+    /// `htstamp_us` of the last healthy snapshot.
+    pub status_htstamp_us: u64,
+    /// `hw_pos` of the last healthy snapshot.
+    pub hw_pos: i64,
+    /// Frames actually written at placement time (`w`).
+    pub appl_pos: u64,
+    pub planned_end_before: u64,
+    pub n_star: i64,
+    pub case: PlacementCase,
+    pub floor_us: i64,
+    pub head_cut_frames: u64,
+    pub silence_inserted_frames: u64,
+    pub planned_end_after: u64,
+    /// `Some(DISCARD_PLACEMENT_QUEUE_FULL)` when case (i) exceeded `Q`.
+    pub rejected: Option<&'static str>,
+}
+
+/// One `trim` row (contract §2-3): a later placement removed unwritten
+/// frames of an earlier tick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrimRecord {
+    /// The trimmed tick.
+    pub submission: L2Submission,
+    /// The tick whose placement trimmed it.
+    pub by: L2Submission,
+    pub tail_cut_frames: u64,
+    /// Its first frame was removed (none of it was written): it ends as
+    /// `explicit_discard(occluded)`.
+    pub start_removed: bool,
+}
+
+/// The offered tick's own outcome in aligned mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlignedAdmission {
+    /// Placed (case gap, queue_overlap or device_overlap): its terminal is a
+    /// later `output` (or `occluded` / `device_failure`).
+    Placed,
+    /// Case (iv): `explicit_discard(too_late)` after submit.
+    TooLate,
+    /// Case (i) over `Q`: `explicit_discard(placement_queue_full)` after submit.
+    PlacementQueueFull,
+    /// Not a playable PCM tick: `explicit_discard(payload_invalid)` after
+    /// submit and the integrity failure `haptic_payload_invalid` (no
+    /// placement row).
+    PayloadInvalid,
+}
+
+/// What one aligned placement did ([`HapticPlacement::place`]). The lane
+/// writes, in this order: the submit row, the placement row, every trim row
+/// (plan order), one `explicit_discard(occluded)` per `occluded` (plan
+/// order), then the offered tick's own discard if `admission` is one.
+#[must_use = "every trim and occlusion needs its row"]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlignedOffered {
+    /// `None` only for `PayloadInvalid`.
+    pub placement: Option<PlacementRecord>,
+    pub trims: Vec<TrimRecord>,
+    /// The trimmed ticks whose start was removed, in plan order (each one is
+    /// a `start_removed` trim).
+    pub occluded: Vec<L2Submission>,
+    pub admission: AlignedAdmission,
+}
+
+/// Aligned-placement counters (contract §2-5; present only in aligned mode).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AlignedStats {
+    /// Ticks whose start a later placement removed (`occluded`).
+    pub ticks_occluded: u64,
+    /// Case (iv) ticks (`too_late`).
+    pub ticks_too_late: u64,
+    /// Case (iii) placements (head cut > 0).
+    pub ticks_head_cut: u64,
+    /// Case (i) rejections (`placement_queue_full`).
+    pub ticks_placement_queue_full: u64,
+    /// Σ `trim.tail_cut_frames` (occluded ticks included).
+    pub frames_tail_cut: u64,
+    /// Σ `placement.head_cut_frames`.
+    pub frames_head_cut: u64,
+    /// Σ `placement.silence_inserted_frames`.
+    pub frames_silence_inserted: u64,
+    /// The largest planned (waiting) silence after any placement (<= Q).
+    pub max_waiting_silence_frames: u64,
 }
 
 /// A device failure (registration §6-1, Codex 109 P1). No occurrence time
@@ -585,10 +801,23 @@ pub struct AlsaOutputDetail {
     pub audio_tstamp: AudioTstampReport,
     /// Raw snapshot values: diagnostics file only, never the ledger.
     pub raw: RawSnapshot,
+    /// Aligned mode only (`Some`; the key is absent otherwise): frames cut
+    /// from the tick's head at placement (case device_overlap), 0 for every
+    /// other tick.
+    pub head_cut_frames: Option<u64>,
 }
 
 impl AlsaOutputDetail {
     pub fn to_json(&self) -> serde_json::Value {
+        let mut json = self.legacy_json();
+        if let Some(head_cut_frames) = self.head_cut_frames {
+            let map = json.as_object_mut().expect("output detail is an object");
+            map.insert("head_cut_frames".into(), head_cut_frames.into());
+        }
+        json
+    }
+
+    fn legacy_json(&self) -> serde_json::Value {
         let report = &self.audio_tstamp;
         serde_json::json!({
             "device": "alsa",
@@ -698,6 +927,8 @@ pub struct LaneStats {
     /// `Some` iff a latency bound `B` is configured; its keys are emitted
     /// only then, so without `B` the counters are exactly the former ones.
     pub latency_bound: Option<LatencyBoundStats>,
+    /// `Some` iff the placement is aligned; its keys are emitted only then.
+    pub aligned: Option<AlignedStats>,
 }
 
 /// Upper bounds (exclusive, µs) of the status-gap histogram buckets.
@@ -740,6 +971,17 @@ impl LaneStats {
             map.insert("ticks_latency_bound".into(), bound.ticks_dropped.into());
             map.insert("latency_bound_frames_dropped".into(), bound.frames_dropped.into());
         }
+        if let Some(a) = &self.aligned {
+            let map = json.as_object_mut().expect("lane stats are an object");
+            map.insert("ticks_occluded".into(), a.ticks_occluded.into());
+            map.insert("ticks_too_late".into(), a.ticks_too_late.into());
+            map.insert("ticks_head_cut".into(), a.ticks_head_cut.into());
+            map.insert("ticks_placement_queue_full".into(), a.ticks_placement_queue_full.into());
+            map.insert("frames_tail_cut".into(), a.frames_tail_cut.into());
+            map.insert("frames_head_cut".into(), a.frames_head_cut.into());
+            map.insert("frames_silence_inserted".into(), a.frames_silence_inserted.into());
+            map.insert("max_waiting_silence_frames".into(), a.max_waiting_silence_frames.into());
+        }
         json
     }
 }
@@ -772,6 +1014,84 @@ struct Current {
     pcm: Vec<i16>,
     total_frames: u64,
     offset_frames: u64,
+}
+
+/// One segment of the aligned plan, a frame-indexed queue covering
+/// `[w, w + plan_frames)` (`planned_end = w + plan_frames >= appl_pos = w`
+/// by construction).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Segment {
+    /// A run of planned silence (case gap).
+    Silence { frames: u64 },
+    /// `frames` frames of tick `id` from frame `offset` of its full PCM
+    /// (`id` = placement index; the tick carries its seq).
+    Tick { id: u64, offset: u64, frames: u64 },
+}
+
+impl Segment {
+    fn frames(&self) -> u64 {
+        match self {
+            Self::Silence { frames } | Self::Tick { frames, .. } => *frames,
+        }
+    }
+}
+
+/// A placed tick of the aligned plan, from its placement until its output
+/// row (or occlusion, or abandonment after a device failure).
+struct AlignedTick {
+    submission: L2Submission,
+    /// The full tick (L frames, interleaved stereo); a head cut skips the
+    /// first `head_cut` frames of it.
+    pcm: Vec<i16>,
+    samples_8k: u64,
+    head_cut: u64,
+    /// Frame of its first remaining frame (the recorded `n_k`).
+    n_k: u64,
+    /// Recorded frames: L − head cut − every tail cut so far.
+    frames: u64,
+    /// Frames of it written to the device.
+    written: u64,
+    /// Clock read after the writei that wrote frame `n_k`.
+    t_write_us: Option<u64>,
+    /// Clock read after the latest writei that wrote a frame of it.
+    t_write_last_us: Option<u64>,
+}
+
+/// The aligned placement's state (module doc "Aligned placement").
+struct AlignedState {
+    align_offset_us: i64,
+    write_ahead_frames: u64,
+    plan: VecDeque<Segment>,
+    plan_frames: u64,
+    /// Planned (waiting) silence frames in `plan`.
+    plan_silence_frames: u64,
+    /// Every placed tick not yet output, occluded or abandoned, by id
+    /// (= placement order = plan order).
+    ticks: BTreeMap<u64, AlignedTick>,
+    next_id: u64,
+    /// Ticks whose first remaining frame was written, in frame order; only
+    /// the back can still have planned frames.
+    in_flight: VecDeque<u64>,
+}
+
+impl AlignedState {
+    fn new(align_offset_us: i64, write_ahead_frames: u64) -> Self {
+        Self {
+            align_offset_us,
+            write_ahead_frames,
+            plan: VecDeque::new(),
+            plan_frames: 0,
+            plan_silence_frames: 0,
+            ticks: BTreeMap::new(),
+            next_id: 0,
+            in_flight: VecDeque::new(),
+        }
+    }
+
+    /// Tick frames of the plan (the aligned counterpart of the `Q` count).
+    fn plan_tick_frames(&self) -> u64 {
+        self.plan_frames - self.plan_silence_frames
+    }
 }
 
 /// What the stream epoch looked like right after `start`.
@@ -809,6 +1129,9 @@ pub struct HapticPlacement {
     last_htstamp_ns: u64,
     last_status_t0_us: Option<u64>,
     stats: LaneStats,
+    /// `Some` iff the placement is aligned (the legacy/FIFO state above is
+    /// then unused: `pending`, `current` and `in_flight` stay empty).
+    aligned: Option<AlignedState>,
 }
 
 impl HapticPlacement {
@@ -838,8 +1161,10 @@ impl HapticPlacement {
             last_status_t0_us: None,
             stats: LaneStats {
                 latency_bound: cfg.latency_bound_frames.map(|_| LatencyBoundStats::default()),
+                aligned: cfg.mode.aligned().map(|_| AlignedStats::default()),
                 ..LaneStats::default()
             },
+            aligned: cfg.mode.aligned().map(|(c, w)| AlignedState::new(c, w)),
         })
     }
 
@@ -860,17 +1185,42 @@ impl HapticPlacement {
         self.w
     }
 
-    /// Frames waiting in the write queue (not yet written).
+    /// Frames waiting in the write queue (not yet written). Aligned: the
+    /// tick frames of the plan (silence excluded).
     pub fn pending_frames(&self) -> u64 {
+        if let Some(st) = &self.aligned {
+            return st.plan_tick_frames();
+        }
         self.pending_frames
+    }
+
+    /// Aligned only: `planned_end` (`w` + every planned frame, `>= w`).
+    pub fn planned_end(&self) -> Option<u64> {
+        self.aligned.as_ref().map(|st| self.w + st.plan_frames)
+    }
+
+    /// Aligned only: the planned (waiting) silence frames.
+    pub fn waiting_silence_frames(&self) -> Option<u64> {
+        self.aligned.as_ref().map(|st| st.plan_silence_frames)
+    }
+
+    /// Aligned only: the write-ahead fill estimate `w − hw_pos` of the last
+    /// healthy snapshot (= its `delay` + frames written since it).
+    pub fn fill_estimate(&self) -> Option<i64> {
+        self.aligned.as_ref()?;
+        self.last_hw_pos.map(|hw_pos| self.w as i64 - hw_pos)
     }
 
     /// Nothing queued, nothing partially written, no onset awaiting its
     /// output, AND the last written tick fully played: `hw_pos >= n_k +
     /// frames`, i.e. its LAST frame passed (registration 3-3a "종료"; the
     /// onset output alone does not mean the tick was played, Codex 109 P1).
-    /// Trailing silence is never waited for.
+    /// Trailing silence is never waited for. Aligned: no placed tick left
+    /// (planned, being written or awaiting its output) and the tail played.
     pub fn idle(&self) -> bool {
+        if let Some(st) = &self.aligned {
+            return st.ticks.is_empty() && self.tick_tail_played();
+        }
         self.pending.is_empty()
             && self.in_flight.is_empty()
             && !matches!(self.current, Some(Current { kind: ChunkKind::Tick { .. }, .. }))
@@ -901,8 +1251,11 @@ impl HapticPlacement {
 
     /// Every tick frame not yet written to the device: the waiting queue
     /// plus the unwritten remainder of the tick being written (the `Q`
-    /// count, registration 3-3a "상한").
+    /// count, registration 3-3a "상한"). Aligned: the tick frames of the plan.
     pub fn unwritten_tick_frames(&self) -> u64 {
+        if let Some(st) = &self.aligned {
+            return st.plan_tick_frames();
+        }
         let current = match &self.current {
             Some(c @ Current { kind: ChunkKind::Tick { .. }, .. }) => c.total_frames - c.offset_frames,
             _ => 0,
@@ -970,6 +1323,7 @@ impl HapticPlacement {
     /// only, blind to identity), then the unchanged `Q` rule decides the
     /// offered tick. Without `B` this is exactly the former admission.
     pub fn offer(&mut self, submission: L2Submission, payload: Option<&[u8]>) -> Offered {
+        assert!(self.aligned.is_none(), "the aligned placement offers through place()");
         let mut latency_dropped = Vec::new();
         let admission = self.admit_after_bound(submission, payload, &mut latency_dropped);
         Offered { latency_dropped, admission }
@@ -1038,10 +1392,381 @@ impl HapticPlacement {
         Admission::Queued
     }
 
+    /// Aligned placement of one released haptic submission (module doc
+    /// "Aligned placement"; design §5-3). Payload validation first (the same
+    /// three checks as [`Self::offer`]; an unplayable payload makes no
+    /// placement row). Then, from the LAST HEALTHY snapshot (`hw_pos`,
+    /// `htstamp_us`) and `appl_pos = w` (frames actually written so far, no
+    /// fresh status call), `n*` and `floor_us` are computed for EVERY
+    /// attempt before any cut or discard, the case is classified, its result
+    /// is precomputed, and the plan is mutated only if it is not rejected.
+    pub fn place(&mut self, submission: L2Submission, payload: Option<&[u8]>) -> AlignedOffered {
+        let Some((align_offset_us, _)) = self.cfg.mode.aligned() else {
+            panic!("place() is the aligned placement; the FIFO placement offers through offer()");
+        };
+        let invalid = AlignedOffered {
+            placement: None,
+            trims: Vec::new(),
+            occluded: Vec::new(),
+            admission: AlignedAdmission::PayloadInvalid,
+        };
+        let Some(payload) = payload else {
+            self.stats.ticks_payload_invalid += 1;
+            return invalid;
+        };
+        let samples = payload.len() / 2;
+        if payload.is_empty() || payload.len() % 2 != 0 || samples > MAX_TICK_SAMPLES {
+            self.stats.ticks_payload_invalid += 1;
+            return invalid;
+        }
+        let frames = samples as u64 * UPSAMPLE_FACTOR;
+        if frames > self.cfg.max_tick_frames() {
+            self.stats.ticks_payload_invalid += 1;
+            return invalid;
+        }
+        // The lane offers only after its epoch began (`begin_epoch` seeds the
+        // healthy snapshot): anything else is a programming error.
+        assert!(self.epoch.is_some(), "an aligned placement needs a healthy snapshot (begin_epoch first)");
+        let hw_pos = self.last_hw_pos.expect("begin_epoch recorded a healthy snapshot");
+        let htstamp_us = ns_to_us_floor(self.last_htstamp_ns);
+        let appl_pos = self.w;
+        let mut st = self.aligned.take().expect("aligned state");
+        let planned_end_before = appl_pos + st.plan_frames;
+        debug_assert_eq!(st.align_offset_us, align_offset_us);
+
+        // Signed i128, `div_round_half_away` (the rule of `t_output_us`).
+        let rate = PCM_RATE_HZ as i128;
+        let t_release = submission.t_release_us as i128;
+        let n_star =
+            hw_pos as i128 + div_round_half_away((t_release + align_offset_us as i128 - htstamp_us as i128) * rate, 1_000_000);
+        let floor_us = htstamp_us as i128 + div_round_half_away((appl_pos as i128 - hw_pos as i128) * 1_000_000, rate) - t_release;
+        let l = frames as i128;
+        let (a, end) = (appl_pos as i128, planned_end_before as i128);
+        let case = if n_star >= end {
+            PlacementCase::Gap
+        } else if n_star >= a {
+            PlacementCase::QueueOverlap
+        } else if n_star + l > a {
+            PlacementCase::DeviceOverlap
+        } else {
+            PlacementCase::TooLate
+        };
+        let mut trims = Vec::new();
+        let mut head_cut = 0u64;
+        let mut silence = 0u64;
+        let mut rejected = None;
+        // Where the tick's first remaining frame goes, if it is placed.
+        let mut start = None;
+        match case {
+            PlacementCase::Gap => {
+                // The candidate's waiting frames: the whole plan after it,
+                // planned silence included ([appl_pos, n* + L)).
+                if n_star + l - a > self.cfg.queue_limit_frames as i128 {
+                    rejected = Some(DISCARD_PLACEMENT_QUEUE_FULL);
+                } else {
+                    silence = (n_star - end) as u64;
+                    start = Some(n_star as u64);
+                }
+            }
+            PlacementCase::QueueOverlap => {
+                trims = self.cut_from(&mut st, n_star as u64, submission);
+                start = Some(n_star as u64);
+            }
+            PlacementCase::DeviceOverlap => {
+                // No rewind: every planned frame goes, then the head.
+                trims = self.cut_from(&mut st, appl_pos, submission);
+                head_cut = (a - n_star) as u64;
+                start = Some(appl_pos);
+            }
+            PlacementCase::TooLate => {}
+        }
+        let counters = self.stats.aligned.as_mut().expect("aligned counters");
+        let admission = match (case, start) {
+            (_, Some(start)) => {
+                if silence > 0 {
+                    st.plan.push_back(Segment::Silence { frames: silence });
+                    st.plan_frames += silence;
+                    st.plan_silence_frames += silence;
+                }
+                assert_eq!(appl_pos + st.plan_frames, start, "the tick starts where the plan ends");
+                let mut pcm = Vec::with_capacity(frames as usize * PCM_CHANNELS);
+                for bytes in payload.chunks_exact(2) {
+                    let sample = i16::from_le_bytes([bytes[0], bytes[1]]);
+                    for _ in 0..UPSAMPLE_FACTOR {
+                        pcm.push(sample);
+                        pcm.push(sample);
+                    }
+                }
+                let id = st.next_id;
+                st.next_id += 1;
+                let remaining = frames - head_cut;
+                st.ticks.insert(
+                    id,
+                    AlignedTick {
+                        submission,
+                        pcm,
+                        samples_8k: samples as u64,
+                        head_cut,
+                        n_k: start,
+                        frames: remaining,
+                        written: 0,
+                        t_write_us: None,
+                        t_write_last_us: None,
+                    },
+                );
+                st.plan.push_back(Segment::Tick { id, offset: head_cut, frames: remaining });
+                st.plan_frames += remaining;
+                counters.frames_silence_inserted += silence;
+                counters.frames_head_cut += head_cut;
+                if head_cut > 0 {
+                    counters.ticks_head_cut += 1;
+                }
+                counters.max_waiting_silence_frames = counters.max_waiting_silence_frames.max(st.plan_silence_frames);
+                self.stats.ticks_admitted += 1;
+                self.stats.max_unwritten_tick_frames = self.stats.max_unwritten_tick_frames.max(st.plan_tick_frames());
+                AlignedAdmission::Placed
+            }
+            (PlacementCase::Gap, None) => {
+                counters.ticks_placement_queue_full += 1;
+                AlignedAdmission::PlacementQueueFull
+            }
+            (_, None) => {
+                counters.ticks_too_late += 1;
+                AlignedAdmission::TooLate
+            }
+        };
+        let planned_end_after = appl_pos + st.plan_frames;
+        assert!(planned_end_after >= appl_pos);
+        assert!(
+            st.plan_silence_frames <= self.cfg.queue_limit_frames,
+            "waiting silence {} > Q {}",
+            st.plan_silence_frames,
+            self.cfg.queue_limit_frames
+        );
+        self.aligned = Some(st);
+        let occluded = trims.iter().filter(|t| t.start_removed).map(|t| t.submission).collect();
+        let record = PlacementRecord {
+            submission,
+            status_htstamp_us: htstamp_us,
+            hw_pos,
+            appl_pos,
+            planned_end_before,
+            n_star: i64::try_from(n_star).expect("n* of a CLOCK_MONOTONIC µs time fits i64"),
+            case,
+            floor_us: i64::try_from(floor_us).expect("floor of a CLOCK_MONOTONIC µs time fits i64"),
+            head_cut_frames: head_cut,
+            silence_inserted_frames: silence,
+            planned_end_after,
+            rejected,
+        };
+        AlignedOffered { placement: Some(record), trims, occluded, admission }
+    }
+
+    /// Remove every planned frame at or after `pos` (`w <= pos <=
+    /// planned_end`), silence included. Each affected tick gets one trim
+    /// (plan order). A tick whose first frame is removed is occluded: none of
+    /// it was written (asserted) and it leaves the plan. A tick whose start
+    /// was written but whose tail is cut shrinks its recorded `frames`, the
+    /// `tick_extent` end and `last_tick_end_frame`.
+    fn cut_from(&mut self, st: &mut AlignedState, pos: u64, by: L2Submission) -> Vec<TrimRecord> {
+        let mut p = self.w;
+        assert!(pos >= p && pos <= p + st.plan_frames, "cut inside the plan");
+        let mut kept = VecDeque::with_capacity(st.plan.len());
+        let mut removed: Vec<(u64, u64)> = Vec::new();
+        for seg in st.plan.drain(..) {
+            let f = seg.frames();
+            if p + f <= pos {
+                kept.push_back(seg);
+            } else {
+                let keep = pos.saturating_sub(p);
+                let cut = f - keep;
+                match seg {
+                    Segment::Silence { .. } => {
+                        if keep > 0 {
+                            kept.push_back(Segment::Silence { frames: keep });
+                        }
+                        st.plan_silence_frames -= cut;
+                    }
+                    Segment::Tick { id, offset, .. } => {
+                        if keep > 0 {
+                            kept.push_back(Segment::Tick { id, offset, frames: keep });
+                        }
+                        match removed.iter_mut().find(|(i, _)| *i == id) {
+                            Some(entry) => entry.1 += cut,
+                            None => removed.push((id, cut)),
+                        }
+                    }
+                }
+            }
+            p += f;
+        }
+        st.plan = kept;
+        st.plan_frames = pos - self.w;
+        let counters = self.stats.aligned.as_mut().expect("aligned counters");
+        let mut trims = Vec::with_capacity(removed.len());
+        for (id, cut) in removed {
+            let tick = st.ticks.get_mut(&id).expect("a planned slice has its tick");
+            counters.frames_tail_cut += cut;
+            let start_removed = tick.n_k >= pos;
+            if start_removed {
+                assert_eq!(tick.written, 0, "start_removed implies that no frame of the tick was written");
+                assert_eq!(cut, tick.frames, "an occluded tick loses every frame");
+                assert!(!st.in_flight.contains(&id), "an occluded tick never entered in_flight");
+                let tick = st.ticks.remove(&id).expect("present");
+                counters.ticks_occluded += 1;
+                trims.push(TrimRecord { submission: tick.submission, by, tail_cut_frames: cut, start_removed: true });
+            } else {
+                tick.frames -= cut;
+                if tick.written > 0 {
+                    // Started being written, so it is the latest such tick.
+                    assert_eq!(self.tick_extent.map(|e| e.0), Some(tick.n_k), "the trimmed tick is the latest written");
+                    let end = tick.n_k + tick.frames;
+                    self.tick_extent = Some((tick.n_k, end));
+                    self.stats.last_tick_end_frame = Some(end);
+                    if tick.written == tick.frames {
+                        self.stats.ticks_written += 1; // its remaining frames are all written now
+                    }
+                }
+                trims.push(TrimRecord { submission: tick.submission, by, tail_cut_frames: cut, start_removed: false });
+            }
+        }
+        trims
+    }
+
+    /// Aligned write-ahead fill: `fill_est` = the last healthy snapshot's
+    /// `delay` + frames written since it (`w − hw_pos`, the design's
+    /// `appl_pos − hw_pos`, NOT `buffer − avail`). While `fill_est < W` and
+    /// `avail >= period`, ONE period-sized chunk is written from the plan
+    /// front (it may span segments; padded with silence if the plan runs out
+    /// mid-chunk; one period of silence if the plan is empty); `fill_est`
+    /// and `avail` advance by the frames actually written. A short write
+    /// ends the call: the unwritten planned frames stay first in the plan
+    /// (the unwritten silence pad lies past `planned_end` and is not kept).
+    /// The available space is NOT filled as the FIFO placement does.
+    fn fill_aligned(&mut self, pcm: &mut dyn HapticPcm, avail: u64, clock: &mut dyn FnMut() -> u64) -> Result<(), PcmError> {
+        let mut st = self.aligned.take().expect("aligned state");
+        let result = self.fill_aligned_with(&mut st, pcm, avail, clock);
+        self.aligned = Some(st);
+        result
+    }
+
+    fn fill_aligned_with(
+        &mut self,
+        st: &mut AlignedState,
+        pcm: &mut dyn HapticPcm,
+        avail: u64,
+        clock: &mut dyn FnMut() -> u64,
+    ) -> Result<(), PcmError> {
+        let period = self.cfg.period_frames;
+        let mut avail = avail.min(self.cfg.buffer_frames);
+        let hw_pos = self.last_hw_pos.expect("fill after begin_epoch");
+        let mut fill_est = self.w as i128 - hw_pos as i128;
+        let mut chunk: Vec<i16> = Vec::with_capacity(period as usize * PCM_CHANNELS);
+        while fill_est < st.write_ahead_frames as i128 && avail >= period {
+            chunk.clear();
+            let mut planned = 0u64;
+            for seg in &st.plan {
+                if planned == period {
+                    break;
+                }
+                let n = seg.frames().min(period - planned);
+                match *seg {
+                    Segment::Silence { .. } => chunk.resize(chunk.len() + n as usize * PCM_CHANNELS, 0),
+                    Segment::Tick { id, offset, .. } => {
+                        let from = offset as usize * PCM_CHANNELS;
+                        chunk.extend_from_slice(&st.ticks[&id].pcm[from..from + n as usize * PCM_CHANNELS]);
+                    }
+                }
+                planned += n;
+            }
+            chunk.resize(period as usize * PCM_CHANNELS, 0);
+            let t_before = clock();
+            let result = pcm.writei(&chunk, t_before);
+            let t_after = clock();
+            self.stats.writei_calls += 1;
+            self.stats.writei_max_us = self.stats.writei_max_us.max(t_after.saturating_sub(t_before));
+            let written = match result {
+                Ok(k) => k.min(period),
+                Err(PcmError::WouldBlock) => {
+                    self.stats.writei_wouldblock += 1;
+                    break;
+                }
+                Err(e) => return Err(e),
+            };
+            if written == 0 {
+                self.stats.writei_wouldblock += 1;
+                break;
+            }
+            if written < period {
+                self.stats.writei_short += 1;
+            }
+            let from_plan = written.min(planned);
+            self.consume(st, from_plan, t_after);
+            // Silence past planned_end: planned_end = w + plan_frames follows w.
+            self.stats.silence_frames_written += written - from_plan;
+            self.w += written;
+            self.stats.frames_written += written;
+            avail -= written;
+            fill_est += written as i128;
+            if written < period {
+                break; // short write: the planned rest goes first next time
+            }
+        }
+        Ok(())
+    }
+
+    /// The first `n` planned frames were written (at `w..w + n`, before `w`
+    /// advances). A tick enters `in_flight` (its `n_k` and `t_write_us` are
+    /// fixed) when its first remaining frame is written.
+    fn consume(&mut self, st: &mut AlignedState, n: u64, t_after: u64) {
+        let mut rem = n;
+        let mut p = self.w;
+        while rem > 0 {
+            let seg = st.plan.front_mut().expect("written frames come from the plan");
+            let m = seg.frames().min(rem);
+            match seg {
+                Segment::Silence { frames } => {
+                    *frames -= m;
+                    st.plan_silence_frames -= m;
+                    self.stats.silence_frames_written += m;
+                }
+                Segment::Tick { id, offset, frames } => {
+                    let tick = st.ticks.get_mut(id).expect("a planned slice has its tick");
+                    if tick.written == 0 {
+                        assert_eq!(tick.n_k, p, "a tick's first remaining frame is written at its planned frame");
+                        tick.t_write_us = Some(t_after);
+                        st.in_flight.push_back(*id);
+                        let end = tick.n_k + tick.frames;
+                        self.tick_extent = Some((tick.n_k, end));
+                        self.stats.last_tick_end_frame = Some(end);
+                    }
+                    tick.written += m;
+                    tick.t_write_last_us = Some(t_after);
+                    self.stats.tick_frames_written += m;
+                    if tick.written == tick.frames {
+                        self.stats.ticks_written += 1;
+                    }
+                    *offset += m;
+                    *frames -= m;
+                }
+            }
+            if seg.frames() == 0 {
+                st.plan.pop_front();
+            }
+            st.plan_frames -= m;
+            rem -= m;
+            p += m;
+        }
+    }
+
     /// Write what the snapshot's `avail` allows: the chunk in progress, then
     /// whole ticks back to back, then — only with an empty queue and a
     /// queued fill below `F` — one period of silence.
+    /// Aligned: the write-ahead fill ([`Self::fill_aligned`]).
     pub fn fill(&mut self, pcm: &mut dyn HapticPcm, avail: u64, clock: &mut dyn FnMut() -> u64) -> Result<(), PcmError> {
+        if self.aligned.is_some() {
+            return self.fill_aligned(pcm, avail, clock);
+        }
         let mut avail = avail.min(self.cfg.buffer_frames);
         let mut silence_written = false;
         loop {
@@ -1275,8 +2000,66 @@ impl HapticPlacement {
                     audio_tstamp_type_requested: self.audio_tstamp_type_requested,
                     audio_tstamp: s.audio_tstamp,
                     raw: RawSnapshot::of(s),
+                    head_cut_frames: None,
                 },
             });
+        }
+        if let Some(mut st) = self.aligned.take() {
+            // Aligned: a tick is output once NO planned frame of it remains
+            // (fully written, or its tail trimmed to what was written), so
+            // its `frames` and `t_write_done_us` are final, and the snapshot
+            // shows hw_pos > n_k; the same formula as above.
+            while let Some(&id) = st.in_flight.front() {
+                let tick = &st.ticks[&id];
+                if tick.written < tick.frames || (tick.n_k as i64) >= hw_pos {
+                    break;
+                }
+                let Some(t_output_us) = output_time_us(htstamp_us, tick.n_k, hw_pos) else {
+                    let n_k = tick.n_k;
+                    self.aligned = Some(st);
+                    return Err(self.failure(
+                        FAIL_ALSA_STATUS_INCONSISTENT,
+                        None,
+                        t1,
+                        format!("negative output time for n_k {n_k}"),
+                    ));
+                };
+                st.in_flight.pop_front();
+                let tick = st.ticks.remove(&id).expect("an in-flight tick is placed");
+                let n_k_minus_hw_pos = tick.n_k as i64 - hw_pos;
+                placed.push(Placed {
+                    submission: tick.submission,
+                    t_output_us,
+                    t_callback_us: t1,
+                    detail: AlsaOutputDetail {
+                        backend: self.backend,
+                        n_k: tick.n_k,
+                        frames: tick.frames,
+                        samples_8k: tick.samples_8k,
+                        t_write_us: tick.t_write_us.expect("written"),
+                        t_write_done_us: tick.t_write_last_us.expect("written"),
+                        status_t0_us: t0,
+                        htstamp_us,
+                        trigger_htstamp_us: ns_to_us_floor(s.trigger_htstamp_ns),
+                        driver_htstamp_us: ns_to_us_floor(s.driver_htstamp_ns),
+                        appl_pos,
+                        delay_frames: s.delay,
+                        avail_frames: s.avail,
+                        hw_pos,
+                        queued_frames: queued,
+                        hw_ptr_pos,
+                        driver_delay_frames: s.delay - queued as i64,
+                        n_k_minus_hw_pos,
+                        offset_us: frames_to_us_round_half_away(n_k_minus_hw_pos, PCM_RATE_HZ),
+                        state: s.state.as_str(),
+                        audio_tstamp_type_requested: self.audio_tstamp_type_requested,
+                        audio_tstamp: s.audio_tstamp,
+                        raw: RawSnapshot::of(s),
+                        head_cut_frames: Some(tick.head_cut),
+                    },
+                });
+            }
+            self.aligned = Some(st);
         }
         self.stats.ticks_output += placed.len() as u64;
         self.stats.queued_max_frames = self.stats.queued_max_frames.max(queued);
@@ -1331,8 +2114,18 @@ impl HapticPlacement {
 
     /// Everything submitted that can no longer be output (after a device
     /// failure): written-but-unobserved ticks, the tick in progress and the
-    /// write queue, in submission order of their placement.
+    /// write queue, in submission order of their placement. Aligned: every
+    /// placed tick not yet output, once each (a partly written tick is in
+    /// `in_flight` and in the plan), in placement order.
     pub fn abandon(&mut self) -> Vec<L2Submission> {
+        if let Some(st) = self.aligned.as_mut() {
+            let out = std::mem::take(&mut st.ticks).into_values().map(|t| t.submission).collect();
+            st.plan.clear();
+            st.plan_frames = 0;
+            st.plan_silence_frames = 0;
+            st.in_flight.clear();
+            return out;
+        }
         let mut out: Vec<L2Submission> = self.in_flight.drain(..).map(|t| t.submission).collect();
         if let Some(Current { kind: ChunkKind::Tick { submission, .. }, .. }) = self.current.take() {
             out.push(submission);
@@ -1609,6 +2402,7 @@ mod tests {
             prefill_frames: 512,
             queue_limit_frames: 48_000,
             latency_bound_frames: None,
+            mode: PlacementMode::None,
         }
     }
 
@@ -2487,5 +3281,605 @@ mod tests {
         keys_off.extend(["latency_bound_frames_dropped".to_string(), "ticks_latency_bound".to_string()]);
         keys_off.sort();
         assert_eq!(keys_on, keys_off);
+    }
+    // ---- aligned placement R2 (experiment 4, design §5) ----------------------
+    //
+    // Common start (`started` at t0 = 1,000,000): prefill 512, first
+    // snapshot hw_pos = 0, htstamp_us = t0, w = appl_pos = 512, empty plan.
+    // At 1 ms steps the simulated stream has consumed exactly 48 frames per
+    // ms (a multiple of the 16-frame granularity), so hw_pos is exact and
+    // frame n plays at t0 + n / 48 kHz.
+
+    const W: u64 = 512;
+    const T0: u64 = 1_000_000;
+
+    fn aligned_cfg(c: i64) -> PlacementConfig {
+        PlacementConfig { mode: PlacementMode::Aligned { align_offset_us: c, write_ahead_frames: W }, ..cfg() }
+    }
+
+    fn released(seq: u32, t_release_us: u64, t_submit_us: u64) -> L2Submission {
+        let mut s = submission(seq, t_submit_us);
+        s.t_release_us = t_release_us;
+        s
+    }
+
+    /// Distinct, never-zero content per tick (so device frames identify it).
+    fn tick_payload(seq: u32, samples: usize) -> Vec<u8> {
+        (0..samples).flat_map(|i| (1 + ((seq as i64 * 977 + i as i64) % 30_000) as i16).to_le_bytes()).collect()
+    }
+
+    /// The tick's left-channel 48 kHz frames (×6 repetition).
+    fn tick_frames(seq: u32, samples: usize) -> Vec<i16> {
+        let bytes = tick_payload(seq, samples);
+        bytes.chunks_exact(2).flat_map(|b| std::iter::repeat_n(i16::from_le_bytes([b[0], b[1]]), 6)).collect()
+    }
+
+    fn place(engine: &mut HapticPlacement, s: L2Submission, samples: usize) -> AlignedOffered {
+        engine.place(s, Some(&tick_payload(s.identity.seq, samples)))
+    }
+
+    /// Step at 1 ms until idle, collecting outputs.
+    fn drain_until_idle(engine: &mut HapticPlacement, pcm: &mut dyn HapticPcm, t: &mut u64) -> Vec<Placed> {
+        let mut out = Vec::new();
+        for _ in 0..10_000 {
+            if engine.idle() {
+                break;
+            }
+            *t += 1_000;
+            out.extend(step_dyn(engine, pcm, *t).unwrap());
+        }
+        assert!(engine.idle(), "drained");
+        out
+    }
+
+    fn step_dyn(engine: &mut HapticPlacement, pcm: &mut dyn HapticPcm, t: u64) -> Result<Vec<Placed>, DeviceFailure> {
+        let s = pcm.status(t).map_err(|e| engine.failure_from_error(&e, None, t, "status"))?;
+        let placed = engine.observe(&s, t, t)?;
+        let mut clock = || t;
+        engine.fill(pcm, s.avail, &mut clock).map_err(|e| engine.failure_from_error(&e, None, t, "writei"))?;
+        Ok(placed)
+    }
+
+    /// A simulated stream that also records every frame written (left channel).
+    struct Recording {
+        sim: SimPcm,
+        frames: Vec<i16>,
+    }
+
+    impl HapticPcm for Recording {
+        fn params(&self) -> &PcmParams {
+            self.sim.params()
+        }
+        fn writei(&mut self, pcm: &[i16], now_us: u64) -> Result<u64, PcmError> {
+            let n = self.sim.writei(pcm, now_us)?;
+            self.frames.extend(pcm[..n as usize * PCM_CHANNELS].iter().step_by(PCM_CHANNELS));
+            Ok(n)
+        }
+        fn start(&mut self, now_us: u64) -> Result<(), PcmError> {
+            self.sim.start(now_us)
+        }
+        fn status(&mut self, now_us: u64) -> Result<PcmStatus, PcmError> {
+            self.sim.status(now_us)
+        }
+        fn stop(&mut self) -> Result<(), PcmError> {
+            self.sim.stop()
+        }
+    }
+
+    fn started_recording(c: PlacementConfig, sim: SimPcmConfig) -> (HapticPlacement, Recording) {
+        let mut pcm = Recording { sim: SimPcm::new(sim), frames: Vec::new() };
+        let mut engine = HapticPlacement::new(c, pcm.params()).unwrap();
+        let mut clock = || T0;
+        engine.prefill(&mut pcm, &mut clock).unwrap();
+        pcm.start(T0).unwrap();
+        let s = pcm.status(T0).unwrap();
+        engine.begin_epoch(T0, s, T0).unwrap();
+        (engine, pcm)
+    }
+
+    /// The device frames of an output equal the tick's frames after its head cut.
+    fn assert_output_content(pcm: &Recording, p: &Placed, samples: usize) {
+        let d = &p.detail;
+        let head = d.head_cut_frames.expect("aligned output") as usize;
+        let want = &tick_frames(p.submission.identity.seq, samples)[head..head + d.frames as usize];
+        let got = &pcm.frames[d.n_k as usize..(d.n_k + d.frames) as usize];
+        assert_eq!(got, want, "seq {}: the frames at n_k are the tick's", p.submission.identity.seq);
+    }
+
+    #[test]
+    fn the_placement_mode_refuses_a_latency_bound_and_bad_aligned_parameters() {
+        for mode in [PlacementMode::Fifo, PlacementMode::Aligned { align_offset_us: 40_000, write_ahead_frames: W }] {
+            PlacementConfig { mode, ..cfg() }.validate().unwrap();
+            let err = PlacementConfig { mode, latency_bound_frames: Some(1_068), ..cfg() }.validate().unwrap_err();
+            assert!(err.contains("no latency bound"), "{mode:?}: {err}");
+        }
+        PlacementConfig { latency_bound_frames: Some(1_068), ..cfg() }.validate().unwrap();
+        for (c, w) in [(-1, W), (40_000, 0), (40_000, BUFFER - PERIOD + 1)] {
+            let bad = PlacementConfig { mode: PlacementMode::Aligned { align_offset_us: c, write_ahead_frames: w }, ..cfg() };
+            assert!(bad.validate().is_err(), "{bad:?}");
+        }
+        aligned_cfg(0).validate().unwrap();
+        PlacementConfig { mode: PlacementMode::Aligned { align_offset_us: 0, write_ahead_frames: BUFFER - PERIOD }, ..cfg() }
+            .validate()
+            .unwrap();
+        assert_eq!(PlacementMode::None.as_str(), None);
+        assert_eq!(PlacementMode::Fifo.as_str(), Some("fifo"));
+        assert_eq!(aligned_cfg(1).mode.as_str(), Some("aligned"));
+    }
+
+    /// Fifo = the legacy engine path with B off: the same outputs and counters.
+    #[test]
+    fn the_fifo_mode_engine_equals_the_legacy_engine() {
+        let run = |c: PlacementConfig| {
+            let (mut engine, mut pcm) = started(c, SimPcmConfig::new(PERIOD, BUFFER), T0);
+            let mut t = T0;
+            let mut outputs = Vec::new();
+            let mut admissions = Vec::new();
+            for k in 0..300u32 {
+                let due = T0 + k as u64 * 7_000;
+                while t + 1_000 <= due {
+                    t += 1_000;
+                    outputs.extend(step(&mut engine, &mut pcm, t).unwrap().into_iter().map(|p| (p.t_output_us, p.detail.to_json())));
+                }
+                let offered = engine.offer(submission(k, t), Some(&payload(88 + (k % 9 != 0) as usize, 1)));
+                assert!(offered.latency_dropped.is_empty());
+                admissions.push(offered.admission);
+            }
+            for _ in 0..4_000 {
+                t += 1_000;
+                outputs.extend(step(&mut engine, &mut pcm, t).unwrap().into_iter().map(|p| (p.t_output_us, p.detail.to_json())));
+            }
+            assert!(engine.idle());
+            (outputs, admissions, engine.stats().to_json())
+        };
+        let legacy = run(cfg());
+        let fifo = run(PlacementConfig { mode: PlacementMode::Fifo, ..cfg() });
+        let queued = legacy.1.iter().filter(|a| **a == Admission::Queued).count();
+        assert!(queued > 200 && queued < 300, "a compressed schedule also reaches Q: {queued}");
+        assert_eq!(legacy.0.len(), queued);
+        assert!(legacy.0.iter().all(|(_, d)| d.get("head_cut_frames").is_none()), "no aligned key in FIFO rows");
+        assert_eq!(legacy, fifo);
+    }
+
+    #[test]
+    #[should_panic(expected = "offers through place()")]
+    fn the_aligned_engine_refuses_the_fifo_offer() {
+        let (mut engine, _pcm) = started(aligned_cfg(40_000), SimPcmConfig::new(PERIOD, BUFFER), T0);
+        let _ = engine.offer(submission(0, T0), Some(&payload(89, 1)));
+    }
+
+    #[test]
+    #[should_panic(expected = "healthy snapshot")]
+    fn an_aligned_placement_without_a_healthy_snapshot_is_a_programming_error() {
+        let mut pcm = SimPcm::new(SimPcmConfig::new(PERIOD, BUFFER));
+        let mut engine = HapticPlacement::new(aligned_cfg(40_000), pcm.params()).unwrap();
+        let mut clock = || T0;
+        engine.prefill(&mut pcm, &mut clock).unwrap();
+        let _ = place(&mut engine, submission(0, T0), 89);
+    }
+
+    /// Case (i) gap: n* = 0 + round(40,000 µs × 48 kHz) = 1,920 >= planned_end
+    /// 512 -> 1,408 frames of planned silence, then the tick; floor = t0 +
+    /// round(512 × 1e6 / 48,000) − t0 = 10,667 µs. A second tick released
+    /// 20 ms later: n* = 2,880 >= 2,454 -> 426 frames of silence. Both are
+    /// output at exactly t0 + 40 ms and t0 + 60 ms.
+    #[test]
+    fn aligned_case_i_gap_inserts_planned_silence_up_to_n_star() {
+        let (mut engine, mut pcm) = started_recording(aligned_cfg(40_000), SimPcmConfig::new(PERIOD, BUFFER));
+        let first = place(&mut engine, released(0, T0, T0), 89);
+        assert_eq!(first.admission, AlignedAdmission::Placed);
+        assert!(first.trims.is_empty() && first.occluded.is_empty());
+        let r = first.placement.unwrap();
+        assert_eq!(
+            (r.case, r.status_htstamp_us, r.hw_pos, r.appl_pos, r.planned_end_before, r.n_star),
+            (PlacementCase::Gap, T0, 0, 512, 512, 1_920)
+        );
+        assert_eq!((r.floor_us, r.head_cut_frames, r.silence_inserted_frames, r.planned_end_after, r.rejected), (10_667, 0, 1_408, 2_454, None));
+        let second = place(&mut engine, released(1, T0 + 20_000, T0 + 20_000), 89).placement.unwrap();
+        assert_eq!((second.case, second.n_star, second.silence_inserted_frames, second.planned_end_after), (PlacementCase::Gap, 2_880, 426, 3_414));
+        assert_eq!(second.floor_us, 10_667 - 20_000, "floor is signed");
+        assert_eq!(engine.planned_end(), Some(3_414));
+        assert_eq!(engine.waiting_silence_frames(), Some(1_408 + 426));
+        let mut t = T0;
+        let outputs = drain_until_idle(&mut engine, &mut pcm, &mut t);
+        let got: Vec<(u32, u64, u64, u64, Option<u64>)> = outputs
+            .iter()
+            .map(|p| (p.submission.identity.seq, p.detail.n_k, p.detail.frames, p.t_output_us, p.detail.head_cut_frames))
+            .collect();
+        assert_eq!(got, vec![(0, 1_920, 534, T0 + 40_000, Some(0)), (1, 2_880, 534, T0 + 60_000, Some(0))]);
+        for p in &outputs {
+            assert_output_content(&pcm, p, 89);
+            assert!(p.detail.hw_pos > p.detail.n_k as i64);
+        }
+        assert!(pcm.frames[512..1_920].iter().all(|f| *f == 0), "the gap is silence");
+        let a = engine.stats().aligned.unwrap();
+        assert_eq!((a.frames_silence_inserted, a.ticks_head_cut, a.ticks_occluded, a.frames_tail_cut), (1_834, 0, 0, 0));
+        assert_eq!(a.max_waiting_silence_frames, 1_834);
+        assert_eq!(engine.stats().last_tick_end_frame, Some(3_414));
+    }
+
+    /// Case (i) over Q: Q = 2,000; the first tick's candidate waits 1,942
+    /// frames (accepted); a tick released 12 ms later has n* = 2,496 >= 2,454
+    /// and would wait 2,518 > Q: rejected with the plan and planned_end
+    /// unchanged; its placement row is still made (floor −1,333 µs).
+    #[test]
+    fn aligned_case_i_over_q_is_refused_and_leaves_the_plan_unchanged() {
+        let c = PlacementConfig { queue_limit_frames: 2_000, ..aligned_cfg(40_000) };
+        let (mut engine, _pcm) = started(c, SimPcmConfig::new(PERIOD, BUFFER), T0);
+        assert_eq!(place(&mut engine, released(0, T0, T0), 89).admission, AlignedAdmission::Placed);
+        let before = (engine.planned_end(), engine.waiting_silence_frames(), engine.pending_frames());
+        assert_eq!(before, (Some(2_454), Some(1_408), 534));
+        let refused = place(&mut engine, released(1, T0 + 12_000, T0 + 12_000), 89);
+        assert_eq!(refused.admission, AlignedAdmission::PlacementQueueFull);
+        let r = refused.placement.unwrap();
+        assert_eq!((r.case, r.n_star, r.planned_end_before, r.planned_end_after), (PlacementCase::Gap, 2_496, 2_454, 2_454));
+        assert_eq!((r.silence_inserted_frames, r.head_cut_frames, r.floor_us), (0, 0, -1_333));
+        assert_eq!(r.rejected, Some(DISCARD_PLACEMENT_QUEUE_FULL));
+        assert_eq!((engine.planned_end(), engine.waiting_silence_frames(), engine.pending_frames()), before);
+        let a = engine.stats().aligned.unwrap();
+        assert_eq!((a.ticks_placement_queue_full, a.frames_silence_inserted), (1, 1_408));
+        assert_eq!(engine.stats().ticks_admitted, 1);
+    }
+
+    /// Case (ii) on WAITING ticks: tick 0 at 1,920 (after 1,408 silence);
+    /// tick 1 released 10 ms before t0 -> n* = 1,440 in [512, 2,454): the
+    /// silence from 1,440 and the whole tick 0 are removed (trim: tail 534,
+    /// start_removed -> occluded), tick 1 goes at 1,440. Tick 2 released
+    /// 4 ms before t0 -> n* = 1,728 cuts tick 1's tail at 1,728 (trim: tail
+    /// 246, start kept, frames 534 -> 288).
+    #[test]
+    fn aligned_case_ii_trims_waiting_ticks_and_occludes_a_removed_start() {
+        let (mut engine, mut pcm) = started_recording(aligned_cfg(40_000), SimPcmConfig::new(PERIOD, BUFFER));
+        let s0 = released(0, T0, T0);
+        let s1 = released(1, T0 - 10_000, T0);
+        let s2 = released(2, T0 - 4_000, T0);
+        assert_eq!(place(&mut engine, s0, 89).admission, AlignedAdmission::Placed);
+        let one = place(&mut engine, s1, 89);
+        assert_eq!(one.admission, AlignedAdmission::Placed);
+        let r = one.placement.unwrap();
+        assert_eq!((r.case, r.n_star, r.planned_end_before, r.planned_end_after, r.floor_us), (PlacementCase::QueueOverlap, 1_440, 2_454, 1_974, 20_667));
+        assert_eq!(one.trims, vec![TrimRecord { submission: s0, by: s1, tail_cut_frames: 534, start_removed: true }]);
+        assert_eq!(one.occluded, vec![s0]);
+        assert_eq!(engine.waiting_silence_frames(), Some(1_440 - 512), "the silence after n* went too");
+        let two = place(&mut engine, s2, 89);
+        let r = two.placement.unwrap();
+        assert_eq!((r.case, r.n_star, r.planned_end_before, r.planned_end_after), (PlacementCase::QueueOverlap, 1_728, 1_974, 2_262));
+        assert_eq!(two.trims, vec![TrimRecord { submission: s1, by: s2, tail_cut_frames: 246, start_removed: false }]);
+        assert!(two.occluded.is_empty());
+        let mut t = T0;
+        let outputs = drain_until_idle(&mut engine, &mut pcm, &mut t);
+        let got: Vec<(u32, u64, u64, u64)> =
+            outputs.iter().map(|p| (p.submission.identity.seq, p.detail.n_k, p.detail.frames, p.t_output_us)).collect();
+        assert_eq!(got, vec![(1, 1_440, 288, T0 + 30_000), (2, 1_728, 534, T0 + 36_000)]);
+        for p in &outputs {
+            assert_output_content(&pcm, p, 89);
+        }
+        assert!(pcm.frames[512..1_440].iter().all(|f| *f == 0));
+        let a = engine.stats().aligned.unwrap();
+        assert_eq!((a.ticks_occluded, a.frames_tail_cut, a.frames_silence_inserted), (1, 534 + 246, 1_408));
+        assert_eq!(engine.stats().ticks_output, 2);
+        assert_eq!(engine.stats().last_tick_end_frame, Some(2_262));
+    }
+
+    /// Case (ii) on a PARTLY WRITTEN tick: c = 10,667 µs puts tick 0 at
+    /// n* = round(10,667 × 0.048) = 512 = appl_pos (gap, no silence). At
+    /// t0 + 1 ms (hw_pos 48, fill estimate 464 < W) one 256-frame chunk of it
+    /// is written: frames 512..768, it enters in_flight with n_k 512. Tick 1
+    /// released at t0 + 8,083 µs: n* = 48 + round(17,750 × 0.048) = 900 in
+    /// [768, 1,046): its tail 900..1,046 (146 frames) is cut, start kept;
+    /// frames 534 -> 388, tick_extent end and last_tick_end_frame 1,046 -> 900.
+    /// Its output row carries the shrunk frames.
+    #[test]
+    fn aligned_case_ii_cuts_the_tail_of_a_partly_written_tick() {
+        let (mut engine, mut pcm) = started_recording(aligned_cfg(10_667), SimPcmConfig::new(PERIOD, BUFFER));
+        let s0 = released(0, T0, T0);
+        let r = place(&mut engine, s0, 89).placement.unwrap();
+        assert_eq!((r.case, r.n_star, r.silence_inserted_frames, r.planned_end_after), (PlacementCase::Gap, 512, 0, 1_046));
+        assert!(step_dyn(&mut engine, &mut pcm, T0 + 1_000).unwrap().is_empty());
+        assert_eq!(engine.written_frames(), 768);
+        let id = *engine.aligned.as_ref().unwrap().in_flight.front().expect("tick 0 entered in_flight at its first frame");
+        assert_eq!(engine.aligned.as_ref().unwrap().ticks[&id].written, 256);
+        assert_eq!(engine.stats().last_tick_end_frame, Some(1_046));
+        assert_eq!(engine.tick_extent, Some((512, 1_046)));
+        let s1 = released(1, T0 + 8_083, T0 + 8_083);
+        let one = place(&mut engine, s1, 89);
+        let r = one.placement.unwrap();
+        assert_eq!((r.case, r.hw_pos, r.status_htstamp_us, r.appl_pos, r.n_star), (PlacementCase::QueueOverlap, 48, T0 + 1_000, 768, 900));
+        assert_eq!(r.floor_us, 1_000 + 15_000 - 8_083);
+        assert_eq!(one.trims, vec![TrimRecord { submission: s0, by: s1, tail_cut_frames: 146, start_removed: false }]);
+        assert!(one.occluded.is_empty(), "its start was written: never occluded");
+        assert_eq!(engine.tick_extent, Some((512, 900)));
+        assert_eq!(engine.stats().last_tick_end_frame, Some(900));
+        assert_eq!(engine.planned_end(), Some(1_434));
+        let mut t = T0 + 1_000;
+        let outputs = drain_until_idle(&mut engine, &mut pcm, &mut t);
+        let got: Vec<(u32, u64, u64)> = outputs.iter().map(|p| (p.submission.identity.seq, p.detail.n_k, p.detail.frames)).collect();
+        assert_eq!(got, vec![(0, 512, 388), (1, 900, 534)]);
+        for p in &outputs {
+            assert_output_content(&pcm, p, 89);
+        }
+        assert_eq!(outputs[0].detail.t_write_us, T0 + 1_000);
+        assert!(outputs[0].t_output_us.abs_diff(T0 + 10_667) <= 1, "{}", outputs[0].t_output_us);
+        assert_eq!(engine.stats().ticks_written, 2);
+        assert_eq!(engine.stats().aligned.unwrap().frames_tail_cut, 146);
+    }
+
+    /// Case (iii): at t0 + 1 ms one period of silence was written (w 768,
+    /// hw_pos 48). c = 12 ms: n* = 48 + 576 = 624 < 768 < 1,158 -> no rewind,
+    /// head 768 − 624 = 144 frames cut, the remaining 390 go at 768 = n_k;
+    /// t_output = t0 + 768 / 48 kHz = t0 + 16 ms; floor = 15,000 µs > c.
+    #[test]
+    fn aligned_case_iii_cuts_the_head_and_records_n_k_at_appl_pos() {
+        let (mut engine, mut pcm) = started_recording(aligned_cfg(12_000), SimPcmConfig::new(PERIOD, BUFFER));
+        assert!(step_dyn(&mut engine, &mut pcm, T0 + 1_000).unwrap().is_empty());
+        assert_eq!(engine.written_frames(), 768, "an empty plan writes one period of silence");
+        let three = place(&mut engine, released(0, T0 + 1_000, T0 + 1_000), 89);
+        assert_eq!(three.admission, AlignedAdmission::Placed);
+        let r = three.placement.unwrap();
+        assert_eq!((r.case, r.n_star, r.appl_pos, r.head_cut_frames, r.planned_end_after), (PlacementCase::DeviceOverlap, 624, 768, 144, 1_158));
+        assert_eq!(r.floor_us, 15_000);
+        let mut t = T0 + 1_000;
+        let outputs = drain_until_idle(&mut engine, &mut pcm, &mut t);
+        assert_eq!(outputs.len(), 1);
+        let p = &outputs[0];
+        assert_eq!((p.detail.n_k, p.detail.frames, p.detail.samples_8k, p.detail.head_cut_frames), (768, 390, 89, Some(144)));
+        assert_eq!(p.t_output_us, T0 + 16_000);
+        assert_eq!(p.t_output_us, output_time_us(p.detail.htstamp_us, p.detail.n_k, p.detail.hw_pos).unwrap(), "the unchanged formula");
+        assert_eq!(p.detail.to_json()["head_cut_frames"], 144);
+        assert_output_content(&pcm, p, 89);
+        let a = engine.stats().aligned.unwrap();
+        assert_eq!((a.ticks_head_cut, a.frames_head_cut), (1, 144));
+        assert_eq!(engine.stats().last_tick_end_frame, Some(1_158));
+    }
+
+    /// Case (iv): released 20 ms before t0, seen at t0 + 1 ms (w 768): n* =
+    /// 48 + round(−9,000 × 0.048) = −384 (signed), n* + 534 = 150 <= 768.
+    #[test]
+    fn aligned_case_iv_discards_a_tick_wholly_before_appl_pos() {
+        let (mut engine, mut pcm) = started(aligned_cfg(12_000), SimPcmConfig::new(PERIOD, BUFFER), T0);
+        step(&mut engine, &mut pcm, T0 + 1_000).unwrap();
+        let late = place(&mut engine, released(0, T0 - 20_000, T0 + 1_000), 89);
+        assert_eq!(late.admission, AlignedAdmission::TooLate);
+        let r = late.placement.unwrap();
+        assert_eq!((r.case, r.n_star, r.appl_pos, r.planned_end_before, r.planned_end_after), (PlacementCase::TooLate, -384, 768, 768, 768));
+        assert_eq!((r.floor_us, r.head_cut_frames, r.silence_inserted_frames, r.rejected), (36_000, 0, 0, None));
+        assert_eq!(engine.stats().aligned.unwrap().ticks_too_late, 1);
+        assert!(engine.idle(), "nothing was placed");
+        // An unplayable payload: no placement row at all.
+        let bad = engine.place(released(1, T0, T0 + 1_000), None);
+        assert_eq!(bad, AlignedOffered { placement: None, trims: Vec::new(), occluded: Vec::new(), admission: AlignedAdmission::PayloadInvalid });
+        assert_eq!(engine.stats().ticks_payload_invalid, 1);
+    }
+
+    /// Write-ahead: a write happens only while fill_est < W (and avail >=
+    /// period), and after every fill fill_est < W + period.
+    #[test]
+    fn aligned_write_ahead_keeps_the_fill_estimate_below_w_plus_a_period() {
+        let (mut engine, mut pcm) = started(aligned_cfg(40_000), SimPcmConfig::new(PERIOD, BUFFER), T0);
+        let mut t = T0;
+        let mut writes = 0;
+        for k in 0..400u32 {
+            let due = T0 + k as u64 * 11_111;
+            while t < due {
+                t += 1_000;
+                let s = pcm.status(t).unwrap();
+                engine.observe(&s, t, t).unwrap();
+                let before = engine.fill_estimate().unwrap();
+                let w0 = engine.written_frames();
+                let mut clock = || t;
+                engine.fill(&mut pcm, s.avail, &mut clock).unwrap();
+                let after = engine.fill_estimate().unwrap();
+                if before >= W as i64 {
+                    assert_eq!(engine.written_frames(), w0, "no write while fill_est >= W");
+                } else {
+                    assert!(engine.written_frames() > w0, "fill_est {before} < W: a chunk is written");
+                    writes += 1;
+                }
+                assert!(after < (W + PERIOD) as i64, "fill_est {after} after a fill");
+                assert!(after >= W as i64 || engine.written_frames() == w0);
+                assert_eq!((engine.written_frames() - w0) % PERIOD, 0, "whole chunks");
+            }
+            let samples = if k % 9 == 0 { 88 } else { 89 };
+            let r = place(&mut engine, released(k, t, t), samples);
+            assert_ne!(r.admission, AlignedAdmission::PlacementQueueFull);
+        }
+        assert!(writes > 100);
+        let mut t2 = t;
+        let outputs = drain_until_idle(&mut engine, &mut pcm, &mut t2);
+        assert!(!outputs.is_empty());
+    }
+
+    /// A partly written tick sits in in_flight AND the plan: abandoned once.
+    #[test]
+    fn aligned_abandon_ends_a_partly_written_tick_once() {
+        let (mut engine, mut pcm) = started(aligned_cfg(10_667), SimPcmConfig::new(PERIOD, BUFFER), T0);
+        let _ = place(&mut engine, released(0, T0, T0), 89);
+        let _ = place(&mut engine, released(1, T0 + 11_111, T0), 89);
+        step(&mut engine, &mut pcm, T0 + 1_000).unwrap();
+        assert_eq!(engine.aligned.as_ref().unwrap().in_flight.len(), 1);
+        let abandoned: Vec<u32> = engine.abandon().iter().map(|s| s.identity.seq).collect();
+        assert_eq!(abandoned, vec![0, 1]);
+        assert!(engine.unwritten_tick_frames() == 0 && engine.planned_end() == Some(engine.written_frames()));
+    }
+
+    /// The seeded randomized check of design §5-5 over many ticks with
+    /// jitter, out-of-order bursts and late ticks (all four cases, trims and
+    /// occlusions), for two Q (the second small enough to refuse some).
+    #[test]
+    fn aligned_randomized_run_keeps_the_section_5_5_invariants() {
+        for (seed, q) in [(0x5eed_0001u64, 48_000u64), (0x5eed_0002, 1_900)] {
+            let c = 40_000i64;
+            let config = PlacementConfig { queue_limit_frames: q, ..aligned_cfg(c) };
+            let (mut engine, mut pcm) = started_recording(config, SimPcmConfig::new(PERIOD, BUFFER));
+            let mut rng = seed;
+            let mut next = move |n: u64| {
+                rng ^= rng >> 12;
+                rng ^= rng << 25;
+                rng ^= rng >> 27;
+                rng.wrapping_mul(0x2545_F491_4F6C_DD1D) % n
+            };
+            // (arrival, release, seq): mostly prompt, some bursts delayed
+            // together (reordering), some very late.
+            let n = 1_500u32;
+            let mut arrivals: Vec<(u64, u64, u32)> = Vec::new();
+            let mut k = 0u32;
+            while k < n {
+                let release = |k: u32, j: u64| T0 + 20_000 + k as u64 * 11_111 + j;
+                match next(20) {
+                    0 => {
+                        // A burst: up to 6 ticks arrive together, late.
+                        let len = 1 + next(6) as u32;
+                        let last = (k + len).min(n);
+                        let at = release(last - 1, 0) + 5_000 + next(40_000);
+                        for j in k..last {
+                            arrivals.push((at - next(300), release(j, next(300)), j));
+                        }
+                        k = last;
+                    }
+                    1 => {
+                        let r = release(k, next(300));
+                        arrivals.push((r + 30_000 + next(60_000), r, k));
+                        k += 1;
+                    }
+                    _ => {
+                        let r = release(k, next(300));
+                        arrivals.push((r + next(2_000), r, k));
+                        k += 1;
+                    }
+                }
+            }
+            arrivals.sort_by_key(|a| a.0);
+            let samples_of = |k: u32| {
+                let (a, b) = crate::pcm_sample_bounds(k as u64, 8_000, 90);
+                (b - a) as usize
+            };
+            let mut terminal: std::collections::HashMap<u32, &'static str> = std::collections::HashMap::new();
+            let end = |seq: u32, what: &'static str, terminal: &mut std::collections::HashMap<u32, &'static str>| {
+                assert!(terminal.insert(seq, what).is_none(), "seq {seq}: a second terminal ({what})");
+            };
+            let (mut records, mut trims, mut outputs) = (Vec::new(), Vec::new(), Vec::new());
+            let mut t = T0;
+            let mut last_w = engine.written_frames();
+            let mut i = 0;
+            let mut invalid = 0;
+            while i < arrivals.len() || !engine.idle() {
+                t += 1_000;
+                assert!(t < T0 + 60_000_000, "the run ends");
+                let s = pcm.status(t).unwrap();
+                for p in engine.observe(&s, t, t).unwrap() {
+                    end(p.submission.identity.seq, "output", &mut terminal);
+                    outputs.push(p);
+                }
+                while i < arrivals.len() && arrivals[i].0 <= t {
+                    let (_, release, seq) = arrivals[i];
+                    i += 1;
+                    let sub = released(seq, release, t.max(release));
+                    if seq % 211 == 7 {
+                        invalid += 1;
+                        let bad = engine.place(sub, None);
+                        assert_eq!(bad.admission, AlignedAdmission::PayloadInvalid);
+                        assert!(bad.placement.is_none(), "no placement row for payload_invalid");
+                        end(seq, "payload_invalid", &mut terminal);
+                        continue;
+                    }
+                    let offered = place(&mut engine, sub, samples_of(seq));
+                    let r = offered.placement.clone().expect("a placement row per playable submission");
+                    // Recompute n* and floor independently of the engine.
+                    let rate = 48_000i128;
+                    let n_star = r.hw_pos as i128
+                        + div_round_half_away((release as i128 + c as i128 - r.status_htstamp_us as i128) * rate, 1_000_000);
+                    let floor = r.status_htstamp_us as i128
+                        + div_round_half_away((r.appl_pos as i128 - r.hw_pos as i128) * 1_000_000, rate)
+                        - release as i128;
+                    assert_eq!((r.n_star as i128, r.floor_us as i128), (n_star, floor));
+                    assert!(r.planned_end_after >= r.appl_pos && r.planned_end_before >= r.appl_pos);
+                    assert_eq!(r.appl_pos, engine.written_frames());
+                    assert!(engine.waiting_silence_frames().unwrap() <= q, "waiting silence <= Q");
+                    let l = 6 * samples_of(seq) as i64;
+                    let want_case = if r.n_star >= r.planned_end_before as i64 {
+                        PlacementCase::Gap
+                    } else if r.n_star >= r.appl_pos as i64 {
+                        PlacementCase::QueueOverlap
+                    } else if r.n_star + l > r.appl_pos as i64 {
+                        PlacementCase::DeviceOverlap
+                    } else {
+                        PlacementCase::TooLate
+                    };
+                    assert_eq!(r.case, want_case);
+                    let occluded: Vec<L2Submission> = offered.trims.iter().filter(|t| t.start_removed).map(|t| t.submission).collect();
+                    assert_eq!(offered.occluded, occluded);
+                    for o in &offered.occluded {
+                        end(o.identity.seq, "occluded", &mut terminal);
+                    }
+                    match offered.admission {
+                        AlignedAdmission::Placed => {}
+                        AlignedAdmission::TooLate => end(seq, "too_late", &mut terminal),
+                        AlignedAdmission::PlacementQueueFull => end(seq, "placement_queue_full", &mut terminal),
+                        AlignedAdmission::PayloadInvalid => panic!("playable"),
+                    }
+                    trims.extend(offered.trims);
+                    records.push(r);
+                }
+                let mut clock = || t;
+                engine.fill(&mut pcm, s.avail, &mut clock).unwrap();
+                assert!(engine.written_frames() >= last_w, "written frames are monotonic");
+                last_w = engine.written_frames();
+                assert!(engine.fill_estimate().unwrap() < (W + PERIOD) as i64);
+                assert!(engine.planned_end().unwrap() >= engine.written_frames());
+            }
+            // Terminals = submissions, exactly one each.
+            assert_eq!(terminal.len(), n as usize);
+            let count = |what: &str| terminal.values().filter(|v| **v == what).count() as u64;
+            let a = engine.stats().aligned.unwrap();
+            let case_count = |c: PlacementCase| records.iter().filter(|r| r.case == c).count() as u64;
+            eprintln!(
+                "seed {seed:#x} Q {q}: outputs {} occluded {} too_late {} queue_full {} gap {} queue_overlap {} device_overlap {} trims {}",
+                count("output"), count("occluded"), count("too_late"), count("placement_queue_full"),
+                case_count(PlacementCase::Gap), case_count(PlacementCase::QueueOverlap), case_count(PlacementCase::DeviceOverlap), trims.len()
+            );
+            // Every case and kind of terminal is exercised.
+            for c in [PlacementCase::Gap, PlacementCase::QueueOverlap, PlacementCase::DeviceOverlap, PlacementCase::TooLate] {
+                assert!(case_count(c) > 0, "{c:?} exercised");
+            }
+            assert!(count("occluded") > 0 && trims.iter().any(|t| !t.start_removed));
+            if q < 48_000 {
+                assert!(count("placement_queue_full") > 0);
+            }
+            // Counters = row counts.
+            assert_eq!(records.len() as u64 + invalid, n as u64, "one placement row per playable submission");
+            assert_eq!(a.ticks_occluded, count("occluded"));
+            assert_eq!(a.ticks_occluded, trims.iter().filter(|t| t.start_removed).count() as u64, "occluded = start_removed trims");
+            assert_eq!(a.ticks_too_late, count("too_late"));
+            assert_eq!(a.ticks_placement_queue_full, count("placement_queue_full"));
+            assert_eq!(a.ticks_placement_queue_full, records.iter().filter(|r| r.rejected.is_some()).count() as u64);
+            assert_eq!(a.ticks_head_cut, case_count(PlacementCase::DeviceOverlap));
+            assert_eq!(a.frames_head_cut, records.iter().map(|r| r.head_cut_frames).sum::<u64>());
+            assert_eq!(a.frames_silence_inserted, records.iter().map(|r| r.silence_inserted_frames).sum::<u64>());
+            assert_eq!(a.frames_tail_cut, trims.iter().map(|t| t.tail_cut_frames).sum::<u64>());
+            assert!(a.max_waiting_silence_frames <= q);
+            let stats = engine.stats();
+            assert_eq!(stats.ticks_output, count("output"));
+            assert_eq!(stats.ticks_payload_invalid, invalid);
+            assert_eq!(stats.ticks_admitted, records.iter().filter(|r| r.rejected.is_none() && r.case != PlacementCase::TooLate).count() as u64);
+            assert_eq!(stats.frames_written, stats.tick_frames_written + stats.silence_frames_written);
+            assert_eq!(stats.frames_written, pcm.frames.len() as u64);
+            // Each frame written once: the output extents are disjoint, hold
+            // exactly their tick's frames, and every other frame is silence.
+            let mut covered = vec![false; pcm.frames.len()];
+            for p in &outputs {
+                let d = &p.detail;
+                assert_output_content(&pcm, p, samples_of(p.submission.identity.seq));
+                assert_eq!(d.frames + d.head_cut_frames.unwrap() <= 6 * d.samples_8k, true);
+                for f in d.n_k..d.n_k + d.frames {
+                    assert!(!covered[f as usize], "frame {f} belongs to two outputs");
+                    covered[f as usize] = true;
+                }
+                assert_eq!(p.t_output_us, output_time_us(d.htstamp_us, d.n_k, d.hw_pos).unwrap());
+                assert!(d.hw_pos > d.n_k as i64);
+            }
+            assert_eq!(covered.iter().filter(|c| **c).count() as u64, stats.tick_frames_written, "every tick frame is in one output");
+            assert!(pcm.frames.iter().zip(&covered).all(|(f, c)| *c || *f == 0), "no stray tick frame");
+            assert!(outputs.windows(2).all(|w| w[0].detail.n_k + w[0].detail.frames <= w[1].detail.n_k), "outputs in frame order");
+        }
     }
 }

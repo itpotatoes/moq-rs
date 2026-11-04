@@ -45,7 +45,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 
-use skew_moq::l2_haptic::PlacementConfig;
+use skew_moq::l2_haptic::{PlacementConfig, PlacementMode};
 use skew_moq::l2_output::{
     AlsaBackend, AlsaSinkConfig, L2Config, L2Identity, L2Modality, L2Output, L2SinkKind, L2Sinks,
     ALSA_DEFAULT_BUFFER_FRAMES, ALSA_DEFAULT_DEVICE, ALSA_DEFAULT_PERIOD_FRAMES, ALSA_DEFAULT_PREFILL_FRAMES,
@@ -256,6 +256,7 @@ fn run(args: &Args) -> Result<bool> {
                 queue_limit_frames: args.queue_frames,
                 // The probe measures the unbounded sink (mode A is off).
                 latency_bound_frames: None,
+                mode: PlacementMode::None,
             },
             status_interval_us: args.status_interval_us,
             ready_timeout_us: ALSA_READY_TIMEOUT_US,
