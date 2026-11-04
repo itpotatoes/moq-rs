@@ -17,11 +17,19 @@
 //! like the Exp 2/3 recorder's L2 link (`exp2_recorder.rs`): identity
 //! (`tier = HAPTIC_TIER_FULL`, `route = None`), `t_release_us`, payload.
 //!
-//! Renderers (design §3-3; R2 is a later task and is refused here):
+//! Renderers (design §3-3):
 //! * `R0` — the Exp 2 FIFO sink, no latency bound (`latency_bound_frames`
 //!   null). Purpose `V2`.
 //! * `R1` — sink mode A with `B` = 1,068 frames (the Exp 3 value,
 //!   `2 × REGULAR_TICK_MAX_FRAMES`). Purpose `V3`.
+//! * `R2` — the time-aligned placement (design §5, `PlacementMode::Aligned`,
+//!   L2 `event-pair-l2-v1.8`) with `--align-offset-us <c>` (required) and
+//!   `--write-ahead-frames <W>` (default 512, design D11). Purposes `V4a`
+//!   (c₀ calibration) and `V4b` (fixed c). R2 reads each submission's
+//!   `t_release_us`, which the replay passes as `replay_t0_us +
+//!   t_release_rel_us` (the `scheduled_release_us` of the sidecar). Both
+//!   flags are refused with R0 / R1, which stay the legacy engine (v1.7,
+//!   byte-identical rows).
 //!
 //! Sink parameters are the library defaults (`ALSA_DEFAULT_*`: period 256,
 //! buffer 2,048, target fill 512, prefill 512, queue limit 48,000, status
@@ -56,7 +64,8 @@
 //! t_submit_rel_us`: the main thread sleeps with
 //! `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME)` until then (never early),
 //! reads `t_call_us`, and calls `submit_payload` with `t_release_us =
-//! replay_t0_us + t_release_rel_us` (carried, unused by R0/R1); the engine
+//! replay_t0_us + t_release_rel_us` (carried, unused by R0/R1, the alignment
+//! target of R2); the engine
 //! reads its own `t_submit_us` inside that call. Submit lateness (stage-1 V1)
 //! = ledger `t_submit_us − due`; `t_call_us − due` is kept too.
 //!
@@ -88,8 +97,9 @@
 //! error.
 //!
 //! Known limits (reported, not hidden): the replay ledger's L2 meta is the
-//! engine's current tag (v1.7 rows; the v1.8 `alsa.placement` fields are
-//! given in `replay_meta` instead); the trace has no tier / route, so rows
+//! engine's tag for the renderer (R0/R1: v1.7 rows, the `placement` fields
+//! are given in `replay_meta` only; R2: v1.8 with `alsa.placement` aligned,
+//! placement and trim rows); the trace has no tier / route, so rows
 //! carry `tier = 0` and no route; the source's pre-submit discards cannot
 //! become engine rows and are carried in `replay_meta`; the simulated PCM
 //! runs on the real clock (a replay takes the trace's real duration).
@@ -109,12 +119,14 @@ use clap::{ArgGroup, Parser, ValueEnum};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
-use skew_moq::l2_haptic::{PlacementConfig, SimFault, SimPcmConfig, PCM_RATE_HZ, REGULAR_TICK_MAX_FRAMES, UPSAMPLE_FACTOR};
+use skew_moq::l2_haptic::{
+    PlacementConfig, PlacementMode, SimFault, SimPcmConfig, PCM_RATE_HZ, REGULAR_TICK_MAX_FRAMES, UPSAMPLE_FACTOR,
+};
 use skew_moq::l2_output::{
     AlsaBackend, AlsaSinkConfig, L2Config, L2Identity, L2Modality, L2Output, L2SinkKind, L2Sinks, L2SubmitOutcome,
     ALSA_DEFAULT_BUFFER_FRAMES, ALSA_DEFAULT_PERIOD_FRAMES, ALSA_DEFAULT_PREFILL_FRAMES, ALSA_DEFAULT_QUEUE_FRAMES,
     ALSA_DEFAULT_STATUS_INTERVAL_US, ALSA_DEFAULT_TARGET_FILL_FRAMES, ALSA_READY_TIMEOUT_US, ALSA_RELEASE_TIMEOUT_US,
-    L2_SCHEMA,
+    DISCARD_OCCLUDED, L2_SCHEMA,
 };
 use skew_moq::{
     load_haptic_pcm, now_us, pcm_sample_bounds, pcm_tick_payload, timestamp_us, HAPTIC_RATE_HZ_V5, HAPTIC_TIER_FULL,
@@ -137,6 +149,8 @@ const N_HAPTIC: u64 = 3_600;
 /// freeze `l2_alsa_sink`; receiver `--l2-alsa-latency-bound-frames 1068`).
 const R1_LATENCY_BOUND_FRAMES: u64 = 1_068;
 const _: () = assert!(R1_LATENCY_BOUND_FRAMES == 2 * REGULAR_TICK_MAX_FRAMES);
+/// R2's registered write-ahead W (design §5-3 D11: W = F = 512 frames).
+const R2_DEFAULT_WRITE_AHEAD_FRAMES: u64 = 512;
 /// The receiver's output-stage capacities (`moq_receiver.rs`
 /// `L2_DEFAULT_QUEUE_CAPACITY`, `L2_ROW_CAPACITY`, `L2_MAX_TRACKED_OBJECTS`;
 /// bin-private there, recorded in every Exp 2/3 L2 meta).
@@ -520,14 +534,28 @@ fn regenerate_payloads(ticks: &[TraceTick], pcm: &[u8]) -> Result<(Vec<Bytes>, S
 
 // ---------------------------------------------------------------- request
 
+/// `--renderer` (the R2 parameters come from their own flags).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum Renderer {
+enum RendererArg {
     /// The Exp 2 FIFO sink (no latency bound).
     #[value(name = "R0")]
     R0,
     /// Sink mode A, B = 1,068 frames (Exp 3).
     #[value(name = "R1")]
     R1,
+    /// The time-aligned placement (design §5): needs --align-offset-us.
+    #[value(name = "R2")]
+    R2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Renderer {
+    /// The Exp 2 FIFO sink (no latency bound).
+    R0,
+    /// Sink mode A, B = 1,068 frames (Exp 3).
+    R1,
+    /// The time-aligned placement: c (µs) and W (frames).
+    R2 { align_offset_us: i64, write_ahead_frames: u64 },
 }
 
 impl Renderer {
@@ -535,14 +563,27 @@ impl Renderer {
         match self {
             Self::R0 => "R0",
             Self::R1 => "R1",
+            Self::R2 { .. } => "R2",
         }
     }
 
     fn latency_bound_frames(self) -> Option<u64> {
         match self {
-            Self::R0 => None,
+            Self::R0 | Self::R2 { .. } => None,
             Self::R1 => Some(R1_LATENCY_BOUND_FRAMES),
         }
+    }
+
+    /// R0 / R1: the legacy engine (v1.7); R2: aligned (v1.8).
+    fn placement_mode(self) -> PlacementMode {
+        match self {
+            Self::R0 | Self::R1 => PlacementMode::None,
+            Self::R2 { align_offset_us, write_ahead_frames } => PlacementMode::Aligned { align_offset_us, write_ahead_frames },
+        }
+    }
+
+    fn aligned(self) -> Option<(i64, u64)> {
+        self.placement_mode().aligned()
     }
 }
 
@@ -554,6 +595,12 @@ enum Purpose {
     /// R1 cross-check against live P0-A (design §3-4 V3).
     #[value(name = "V3")]
     V3,
+    /// R2 floor calibration at c₀ (design §3-4 V4a, §5-4).
+    #[value(name = "V4a")]
+    V4a,
+    /// R2 at the fixed c (design §3-4 V4b).
+    #[value(name = "V4b")]
+    V4b,
 }
 
 impl Purpose {
@@ -561,13 +608,17 @@ impl Purpose {
         match self {
             Self::V2 => "V2",
             Self::V3 => "V3",
+            Self::V4a => "V4a",
+            Self::V4b => "V4b",
         }
     }
 
-    fn renderer(self) -> Renderer {
+    /// The renderer this purpose replays with (contract §7).
+    fn renderer_name(self) -> &'static str {
         match self {
-            Self::V2 => Renderer::R0,
-            Self::V3 => Renderer::R1,
+            Self::V2 => "R0",
+            Self::V3 => "R1",
+            Self::V4a | Self::V4b => "R2",
         }
     }
 }
@@ -595,7 +646,7 @@ struct ReplayRequest {
 #[derive(Parser, Debug)]
 #[command(
     name = "l2_haptic_replay",
-    about = "Experiment 4 stage 1 haptic L2 replay (non-evidence) through the existing haptic ALSA sink (R0/R1)"
+    about = "Experiment 4 stage 1 haptic L2 replay (non-evidence) through the haptic ALSA sink (R0/R1 legacy, R2 aligned)"
 )]
 #[command(group(ArgGroup::new("pcm").required(true).args(["device", "sim"])))]
 struct Cli {
@@ -603,10 +654,16 @@ struct Cli {
     #[arg(long)]
     trace: PathBuf,
     #[arg(long, value_enum)]
-    renderer: Renderer,
-    /// Stage-1 purpose: V2 (R0 reproduction) or V3 (R1 cross-check).
+    renderer: RendererArg,
+    /// Stage-1 purpose: V2 (R0 reproduction), V3 (R1 cross-check), V4a / V4b (R2).
     #[arg(long, value_enum)]
     purpose: Purpose,
+    /// R2 only, required: the aligned placement offset c (µs, >= 0).
+    #[arg(long)]
+    align_offset_us: Option<i64>,
+    /// R2 only: the write-ahead W (frames; default 512).
+    #[arg(long)]
+    write_ahead_frames: Option<u64>,
     /// Output directory to create (must not exist; its parent must).
     #[arg(long)]
     out: PathBuf,
@@ -645,10 +702,32 @@ impl Cli {
             }
             _ => return Err(refusal("exactly one of --device and --sim")),
         };
+        let renderer = match self.renderer {
+            RendererArg::R0 | RendererArg::R1 => {
+                need!(
+                    self.align_offset_us.is_none() && self.write_ahead_frames.is_none(),
+                    "--align-offset-us and --write-ahead-frames apply only to --renderer R2"
+                );
+                if self.renderer == RendererArg::R0 {
+                    Renderer::R0
+                } else {
+                    Renderer::R1
+                }
+            }
+            RendererArg::R2 => {
+                let Some(align_offset_us) = self.align_offset_us else {
+                    return Err(refusal("--renderer R2 requires --align-offset-us <c in us>"));
+                };
+                Renderer::R2 {
+                    align_offset_us,
+                    write_ahead_frames: self.write_ahead_frames.unwrap_or(R2_DEFAULT_WRITE_AHEAD_FRAMES),
+                }
+            }
+        };
         Ok(ReplayRequest {
             trace: self.trace.clone(),
             wav: self.haptic_wav.clone(),
-            renderer: self.renderer,
+            renderer,
             purpose: self.purpose,
             out: self.out.clone(),
             backend,
@@ -675,12 +754,15 @@ fn replay_run_id(renderer: Renderer, source_run_id: &str) -> String {
 /// Everything that can refuse, before anything is written.
 fn prepare(request: &ReplayRequest) -> Result<Prepared> {
     need!(
-        request.purpose.renderer() == request.renderer,
+        request.purpose.renderer_name() == request.renderer.as_str(),
         "stage-1 purpose {} replays with {}, not {}",
         request.purpose.as_str(),
-        request.purpose.renderer().as_str(),
+        request.purpose.renderer_name(),
         request.renderer.as_str()
     );
+    placement_config(request.renderer)
+        .validate()
+        .map_err(|e| refusal(format!("renderer {} placement: {e}", request.renderer.as_str())))?;
     let trace = load_trace(&request.trace)?;
     let pcm = load_wav(&request.wav, &trace.wav_sha256, trace.wav_total_samples)?;
     let (payloads, payload_concat_sha256) = regenerate_payloads(&trace.ticks, &pcm)?;
@@ -717,6 +799,19 @@ fn binary_info() -> Value {
 
 // ---------------------------------------------------------------- execution
 
+/// The sink placement of a renderer (library defaults; R2 adds its mode).
+fn placement_config(renderer: Renderer) -> PlacementConfig {
+    PlacementConfig {
+        period_frames: ALSA_DEFAULT_PERIOD_FRAMES,
+        buffer_frames: ALSA_DEFAULT_BUFFER_FRAMES,
+        target_fill_frames: ALSA_DEFAULT_TARGET_FILL_FRAMES,
+        prefill_frames: ALSA_DEFAULT_PREFILL_FRAMES,
+        queue_limit_frames: ALSA_DEFAULT_QUEUE_FRAMES,
+        latency_bound_frames: renderer.latency_bound_frames(),
+        mode: renderer.placement_mode(),
+    }
+}
+
 fn l2_config(p: &Prepared) -> L2Config {
     let backend = match &p.request.backend {
         Backend::Device(name) => AlsaBackend::Device { name: name.clone() },
@@ -733,15 +828,7 @@ fn l2_config(p: &Prepared) -> L2Config {
         fake: None,
         alsa: Some(AlsaSinkConfig {
             backend,
-            placement: PlacementConfig {
-                period_frames: ALSA_DEFAULT_PERIOD_FRAMES,
-                buffer_frames: ALSA_DEFAULT_BUFFER_FRAMES,
-                target_fill_frames: ALSA_DEFAULT_TARGET_FILL_FRAMES,
-                prefill_frames: ALSA_DEFAULT_PREFILL_FRAMES,
-                queue_limit_frames: ALSA_DEFAULT_QUEUE_FRAMES,
-                latency_bound_frames: p.request.renderer.latency_bound_frames(),
-                mode: skew_moq::l2_haptic::PlacementMode::None,
-            },
+            placement: placement_config(p.request.renderer),
             status_interval_us: ALSA_DEFAULT_STATUS_INTERVAL_US,
             ready_timeout_us: ALSA_READY_TIMEOUT_US,
             release_timeout_us: ALSA_RELEASE_TIMEOUT_US,
@@ -843,6 +930,11 @@ struct LedgerView {
     haptic_discards_after: BTreeMap<String, u64>,
     haptic_discards_before: BTreeMap<String, u64>,
     pc_rows: u64,
+    /// R2 (v1.8): `(seq, appl_pos, planned_end_after)` of every placement row.
+    haptic_placements: Vec<(u32, u64, u64)>,
+    /// R2 (v1.8): trim rows, and those with `start_removed`.
+    haptic_trims: u64,
+    haptic_trims_start_removed: u64,
 }
 
 impl LedgerView {
@@ -851,7 +943,9 @@ impl LedgerView {
     }
 }
 
-fn read_ledger(bytes: &[u8], run_id: &str) -> Result<LedgerView> {
+/// `l2_schema`: the tag the replay's configuration writes; the aligned rows
+/// (`placement`, `trim`) are accepted only under v1.8.
+fn read_ledger(bytes: &[u8], run_id: &str, l2_schema: &str) -> Result<LedgerView> {
     let text = std::str::from_utf8(bytes).context("L2 ledger is not UTF-8")?;
     anyhow::ensure!(text.ends_with('\n'), "L2 ledger is not newline-terminated");
     let rows: Vec<Value> = text[..text.len() - 1]
@@ -861,7 +955,8 @@ fn read_ledger(bytes: &[u8], run_id: &str) -> Result<LedgerView> {
         .collect::<Result<_>>()?;
     anyhow::ensure!(rows.len() >= 2, "L2 ledger has fewer than 2 rows");
     let meta = &rows[0];
-    anyhow::ensure!(meta["role"] == "meta" && meta["l2_schema"] == L2_SCHEMA, "L2 ledger line 1 is not a {L2_SCHEMA} meta row");
+    anyhow::ensure!(meta["role"] == "meta" && meta["l2_schema"] == l2_schema, "L2 ledger line 1 is not a {l2_schema} meta row");
+    let aligned_rows = l2_schema != L2_SCHEMA;
     let sentinel = rows.last().expect("non-empty").clone();
     anyhow::ensure!(sentinel["role"] == "instrumentation_end", "L2 ledger's last row is not instrumentation_end");
     let mut view = LedgerView { lines: rows.len() as u64, sentinel, ..LedgerView::default() };
@@ -875,6 +970,17 @@ fn read_ledger(bytes: &[u8], run_id: &str) -> Result<LedgerView> {
                 view.haptic_submits.push((seq, t));
             }
             (Some("haptic"), Some("output")) => view.haptic_outputs += 1,
+            (Some("haptic"), Some("placement")) if aligned_rows => {
+                let field = |k: &str| r[k].as_u64().with_context(|| format!("L2 ledger line {}: placement {k}", n + 1));
+                let seq = u32::try_from(field("seq")?).context("placement seq")?;
+                view.haptic_placements.push((seq, field("appl_pos")?, field("planned_end_after")?));
+            }
+            (Some("haptic"), Some("trim")) if aligned_rows => {
+                view.haptic_trims += 1;
+                if r["start_removed"].as_bool().context("trim start_removed")? {
+                    view.haptic_trims_start_removed += 1;
+                }
+            }
             (Some("haptic"), Some("explicit_discard")) => {
                 let reason = r["reason"].as_str().unwrap_or("?").to_string();
                 match r["discard_phase"].as_str() {
@@ -942,6 +1048,7 @@ fn execute(p: &Prepared) -> Result<Report> {
     let config = l2_config(p);
     config.validate()?;
     let sinks = config.sinks;
+    let l2_schema = config.l2_schema();
     // Opens, prefills and starts the stream; the meta row is written before it returns.
     let output = L2Output::start(&l2_path, config)?;
     let mut invalid: Vec<String> = Vec::new();
@@ -988,7 +1095,7 @@ fn execute(p: &Prepared) -> Result<Report> {
     // ---- read back and judge
     let raw = fs::read(&l2_path).with_context(|| format!("read {}", l2_path.display()))?;
     let l2_sha256 = sha256_hex(&raw);
-    let ledger = read_ledger(&raw, &p.run_id)?;
+    let ledger = read_ledger(&raw, &p.run_id, l2_schema)?;
     let t_submit_by_seq: HashMap<u32, u64> = ledger.haptic_submits.iter().copied().collect();
     let order_of: HashMap<u64, u64> = p.trace.ticks.iter().map(|t| (t.k, t.submit_order)).collect();
     let ledger_orders: Vec<u64> = ledger
@@ -1021,6 +1128,33 @@ fn execute(p: &Prepared) -> Result<Report> {
     }
     if ledger.pc_rows > 0 {
         invalid.push(format!("pc_rows: {} PC rows in a haptic-only replay", ledger.pc_rows));
+    }
+    if p.request.renderer.aligned().is_some() {
+        // Contract §2-6 (aligned): one placement row per submission (except
+        // payload_invalid and after a device failure, which is invalid
+        // already), planned_end_after >= appl_pos, occluded = start_removed.
+        let payload_invalid = ledger.haptic_discards_after.get("payload_invalid").copied().unwrap_or(0);
+        let placed: HashSet<u32> = ledger.haptic_placements.iter().map(|(seq, _, _)| *seq).collect();
+        let submitted_seqs: HashSet<u32> = ledger.haptic_submits.iter().map(|(seq, _)| *seq).collect();
+        if ledger.sentinel["lanes"]["haptic"]["device_failure"].is_null()
+            && (ledger.haptic_placements.len() as u64 != submitted - payload_invalid || !placed.is_subset(&submitted_seqs))
+        {
+            invalid.push(format!(
+                "placement_rows_ne_submits: {} placement rows for {submitted} submits ({payload_invalid} payload_invalid)",
+                ledger.haptic_placements.len()
+            ));
+        }
+        let behind = ledger.haptic_placements.iter().filter(|(_, appl, end)| end < appl).count();
+        if behind > 0 {
+            invalid.push(format!("planned_end_before_appl_pos: {behind} placement rows"));
+        }
+        let occluded = ledger.haptic_discards_after.get(DISCARD_OCCLUDED).copied().unwrap_or(0);
+        if occluded != ledger.haptic_trims_start_removed {
+            invalid.push(format!(
+                "occluded_ne_start_removed_trims: {occluded} occluded for {} start_removed trims",
+                ledger.haptic_trims_start_removed
+            ));
+        }
     }
 
     // ---- per-tick submit records (V1)
@@ -1116,6 +1250,16 @@ fn execute(p: &Prepared) -> Result<Report> {
         "finish_start_us": summary.finish_start_us,
         "close_deadline_us": summary.close_deadline_us,
     });
+    let mut outcome = outcome;
+    if p.request.renderer.aligned().is_some() {
+        let map = outcome.as_object_mut().expect("outcome is an object");
+        map.insert("placement_rows".into(), ledger.haptic_placements.len().into());
+        map.insert("trim_rows".into(), ledger.haptic_trims.into());
+        map.insert("start_removed_trims".into(), ledger.haptic_trims_start_removed.into());
+        for key in ["ticks_occluded", "ticks_too_late", "ticks_head_cut", "ticks_placement_queue_full", "frames_tail_cut", "frames_head_cut", "frames_silence_inserted", "max_waiting_silence_frames", "xrun"] {
+            map.insert(key.into(), lane[key].clone());
+        }
+    }
     let v1 = json!({
         "ticks": n_ticks,
         "submitted": submitted,
@@ -1145,6 +1289,17 @@ fn execute(p: &Prepared) -> Result<Report> {
         "row_capacity": L2_ROW_CAPACITY,
         "max_tracked_objects": L2_MAX_TRACKED_OBJECTS,
     });
+    let mut sink = sink;
+    if let Some((align_offset_us, write_ahead_frames)) = renderer.aligned() {
+        let map = sink.as_object_mut().expect("sink is an object");
+        map.insert(
+            "engine".into(),
+            "skew_moq::l2_output::L2Output (pc null, haptic alsa) with the l2_haptic aligned placement (PlacementMode::Aligned, R2)".into(),
+        );
+        map.insert("placement".into(), "aligned".into());
+        map.insert("align_offset_us".into(), align_offset_us.into());
+        map.insert("write_ahead_frames".into(), write_ahead_frames.into());
+    }
     let close = json!({
         "rule": "after the last submit the producer handle is dropped and L2Output::finish runs the 1-D close: deadline = finish_start_us + report_window_us; the lane ends once the last tick's tail played (idle); the source run's close deadline is not in the trace and is not reproduced",
         "report_window_us": CLOSE_GRACE_US,
@@ -1191,9 +1346,9 @@ fn execute(p: &Prepared) -> Result<Report> {
         "trace_sha256": p.trace.sha256,
         "trace_schema": TRACE_SCHEMA,
         "renderer": renderer.as_str(),
-        "placement": "fifo",
-        "align_offset_us": null,
-        "write_ahead_frames": null,
+        "placement": if renderer.aligned().is_some() { "aligned" } else { "fifo" },
+        "align_offset_us": renderer.aligned().map(|(c, _)| c),
+        "write_ahead_frames": renderer.aligned().map(|(_, w)| w),
         "latency_bound_frames": renderer.latency_bound_frames(),
         "stage1_purpose": p.request.purpose.as_str(),
         "wav_path": p.request.wav.display().to_string(),
@@ -1201,7 +1356,7 @@ fn execute(p: &Prepared) -> Result<Report> {
         "backend": backend,
         "device": device,
         "sim_faults": p.request.sim_faults.iter().map(|f| format!("{f:?}")).collect::<Vec<_>>(),
-        "l2_schema": L2_SCHEMA,
+        "l2_schema": l2_schema,
         "l2_method": L2_METHOD,
         "sink": sink,
         "close": close,
@@ -1737,7 +1892,14 @@ mod tests {
         assert_eq!(neither.kind(), clap::error::ErrorKind::MissingRequiredArgument);
         let error = with(&["--sim", "--i-have-approval"]).unwrap().request().unwrap_err();
         assert!(is_refusal(&error) && error.to_string().contains("only to --device"), "{error}");
-        assert!(Cli::try_parse_from(base.iter().map(|a| if *a == "R1" { "R2" } else { a })).is_err(), "R2 is not here");
+        // R2 is here (Task C): it parses, needs --align-offset-us, defaults W to 512.
+        let r2 = |extra: &[&str]| {
+            Cli::try_parse_from(base.iter().map(|a| if *a == "R1" { "R2" } else { a }).chain(extra.iter().copied()))
+        };
+        let error = r2(&["--sim"]).unwrap().request().unwrap_err();
+        assert!(is_refusal(&error) && error.to_string().contains("--align-offset-us"), "{error}");
+        let request = r2(&["--sim", "--align-offset-us", "40000"]).unwrap().request().unwrap();
+        assert_eq!(request.renderer, Renderer::R2 { align_offset_us: 40_000, write_ahead_frames: 512 });
         // A device without approval is refused before anything is read.
         let cli = with(&["--device", "hw:9,9"]).unwrap();
         let error = cli.request().unwrap_err();
@@ -1778,5 +1940,137 @@ mod tests {
             refused(prepare(&req), needle);
         }
         assert!(!fx.dir.0.join("out").exists());
+    }
+    // ---- R2 (Task C) --------------------------------------------------------
+
+    const R2_C0: Renderer = Renderer::R2 { align_offset_us: 40_000, write_ahead_frames: 512 };
+
+    /// The R2 flags: refused with R0 / R1, required (c) for R2, W defaults to
+    /// 512; the purpose binding V4a / V4b <-> R2; an out-of-range W or a
+    /// negative c is refused before anything is written.
+    #[test]
+    fn the_r2_flags_and_purposes_bind_to_the_aligned_renderer() {
+        let cli = |args: &[&str]| {
+            let base = ["l2_haptic_replay", "--trace", "t.json", "--out", "o", "--haptic-wav", "w.wav", "--sim"];
+            Cli::try_parse_from(base.iter().copied().chain(args.iter().copied())).unwrap().request()
+        };
+        for (renderer, purpose) in [("R0", "V2"), ("R1", "V3")] {
+            for flag in [["--align-offset-us", "40000"], ["--write-ahead-frames", "512"]] {
+                let args = ["--renderer", renderer, "--purpose", purpose, flag[0], flag[1]];
+                let error = cli(&args).unwrap_err();
+                assert!(is_refusal(&error) && error.to_string().contains("only to --renderer R2"), "{error}");
+            }
+        }
+        let r = cli(&["--renderer", "R2", "--purpose", "V4b", "--align-offset-us", "23456", "--write-ahead-frames", "768"]).unwrap();
+        assert_eq!(r.renderer, Renderer::R2 { align_offset_us: 23_456, write_ahead_frames: 768 });
+        assert_eq!(r.purpose, Purpose::V4b);
+        assert_eq!(cli(&["--renderer", "R2", "--purpose", "V4a", "--align-offset-us", "40000"]).unwrap().renderer, R2_C0);
+        let fx = fixture("r2-binding", &Spec::regular(5, 11_111));
+        refused(prepare(&fx.request(R2_C0, Purpose::V2, "out")), "stage-1 purpose V2 replays with R0, not R2");
+        refused(prepare(&fx.request(Renderer::R0, Purpose::V4a, "out")), "stage-1 purpose V4a replays with R2, not R0");
+        refused(prepare(&fx.request(Renderer::R1, Purpose::V4b, "out")), "replays with R2, not R1");
+        for bad in [
+            Renderer::R2 { align_offset_us: -1, write_ahead_frames: 512 },
+            Renderer::R2 { align_offset_us: 40_000, write_ahead_frames: 0 },
+            Renderer::R2 { align_offset_us: 40_000, write_ahead_frames: ALSA_DEFAULT_BUFFER_FRAMES },
+        ] {
+            refused(prepare(&fx.request(bad, Purpose::V4a, "out")), "renderer R2 placement");
+        }
+        prepare(&fx.request(R2_C0, Purpose::V4a, "out")).unwrap();
+        assert!(!fx.dir.0.join("out").exists());
+    }
+
+    /// Acceptance (Task C 5): R2 with c = 40,000 µs and W = 512 on the
+    /// simulated stream: an `event-pair-l2-v1.8` ledger with alsa.placement
+    /// aligned, one placement row right after each submit, one terminal per
+    /// submit, and every existing replay integrity check passes (exit 0).
+    /// At real-time pace floor (~11-16 ms) < c, so uncut ticks are output at
+    /// t_release + c within the snapshot quantisation. (t_release is the
+    /// SCHEDULED release, so a submit thread that wakes > ~24 ms late under
+    /// load makes that tick device_overlap or too_late without invalidating
+    /// the replay: the per-tick alignment is asserted only for uncut ticks,
+    /// and most ticks must be uncut.)
+    #[test]
+    fn an_r2_sim_replay_writes_a_v1_8_aligned_ledger_that_passes_the_replay_checks() {
+        let spec = Spec::regular(30, 11_111);
+        let fx = fixture("r2", &spec);
+        let result = replay(&fx.request(R2_C0, Purpose::V4a, "out"));
+        assert_eq!(exit_status(&result), 0, "{:?}", result.as_ref().map(|r| r.invalid_reasons.clone()));
+        let out = fx.dir.0.join("out");
+        let replay_bytes = fs::read(out.join(REPLAY_FILE)).unwrap();
+        let engine = fs::read(out.join(L2_FILE)).unwrap();
+        let cut = replay_bytes.iter().position(|b| *b == b'\n').unwrap() + 1;
+        assert_eq!(&replay_bytes[cut..], &engine[..], "engine rows verbatim after the head row");
+        let rows = rows(&out.join(REPLAY_FILE));
+        let meta = &rows[0];
+        assert_eq!(meta["role"], "replay_meta");
+        assert_eq!(meta["files"]["l2_rows"]["sha256"], sha256_hex(&engine));
+        assert_eq!((meta["renderer"].as_str(), meta["placement"].as_str(), meta["stage1_purpose"].as_str()), (Some("R2"), Some("aligned"), Some("V4a")));
+        assert_eq!((meta["align_offset_us"].as_i64(), meta["write_ahead_frames"].as_u64()), (Some(40_000), Some(512)));
+        assert_eq!(meta["latency_bound_frames"], Value::Null);
+        assert_eq!(meta["l2_schema"], "event-pair-l2-v1.8");
+        assert_eq!(meta["run_id"], "exp4r-R2-exp3-L2-direct-D1-bin-k0-a1-p0-P0A");
+        assert_eq!(meta["sink"]["placement"], "aligned");
+        assert_eq!(meta["outcome"]["valid"], true);
+        assert_eq!(meta["outcome"]["placement_rows"], 30);
+        let l2_meta = &rows[1];
+        assert_eq!(l2_meta["l2_schema"], "event-pair-l2-v1.8");
+        assert_eq!(l2_meta["method"], "replay");
+        assert_eq!((l2_meta["alsa"]["placement"].as_str(), l2_meta["alsa"]["align_offset_us"].as_i64()), (Some("aligned"), Some(40_000)));
+        assert_eq!(l2_meta["alsa"]["write_ahead_frames"], 512);
+        assert_eq!(l2_meta["alsa"]["placement_policy"], skew_moq::l2_output::ALIGNED_PLACEMENT_POLICY);
+        let end = rows.last().unwrap();
+        assert_eq!(end["role"], "instrumentation_end");
+        assert_eq!(end["integrity_ok"], true);
+        assert!(end["lanes"]["haptic"]["device_failure"].is_null());
+        let body = &rows[2..rows.len() - 1];
+        let submits: Vec<usize> = (0..body.len()).filter(|&i| body[i]["role"] == "submit").collect();
+        let seqs: Vec<u64> = submits.iter().map(|&i| body[i]["seq"].as_u64().unwrap()).collect();
+        assert_eq!(seqs, spec.ks, "every tick submitted, in trace submit order");
+        for &i in &submits {
+            assert_eq!((body[i + 1]["role"].as_str(), &body[i + 1]["seq"]), (Some("placement"), &body[i]["seq"]), "placement right after its submit");
+        }
+        let placements = haptic(&rows, "placement");
+        assert_eq!(placements.len(), 30, "one placement row per submission");
+        let sidecar = rows_of(&out.join(SUBMITS_FILE));
+        for p in &placements {
+            assert!(p["planned_end_after"].as_u64() >= p["appl_pos"].as_u64());
+            // R2 aligns to the replay's scheduled release (sidecar).
+            let side = sidecar.iter().find(|r| r["seq"] == p["seq"]).unwrap();
+            assert_eq!(p["t_release_us"], side["scheduled_release_us"]);
+        }
+        let mut terminals: HashMap<u64, usize> = HashMap::new();
+        for r in rows.iter().filter(|r| r["track"] == "haptic" && (r["role"] == "output" || r["role"] == "explicit_discard")) {
+            *terminals.entry(r["seq"].as_u64().unwrap()).or_default() += 1;
+        }
+        assert!(spec.ks.iter().all(|k| terminals.get(k) == Some(&1)), "exactly one terminal per submit");
+        let outputs = haptic(&rows, "output");
+        let uncut: Vec<&&Value> = outputs.iter().filter(|o| o["output_detail"]["head_cut_frames"] == 0).collect();
+        assert!(uncut.len() >= 25, "at real-time pace (nearly) every tick is placed uncut: {} of 30", uncut.len());
+        for o in &uncut {
+            let lag = o["t_output_us"].as_i64().unwrap() - o["t_release_us"].as_i64().unwrap();
+            assert!((lag - 40_000).abs() <= 1_000, "seq {}: output - release {lag} us", o["seq"]);
+        }
+        let lane = &end["lanes"]["haptic"];
+        assert_eq!(lane["placement_rows"], 30);
+        assert_eq!(lane["occluded_discards"], lane["ticks_occluded"]);
+        assert_eq!(lane["xrun"], 0);
+        assert_eq!(meta["outcome"]["trim_rows"], haptic(&rows, "trim").len());
+    }
+
+    /// The R0 ledger is still the legacy v1.7 one (no aligned row or key).
+    #[test]
+    fn r0_and_r1_replays_stay_legacy_v1_7() {
+        let spec = Spec::regular(10, 11_111);
+        let fx = fixture("r0-legacy", &spec);
+        let report = replay(&fx.request(Renderer::R0, Purpose::V2, "out")).unwrap();
+        assert!(report.valid, "{:?}", report.invalid_reasons);
+        let (rows, _) = check_common(&fx.dir.0.join("out"), &spec.ks);
+        assert_eq!(rows[0]["l2_schema"], L2_SCHEMA);
+        assert_eq!(rows[0]["placement"], "fifo");
+        assert!(rows[0]["outcome"].get("placement_rows").is_none() && rows[0]["sink"].get("placement").is_none());
+        assert!(rows[1]["alsa"].get("placement").is_none());
+        assert!(haptic(&rows, "placement").is_empty() && haptic(&rows, "trim").is_empty());
+        assert!(rows.last().unwrap()["lanes"]["haptic"].get("ticks_occluded").is_none());
     }
 }
