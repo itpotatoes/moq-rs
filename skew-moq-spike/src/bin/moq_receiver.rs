@@ -220,6 +220,21 @@ impl From<CliReleaseRule> for skew_moq::s3np::ReleaseRule {
     }
 }
 
+/// `--l2-alsa-placement`: the experiment-4 haptic ALSA placement (contract
+/// `md/20261104_실험4_계약.md` §3). A CLI mirror of the two non-legacy
+/// `skew_moq::l2_haptic::PlacementMode` variants; the flag's absence is the
+/// legacy placement ([`l2_alsa_placement_mode`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
+enum CliPlacement {
+    /// `PlacementMode::Fifo`: the legacy FIFO engine path, L2 v1.8 meta.
+    #[value(name = "fifo")]
+    Fifo,
+    /// `PlacementMode::Aligned { c, W }` (R2): needs both
+    /// `--l2-alsa-align-offset-us` and `--l2-alsa-write-ahead-frames`.
+    #[value(name = "aligned")]
+    Aligned,
+}
+
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum CliLatePolicy {
     ReleaseLate,
@@ -287,7 +302,8 @@ struct Args {
     /// ACTUAL release points of b1/s1/s2/s3/s3r submit.
     #[arg(long, default_value = "none", value_parser = parse_l2_sink)]
     l2_sink: L2SinkArg,
-    /// Separate L2 JSONL (schema tag `skew_moq::l2_output::L2_SCHEMA`).
+    /// Separate L2 JSONL (schema tag `skew_moq::l2_output::L2_SCHEMA`, or
+    /// `L2_SCHEMA_V1_8` with `--l2-alsa-placement`).
     /// Required iff `--l2-sink` is not `none`; must not exist yet and must
     /// not be the rx log.
     #[arg(long)]
@@ -339,6 +355,27 @@ struct Args {
     /// 534..=Q. Recorded in meta `alsa.latency_bound_frames` (null when off).
     #[arg(long)]
     l2_alsa_latency_bound_frames: Option<u64>,
+    /// Experiment-4 haptic placement (contract `md/20261104_실험4_계약.md`
+    /// §3; `--l2-sink pc=<kind>,haptic=alsa` only). Absent = the legacy
+    /// placement of experiments 2/3 (`PlacementMode::None`, L2
+    /// `event-pair-l2-v1.7`, unchanged). `fifo` = the legacy FIFO engine path
+    /// with L2 `event-pair-l2-v1.8` meta (`alsa.placement` "fifo", c and W
+    /// null); `aligned` = the time-aligned placement R2 (v1.8), which requires
+    /// `--l2-alsa-align-offset-us` and `--l2-alsa-write-ahead-frames`. Refused
+    /// together with `--l2-alsa-latency-bound-frames` (experiment 4 has no
+    /// sink mode A). Recorded in meta `alsa.placement`.
+    #[arg(long, value_enum)]
+    l2_alsa_placement: Option<CliPlacement>,
+    /// Aligned placement only: the offset c in µs (`>= 0`; n* aligns each
+    /// tick to its release time + c). Required with `aligned`, refused
+    /// otherwise. Recorded in meta `alsa.align_offset_us`.
+    #[arg(long)]
+    l2_alsa_align_offset_us: Option<i64>,
+    /// Aligned placement only: the write-ahead bound W in 48 kHz frames
+    /// (`1..=buffer - period`). Required with `aligned` (no default), refused
+    /// otherwise. Recorded in meta `alsa.write_ahead_frames`.
+    #[arg(long)]
+    l2_alsa_write_ahead_frames: Option<u64>,
     /// Status snapshot cadence in µs (the lane also wakes on arrivals;
     /// default 1000).
     #[arg(long)]
@@ -1284,6 +1321,44 @@ const L2_DEFAULT_REPORT_WINDOW_MS: u64 = 1_000;
 /// Bound of the per-object tracking sets (a 30 s run has 3,600 objects).
 const L2_MAX_TRACKED_OBJECTS: usize = 65_536;
 
+/// The haptic ALSA placement mode from `--l2-alsa-placement` and its two
+/// aligned-only values (contract `md/20261104_실험4_계약.md` §3, registration
+/// `md/20261105_실험4_사전등록_문안.md` §2-1). Absent = `PlacementMode::None`,
+/// the legacy placement: an experiment-2/3 argv builds the configuration it
+/// built before these flags existed. Refused here: any placement flag with
+/// `--l2-alsa-latency-bound-frames`, c or W without `aligned`, `aligned`
+/// without both. The value ranges (c >= 0, 1 <= W <= buffer - period) are
+/// `PlacementConfig::validate`'s, applied by `L2Config::validate`.
+fn l2_alsa_placement_mode(args: &Args) -> Result<skew_moq::l2_haptic::PlacementMode> {
+    use skew_moq::l2_haptic::PlacementMode;
+    let (c, w) = (args.l2_alsa_align_offset_us, args.l2_alsa_write_ahead_frames);
+    if (args.l2_alsa_placement.is_some() || c.is_some() || w.is_some())
+        && args.l2_alsa_latency_bound_frames.is_some()
+    {
+        bail!(
+            "--l2-alsa-latency-bound-frames (experiment-3 sink mode A) must not be combined with \
+             --l2-alsa-placement/--l2-alsa-align-offset-us/--l2-alsa-write-ahead-frames \
+             (experiment 4 has no latency bound)"
+        );
+    }
+    match args.l2_alsa_placement {
+        Some(CliPlacement::Aligned) => Ok(PlacementMode::Aligned {
+            align_offset_us: c.context("--l2-alsa-placement aligned requires --l2-alsa-align-offset-us <c in us>")?,
+            write_ahead_frames: w
+                .context("--l2-alsa-placement aligned requires --l2-alsa-write-ahead-frames <W in frames>")?,
+        }),
+        placement => {
+            if c.is_some() || w.is_some() {
+                bail!("--l2-alsa-align-offset-us and --l2-alsa-write-ahead-frames require --l2-alsa-placement aligned");
+            }
+            Ok(match placement {
+                Some(CliPlacement::Fifo) => PlacementMode::Fifo,
+                _ => PlacementMode::None,
+            })
+        }
+    }
+}
+
 /// Validate the L2 output-stage options before any log is opened. `Ok(None)`
 /// for `--l2-sink none`, which must also carry no other L2 option.
 fn l2_output_config(args: &Args) -> Result<Option<(PathBuf, skew_moq::l2_output::L2Config)>> {
@@ -1305,6 +1380,9 @@ fn l2_output_config(args: &Args) -> Result<Option<(PathBuf, skew_moq::l2_output:
         || args.l2_alsa_prefill_frames.is_some()
         || args.l2_alsa_queue_frames.is_some()
         || args.l2_alsa_latency_bound_frames.is_some()
+        || args.l2_alsa_placement.is_some()
+        || args.l2_alsa_align_offset_us.is_some()
+        || args.l2_alsa_write_ahead_frames.is_some()
         || args.l2_alsa_status_interval_us.is_some();
     let wayland_given = args.l2_wayland_tiers_meta.is_some() || args.l2_wayland_buffers.is_some();
     let sinks = match args.l2_sink {
@@ -1348,6 +1426,7 @@ fn l2_output_config(args: &Args) -> Result<Option<(PathBuf, skew_moq::l2_output:
         None
     };
     let alsa = if sinks.haptic == L2SinkKind::Alsa {
+        let mode = l2_alsa_placement_mode(args)?;
         Some(AlsaSinkConfig {
             backend: AlsaBackend::Device {
                 name: args.l2_alsa_device.clone().unwrap_or_else(|| ALSA_DEFAULT_DEVICE.to_string()),
@@ -1361,8 +1440,7 @@ fn l2_output_config(args: &Args) -> Result<Option<(PathBuf, skew_moq::l2_output:
                 prefill_frames: args.l2_alsa_prefill_frames.unwrap_or(ALSA_DEFAULT_PREFILL_FRAMES),
                 queue_limit_frames: args.l2_alsa_queue_frames.unwrap_or(ALSA_DEFAULT_QUEUE_FRAMES),
                 latency_bound_frames: args.l2_alsa_latency_bound_frames,
-                // Experiment-4 placement flags are a later task: legacy.
-                mode: skew_moq::l2_haptic::PlacementMode::None,
+                mode,
             },
             status_interval_us: args
                 .l2_alsa_status_interval_us
@@ -10886,6 +10964,9 @@ mod rx_ending_tests {
             l2_alsa_prefill_frames: None,
             l2_alsa_queue_frames: None,
             l2_alsa_latency_bound_frames: None,
+            l2_alsa_placement: None,
+            l2_alsa_align_offset_us: None,
+            l2_alsa_write_ahead_frames: None,
             l2_alsa_status_interval_us: None,
             l2_wayland_tiers_meta: None,
             l2_wayland_buffers: None,
@@ -11193,6 +11274,9 @@ mod rx_ending_tests {
             l2_alsa_prefill_frames: None,
             l2_alsa_queue_frames: None,
             l2_alsa_latency_bound_frames: None,
+            l2_alsa_placement: None,
+            l2_alsa_align_offset_us: None,
+            l2_alsa_write_ahead_frames: None,
             l2_alsa_status_interval_us: None,
             l2_wayland_tiers_meta: None,
             l2_wayland_buffers: None,
@@ -11311,6 +11395,9 @@ mod rx_ending_tests {
             l2_alsa_prefill_frames: None,
             l2_alsa_queue_frames: None,
             l2_alsa_latency_bound_frames: None,
+            l2_alsa_placement: None,
+            l2_alsa_align_offset_us: None,
+            l2_alsa_write_ahead_frames: None,
             l2_alsa_status_interval_us: None,
             l2_wayland_tiers_meta: None,
             l2_wayland_buffers: None,
@@ -19331,6 +19418,234 @@ mod l2_hook_tests {
         let none = b1_cli(&["--l2-alsa-latency-bound-frames", "1068"]).unwrap();
         assert!(l2_output_config(&none).is_err());
         assert!(!fresh.exists(), "validation never creates the L2 log");
+    }
+
+    /// The ALSA base argv of the placement tests (`pc=fake,haptic=alsa`).
+    fn placement_argv<'a>(l2_log: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
+        let mut argv = vec!["--l2-sink", "pc=fake,haptic=alsa", "--l2-log", l2_log,
+                            "--l2-fake-pc-offset-us", "1000", "--l2-fake-haptic-offset-us", "200"];
+        argv.extend_from_slice(extra);
+        argv
+    }
+
+    /// Registration §2-1: the aligned argv of conditions B, D, F.
+    const ALIGNED_ARGV: [&str; 6] = [
+        "--l2-alsa-placement", "aligned", "--l2-alsa-align-offset-us", "21093", "--l2-alsa-write-ahead-frames", "512",
+    ];
+
+    /// Experiment 4 (contract §3, registration §2-1): `--l2-alsa-placement`
+    /// and its aligned-only values map to `PlacementMode`; every other ALSA
+    /// value keeps its default. Absent = legacy (`PlacementMode::None`, L2
+    /// v1.7): the experiment-2 argv (no flag) and the experiment-3 sink-A
+    /// argv (`--l2-alsa-latency-bound-frames` only) build exactly the
+    /// configuration they built before the flags existed.
+    #[test]
+    fn the_placement_flags_map_to_the_placement_mode() {
+        use skew_moq::l2_haptic::{PlacementConfig, PlacementMode};
+        use skew_moq::l2_output::{L2_SCHEMA, L2_SCHEMA_V1_8};
+        let fresh = tmp("cli-alsa-placement");
+        let fresh_s = fresh.display().to_string();
+        let built = |extra: &[&str]| -> (PlacementConfig, &'static str) {
+            let (path, config) = l2_output_config(&b1_cli(&placement_argv(&fresh_s, extra)).unwrap()).unwrap().unwrap();
+            assert_eq!(path, fresh);
+            (config.alsa.as_ref().unwrap().placement, config.l2_schema())
+        };
+        let legacy = |latency_bound_frames| PlacementConfig {
+            period_frames: 256,
+            buffer_frames: 2_048,
+            target_fill_frames: 512,
+            prefill_frames: 512,
+            queue_limit_frames: 48_000,
+            latency_bound_frames,
+            mode: PlacementMode::None,
+        };
+        assert_eq!(built(&[]), (legacy(None), L2_SCHEMA), "experiment 2");
+        assert_eq!(built(&["--l2-alsa-latency-bound-frames", "1068"]), (legacy(Some(1_068)), L2_SCHEMA), "experiment 3 sink A");
+        assert_eq!(
+            built(&["--l2-alsa-placement", "fifo"]),
+            (PlacementConfig { mode: PlacementMode::Fifo, ..legacy(None) }, L2_SCHEMA_V1_8),
+            "experiment 4 FIFO (A, C, E)"
+        );
+        assert_eq!(
+            built(&ALIGNED_ARGV),
+            (
+                PlacementConfig {
+                    mode: PlacementMode::Aligned { align_offset_us: 21_093, write_ahead_frames: 512 },
+                    ..legacy(None)
+                },
+                L2_SCHEMA_V1_8
+            ),
+            "experiment 4 aligned (B, D, F)"
+        );
+        // Any flag order; the ends of the ranges validate accepts (c = 0,
+        // W = 1, W = buffer - period = 1,792).
+        for (c, w) in [("0", "1"), ("21093", "1792")] {
+            let (p, schema) = built(&["--l2-alsa-write-ahead-frames", w, "--l2-alsa-align-offset-us", c, "--l2-alsa-placement", "aligned"]);
+            let want = PlacementMode::Aligned { align_offset_us: c.parse().unwrap(), write_ahead_frames: w.parse().unwrap() };
+            assert_eq!((p.mode, schema), (want, L2_SCHEMA_V1_8));
+        }
+        assert!(!fresh.exists(), "validation never creates the L2 log");
+    }
+
+    /// Experiment 4 (contract §3): refused before any log is opened — c or
+    /// W without `aligned` (alone or with `fifo`); `aligned` without both;
+    /// any placement flag with `--l2-alsa-latency-bound-frames`; values
+    /// `PlacementConfig::validate` refuses; a value clap cannot parse; and
+    /// every placement flag without the ALSA haptic sink (as the latency
+    /// bound).
+    #[test]
+    fn the_placement_flags_are_refused_outside_their_combinations() {
+        let fresh = tmp("cli-alsa-placement-refused");
+        let fresh_s = fresh.display().to_string();
+        let refused = |extra: &[&str]| -> String {
+            let args = b1_cli(&placement_argv(&fresh_s, extra)).unwrap_or_else(|e| panic!("{extra:?}: {e}"));
+            match l2_output_config(&args) {
+                Ok(_) => panic!("{extra:?} accepted"),
+                Err(error) => format!("{error:#}"),
+            }
+        };
+        let (c, w) = (["--l2-alsa-align-offset-us", "21093"], ["--l2-alsa-write-ahead-frames", "512"]);
+        let cw = [c, w].concat();
+        let fifo = ["--l2-alsa-placement", "fifo"];
+        let aligned = ["--l2-alsa-placement", "aligned"];
+        for extra in [c.to_vec(), w.to_vec(), cw.clone(), [&fifo[..], &c].concat(), [&fifo[..], &w].concat(), [&fifo[..], &cw].concat()] {
+            let error = refused(&extra);
+            assert!(error.contains("require --l2-alsa-placement aligned"), "{extra:?}: {error}");
+        }
+        for (extra, missing) in [
+            (aligned.to_vec(), "--l2-alsa-align-offset-us"),
+            ([&aligned[..], &w].concat(), "--l2-alsa-align-offset-us"),
+            ([&aligned[..], &c].concat(), "--l2-alsa-write-ahead-frames"),
+        ] {
+            let error = refused(&extra);
+            assert!(error.contains(&format!("requires {missing}")), "{extra:?}: {error}");
+        }
+        let bound = ["--l2-alsa-latency-bound-frames", "1068"];
+        for extra in [[&fifo[..], &bound].concat(), [&ALIGNED_ARGV[..], &bound].concat(), [&c[..], &bound].concat(), [&w[..], &bound].concat()] {
+            let error = refused(&extra);
+            assert!(error.contains("must not be combined"), "{extra:?}: {error}");
+        }
+        for (extra, says) in [
+            (vec!["--l2-alsa-placement", "aligned", "--l2-alsa-align-offset-us=-1", "--l2-alsa-write-ahead-frames", "512"], "must be >= 0"),
+            ([&aligned[..], &c, &["--l2-alsa-write-ahead-frames", "0"]].concat(), "aligned write-ahead W"),
+            ([&aligned[..], &c, &["--l2-alsa-write-ahead-frames", "1793"]].concat(), "aligned write-ahead W"),
+            ([&aligned[..], &c, &["--l2-alsa-write-ahead-frames", "18446744073709551615"]].concat(), "aligned write-ahead W"),
+            // The bound follows the buffer: 1,024 - 256 = 768 < 769.
+            ([&aligned[..], &c, &["--l2-alsa-write-ahead-frames", "769", "--l2-alsa-buffer-frames", "1024"]].concat(), "aligned write-ahead W"),
+        ] {
+            let error = refused(&extra);
+            assert!(error.contains(says), "{extra:?}: {error}");
+        }
+        // clap refuses what it cannot parse.
+        for extra in [
+            &["--l2-alsa-placement", "FIFO"][..],
+            &["--l2-alsa-placement", "none"][..],
+            &["--l2-alsa-placement", "legacy"][..],
+            &["--l2-alsa-placement", ""][..],
+            &["--l2-alsa-placement", "aligned", "--l2-alsa-align-offset-us", "1.5", "--l2-alsa-write-ahead-frames", "512"][..],
+            &["--l2-alsa-placement", "aligned", "--l2-alsa-align-offset-us", "21093", "--l2-alsa-write-ahead-frames=-1"][..],
+        ] {
+            assert!(b1_cli(&placement_argv(&fresh_s, extra)).is_err(), "{extra:?}");
+        }
+        // Without the ALSA haptic sink (another sink, or none at all).
+        for extra in [&fifo[..], &ALIGNED_ARGV[..], &c[..], &w[..]] {
+            for sink in [&["--l2-sink", "pc=null,haptic=null", "--l2-log", &fresh_s][..],
+                         &["--l2-sink", "fake", "--l2-log", &fresh_s, "--l2-fake-pc-offset-us", "1",
+                           "--l2-fake-haptic-offset-us", "1"][..]] {
+                let args = b1_cli(&[sink, extra].concat()).unwrap();
+                let error = format!("{:#}", l2_output_config(&args).err().expect("refused"));
+                assert!(error.contains("--l2-alsa-* options require --l2-sink pc=<kind>,haptic=alsa"), "{extra:?}: {error}");
+            }
+            let error = format!("{:#}", l2_output_config(&b1_cli(extra).unwrap()).err().expect("refused"));
+            assert!(error.contains("require an --l2-sink other than none"), "{extra:?}: {error}");
+        }
+        assert!(!fresh.exists(), "validation never creates the L2 log");
+    }
+
+    /// Experiment 4 (contract §2-1, registration §2-1): the receiver-built
+    /// configuration writes the v1.8 L2 meta for `fifo` (c and W null) and
+    /// `aligned` (c, W, the R2 policy and the aligned row_queue_overflow
+    /// text), and the unchanged v1.7 meta without the flag (no placement
+    /// key). `latency_bound_frames` is null in all three. The device backend
+    /// is swapped for the simulated stream with the same period and buffer:
+    /// no device is opened, nothing is submitted.
+    #[test]
+    fn the_receiver_built_placement_config_writes_the_v1_8_meta() {
+        use skew_moq::l2_haptic::SimPcmConfig;
+        use skew_moq::l2_output::{
+            AlsaBackend, ALIGNED_PLACEMENT_POLICY, ALIGNED_ROW_QUEUE_OVERFLOW_SEMANTICS, L2_SCHEMA, L2_SCHEMA_V1_8,
+        };
+        use serde_json::Value;
+        let cases: [(&[&str], &str, Option<&str>, Value, Value); 3] = [
+            (&[], L2_SCHEMA, None, Value::Null, Value::Null),
+            (&["--l2-alsa-placement", "fifo"], L2_SCHEMA_V1_8, Some("fifo"), Value::Null, Value::Null),
+            (&ALIGNED_ARGV, L2_SCHEMA_V1_8, Some("aligned"), 21_093.into(), 512.into()),
+        ];
+        let mut row_queue_overflow = Vec::new();
+        for (extra, schema, placement, c, w) in cases {
+            let path = tmp("placement-meta");
+            let path_s = path.display().to_string();
+            let (l2_path, mut config) = l2_output_config(&b1_cli(&placement_argv(&path_s, extra)).unwrap()).unwrap().unwrap();
+            let alsa = config.alsa.as_mut().unwrap();
+            assert!(matches!(alsa.backend, AlsaBackend::Device { .. }));
+            alsa.backend = AlsaBackend::Simulated(SimPcmConfig::new(alsa.placement.period_frames, alsa.placement.buffer_frames));
+            let output = L2Output::start(&l2_path, config).unwrap();
+            let _ = output.finish();
+            let meta: Value = serde_json::from_str(std::fs::read_to_string(&l2_path).unwrap().lines().next().unwrap()).unwrap();
+            let _ = std::fs::remove_file(&l2_path);
+            assert_eq!((meta["role"].as_str(), meta["l2_schema"].as_str(), meta["method"].as_str()), (Some("meta"), Some(schema), Some("b1")));
+            let a = meta["alsa"].as_object().unwrap();
+            assert_eq!(a["latency_bound_frames"], Value::Null);
+            assert_eq!((a["period_frames"].as_u64(), a["buffer_frames"].as_u64(), a["queue_limit_frames"].as_u64()), (Some(256), Some(2_048), Some(48_000)));
+            match placement {
+                None => {
+                    for key in ["placement", "align_offset_us", "write_ahead_frames"] {
+                        assert!(!a.contains_key(key), "legacy meta has no {key}");
+                    }
+                }
+                Some(placement) => {
+                    assert_eq!(a["placement"], placement);
+                    assert_eq!((&a["align_offset_us"], &a["write_ahead_frames"]), (&c, &w));
+                }
+            }
+            assert_eq!(a.get("placement_policy") == Some(&Value::from(ALIGNED_PLACEMENT_POLICY)), placement == Some("aligned"));
+            row_queue_overflow.push(meta["failure_time_semantics"]["row_queue_overflow"].clone());
+        }
+        assert_eq!(row_queue_overflow[1], row_queue_overflow[0], "fifo keeps the legacy text");
+        assert_eq!(row_queue_overflow[2], ALIGNED_ROW_QUEUE_OVERFLOW_SEMANTICS);
+    }
+
+    /// Contract §2-7 (Task E2): the `L2_DEVICE_START_FAILURE` line `main`
+    /// prints for a receiver-built configuration names its l2_schema: v1.8
+    /// with `--l2-alsa-placement fifo|aligned`, v1.7 without. The simulated
+    /// stream refuses to start; no device is opened and no meta row written.
+    #[test]
+    fn the_device_start_failure_line_names_the_configuration_l2_schema() {
+        use skew_moq::l2_haptic::{SimFault, SimPcmConfig};
+        use skew_moq::l2_output::{AlsaBackend, L2DeviceStartFailure, L2_DEVICE_START_FAILURE_PREFIX, L2_SCHEMA, L2_SCHEMA_V1_8};
+        for (extra, schema) in [
+            (&[][..], L2_SCHEMA),
+            (&["--l2-alsa-placement", "fifo"][..], L2_SCHEMA_V1_8),
+            (&ALIGNED_ARGV[..], L2_SCHEMA_V1_8),
+        ] {
+            let path = tmp("placement-start-failure");
+            let path_s = path.display().to_string();
+            let (l2_path, mut config) = l2_output_config(&b1_cli(&placement_argv(&path_s, extra)).unwrap()).unwrap().unwrap();
+            let alsa = config.alsa.as_mut().unwrap();
+            let mut sim = SimPcmConfig::new(alsa.placement.period_frames, alsa.placement.buffer_frames);
+            sim.faults = vec![SimFault::StartError];
+            alsa.backend = AlsaBackend::Simulated(sim);
+            let error = L2Output::start(&l2_path, config).err().expect("refused");
+            let stamped = stamp_l2_start_point(error, "before_session");
+            let typed = stamped.downcast_ref::<L2DeviceStartFailure>().expect("still typed");
+            let line = format!("{} {}", L2_DEVICE_START_FAILURE_PREFIX, typed.to_json());
+            let json: serde_json::Value = serde_json::from_str(line.strip_prefix("L2_DEVICE_START_FAILURE ").unwrap()).unwrap();
+            assert_eq!((json["status"].as_str(), json["l2_schema"].as_str()), (Some("device_start_failure"), Some(schema)), "{extra:?}");
+            assert_eq!((json["track"].as_str(), json["sink"].as_str(), json["stage"].as_str()), (Some("haptic"), Some("alsa"), Some("start")));
+            assert_eq!(json["receiver_start_point"], "before_session");
+            assert_eq!(std::fs::read(&l2_path).unwrap(), b"", "no meta row");
+            let _ = std::fs::remove_file(&l2_path);
+        }
     }
 
     /// M3: `pc=wayland` builds the PC Wayland sink configuration WITHOUT
