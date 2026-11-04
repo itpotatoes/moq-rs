@@ -488,7 +488,9 @@ impl PlacementConfig {
             if align_offset_us < 0 {
                 return Err(format!("aligned placement offset c = {align_offset_us} us must be >= 0"));
             }
-            if write_ahead_frames == 0 || write_ahead_frames + c.period_frames > c.buffer_frames {
+            if write_ahead_frames == 0
+                || write_ahead_frames.checked_add(c.period_frames).map_or(true, |end| end > c.buffer_frames)
+            {
                 return Err(format!(
                     "aligned write-ahead W = {write_ahead_frames} frames must be in 1..=buffer {} - period {}",
                     c.buffer_frames, c.period_frames
@@ -3394,7 +3396,7 @@ mod tests {
             assert!(err.contains("no latency bound"), "{mode:?}: {err}");
         }
         PlacementConfig { latency_bound_frames: Some(1_068), ..cfg() }.validate().unwrap();
-        for (c, w) in [(-1, W), (40_000, 0), (40_000, BUFFER - PERIOD + 1)] {
+        for (c, w) in [(-1, W), (40_000, 0), (40_000, BUFFER - PERIOD + 1), (40_000, u64::MAX)] {
             let bad = PlacementConfig { mode: PlacementMode::Aligned { align_offset_us: c, write_ahead_frames: w }, ..cfg() };
             assert!(bad.validate().is_err(), "{bad:?}");
         }
