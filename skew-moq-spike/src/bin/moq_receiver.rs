@@ -19409,6 +19409,7 @@ mod l2_hook_tests {
     fn a_device_start_failure_is_stamped_with_the_start_point() {
         use skew_moq::l2_output::{L2DeviceStartFailure, L2_DEVICE_START_FAILURE_PREFIX};
         let failure = L2DeviceStartFailure {
+            l2_schema: skew_moq::l2_output::L2_SCHEMA,
             track: "pc",
             sink: "wayland",
             stage: "startup_present",

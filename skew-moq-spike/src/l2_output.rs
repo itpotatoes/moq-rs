@@ -218,7 +218,12 @@ pub const L2_SCHEMA: &str = "event-pair-l2-v1.7";
 /// submission accepted before a device failure, `trim` rows, the after-submit
 /// terminals `occluded`, `too_late`, `placement_queue_full`, the counters of
 /// `lanes.haptic` (contract §2-5). `fifo` writes none of these: apart from
-/// the meta it equals the legacy FIFO with `B` off. A legacy configuration
+/// the meta it equals the legacy FIFO with `B` off. Aligned only, the meta
+/// `failure_time_semantics.row_queue_overflow` text also names the event time
+/// of a placement or trim row ([`ALIGNED_ROW_QUEUE_OVERFLOW_SEMANTICS`]). The
+/// typed device start failure ([`L2DeviceStartFailure::to_json`]) and the
+/// probe-only diagnostics headers carry the configuration's tag
+/// ([`L2Config::l2_schema`]): v1.8 for fifo / aligned. A legacy configuration
 /// (`PlacementMode::None`) keeps writing [`L2_SCHEMA`] exactly as before.
 pub const L2_SCHEMA_V1_8: &str = "event-pair-l2-v1.8";
 pub const L2_CLOCK: &str = "CLOCK_MONOTONIC";
@@ -261,6 +266,10 @@ impl LaneStartError {
 /// (`lane_exited` says whether the lane, and so the device, was released).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct L2DeviceStartFailure {
+    /// The `l2_schema` of the configuration that failed to start
+    /// ([`L2Config::l2_schema`]: [`L2_SCHEMA`] for a legacy placement,
+    /// [`L2_SCHEMA_V1_8`] for fifo / aligned), set by [`L2Output::start`].
+    pub l2_schema: &'static str,
     /// `pc` or `haptic`.
     pub track: &'static str,
     /// `wayland` or `alsa`.
@@ -290,7 +299,7 @@ impl L2DeviceStartFailure {
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "status": "device_start_failure",
-            "l2_schema": L2_SCHEMA,
+            "l2_schema": self.l2_schema,
             "track": self.track,
             "sink": self.sink,
             "stage": self.stage,
@@ -1455,9 +1464,18 @@ Placement-row exceptions: no placement row for payload_invalid (already an integ
 Waiting silence never exceeds Q. \
 Implementation choices: (a) the case-(i) Q test counts every planned frame after the candidate, n* + L - appl_pos (tick frames and silence), and is the only Q rule: the engine never refuses before submit in aligned mode (output_queue_full is then only the bounded submission queue); (b) a rejected candidate records silence_inserted_frames 0, head_cut_frames 0 and planned_end_after = planned_end_before; (c) a tick's output row is emitted only once no planned frame of it remains (fully written, or its tail trimmed to what was written), so its frames and t_write_done_us are final, from the first snapshot after that which shows hw_pos > n_k; (d) the unwritten part of a short write's silence pad lies past planned_end and is not kept (only planned frames stay first); (e) the empty-plan silence period is one chunk of the same loop, repeated while fill_est < W; (f) a trim's tail_cut_frames counts every frame it removed, so an occluded tick's trim carries all its frames; (g) a plan slice's tick key is its placement index (unique even if a seq repeats); rows carry the seq; (h) placement and trim rows carry the row identity (run_id, track, tier, seq, pts_us, event_id) and are neither submits nor terminals; (i) c must be >= 0 and 1 <= W <= buffer_frames - period_frames; a latency bound is refused.";
 
+/// Aligned meta `failure_time_semantics.row_queue_overflow` (v1.8, contract
+/// §2-7): the legacy text plus the event time of the aligned-only rows. The
+/// lane hands a placement row and each trim row to the writer with the
+/// OFFERED submission's `t_submit_us` (`AlsaLane::accept_aligned`), so a
+/// trim row's time is that of the trimming tick (`by_seq`), not of the
+/// trimmed one. Fifo writes neither row and keeps the legacy text.
+pub const ALIGNED_ROW_QUEUE_OVERFLOW_SEMANTICS: &str = "t_discard_us of the discard whose row could not be queued; from a device lane the event time of the row (t_submit_us of a submit, t_callback_us of an output, t_discard_us of a discard, and for a placement or trim row the t_submit_us of the submission whose placement wrote it: the placed tick of a placement row, the trimming tick by_seq of a trim row, not the trimmed tick)";
+
 /// v1.8 meta (experiment 4): a legacy configuration's meta is returned
 /// unchanged (v1.7, byte for byte); fifo / aligned get the v1.8 tag and the
-/// contract §2-1 additions.
+/// contract §2-1 additions; aligned also its row, terminal, counter and
+/// `row_queue_overflow` texts.
 fn exp4_meta(config: &L2Config, mut meta: serde_json::Value) -> serde_json::Value {
     let mode = config.placement_mode();
     let Some(placement) = mode.as_str() else { return meta };
@@ -1516,6 +1534,7 @@ fn exp4_meta(config: &L2Config, mut meta: serde_json::Value) -> serde_json::Valu
             "48 kHz frames recorded for the tick: 6 x samples_8k - head_cut_frames - every frame later placements removed from its tail (trim rows)".into();
         haptic["output_detail"]["head_cut_frames"] =
             "aligned only: frames cut from the tick's head at placement (case device_overlap; n_k is then its first remaining frame), 0 for every other tick".into();
+        meta["failure_time_semantics"][FAIL_ROW_QUEUE_OVERFLOW] = ALIGNED_ROW_QUEUE_OVERFLOW_SEMANTICS.into();
         let counters = &mut meta["counter_semantics"];
         counters["lanes.haptic.aligned"] = "aligned only (contract §2-5): ticks_occluded = occluded discards = start_removed trims; ticks_too_late = too_late discards = placement rows with case too_late; ticks_head_cut = placement rows with case device_overlap; ticks_placement_queue_full = placement_queue_full discards = placement rows with rejected set; frames_tail_cut = sum of trim tail_cut_frames; frames_head_cut = sum of placement head_cut_frames; frames_silence_inserted = sum of placement silence_inserted_frames; max_waiting_silence_frames <= queue_limit_frames; xrun = 1 iff the device failure is alsa_xrun; placement_rows, trim_rows and the *_discards count rows handed to the writer (equal to the rows in an integrity-clean, fully resolved ledger, as for latency_bound)".into();
     }
@@ -1715,6 +1734,7 @@ impl L2Output {
                     Some(DiagLog {
                         file: BufWriter::new(diag_file),
                         run_id: config.run_id.clone(),
+                        l2_schema: config.l2_schema(),
                         outputs: Vec::new(),
                         dropped: 0,
                     })
@@ -1742,7 +1762,7 @@ impl L2Output {
                     {
                         bail!("Wayland diagnostics {} is the same file as an open log", diag_path.display());
                     }
-                    Some(pc_lane::PcDiagLog::new(BufWriter::new(diag_file), config.run_id.clone()))
+                    Some(pc_lane::PcDiagLog::new(BufWriter::new(diag_file), config.run_id.clone(), config.l2_schema()))
                 }
             };
             let (items_tx, items_rx) = mpsc::sync_channel::<SinkMsg>(config.queue_capacity);
@@ -1759,7 +1779,11 @@ impl L2Output {
                     end_shared.note_lane_end(L2Modality::Pc);
                 })
                 .context("spawn L2 Wayland lane thread")?;
-            let (ready, lane, items_tx) = await_lane_ready("pc", "wayland", ready_rx, lane, items_tx, timeout, release)?;
+            let (ready, lane, items_tx) = await_lane_ready("pc", "wayland", ready_rx, lane, items_tx, timeout, release)
+                .map_err(|mut failure| {
+                    failure.l2_schema = config.l2_schema();
+                    failure
+                })?;
             pc_ready = Some(ready);
             let lane_index = L2Modality::Pc.index();
             senders[lane_index] = Some(items_tx);
@@ -1785,6 +1809,7 @@ impl L2Output {
             let (ready, lane, items_tx) = match await_lane_ready("haptic", "alsa", ready_rx, lane, items_tx, timeout, release) {
                 Ok(ready) => ready,
                 Err(mut failure) => {
+                    failure.l2_schema = config.l2_schema();
                     // Close the PC device lane that is already up before
                     // reporting: its queue goes, the lane disconnects.
                     let pc = L2Modality::Pc.index();
@@ -2073,7 +2098,10 @@ fn await_lane_ready<T>(
     timeout: Duration,
     release: Duration,
 ) -> std::result::Result<(T, JoinHandle<()>, SyncSender<SinkMsg>), L2DeviceStartFailure> {
+    // The legacy tag; `L2Output::start_excluding` stamps the configuration's
+    // (`L2Config::l2_schema`) on every failure it returns.
     let failure = |stage, timed_out, ready_timeout_fired, lane_exited, detail| L2DeviceStartFailure {
+        l2_schema: L2_SCHEMA,
         track,
         sink,
         stage,
@@ -2347,6 +2375,8 @@ const DIAG_MAX_RECORDS: usize = 1_000_000;
 pub(crate) struct DiagLog {
     file: BufWriter<File>,
     run_id: String,
+    /// The header's `l2_schema`: the configuration's ([`L2Config::l2_schema`]).
+    l2_schema: &'static str,
     outputs: Vec<(u32, u64, i64, RawSnapshot)>,
     dropped: u64,
 }
@@ -2365,7 +2395,7 @@ impl DiagLog {
         let header = serde_json::json!({
             "role": "diagnostics_meta",
             "diagnostics_schema": L2_ALSA_DIAGNOSTICS_SCHEMA,
-            "l2_schema": L2_SCHEMA,
+            "l2_schema": self.l2_schema,
             "run_id": self.run_id,
             "analysis_time_axis": false,
             "purpose": "M2b device verification only (registration 11-11): raw ALSA snapshot values the L2 JSONL does not carry; never an analysis time axis, never joined to the ledger",
@@ -5547,7 +5577,7 @@ mod tests {
         // ...and the raw values are in the diagnostics record.
         let diag_path = tmp("c110-detail-diag");
         let file = OpenOptions::new().write(true).create_new(true).open(&diag_path).unwrap();
-        let diag = DiagLog { file: BufWriter::new(file), run_id: "t".into(), outputs: Vec::new(), dropped: 0 };
+        let diag = DiagLog { file: BufWriter::new(file), run_id: "t".into(), l2_schema: L2_SCHEMA, outputs: Vec::new(), dropped: 0 };
         diag.write(None, Some(&diag_failure)).unwrap();
         let diag_rows = rows(&diag_path);
         let record = diag_rows.iter().find(|r| r["role"] == "device_failure").unwrap();
@@ -6465,6 +6495,165 @@ mod tests {
             c.alsa.as_mut().unwrap().placement.latency_bound_frames = Some(1_068);
             let err = L2Output::start(&tmp("exp4-refused"), c).err().expect("refused");
             assert!(err.to_string().contains("no latency bound"), "{err}");
+        }
+    }
+
+    /// The three placement modes and the `l2_schema` each writes.
+    const EXP4_MODES: [(PlacementMode, &str); 3] = [
+        (PlacementMode::None, L2_SCHEMA),
+        (PlacementMode::Fifo, L2_SCHEMA_V1_8),
+        (PlacementMode::Aligned { align_offset_us: 150_000, write_ahead_frames: 4_800 }, L2_SCHEMA_V1_8),
+    ];
+
+    /// Contract §2-7 "남은 것" (Task E2): `failure_time_semantics.row_queue_overflow`
+    /// names the event time of the placement and trim rows in the ALIGNED
+    /// meta only. Fifo and legacy keep the legacy text (fifo writes neither
+    /// row), and no other failure_time_semantics entry changes.
+    #[test]
+    fn only_the_aligned_meta_names_the_row_queue_overflow_time_of_placement_and_trim_rows() {
+        let metas: Vec<serde_json::Value> = EXP4_MODES
+            .iter()
+            .map(|(mode, _)| exp4_run(&format!("exp4-fts-{}", mode.as_str().unwrap_or("legacy")), exp4_config(*mode), 0, |_| {}).1[0].clone())
+            .collect();
+        let fts = |meta: &serde_json::Value| meta["failure_time_semantics"].clone();
+        let legacy_text = fts(&metas[0])[FAIL_ROW_QUEUE_OVERFLOW].as_str().unwrap().to_string();
+        assert!(!legacy_text.contains("placement"), "{legacy_text}");
+        assert_eq!(fts(&metas[1]), fts(&metas[0]), "fifo: the legacy failure_time_semantics");
+        let aligned = fts(&metas[2]);
+        assert_eq!(aligned[FAIL_ROW_QUEUE_OVERFLOW], ALIGNED_ROW_QUEUE_OVERFLOW_SEMANTICS);
+        let stem = legacy_text.strip_suffix(')').unwrap();
+        assert!(ALIGNED_ROW_QUEUE_OVERFLOW_SEMANTICS.starts_with(stem), "the aligned text extends the legacy one");
+        let mut rest = aligned.clone();
+        rest[FAIL_ROW_QUEUE_OVERFLOW] = legacy_text.clone().into();
+        assert_eq!(rest, fts(&metas[0]), "only row_queue_overflow differs");
+    }
+
+    /// An aligned lane on the epoch's first snapshot (as in the row-order
+    /// test below: hw_pos 0, htstamp t0, appl_pos 4,800, c = 150 ms) whose
+    /// row queue holds `row_capacity` rows (nothing reads it).
+    fn aligned_virtual_lane(row_capacity: usize) -> (AlsaLane, Receiver<Row>, Arc<Shared>, u64) {
+        let (rows_tx, rows_rx) = mpsc::sync_channel(row_capacity);
+        let shared = Arc::new(Shared::default());
+        let placement = PlacementConfig {
+            mode: PlacementMode::Aligned { align_offset_us: 150_000, write_ahead_frames: 4_800 },
+            ..sim_placement()
+        };
+        let mut pcm = SimPcm::new(SimPcmConfig::new(512, 16_384));
+        let mut engine = HapticPlacement::new(placement, pcm.params()).unwrap();
+        let mut clock = now_us;
+        engine.prefill(&mut pcm, &mut clock).unwrap();
+        let t0 = now_us();
+        pcm.start(t0).unwrap();
+        let first = pcm.status(t0).unwrap();
+        engine.begin_epoch(t0, first, t0).unwrap();
+        (AlsaLane::new(Box::new(pcm), engine, rows_tx, shared.clone()), rows_rx, shared, t0)
+    }
+
+    /// The behaviour the aligned row_queue_overflow text states: a lost
+    /// placement row fails at its submission's t_submit_us, and a lost trim
+    /// row at the TRIMMING submission's t_submit_us (by_seq), not at the
+    /// trimmed tick's (earlier) one. The lane records only that failure here
+    /// (no writer runs), so the timed failure is exactly the lost row's.
+    #[test]
+    fn a_lost_placement_or_trim_row_fails_at_the_placing_submissions_t_submit() {
+        let sub = |t0: u64, seq: u32, release_rel: u64, submit_rel: u64| L2Submission {
+            identity: haptic(seq),
+            t_release_us: t0 + release_rel,
+            t_submit_us: t0 + submit_rel,
+        };
+        // Row queue of 1: submit 1 fits, its placement row (a gap) is lost.
+        let (mut lane, _rows, shared, t0) = aligned_virtual_lane(1);
+        lane.accept(sub(t0, 1, 0, 100), Some(tick_payload(1)));
+        assert_eq!((lane.placement_rows, lane.row_overflow), (1, 1));
+        let timed = shared.failures.lock().unwrap().timed;
+        assert_eq!(timed.map(|(t, _, reason)| (t, reason)), Some((t0 + 100, FAIL_ROW_QUEUE_OVERFLOW)));
+        // Row queue of 4: submit 1 + placement 1 (gap, n* 7,200) and submit 2
+        // + placement 2 (n* 7,733, cuts one frame of tick 1) fit; the trim
+        // row of tick 1 by tick 2 is lost.
+        let (mut lane, rows, shared, t0) = aligned_virtual_lane(4);
+        lane.accept(sub(t0, 1, 0, 100), Some(tick_payload(1)));
+        lane.accept(sub(t0, 2, 11_111, 11_200), Some(tick_payload(1)));
+        assert_eq!((lane.placement_rows, lane.trim_rows, lane.row_overflow), (2, 1, 1));
+        let kept: Vec<String> = rows
+            .try_iter()
+            .map(|row| match row {
+                Row::Submit(s) => format!("submit {}", s.identity.seq),
+                Row::Placement(p) => format!("placement {} {}", p.submission.identity.seq, p.case.as_str()),
+                _ => "other".into(),
+            })
+            .collect();
+        assert_eq!(kept, ["submit 1", "placement 1 gap", "submit 2", "placement 2 queue_overlap"]);
+        let timed = shared.failures.lock().unwrap().timed;
+        assert_eq!(timed.map(|(t, _, reason)| (t, reason)), Some((t0 + 11_200, FAIL_ROW_QUEUE_OVERFLOW)), "the trimming tick's t_submit_us");
+    }
+
+    /// Contract §2-7 "남은 것" (Task E2): the typed device start failure
+    /// (the receiver's `L2_DEVICE_START_FAILURE` line) carries the
+    /// configuration's l2_schema, whichever lane failed: v1.7 legacy, v1.8
+    /// fifo / aligned. No meta row is written in either case.
+    #[test]
+    fn a_device_start_failure_carries_the_configuration_l2_schema() {
+        for (mode, want) in EXP4_MODES {
+            // The haptic stream cannot start.
+            let mut config = exp4_config(mode);
+            match &mut config.alsa.as_mut().unwrap().backend {
+                AlsaBackend::Simulated(sim) => sim.faults = vec![SimFault::StartError],
+                AlsaBackend::Device { .. } => unreachable!("simulated"),
+            }
+            assert_eq!(config.l2_schema(), want);
+            let path = tmp("exp4-start-failure-haptic");
+            let error = L2Output::start(&path, config).err().expect("refused");
+            let failure = error.downcast_ref::<L2DeviceStartFailure>().expect("typed");
+            assert_eq!((failure.track, failure.sink, failure.stage, failure.l2_schema), ("haptic", "alsa", "start", want));
+            let json = failure.to_json();
+            assert_eq!((json["status"].as_str(), json["l2_schema"].as_str()), (Some("device_start_failure"), Some(want)));
+            assert_eq!(std::fs::read(&path).unwrap(), b"", "no meta row");
+            let _ = std::fs::remove_file(&path);
+            // The PC lane refuses first (clock not CLOCK_MONOTONIC) while the
+            // haptic placement is the same.
+            let mut sim = sim_display();
+            sim.clock_id = libc::CLOCK_MONOTONIC_RAW as u32;
+            let mut config = wayland_config(sim, PcRepresentation::Bin);
+            config.sinks = L2Sinks { pc: L2SinkKind::Wayland, haptic: L2SinkKind::Alsa };
+            let mut alsa = sim_alsa(Vec::new());
+            alsa.placement.mode = mode;
+            config.alsa = Some(alsa);
+            let path = tmp("exp4-start-failure-pc");
+            let error = L2Output::start(&path, config).err().expect("refused");
+            let failure = error.downcast_ref::<L2DeviceStartFailure>().expect("typed");
+            assert_eq!((failure.track, failure.stage, failure.l2_schema), ("pc", "clock", want));
+            assert_eq!(failure.to_json()["l2_schema"], want);
+            assert_eq!(std::fs::read(&path).unwrap(), b"", "no meta row");
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// Contract §2-7 "남은 것" (Task E2): the probe-only diagnostics headers
+    /// (ALSA and Wayland) carry the configuration's l2_schema, the same tag
+    /// as the ledger's meta row: v1.7 legacy, v1.8 fifo / aligned.
+    #[test]
+    fn the_diagnostics_headers_carry_the_configuration_l2_schema() {
+        for (mode, want) in EXP4_MODES {
+            let path = tmp("exp4-diag-l2");
+            let alsa_diag = tmp("exp4-diag-alsa");
+            let pc_diag = tmp("exp4-diag-pc");
+            let mut config = wayland_config(sim_display(), PcRepresentation::Bin);
+            config.sinks = L2Sinks { pc: L2SinkKind::Wayland, haptic: L2SinkKind::Alsa };
+            let mut alsa = sim_alsa(Vec::new());
+            alsa.placement.mode = mode;
+            alsa.diagnostics = Some(alsa_diag.clone());
+            config.alsa = Some(alsa);
+            config.wayland.as_mut().unwrap().diagnostics = Some(pc_diag.clone());
+            let out = L2Output::start(&path, config).unwrap();
+            out.finish().unwrap();
+            let l2 = rows(&path);
+            assert_eq!(l2[0]["l2_schema"], want);
+            for diag_path in [&alsa_diag, &pc_diag] {
+                let diag = rows(diag_path);
+                assert_eq!((diag[0]["role"].as_str(), diag[0]["l2_schema"].as_str()), (Some("diagnostics_meta"), Some(want)), "{}", diag_path.display());
+                let _ = std::fs::remove_file(diag_path);
+            }
+            let _ = std::fs::remove_file(&path);
         }
     }
 

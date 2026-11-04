@@ -44,7 +44,7 @@ use super::{
     micros, L2Modality, L2Submission, LaneStartError, OutputDetail, Row, Shared, SinkMsg, WaylandBackendKind,
     WaylandOutputDetail, WaylandSinkConfig, DISCARD_COMPOSITOR_DISCARDED, DISCARD_DEVICE_FAILURE,
     DISCARD_PAYLOAD_INVALID, DISCARD_SUPERSEDED_BEFORE_COMMIT, FAIL_PRODUCERS_ALIVE_AT_FINISH,
-    FAIL_ROW_QUEUE_OVERFLOW, L2_SCHEMA, L2_WAYLAND_DIAGNOSTICS_SCHEMA,
+    FAIL_ROW_QUEUE_OVERFLOW, L2_WAYLAND_DIAGNOSTICS_SCHEMA,
 };
 use crate::l2_pc::{
     presentation_flag_names, BackendEvent, BufferState, EngineOutcome, FramePreparer, Offer, PendingSlot, PixelPool,
@@ -73,6 +73,8 @@ const DIAG_MAX_RECORDS: usize = 1_000_000;
 pub(crate) struct PcDiagLog {
     file: BufWriter<File>,
     run_id: String,
+    /// The header's `l2_schema`: the configuration's (`L2Config::l2_schema`).
+    l2_schema: &'static str,
     records: Vec<(u64, Presented, u64)>,
     /// Anomalies with the raw presentation behind them (Codex 112 P2-5:
     /// the L2 JSONL keeps only the reason and the commit id).
@@ -81,8 +83,8 @@ pub(crate) struct PcDiagLog {
 }
 
 impl PcDiagLog {
-    pub(crate) fn new(file: BufWriter<File>, run_id: String) -> Self {
-        Self { file, run_id, records: Vec::new(), anomalies: Vec::new(), dropped: 0 }
+    pub(crate) fn new(file: BufWriter<File>, run_id: String, l2_schema: &'static str) -> Self {
+        Self { file, run_id, l2_schema, records: Vec::new(), anomalies: Vec::new(), dropped: 0 }
     }
 
     fn note(&mut self, commit_id: u64, presented: Presented, t_callback_us: u64) {
@@ -112,7 +114,7 @@ impl PcDiagLog {
         let header = serde_json::json!({
             "role": "diagnostics_meta",
             "diagnostics_schema": L2_WAYLAND_DIAGNOSTICS_SCHEMA,
-            "l2_schema": L2_SCHEMA,
+            "l2_schema": self.l2_schema,
             "run_id": self.run_id,
             "analysis_time_axis": false,
             "purpose": "M3 display verification only: the raw wp_presentation_feedback.presented values the L2 JSONL does not carry; never an analysis time axis, never joined to the ledger",
@@ -1512,7 +1514,7 @@ mod tests {
         let shared = Arc::new(Shared::default());
         let diag_path = std::env::temp_dir().join(format!("skew-pc-lane-diag-{}-{}.jsonl", std::process::id(), now_us()));
         let diag_file = std::fs::OpenOptions::new().write(true).create_new(true).open(&diag_path).unwrap();
-        let diag = PcDiagLog::new(BufWriter::new(diag_file), "t".into());
+        let diag = PcDiagLog::new(BufWriter::new(diag_file), "t".into(), crate::l2_output::L2_SCHEMA);
         let mut lane = lane(rows_tx.clone(), shared.clone(), Some(diag));
         let identity = L2Identity { modality: L2Modality::Pc, tier: 2, seq: 1, pts_us: 0, event_id: 1, route: None };
         let s = L2Submission { identity, t_release_us: 10, t_submit_us: 11 };
