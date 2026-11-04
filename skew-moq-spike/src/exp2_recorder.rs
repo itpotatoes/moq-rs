@@ -1,9 +1,13 @@
 //! Experiment-2 WP3 recorder: the receiver-side producer of the L1-R output
-//! ledger. Since experiment 3 it writes the generation exp3-contract-v1
-//! (contract `md/20261103_실험3_계약.md`): a delta over exp2-contract-v5
-//! (`md/20260929_실험2_계약.md`) with the same record format, L2 schema
-//! v1.7 and runner-side method-binding meta. Section references "contract
-//! v4 §N" below name the rule's origin, unchanged in v5 and exp3-contract-v1.
+//! ledger. Since experiment 4 it writes the generation exp4-contract-v1
+//! (contract `md/20261104_실험4_계약.md`): a delta over exp3-contract-v1
+//! (`md/20261103_실험3_계약.md`, itself a delta over exp2-contract-v5,
+//! `md/20260929_실험2_계약.md`) with the same record format; the deltas are
+//! outside this module (L2 `event-pair-l2-v1.8` for both haptic sinks, the
+//! receiver's `--l2-alsa-placement` flags, runner-side method binding).
+//! Section references "contract v4 §N" below name the rule's origin,
+//! unchanged in v5, exp3-contract-v1 and exp4-contract-v1. Experiment 3 is
+//! reproduced with its own frozen binaries, not with this generation.
 //!
 //! The recorder owns the run's exp2 JSONL file and, for the core methods, the
 //! WP1 core (`Exp2Playout` for S3NPA'/P0-NP/P0, `Exp2P1` for P1).  B1 and S1
@@ -48,12 +52,14 @@ use crate::{is_warmup_seq, Header, HDR, TRACK_HAPTIC, TRACK_PC};
 
 /// The contract generation this recorder writes (exp2 meta `contract`, rx
 /// `cal_meta` `contract`) and requires of the runner's opportunities file
-/// (`contract`). Current value `exp3-contract-v1` (experiment 3,
-/// `md/20261103_실험3_계약.md`): the exp2-contract-v5 record format below,
-/// unchanged, under a new generation (L2 v1.7, runner-side method binding);
-/// an exp2-contract-v5 (or older) opportunities file is refused. The name
-/// keeps its exp2 prefix (this module's record format); the VALUE is the
-/// generation. v5 (stage-2
+/// (`contract`). Current value `exp4-contract-v1` (experiment 4,
+/// `md/20261104_실험4_계약.md` §1): the exp2-contract-v5 record format below,
+/// unchanged, under a new generation (L2 v1.8 for both haptic sinks,
+/// runner-side method binding); an exp3-contract-v1 (experiment 3) or older
+/// opportunities file is refused. The previous generation was
+/// `exp3-contract-v1` (experiment 3, `md/20261103_실험3_계약.md`: L2 v1.7).
+/// The name keeps its exp2 prefix (this module's record format); the VALUE
+/// is the generation. v5 (stage-2
 /// decision E1, `md/20261025_실험2_2단계_등록변경안.md`) = v4 plus, as
 /// written by this code generation:
 /// * the seal drop `dispatch_after_horizon` with `t_dispatch_us` (a release
@@ -70,13 +76,13 @@ use crate::{is_warmup_seq, Header, HDR, TRACK_HAPTIC, TRACK_PC};
 ///   contract and the metric schema below), L2 meta method `"calibration"`.
 /// Any other contract in an opportunities file is refused
 /// ([`load_opportunities`]).
-pub const EXP2_CONTRACT_VERSION: &str = "exp3-contract-v1";
+pub const EXP2_CONTRACT_VERSION: &str = "exp4-contract-v1";
 /// The exp2 JSONL / summary schema generation (exp2 meta
-/// `metric_schema_version`, rx `cal_meta`): `exp3-v1` = the rows and
+/// `metric_schema_version`, rx `cal_meta`): `exp4-v1` = the rows and
 /// meanings of `exp2-v4` (contract v5, stage-2 decision E2) unchanged, under
-/// the experiment-3 generation; files of another generation are never
-/// merged with it.
-pub const EXP2_METRIC_SCHEMA_VERSION: &str = "exp3-v1";
+/// the experiment-4 generation (previously `exp3-v1`, experiment 3); files
+/// of another generation are never merged with it.
+pub const EXP2_METRIC_SCHEMA_VERSION: &str = "exp4-v1";
 /// Registration §1: run length, B_play, ε_ref, G_report,R (integer µs).
 pub const RUN_DURATION_US: u64 = 40_000_000;
 pub const B_PLAY_US: u64 = 400_000;
@@ -3919,13 +3925,14 @@ mod tests {
     }
 
 
-    /// Stage-2 E1/E2, experiment 3: the generation tags are pinned, written
+    /// Stage-2 E1/E2, experiment 4: the generation tags are pinned, written
     /// into the exp2 meta, and a previous-generation opportunities file
-    /// (experiment 2's v5 included) is refused.
+    /// (experiment 3's exp3-contract-v1 and experiment 2's v5 included) is
+    /// refused.
     #[test]
-    fn the_generation_tags_are_exp3_contract_v1_and_exp3_v1() {
-        assert_eq!(EXP2_CONTRACT_VERSION, "exp3-contract-v1");
-        assert_eq!(EXP2_METRIC_SCHEMA_VERSION, "exp3-v1");
+    fn the_generation_tags_are_exp4_contract_v1_and_exp4_v1() {
+        assert_eq!(EXP2_CONTRACT_VERSION, "exp4-contract-v1");
+        assert_eq!(EXP2_METRIC_SCHEMA_VERSION, "exp4-v1");
         let opp = |contract: &str| {
             let pc: Vec<Value> = (0..N_PC as u64)
                 .map(|i| {
@@ -3942,10 +3949,10 @@ mod tests {
                 .collect();
             canonical_json_bytes(&json!({"contract": contract, "run_id": "run-1", "t0_us": T0, "pc": pc, "haptic": hap}))
         };
-        assert!(load_opportunities(&opp("exp3-contract-v1"), "run-1", T0).is_ok());
-        for old in ["exp2-contract-v5", "exp2-contract-v4", "exp2-contract-v3"] {
+        assert!(load_opportunities(&opp("exp4-contract-v1"), "run-1", T0).is_ok());
+        for old in ["exp3-contract-v1", "exp2-contract-v5", "exp2-contract-v4", "exp2-contract-v3"] {
             let error = load_opportunities(&opp(old), "run-1", T0).unwrap_err();
-            assert!(format!("{error:#}").contains("exp3-contract-v1"), "{error:#}");
+            assert!(format!("{error:#}").contains("exp4-contract-v1"), "{error:#}");
         }
     }
 }
