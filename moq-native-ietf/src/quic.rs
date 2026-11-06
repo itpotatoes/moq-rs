@@ -110,17 +110,66 @@ fn bind_smart(addr: net::SocketAddr) -> anyhow::Result<(net::UdpSocket, bool)> {
     Ok((socket.into(), is_dual_stack))
 }
 
+/// QUIC congestion controller used by every connection of an [`Endpoint`].
+///
+/// The default, [`CongestionChoice::Bbr`], is the controller moq-rs has always
+/// set explicitly; quinn's own default would be CUBIC. Both variants use the
+/// quinn config defaults (`BbrConfig::default()` / `CubicConfig::default()`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum CongestionChoice {
+    /// quinn BBR (`BbrConfig::default()`): the historical moq-rs setting.
+    #[default]
+    Bbr,
+    /// quinn CUBIC (`CubicConfig::default()`).
+    Cubic,
+}
+
+impl CongestionChoice {
+    /// The CLI spelling (`bbr` / `cubic`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CongestionChoice::Bbr => "bbr",
+            CongestionChoice::Cubic => "cubic",
+        }
+    }
+}
+
+impl fmt::Display for CongestionChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Build a TransportConfig with our standard settings
 ///
 /// This is used both for the base endpoint config and when creating
 /// per-connection configs with qlog enabled.
-fn build_transport_config() -> quinn::TransportConfig {
+fn build_transport_config(congestion: CongestionChoice) -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(time::Duration::from_secs(10).try_into().unwrap()));
     transport.keep_alive_interval(Some(time::Duration::from_secs(4))); // TODO make this smarter
-    transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+    match congestion {
+        CongestionChoice::Bbr => transport
+            .congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default())),
+        CongestionChoice::Cubic => transport
+            .congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default())),
+    };
     transport.mtu_discovery_config(None); // Disable MTU discovery
     transport
+}
+
+/// CLOCK_MONOTONIC in µs, the clock of the skew logs (`t_gen`/`t_recv`).
+/// Used only to anchor a client qlog's relative event times.
+fn clock_monotonic_us() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid, writable timespec; CLOCK_MONOTONIC always exists on Linux.
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+    }
+    (ts.tv_sec as u64) * 1_000_000 + (ts.tv_nsec as u64) / 1000
 }
 
 #[derive(Parser, Clone)]
@@ -214,6 +263,13 @@ pub struct Config {
     /// Optional hook to wrap the [`quinn::AsyncUdpSocket`] before endpoint
     /// creation. Defaults to `None` (no wrapping). See [`SocketWrapperFn`].
     pub socket_wrapper: Option<SocketWrapperFn>,
+    /// Congestion controller for every connection (base and per-connection
+    /// qlog transport configs). Defaults to BBR. See [`Config::with_congestion`].
+    pub congestion: CongestionChoice,
+    /// Also write a qlog for each outgoing (client) connection into
+    /// `qlog_dir`. Defaults to `false`: `qlog_dir` alone covers only accepted
+    /// (server) connections, as before. See [`Config::with_client_qlog`].
+    pub client_qlog: bool,
 }
 
 impl Config {
@@ -231,6 +287,8 @@ impl Config {
             tls,
             tags: HashSet::new(),
             socket_wrapper: None,
+            congestion: CongestionChoice::default(),
+            client_qlog: false,
         })
     }
 
@@ -255,6 +313,8 @@ impl Config {
             tls,
             tags: HashSet::new(),
             socket_wrapper: None,
+            congestion: CongestionChoice::default(),
+            client_qlog: false,
         }
     }
 
@@ -273,6 +333,22 @@ impl Config {
             + 'static,
     {
         self.socket_wrapper = Some(Box::new(wrapper));
+        self
+    }
+
+    /// Select the QUIC congestion controller. Without this call the endpoint
+    /// uses [`CongestionChoice::Bbr`], the historical moq-rs setting.
+    pub fn with_congestion(mut self, congestion: CongestionChoice) -> Self {
+        self.congestion = congestion;
+        self
+    }
+
+    /// When `enabled` and `qlog_dir` is set, every outgoing connection made
+    /// through [`Client::connect`] writes `<initial-dcid>_client.qlog` into
+    /// `qlog_dir` (the same CID names the peer's `_server.qlog`). Without this
+    /// call client connections write no qlog, exactly as before.
+    pub fn with_client_qlog(mut self, enabled: bool) -> Self {
+        self.client_qlog = enabled;
         self
     }
 }
@@ -303,7 +379,7 @@ impl Endpoint {
         }
 
         // Build transport config with our standard settings
-        let transport = Arc::new(build_transport_config());
+        let transport = Arc::new(build_transport_config(config.congestion));
 
         let mut server_config = None;
 
@@ -347,11 +423,19 @@ impl Endpoint {
                 .context("failed to create QUIC endpoint")?,
         };
 
+        let qlog_dir = config.qlog_dir.map(Arc::new);
+        let client_qlog_dir = if config.client_qlog {
+            qlog_dir.clone()
+        } else {
+            None
+        };
+
         let server = server_config.map(|base_server_config| Server {
             quic: quic.clone(),
             accept: Default::default(),
-            qlog_dir: config.qlog_dir.map(Arc::new),
+            qlog_dir,
             base_server_config: Arc::new(base_server_config),
+            congestion: config.congestion,
         });
 
         let client = Client {
@@ -359,6 +443,8 @@ impl Endpoint {
             config: config.tls.client,
             transport,
             is_dual_stack: config.is_dual_stack,
+            qlog_dir: client_qlog_dir,
+            congestion: config.congestion,
         };
 
         Ok(Self {
@@ -376,6 +462,7 @@ pub struct Server {
     >,
     qlog_dir: Option<Arc<PathBuf>>,
     base_server_config: Arc<quinn::ServerConfig>,
+    congestion: CongestionChoice,
 }
 
 impl Server {
@@ -386,7 +473,8 @@ impl Server {
                     let conn = res?;
                     let qlog_dir = self.qlog_dir.clone();
                     let base_server_config = self.base_server_config.clone();
-                    self.accept.push(Self::accept_session(conn, qlog_dir, base_server_config).boxed());
+                    let congestion = self.congestion;
+                    self.accept.push(Self::accept_session(conn, qlog_dir, base_server_config, congestion).boxed());
                 },
                 res = self.accept.next(), if !self.accept.is_empty() => {
                     match res? {
@@ -405,6 +493,7 @@ impl Server {
         conn: quinn::Incoming,
         qlog_dir: Option<Arc<PathBuf>>,
         base_server_config: Arc<quinn::ServerConfig>,
+        congestion: CongestionChoice,
     ) -> anyhow::Result<(web_transport::Session, String, Transport)> {
         // Capture the original destination connection ID BEFORE accepting
         // This is the actual QUIC CID that can be used for qlog/mlog correlation
@@ -417,7 +506,7 @@ impl Server {
             let qlog_path = qlog_dir.join(format!("{}_server.qlog", connection_id_hex));
 
             // Create transport config with our standard settings plus qlog
-            let mut transport = build_transport_config();
+            let mut transport = build_transport_config(congestion);
 
             let file = File::create(&qlog_path).context("failed to create qlog file")?;
             let writer = BufWriter::new(file);
@@ -525,6 +614,9 @@ pub struct Client {
     config: rustls::ClientConfig,
     transport: Arc<quinn::TransportConfig>,
     is_dual_stack: bool,
+    /// Set only by [`Config::with_client_qlog`]: per-connection client qlog.
+    qlog_dir: Option<Arc<PathBuf>>,
+    congestion: CongestionChoice,
 }
 
 impl Client {
@@ -572,18 +664,55 @@ impl Client {
 
         let config: quinn::crypto::rustls::QuicClientConfig = config.try_into()?;
         let mut config = quinn::ClientConfig::new(Arc::new(config));
-        config.transport_config(self.transport.clone());
+
+        // Client qlog (opt-in, Config::with_client_qlog): the file is named by
+        // the initial destination CID, so that CID is drawn here, before the
+        // transport config is built, and handed to the provider below.
+        // Without client qlog this is None and nothing below changes.
+        let preset_cid = match &self.qlog_dir {
+            Some(qlog_dir) => {
+                let cid = random_initial_dst_cid();
+                let qlog_path = qlog_dir.join(format!("{}_client.qlog", cid));
+                let file = File::create(&qlog_path).context("failed to create client qlog file")?;
+                let mut qlog = quinn::QlogConfig::default();
+                // qlog event times are ms relative to `start`; record the
+                // CLOCK_MONOTONIC µs of that instant (read back to back) so
+                // they can be aligned with the skew logs' t_gen/t_recv.
+                let start = time::Instant::now();
+                let start_mono_us = clock_monotonic_us();
+                qlog.writer(Box::new(BufWriter::new(file)))
+                    .title(Some("moq-client".into()))
+                    .description(Some(format!(
+                        "congestion={} start_time_clock_monotonic_us={}",
+                        self.congestion, start_mono_us
+                    )))
+                    .start_time(start);
+                let mut transport = build_transport_config(self.congestion);
+                transport.qlog_stream(qlog.into_stream());
+                config.transport_config(Arc::new(transport));
+                tracing::info!(
+                    "client qlog enabled: cid={} path={} congestion={} start_time_clock_monotonic_us={}",
+                    cid,
+                    qlog_path.display(),
+                    self.congestion,
+                    start_mono_us
+                );
+                Some(cid)
+            }
+            None => {
+                config.transport_config(self.transport.clone());
+                None
+            }
+        };
 
         // Capture the initial destination CID that will be sent to the server
         // This is the CID used for qlog/mlog correlation on the server side
         let cid_capture: Arc<Mutex<Option<quinn::ConnectionId>>> = Arc::new(Mutex::new(None));
         let cid_capture_clone = cid_capture.clone();
         config.initial_dst_cid_provider(Arc::new(move || {
-            // Generate a random CID (Quinn's default behavior)
-            use rand::Rng;
-            let mut rng = rand::thread_rng();
-            let random_bytes: [u8; 16] = rng.gen();
-            let cid = quinn::ConnectionId::new(&random_bytes);
+            // Generate a random CID (Quinn's default behavior), unless the
+            // client qlog already drew the one its file is named after.
+            let cid = preset_cid.unwrap_or_else(random_initial_dst_cid);
             *cid_capture_clone.lock().unwrap() = Some(cid);
             cid
         }));
@@ -728,6 +857,14 @@ impl Client {
     }
 }
 
+/// A random 16-byte initial destination CID (Quinn's default behavior).
+fn random_initial_dst_cid() -> quinn::ConnectionId {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let random_bytes: [u8; 16] = rng.gen();
+    quinn::ConnectionId::new(&random_bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -767,5 +904,159 @@ mod tests {
             endpoint.server.is_none(),
             "client-only TLS config should yield no server"
         );
+    }
+
+    fn fixture(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../moq-relay-ietf/tests/fixtures")
+            .join(name)
+    }
+
+    fn test_tls(server: bool) -> tls::Config {
+        let mut args = tls::Args {
+            disable_verify: true,
+            ..Default::default()
+        };
+        if server {
+            args.cert = vec![fixture("localhost-test-only.crt")];
+            args.key = vec![fixture("localhost-test-only.key")];
+        }
+        args.load().expect("test TLS config")
+    }
+
+    /// Without the new builders a `Config` keeps today's behaviour: BBR and
+    /// no client qlog. The builders set exactly their own field.
+    #[test]
+    fn congestion_defaults_to_bbr_and_client_qlog_is_opt_in() {
+        assert_eq!(CongestionChoice::default(), CongestionChoice::Bbr);
+        assert_eq!(CongestionChoice::Bbr.as_str(), "bbr");
+        assert_eq!(CongestionChoice::Cubic.to_string(), "cubic");
+
+        let config = Config::new("127.0.0.1:0".parse().unwrap(), None, test_tls(false)).unwrap();
+        assert_eq!(config.congestion, CongestionChoice::Bbr);
+        assert!(!config.client_qlog);
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let config = Config::with_socket(socket, None, test_tls(false));
+        assert_eq!(config.congestion, CongestionChoice::Bbr);
+        assert!(!config.client_qlog);
+
+        let config = config
+            .with_congestion(CongestionChoice::Cubic)
+            .with_client_qlog(true);
+        assert_eq!(config.congestion, CongestionChoice::Cubic);
+        assert!(config.client_qlog);
+    }
+
+    /// First `congestion_window` value recorded in a qlog file, once the
+    /// buffered writer has flushed it (the stream is flushed when the
+    /// connection state is dropped, so poll).
+    async fn first_cwnd(path: &std::path::Path) -> (u64, String) {
+        let deadline = time::Instant::now() + time::Duration::from_secs(10);
+        loop {
+            let text = std::fs::read_to_string(path).unwrap_or_default();
+            if let Some(at) = text.find("\"congestion_window\":") {
+                let digits: String = text[at + "\"congestion_window\":".len()..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                return (digits.parse().expect("cwnd value"), text);
+            }
+            assert!(
+                time::Instant::now() < deadline,
+                "no congestion_window in {}",
+                path.display()
+            );
+            tokio::time::sleep(time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Loopback (127.0.0.1, raw QUIC): the selected controller reaches both
+    /// per-connection qlog transport configs, visible as the initial window in
+    /// the first metrics_updated (quinn 0.11.13: BBR 200 x 1200 = 240000 B,
+    /// CUBIC 14720 clamped to 10 x 1200 = 12000 B). The client qlog exists only
+    /// with `with_client_qlog(true)`, is named by the CID `connect` returns
+    /// (the server names its file by the same CID), and records the
+    /// CLOCK_MONOTONIC anchor of its relative times.
+    async fn loopback_qlog(congestion: CongestionChoice, client_qlog: bool) {
+        let dir = std::env::temp_dir().join(format!(
+            "moq-native-qlog-{}-{}-{}",
+            congestion,
+            client_qlog,
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).expect("fresh qlog dir");
+
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        let mut server_endpoint = Endpoint::new(
+            Config::with_socket(socket, Some(dir.clone()), test_tls(true))
+                .with_congestion(congestion),
+        )
+        .unwrap();
+        let mut server = server_endpoint.server.take().expect("server");
+        let accept = tokio::spawn(async move { server.accept().await.expect("inbound session") });
+
+        let mut client_config =
+            Config::new("127.0.0.1:0".parse().unwrap(), Some(dir.clone()), test_tls(false))
+                .unwrap()
+                .with_congestion(congestion);
+        if client_qlog {
+            client_config = client_config.with_client_qlog(true);
+        }
+        let client_endpoint = Endpoint::new(client_config).unwrap();
+        let url = Url::parse(&format!("moqt://{addr}")).unwrap();
+        let (client_session, client_cid, _) = client_endpoint
+            .client
+            .connect(&url, None)
+            .await
+            .expect("connect");
+        let (server_session, server_cid, _) =
+            tokio::time::timeout(time::Duration::from_secs(10), accept)
+                .await
+                .expect("accept in time")
+                .unwrap();
+        assert_eq!(client_cid, server_cid, "both ends name the connection by one CID");
+        drop((client_session, server_session, client_endpoint, server_endpoint));
+
+        let expected = match congestion {
+            CongestionChoice::Bbr => 240_000,
+            CongestionChoice::Cubic => 12_000,
+        };
+        let (server_cwnd, _) = first_cwnd(&dir.join(format!("{server_cid}_server.qlog"))).await;
+        assert_eq!(server_cwnd, expected, "server qlog controller ({congestion})");
+
+        let client_path = dir.join(format!("{client_cid}_client.qlog"));
+        if client_qlog {
+            let (client_cwnd, text) = first_cwnd(&client_path).await;
+            assert_eq!(client_cwnd, expected, "client qlog controller ({congestion})");
+            assert!(text.contains("\"title\":\"moq-client\""));
+            assert!(
+                text.contains(&format!("congestion={congestion} start_time_clock_monotonic_us=")),
+                "anchor in the client qlog description"
+            );
+        } else {
+            assert!(
+                std::fs::symlink_metadata(&client_path).is_err(),
+                "no client qlog without with_client_qlog"
+            );
+            let names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+            assert_eq!(names.len(), 1, "only the server qlog: {names:?}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn loopback_qlog_bbr_default_server_only() {
+        loopback_qlog(CongestionChoice::Bbr, false).await;
+    }
+
+    #[tokio::test]
+    async fn loopback_qlog_bbr_with_client_qlog() {
+        loopback_qlog(CongestionChoice::Bbr, true).await;
+    }
+
+    #[tokio::test]
+    async fn loopback_qlog_cubic_with_client_qlog() {
+        loopback_qlog(CongestionChoice::Cubic, true).await;
     }
 }

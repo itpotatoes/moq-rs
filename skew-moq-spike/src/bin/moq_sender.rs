@@ -683,6 +683,15 @@ struct Args {
     /// optional for B1/S1 (always 0: no timeout configured).
     #[arg(long)]
     exp2_wire_out: Option<PathBuf>,
+    /// QUIC congestion controller of the sender's connection (probe). The
+    /// default `bbr` is the controller every earlier run used.
+    #[arg(long, value_enum, default_value_t = quic::CongestionChoice::Bbr)]
+    quic_cc: quic::CongestionChoice,
+    /// Write a qlog of the sender's QUIC connection (`<cid>_client.qlog`)
+    /// into this existing directory (probe). Absent = no qlog. Nothing is
+    /// added to the tx JSONL either way.
+    #[arg(long)]
+    qlog_dir: Option<PathBuf>,
 }
 
 /// CLI mirror of `skew_moq::s3np::ReleaseRule`. Kept a separate type so clap's
@@ -1785,8 +1794,19 @@ impl AcceptSink for S3AcceptSink {
     }
 }
 
+/// The startup stderr line naming the QUIC congestion controller and the
+/// qlog directory (stderr only; the tx JSONL schema is unchanged).
+fn quic_probe_line(quic_cc: quic::CongestionChoice, qlog_dir: Option<&std::path::Path>) -> String {
+    match qlog_dir {
+        Some(dir) => format!("[tx] quic congestion controller: {quic_cc}; qlog dir: {}", dir.display()),
+        None => format!("[tx] quic congestion controller: {quic_cc}; qlog dir: none"),
+    }
+}
+
 async fn connect(
     relay: &Url,
+    quic_cc: quic::CongestionChoice,
+    qlog_dir: Option<PathBuf>,
 ) -> Result<(web_transport::Session, moq_transport::session::Transport)> {
     let tls_args = tls::Args {
         disable_verify: true,
@@ -1794,7 +1814,10 @@ async fn connect(
     };
     let tls = tls_args.load()?;
     let bind: SocketAddr = "[::]:0".parse().unwrap();
-    let quic = quic::Endpoint::new(quic::Config::new(bind, None, tls)?)?;
+    let config = quic::Config::new(bind, qlog_dir, tls)?
+        .with_congestion(quic_cc)
+        .with_client_qlog(true);
+    let quic = quic::Endpoint::new(config)?;
     let (session, _cid, transport) = quic.client.connect(relay, None).await?;
     Ok((session, transport))
 }
@@ -1828,6 +1851,7 @@ async fn main() -> Result<()> {
         )
         .init();
     let args = Args::parse();
+    eprintln!("{}", quic_probe_line(args.quic_cc, args.qlog_dir.as_deref()));
     let ratio = validate_v5_rates(args.pc_rate_hz, args.haptic_rate_hz)?;
     anyhow::ensure!(args.chunk_bytes > 0, "--chunk-bytes must be positive");
     anyhow::ensure!(
@@ -2104,7 +2128,9 @@ async fn main() -> Result<()> {
     // captured so the finalizer still runs (A2-c R1, Codex finding 5).
     let mut outcome: Result<()> = async {
         // ---- MoQ session ----
-        let (sess, tp) = connect(&args.relay).await.context("connect relay")?;
+        let (sess, tp) = connect(&args.relay, args.quic_cc, args.qlog_dir.clone())
+            .await
+            .context("connect relay")?;
         let config = SessionConfig {
             data_priority_mapping: args.data_priority_mapping,
             ..SessionConfig::default()
@@ -3497,7 +3523,51 @@ mod tests {
             d_play_ms: None,
             s3np_release_rule: None,
             exp2_wire_out: None,
+            quic_cc: moq_native_ietf::quic::CongestionChoice::Bbr,
+            qlog_dir: None,
         }
+    }
+
+    /// The smallest command line `Args` accepts (every required option once).
+    const REQUIRED_ARGV: [&str; 21] = [
+        "moq_sender", "--run-id", "t", "--out", "/dev/null", "--duration", "1",
+        "--haptic-wav", "h.wav", "--pc-rate-hz", "30", "--haptic-rate-hz", "90",
+        "--payload-mode", "frame", "--representation", "bin", "--topology", "relay",
+        "--chunk-bytes", "178",
+    ];
+
+    /// Probe flags: absent = BBR (every earlier run) and no qlog; `--quic-cc
+    /// cubic` and `--qlog-dir` parse; an unknown controller is refused.
+    #[test]
+    fn quic_cc_defaults_to_bbr_and_cubic_parses() {
+        use clap::Parser;
+        use moq_native_ietf::quic::CongestionChoice;
+        let base = Args::try_parse_from(REQUIRED_ARGV).expect("required args parse");
+        assert_eq!(base.quic_cc, CongestionChoice::Bbr);
+        assert_eq!(CongestionChoice::default(), CongestionChoice::Bbr);
+        assert!(base.qlog_dir.is_none());
+        assert_eq!(
+            super::quic_probe_line(base.quic_cc, base.qlog_dir.as_deref()),
+            "[tx] quic congestion controller: bbr; qlog dir: none"
+        );
+
+        let mut argv: Vec<&str> = REQUIRED_ARGV.to_vec();
+        argv.extend(["--quic-cc", "cubic", "--qlog-dir", "/tmp/q"]);
+        let cubic = Args::try_parse_from(&argv).expect("--quic-cc cubic parses");
+        assert_eq!(cubic.quic_cc, CongestionChoice::Cubic);
+        assert_eq!(cubic.qlog_dir, Some(PathBuf::from("/tmp/q")));
+        assert_eq!(
+            super::quic_probe_line(cubic.quic_cc, cubic.qlog_dir.as_deref()),
+            "[tx] quic congestion controller: cubic; qlog dir: /tmp/q"
+        );
+
+        let mut argv: Vec<&str> = REQUIRED_ARGV.to_vec();
+        argv.extend(["--quic-cc", "bbr"]);
+        assert_eq!(Args::try_parse_from(&argv).unwrap().quic_cc, CongestionChoice::Bbr);
+
+        let mut argv: Vec<&str> = REQUIRED_ARGV.to_vec();
+        argv.extend(["--quic-cc", "reno"]);
+        assert!(Args::try_parse_from(&argv).is_err(), "only bbr|cubic are accepted");
     }
 
     #[test]
